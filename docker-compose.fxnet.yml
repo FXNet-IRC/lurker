@@ -1,0 +1,45 @@
+# FXNet — production deployment of the lurker fork.
+#
+#   cp .env.fxnet.example .env.fxnet   # then fill in the secrets
+#   docker compose -f docker-compose.fxnet.yml up -d
+#
+# This runs our forked image (built + pushed by scripts/release.sh) with the
+# network lock active, so every account is bound to irc.fxnet.org. Front it with
+# your TLS-terminating reverse proxy at https://chat.fxnet.org — the container
+# listens on localhost only.
+
+services:
+  lurker:
+    image: reg.xfnet.org/fxnet/lurker:latest
+    container_name: fxnet-lurker
+    ports:
+      # Bind to localhost only; the reverse proxy (Caddy/nginx) terminates TLS
+      # for chat.fxnet.org and forwards here.
+      - '127.0.0.1:8015:8015'
+    volumes:
+      # All persistent state — SQLite DB, session secret, uploads. Back this up.
+      - ./data:/app/data
+    env_file:
+      # Secrets only: LURKER_PROVISION_SECRET, SESSION_SECRET. See the example.
+      - .env.fxnet
+    environment:
+      - NODE_ENV=production
+      - PORT=8015
+      - DATABASE_PATH=/app/data/lurker.db
+
+      # ───── FXNet network lock ────────────────────────────────────────────
+      # Bind every account to irc.fxnet.org and hide add/remove-network UI.
+      - LURKER_LOCK_NETWORKS=true
+      - LURKER_FORCED_NETWORK_NAME=FXNet
+      - LURKER_FORCED_NETWORK_HOST=irc.fxnet.org
+      - LURKER_FORCED_NETWORK_PORT=6697
+      - LURKER_FORCED_NETWORK_TLS=1
+      # Comma-separated channels auto-joined for new accounts.
+      - LURKER_FORCED_NETWORK_CHANNELS=#chat,#help,#fxnet
+
+      # ───── Passkeys + secure cookies for chat.fxnet.org ──────────────────
+      - WEBAUTHN_RP_ID=chat.fxnet.org
+      - WEBAUTHN_RP_NAME=FXNet Chat
+      - WEBAUTHN_ORIGIN=https://chat.fxnet.org
+      - COOKIE_SECURE=true
+    restart: unless-stopped

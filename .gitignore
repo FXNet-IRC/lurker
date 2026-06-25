@@ -1,6 +1,7 @@
 node_modules/
 .env
 .env.local
+.env.fxnet
 docker-compose.override.yml
 *.log
 npm-debug.log*
