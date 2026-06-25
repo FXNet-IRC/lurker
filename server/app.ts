@@ -27,6 +27,7 @@ import { exportsRouter, importRouter } from './routes/exports.js';
 import apiTokensRouter from './routes/apiTokens.js';
 import configRouter from './routes/config.js';
 import nodeRouter from './routes/node.js';
+import provisionRouter from './routes/provision.js';
 import mcpRouter from './services/mcpServer.js';
 import { requireApiAuth } from './middleware/apiAuth.js';
 import { isNodeMode } from './utils/edition.js';
@@ -64,6 +65,11 @@ export function buildApp(sessionSecret: string): Express {
   app.use('/api/exports', exportsRouter);
   app.use('/api/imports', importRouter);
   app.use('/api/config', configRouter);
+
+  // FXNet account provisioning. Mounted unconditionally — the route's middleware
+  // fails closed (503) until LURKER_PROVISION_SECRET is set, so an instance that
+  // doesn't use the FXNet signup broker never exposes a usable surface here.
+  app.use('/api/provision', provisionRouter);
 
   // The HTTP API-token feature and the MCP server are the two ends of the same
   // bearer-token model: /api/api-tokens (session-cookie auth) mints the tokens,
