@@ -24,6 +24,7 @@ import { effectiveSetting } from './settingsService.js';
 import { IRC_VERSION, APP_VERSION } from '../utils/userAgent.js';
 import { findUserById } from '../db/users.js';
 import { isNodeMode } from '../utils/edition.js';
+import { resolveConnectTarget } from '../utils/forcedNetwork.js';
 import { deriveIdent } from '../utils/ident.js';
 import { registerIdent, unregisterIdent, isIdentdEnabled } from './identd.js';
 import { MESSAGE_MAX_BYTES, partitionMultiline, reassembleMultiline } from './messageSplit.js';
@@ -2074,18 +2075,24 @@ export class IrcConnection {
     const account = sasl_password
       ? { account: sasl_account || nick, password: sasl_password }
       : undefined;
-    const proto = this.network.tls ? ' (TLS)' : '';
+    // Destination is resolved through forcedNetwork: when the FXNet lock is
+    // active this returns the forced host/port/tls regardless of what is stored
+    // on the row, so a tampered or legacy network can only ever reach FXNet.
+    // Unlocked, it mirrors the row exactly (upstream behavior). Identity fields
+    // (nick / user / SASL / server password) always come from the user's row.
+    const target = resolveConnectTarget(this.network);
+    const proto = target.tls ? ' (TLS)' : '';
     this.publish({
       type: 'notice',
       target: this.serverTarget(),
       nick: 'lurker',
-      text: `Connecting to ${this.network.host}:${this.network.port}${proto}…`,
+      text: `Connecting to ${target.host}:${target.port}${proto}…`,
     });
     this.client.connect({
-      host: this.network.host,
-      port: this.network.port,
-      tls: !!this.network.tls,
-      rejectUnauthorized: this.network.trusted_certificates !== 0,
+      host: target.host,
+      port: target.port,
+      tls: target.tls,
+      rejectUnauthorized: target.rejectUnauthorized,
       nick,
       username: this.network.username || nick,
       gecos: this.network.realname || nick,
