@@ -37,7 +37,12 @@
         <button class="link" @click="showUploads = true" title="Recent uploads">
           <i class="fa-solid fa-paperclip"></i>
         </button>
-        <button class="link" @click="openAddNetwork" title="Add network">
+        <button
+          v-if="!config.isNetworkLocked"
+          class="link"
+          @click="openAddNetwork"
+          title="Add network"
+        >
           <i class="fa-solid fa-plus"></i>
         </button>
       </div>
@@ -216,6 +221,7 @@ import { useBuffersStore, type Buffer } from '../stores/buffers.js';
 import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
 import { useSocket } from '../composables/useSocket.js';
 import { useNetworksStore } from '../stores/networks.js';
+import { useConfigStore } from '../stores/config.js';
 import { useChatBootstrap } from '../composables/useChatBootstrap.js';
 import { useActiveBuffer } from '../composables/useActiveBuffer.js';
 import { useSettingsStore } from '../stores/settings.js';
@@ -252,6 +258,7 @@ import { useNetworkEditor } from '../composables/useNetworkEditor.js';
 import { useJumpToMessage } from '../composables/useJumpToMessage.js';
 
 const networks = useNetworksStore();
+const config = useConfigStore();
 const buffers = useBuffersStore();
 // Registers the WebSocket connect lifecycle (onMounted) for the desktop shell —
 // must be called even though we don't read `connected` here (the LURKER row's

@@ -15,14 +15,14 @@
 
     <form v-else class="modal-form" @submit.prevent="submit">
       <div class="net-form">
-        <button v-if="!isEdit" type="button" class="back-link" @click="step = 'pick'">
+        <button v-if="!isEdit && !locked" type="button" class="back-link" @click="step = 'pick'">
           ← {{ picked ? picked.name : 'pick a network' }}
         </button>
-        <label>
+        <label v-if="!locked">
           <span>Name</span>
           <input v-model="form.name" placeholder="Libera" required />
         </label>
-        <div class="row">
+        <div v-if="!locked" class="row">
           <label class="grow">
             <span>Host</span>
             <input v-model="form.host" placeholder="irc.libera.chat" required />
@@ -107,7 +107,7 @@
             <input v-model="form.autoconnect" type="checkbox" />
             <span>Reconnect automatically</span>
           </label>
-          <label class="check">
+          <label v-if="!locked" class="check">
             <input v-model="form.trusted_certificates" type="checkbox" />
             <span>Only allow trusted certificates</span>
           </label>
@@ -116,7 +116,7 @@
       </div>
       <footer class="modal-footer">
         <button
-          v-if="isEdit"
+          v-if="isEdit && !locked"
           type="button"
           class="btn-secondary danger"
           :disabled="loading"
@@ -165,6 +165,12 @@ const config = useConfigStore();
 
 const isEdit = computed(() => !!props.network);
 
+// When the instance locks every account to one network (FXNet), the destination
+// is fixed and there is no network picker — the form is identity-only (nick,
+// realname, SASL, etc.). Add/remove are hidden elsewhere, so a locked form is
+// only ever reached by editing the seeded network.
+const locked = computed(() => config.isNetworkLocked);
+
 // Cast to a loose record so we can read extra API fields not declared in
 // the typed Network interface (sasl_account, autoconnect, connect_commands, etc.).
 const netRaw = props.network as Record<string, unknown> | null;
@@ -200,7 +206,7 @@ const showAdvanced = ref(
 // Add-flow opens on the network picker (#169); editing jumps straight to the
 // form. Picking a built-in prefills the connection fields so the user only has
 // to supply a nick.
-const step = ref<'pick' | 'form'>(isEdit.value ? 'form' : 'pick');
+const step = ref<'pick' | 'form'>(isEdit.value || locked.value ? 'form' : 'pick');
 const picked = ref<BuiltinNetwork | null>(null);
 
 function onPick(net: BuiltinNetwork): void {

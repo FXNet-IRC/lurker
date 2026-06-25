@@ -15,19 +15,26 @@ export type Edition = 'standalone' | 'node';
 export const useConfigStore = defineStore('config', {
   state: () => ({
     edition: 'standalone' as Edition,
+    // True when this instance binds every account to one network (FXNet lock):
+    // the UI then hides add/remove-network and the destination fields.
+    networkLock: false,
     checked: false,
   }),
   getters: {
     // True when this client is talking to a hosted cell, not a self-hosted box.
     isNode: (s): boolean => s.edition === 'node',
+    // True when accounts are locked to a single network on this instance.
+    isNetworkLocked: (s): boolean => s.networkLock,
   },
   actions: {
     async fetch(): Promise<Edition> {
       try {
-        const data = await api<{ edition?: string }>('/api/config');
+        const data = await api<{ edition?: string; networkLock?: boolean }>('/api/config');
         this.edition = data.edition === 'node' ? 'node' : 'standalone';
+        this.networkLock = data.networkLock === true;
       } catch (_err) {
         this.edition = 'standalone';
+        this.networkLock = false;
       } finally {
         this.checked = true;
       }

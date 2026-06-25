@@ -25,7 +25,12 @@
         <button class="icon" title="Recent uploads" @click="showUploads = true">
           <i class="fa-solid fa-paperclip"></i>
         </button>
-        <button class="icon" title="Add network" @click="openAddNetwork">
+        <button
+          v-if="!config.isNetworkLocked"
+          class="icon"
+          title="Add network"
+          @click="openAddNetwork"
+        >
           <i class="fa-solid fa-plus"></i>
         </button>
         <RouterLink class="icon" to="/settings" title="Settings">
@@ -181,6 +186,7 @@ import { computed, reactive, ref, watch } from 'vue';
 import type { Network } from '../stores/networks.js';
 import type { BufferLike } from '../composables/useBufferActions.js';
 import { useNetworksStore } from '../stores/networks.js';
+import { useConfigStore } from '../stores/config.js';
 import { useSocket } from '../composables/useSocket.js';
 import { useChatBootstrap } from '../composables/useChatBootstrap.js';
 import { useActiveBuffer } from '../composables/useActiveBuffer.js';
@@ -217,6 +223,7 @@ import { useBuffersStore } from '../stores/buffers.js';
 import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
 
 const networks = useNetworksStore();
+const config = useConfigStore();
 const buffers = useBuffersStore();
 const { connected } = useSocket();
 const { keyboardOpen } = useVisualViewport();
