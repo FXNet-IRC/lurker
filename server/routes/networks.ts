@@ -17,6 +17,12 @@ import {
 } from '../db/networks.js';
 import ircManager from '../services/ircManager.js';
 import { fanOutToUser } from '../services/wsHub.js';
+import { isNetworkLockEnabled } from '../utils/forcedNetwork.js';
+
+// Destination fields a locked account may never set or change — the lock binds
+// everyone to the forced FXNet network, so only identity/preferences are
+// editable. Stripped from PATCH bodies and rejected on POST.
+const LOCKED_DESTINATION_FIELDS = ['host', 'port', 'tls', 'trusted_certificates'] as const;
 
 const router = Router();
 router.use(requireAuth);
@@ -45,6 +51,12 @@ router.get('/', (req: Request, res: Response) => {
 });
 
 router.post('/', (req: Request, res: Response) => {
+  // Locked accounts get exactly one network, seeded at provisioning. Adding
+  // more would let a user reach a non-FXNet server, so creation is disabled.
+  if (isNetworkLockEnabled()) {
+    res.status(403).json({ error: 'adding networks is disabled on this instance' });
+    return;
+  }
   const {
     name,
     host,
@@ -122,11 +134,25 @@ router.patch('/:id', (req: Request, res: Response) => {
     res.status(404).json({ error: 'network not found' });
     return;
   }
-  const updated = updateNetwork(id, req.user!.id, req.body || {});
+  // When locked, silently drop any attempt to edit the destination — the lock
+  // is enforced at connect regardless, but stripping it here keeps the stored
+  // row honest and the API response truthful. Identity/preference fields pass
+  // through unchanged.
+  const fields = { ...req.body };
+  if (isNetworkLockEnabled()) {
+    for (const key of LOCKED_DESTINATION_FIELDS) delete fields[key];
+  }
+  const updated = updateNetwork(id, req.user!.id, fields);
   res.json({ network: networkPayload(updated) });
 });
 
 router.delete('/:id', (req: Request, res: Response) => {
+  // Deleting the lone FXNet network would leave the account with nothing to
+  // connect to, so removal is disabled while locked.
+  if (isNetworkLockEnabled()) {
+    res.status(403).json({ error: 'removing networks is disabled on this instance' });
+    return;
+  }
   const id = Number(req.params.id);
   const existing = getNetwork(id, req.user!.id);
   if (!existing) {
