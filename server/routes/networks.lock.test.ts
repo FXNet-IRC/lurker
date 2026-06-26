@@ -79,18 +79,20 @@ describe('network lock', () => {
     expect(fakeManager.calls.some(([m]) => m === 'disposeNetwork')).toBe(false);
   });
 
-  it('strips destination edits but applies identity edits', async () => {
+  it('strips destination and ident edits but applies identity edits', async () => {
     const res = await agent.patch(`/api/networks/${seededId}`).send({
       host: 'evil.example.com',
       port: 1234,
       tls: false,
+      username: 'spoofed-ident',
       nick: 'newnick',
     });
     expect(res.status).toBe(200);
-    // Destination is untouched; only the nick changed.
+    // Destination + ident source are untouched; only the nick changed.
     expect(res.body.network.host).toBe('irc.fxnet.org');
     expect(res.body.network.port).toBe(6697);
     expect(res.body.network.tls).toBe(true);
+    expect(res.body.network.username).not.toBe('spoofed-ident');
     expect(res.body.network.nick).toBe('newnick');
   });
 });

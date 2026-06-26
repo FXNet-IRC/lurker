@@ -37,6 +37,18 @@ services:
       # Comma-separated channels auto-joined for new accounts.
       - LURKER_FORCED_NETWORK_CHANNELS=#chat,#help,#fxnet
 
+      # ───── Per-user ident (single-user bans) ─────────────────────────────
+      # Locked connections present a stable, unspoofable ident `lu<userId>`,
+      # so an oper can ban exactly one lurker user without catching the rest
+      # that share this server's IP:
+      #     KLINE *!lu<userId>@<lurker-host>      (or a channel ban)
+      # The user id is shown in lurker's admin user list. With identd enabled
+      # below (and the IRCd configured to query it on port 113), the ident is
+      # reported authoritatively (no leading ~); without it the IRCd records
+      # ~lu<userId>, which is still unique and bannable.
+      # - LURKER_IDENTD_ENABLED=true
+      # - LURKER_IDENTD_PORT=113
+
       # ───── Passkeys + secure cookies for chat.fxnet.org ──────────────────
       - WEBAUTHN_RP_ID=chat.fxnet.org
       - WEBAUTHN_RP_NAME=FXNet Chat

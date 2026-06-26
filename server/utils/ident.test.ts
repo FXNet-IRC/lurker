@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import { describe, it, expect } from 'vitest';
-import { deriveIdent } from './ident.js';
+import { deriveIdent, lockedAccountIdent } from './ident.js';
 
 describe('deriveIdent', () => {
   it('node edition surfaces the global account id from the acct-<id> username', () => {
@@ -69,5 +69,44 @@ describe('deriveIdent', () => {
     expect(
       deriveIdent({ nodeMode: false, accountUsername: '', networkUsername: 'a b@c!', nick: 'x' }),
     ).toBe('abc');
+  });
+
+  it('a locked account keys the ident off the user id, ignoring username and nick', () => {
+    expect(
+      deriveIdent({
+        nodeMode: false,
+        accountUsername: 'alice',
+        networkUsername: 'spoofed',
+        nick: 'alsospoofed',
+        networkLocked: true,
+        userId: 42,
+      }),
+    ).toBe('lu42');
+  });
+
+  it('two locked users with the same chosen nick still get distinct idents', () => {
+    const a = deriveIdent({
+      nodeMode: false,
+      accountUsername: 'a',
+      networkUsername: 'bob',
+      nick: 'bob',
+      networkLocked: true,
+      userId: 7,
+    });
+    const b = deriveIdent({
+      nodeMode: false,
+      accountUsername: 'b',
+      networkUsername: 'bob',
+      nick: 'bob',
+      networkLocked: true,
+      userId: 8,
+    });
+    expect([a, b]).toEqual(['lu7', 'lu8']);
+  });
+});
+
+describe('lockedAccountIdent', () => {
+  it('is the stable lu<id> token', () => {
+    expect(lockedAccountIdent(42)).toBe('lu42');
   });
 });

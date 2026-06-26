@@ -19,10 +19,18 @@ import ircManager from '../services/ircManager.js';
 import { fanOutToUser } from '../services/wsHub.js';
 import { isNetworkLockEnabled } from '../utils/forcedNetwork.js';
 
-// Destination fields a locked account may never set or change — the lock binds
-// everyone to the forced FXNet network, so only identity/preferences are
-// editable. Stripped from PATCH bodies and rejected on POST.
-const LOCKED_DESTINATION_FIELDS = ['host', 'port', 'tls', 'trusted_certificates'] as const;
+// Fields a locked account may never set or change — the lock binds everyone to
+// the forced FXNet network, so only identity/preferences (nick, realname, SASL,
+// channels) are editable. `username` is the IRC ident source: locking it keeps
+// it from drifting from the per-account ident the connection forces, so
+// single-user bans stay reliable. Stripped from PATCH bodies and rejected on POST.
+const LOCKED_DESTINATION_FIELDS = [
+  'host',
+  'port',
+  'tls',
+  'trusted_certificates',
+  'username',
+] as const;
 
 const router = Router();
 router.use(requireAuth);

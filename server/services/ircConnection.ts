@@ -24,8 +24,8 @@ import { effectiveSetting } from './settingsService.js';
 import { IRC_VERSION, APP_VERSION } from '../utils/userAgent.js';
 import { findUserById } from '../db/users.js';
 import { isNodeMode } from '../utils/edition.js';
-import { resolveConnectTarget } from '../utils/forcedNetwork.js';
-import { deriveIdent } from '../utils/ident.js';
+import { resolveConnectTarget, isNetworkLockEnabled } from '../utils/forcedNetwork.js';
+import { deriveIdent, lockedAccountIdent } from '../utils/ident.js';
 import { registerIdent, unregisterIdent, isIdentdEnabled } from './identd.js';
 import { MESSAGE_MAX_BYTES, partitionMultiline, reassembleMultiline } from './messageSplit.js';
 import type { MultilineLimits } from './messageSplit.js';
@@ -916,6 +916,8 @@ export class IrcConnection {
             accountUsername: findUserById(this.network.user_id)?.username || '',
             networkUsername: this.network.username,
             nick: this.network.nick,
+            networkLocked: isNetworkLockEnabled(),
+            userId: this.network.user_id,
           }),
         });
       },
@@ -2094,7 +2096,12 @@ export class IrcConnection {
       tls: target.tls,
       rejectUnauthorized: target.rejectUnauthorized,
       nick,
-      username: this.network.username || nick,
+      // When locked, force the ident to the stable per-account token so the
+      // IRCd records a unique, unspoofable ident (whether or not it queries our
+      // identd) and a single user can be banned without hitting others.
+      username: isNetworkLockEnabled()
+        ? lockedAccountIdent(this.network.user_id)
+        : this.network.username || nick,
       gecos: this.network.realname || nick,
       password: this.network.server_password || undefined,
       account,
