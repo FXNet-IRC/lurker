@@ -20,18 +20,28 @@
 #   - Creates a local git tag `vX.Y.Z` (not pushed automatically — you
 #     review and `git push --tags` when ready)
 #
+# Before building, the script runs the full quality gate (typecheck, client
+# typecheck, lint, format check, and the test suite) so a broken build never
+# becomes a pushed image. Skip it with --skip-checks when you know better.
+#
+# The image is stamped with OCI provenance labels (version, git revision, build
+# time, source) so `docker inspect` / the registry can tell exactly what's inside.
+#
 # Usage:
-#   scripts/release.sh                  # bump patch (default)
+#   scripts/release.sh                  # check, build, push; bump patch (default)
 #   scripts/release.sh --minor          # bump minor
 #   scripts/release.sh --major          # bump major
 #   scripts/release.sh --version 1.2.0  # explicit version
 #   scripts/release.sh --no-bump        # rebuild current VERSION as-is
-#   scripts/release.sh --dry-run        # build + tag but skip push
+#   scripts/release.sh --dry-run        # check + build + tag but skip push
 #   scripts/release.sh --no-latest      # skip the :latest tag
+#   scripts/release.sh --skip-checks    # skip the typecheck/lint/test gate
+#   scripts/release.sh --platform P     # build for a target arch (e.g. linux/amd64)
 #   scripts/release.sh --help
 #
 # Pre-flight:
 #   - Working tree should be clean; pass --force-dirty to override.
+#   - The quality gate must pass; pass --skip-checks to bypass.
 #   - You must be `docker login`'d to reg.xfnet.org.
 
 set -euo pipefail
@@ -76,6 +86,8 @@ explicit_version=""
 dry_run=0
 tag_latest=1
 force_dirty=0
+skip_checks=0
+platform=""           # empty = native build; else passed to docker build --platform
 
 usage() {
     # Print the leading comment block as the help text. awk stops at the
@@ -105,6 +117,14 @@ while [[ $# -gt 0 ]]; do
         --dry-run)      dry_run=1; shift ;;
         --no-latest)    tag_latest=0; shift ;;
         --force-dirty)  force_dirty=1; shift ;;
+        --skip-checks)  skip_checks=1; shift ;;
+        --platform)
+            platform="${2:-}"
+            if [[ -z "${platform}" ]]; then
+                fail "--platform requires a value (e.g. --platform linux/amd64)"
+            fi
+            shift 2
+            ;;
         -h|--help)      usage 0 ;;
         *)              warn "Unknown argument: $1"; usage 1 ;;
     esac
@@ -115,6 +135,9 @@ done
 # -----------------------------------------------------------------------------
 command -v docker >/dev/null 2>&1 || fail "docker is not installed."
 command -v git    >/dev/null 2>&1 || fail "git is not installed."
+if [[ "${skip_checks}" -eq 0 ]]; then
+    command -v npm >/dev/null 2>&1 || fail "npm is not installed (needed for the quality gate; use --skip-checks to bypass)."
+fi
 
 cd "${REPO_ROOT}"
 
@@ -168,6 +191,8 @@ echo -e "  ${C_DIM}from      :${C_RESET} v${current_version}"
 echo -e "  ${C_DIM}to        :${C_RESET} v${new_version}"
 echo -e "  ${C_DIM}git sha   :${C_RESET} ${git_sha}"
 echo -e "  ${C_DIM}tags      :${C_RESET} v${new_version}, sha-${git_sha}$([[ "${tag_latest}" -eq 1 ]] && echo ", latest")"
+echo -e "  ${C_DIM}platform  :${C_RESET} $([[ -n "${platform}" ]] && echo "${platform}" || echo "native")"
+echo -e "  ${C_DIM}checks    :${C_RESET} $([[ "${skip_checks}" -eq 1 ]] && echo "skipped" || echo "yes")"
 echo -e "  ${C_DIM}dry run   :${C_RESET} $([[ "${dry_run}" -eq 1 ]] && echo "yes" || echo "no")"
 echo
 
@@ -183,11 +208,51 @@ if [[ "${tag_latest}" -eq 1 ]]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Build
+# Quality gate
+#
+# The Dockerfile builds the client and runs the server straight from TS via tsx —
+# it never typechecks or tests. So we gate here: typecheck (server + client),
+# lint, format check (all via `npm run check`) and the full test suite. A failure
+# aborts before we build or push, so a broken commit can't become a release.
 # -----------------------------------------------------------------------------
+if [[ "${skip_checks}" -eq 1 ]]; then
+    warn "Skipping quality gate (--skip-checks)."
+else
+    info "Running quality gate (typecheck, lint, format, tests)..."
+    npm run check
+    npm test
+    ok "Quality gate passed."
+fi
+
+# -----------------------------------------------------------------------------
+# Build
+#
+# OCI provenance labels are baked in so `docker inspect <image>` and the registry
+# UI report exactly which version/commit the image was built from, and when.
+# -----------------------------------------------------------------------------
+build_created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+git_sha_full="$(git rev-parse HEAD 2>/dev/null || echo 'nogit')"
+git_remote="$(git config --get remote.origin.url 2>/dev/null || true)"
+
+declare -a label_args=(
+    --label "org.opencontainers.image.title=fxnet-lurker"
+    --label "org.opencontainers.image.version=${new_version}"
+    --label "org.opencontainers.image.revision=${git_sha_full}"
+    --label "org.opencontainers.image.created=${build_created}"
+)
+[[ -n "${git_remote}" ]] && label_args+=(--label "org.opencontainers.image.source=${git_remote}")
+
+declare -a platform_args=()
+if [[ -n "${platform}" ]]; then
+    platform_args+=(--platform "${platform}")
+    info "Targeting platform: ${platform}"
+fi
+
 info "Building image..."
 DOCKER_BUILDKIT=1 docker build \
     "${tag_args[@]}" \
+    "${label_args[@]}" \
+    "${platform_args[@]}" \
     --file Dockerfile \
     .
 ok "Built ${IMAGE}:v${new_version}"
