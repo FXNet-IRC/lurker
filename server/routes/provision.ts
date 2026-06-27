@@ -33,12 +33,16 @@ router.get('/check', (req: Request, res: Response) => {
   res.json({ valid: true, available: !findUserByUsername(username) });
 });
 
-// Provision a verified account. Role is always 'user' (the operator's admin is
-// created separately and must never come from this path). Same username/password
-// rules as lurker's own auth, so the account is valid everywhere it surfaces.
+// Provision a verified account. Defaults to a regular 'user'; the operator can
+// pass role:"admin" to bootstrap their admin account. This is safe here and
+// nowhere else because the route is behind the provisioning secret
+// (requireProvisionAuth) — open first-run setup is disabled on a public instance,
+// so the secret is the only trusted channel to mint an admin. Same
+// username/password rules as lurker's own auth.
 router.post('/users', (req: Request, res: Response) => {
   const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const requestedRole = req.body?.role === 'admin' ? 'admin' : 'user';
 
   if (!isValidUsername(username)) {
     res.status(400).json({ error: 'invalid username' });
@@ -53,7 +57,7 @@ router.post('/users', (req: Request, res: Response) => {
     return;
   }
 
-  const user = createUser(username); // role defaults to 'user'
+  const user = createUser(username, { role: requestedRole });
   try {
     setPasswordHash(user.id, hashPassword(password));
     seedForcedNetwork(user.id, username);
@@ -64,7 +68,7 @@ router.post('/users', (req: Request, res: Response) => {
     throw err;
   }
 
-  res.status(201).json({ id: user.id, username: user.username });
+  res.status(201).json({ id: user.id, username: user.username, role: user.role });
 });
 
 export default router;

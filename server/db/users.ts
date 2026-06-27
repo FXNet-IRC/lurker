@@ -64,6 +64,14 @@ export function countUsers(): number {
   return (db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n;
 }
 
+// Real (non-guest) accounts only. First-run setup gates on this rather than
+// countUsers so ephemeral guests (public webchat) can't make the operator look
+// "already set up" and lock them out of bootstrapping their admin.
+export function countNonGuestUsers(): number {
+  return (db.prepare('SELECT COUNT(*) AS n FROM users WHERE is_guest = 0').get() as { n: number })
+    .n;
+}
+
 export function countAdmins(): number {
   return (db.prepare(`SELECT COUNT(*) AS n FROM users WHERE role = 'admin'`).get() as { n: number })
     .n;

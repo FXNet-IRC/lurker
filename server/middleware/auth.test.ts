@@ -17,12 +17,24 @@ const ctx: TestDbContext = setupTestDb('auth-mw');
 let app: Express;
 let userId: number;
 
+let adminId: number;
+let guestId: number;
+
 beforeAll(async () => {
-  const { createUser } = await import('../db/users.js');
-  const { requireAuth } = await import('./auth.js');
+  const { createUser, createGuestUser } = await import('../db/users.js');
+  const db = (await import('../db/index.js')).default;
+  const { requireAuth, requireAdmin } = await import('./auth.js');
   userId = createUser('alice').id;
+  adminId = createUser('boss', { role: 'admin' }).id;
+  // A guest that has somehow been handed the admin role — the exact bug we're
+  // guarding against. requireAdmin must still refuse it.
+  guestId = createGuestUser('guest-x').id;
+  db.prepare(`UPDATE users SET role = 'admin' WHERE id = ?`).run(guestId);
   const router = Router();
   router.get('/', requireAuth, (_req, res) => {
+    res.json({ ok: true });
+  });
+  router.get('/admin', requireAuth, requireAdmin, (_req, res) => {
     res.json({ ok: true });
   });
   app = createTestApp({ '/protected': router });
@@ -60,5 +72,22 @@ describe('requireAuth stale-session recovery', () => {
     const res = await request(app).get('/protected');
     expect(res.status).toBe(401);
     expect(res.headers['set-cookie']).toBeUndefined();
+  });
+});
+
+describe('requireAdmin', () => {
+  it('lets a real admin through', async () => {
+    const agent = await createAuthedAgent(app, adminId);
+    expect((await agent.get('/protected/admin')).status).toBe(200);
+  });
+
+  it('forbids a regular user', async () => {
+    const agent = await createAuthedAgent(app, userId);
+    expect((await agent.get('/protected/admin')).status).toBe(403);
+  });
+
+  it('forbids a guest even if it carries the admin role', async () => {
+    const agent = await createAuthedAgent(app, guestId);
+    expect((await agent.get('/protected/admin')).status).toBe(403);
   });
 });

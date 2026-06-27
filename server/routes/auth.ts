@@ -17,7 +17,7 @@ import {
 import {
   findUserById,
   findUserByUsername,
-  countUsers,
+  countNonGuestUsers,
   createUser,
   deleteUser,
   getPasswordHash,
@@ -28,6 +28,7 @@ import {
 import { inviteStatus, consumeInvite } from '../db/invites.js';
 import { setClientIpForAllUserNetworks } from '../db/networks.js';
 import { normalizeIp } from '../utils/clientIp.js';
+import { isPublicModeEnabled } from '../utils/publicMode.js';
 import { isValidUsername } from '../utils/username.js';
 import {
   listForUser as listCredentialsForUser,
@@ -85,11 +86,14 @@ const router = Router();
 
 // ---------- setup status ----------
 
-// "Needs setup" means the system has no users yet — i.e. the very first run
-// before the operator bootstraps their admin account. Once a user exists,
-// further accounts come in through the invite flow, not this endpoint.
+// "Needs setup" means there are no REAL accounts yet — the very first run before
+// the operator bootstraps their admin. Counts non-guest users so ephemeral
+// guests can't mask first-run. Disabled entirely in public mode: an open
+// "create the first admin" form on a public site would let any visitor seize
+// admin, so on a public instance the admin is provisioned via the secret-guarded
+// API instead (POST /api/provision/users with role=admin).
 router.get('/setup-status', (_req: Request, res: Response) => {
-  if (countUsers() === 0) {
+  if (!isPublicModeEnabled() && countNonGuestUsers() === 0) {
     res.json({ needsSetup: true, mode: 'create-user' });
     return;
   }
@@ -104,7 +108,7 @@ router.get('/setup-status', (_req: Request, res: Response) => {
 router.post(
   '/setup/options',
   asyncHandler(async (req: Request, res: Response) => {
-    if (countUsers() > 0) {
+    if (isPublicModeEnabled() || countNonGuestUsers() > 0) {
       res.status(409).json({ error: 'setup already complete' });
       return;
     }
@@ -210,7 +214,7 @@ router.post(
 // skips the WebAuthn dance — operator picks a username and password and is
 // signed in straight away. They can add a passkey later from settings.
 router.post('/setup/password', (req: Request, res: Response) => {
-  if (countUsers() > 0) {
+  if (isPublicModeEnabled() || countNonGuestUsers() > 0) {
     res.status(409).json({ error: 'setup already complete' });
     return;
   }

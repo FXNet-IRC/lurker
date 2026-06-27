@@ -131,6 +131,21 @@ describe('POST /api/auth/claim/password', () => {
   });
 });
 
+describe('first-run setup is closed in public mode', () => {
+  it('setup-status reports needsSetup:false', async () => {
+    const res = await request(app).get('/api/auth/setup-status');
+    expect(res.status).toBe(200);
+    expect(res.body.needsSetup).toBe(false);
+  });
+
+  it('refuses open password setup (no public visitor can seize admin)', async () => {
+    const res = await request(app)
+      .post('/api/auth/setup/password')
+      .send({ username: 'wannabeadmin', password: 'password123' });
+    expect(res.status).toBe(409);
+  });
+});
+
 describe('guest reaper', () => {
   it('reaps an idle guest but spares a fresh one', async () => {
     const db = (await import('../db/index.js')).default;

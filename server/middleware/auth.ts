@@ -86,7 +86,10 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction): v
     res.status(401).json({ error: 'unauthorized' });
     return;
   }
-  if (req.user.role !== 'admin') {
+  // A guest must never have admin powers. Belt-and-suspenders: guests are created
+  // role 'user' and backfillFirstAdmin demotes any that slipped through, so this
+  // should never fire — but it guarantees the invariant at the gate regardless.
+  if (req.user.role !== 'admin' || req.user.is_guest) {
     res.status(403).json({ error: 'forbidden' });
     return;
   }

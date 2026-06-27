@@ -99,6 +99,26 @@ describe('POST /api/provision/users', () => {
     const res = await provision({ username: 'dup', password: 'password123' });
     expect(res.status).toBe(409);
   });
+
+  it('defaults to a regular user role', async () => {
+    const res = await provision({ username: 'regular', password: 'password123' });
+    expect(res.status).toBe(201);
+    expect(res.body.role).toBe('user');
+    expect(findUserByUsername('regular')!.role).toBe('user');
+  });
+
+  it('can bootstrap an admin when role=admin is requested (secret-guarded path)', async () => {
+    const res = await provision({ username: 'theboss', password: 'password123', role: 'admin' });
+    expect(res.status).toBe(201);
+    expect(res.body.role).toBe('admin');
+    expect(findUserByUsername('theboss')!.role).toBe('admin');
+  });
+
+  it('ignores an unknown role and falls back to user', async () => {
+    const res = await provision({ username: 'sneaky', password: 'password123', role: 'superuser' });
+    expect(res.status).toBe(201);
+    expect(findUserByUsername('sneaky')!.role).toBe('user');
+  });
 });
 
 describe('GET /api/provision/check', () => {

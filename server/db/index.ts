@@ -5,6 +5,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { isNodeMode } from '../utils/edition.js';
+import { isPublicModeEnabled } from '../utils/publicMode.js';
 import { foldBufferCase } from './foldBufferCase.js';
 
 // Guardrail: under vitest, refuse to fall back to the real database. A test
@@ -587,13 +588,23 @@ function columnExists(table: string, column: string): boolean {
 // breach the hosted tenant/admin boundary (a tenant must never become admin).
 export function backfillFirstAdmin(): void {
   if (isNodeMode()) return;
+  // A guest must NEVER hold admin. Self-heal any that wrongly did — e.g. a
+  // pre-fix boot that promoted the earliest user before this check existed, when
+  // in public mode that earliest user is an ephemeral guest. Runs every boot and
+  // is idempotent.
+  db.exec(`UPDATE users SET role = 'user' WHERE role = 'admin' AND is_guest = 1`);
+  // In public mode never auto-promote anyone: the earliest account is a guest (or
+  // a self-serve member), and handing it admin is exactly the bug above. The
+  // operator's admin is created explicitly via the secret-guarded provisioning
+  // API (POST /api/provision/users with role=admin) or first-run setup.
+  if (isPublicModeEnabled()) return;
   const adminCount = (
     db.prepare(`SELECT COUNT(*) AS n FROM users WHERE role = 'admin'`).get() as { n: number }
   ).n;
   if (adminCount === 0) {
-    // Promote the earliest-created user (id ASC) if any exist.
+    // Promote the earliest-created NON-GUEST user (id ASC) if any exist.
     db.exec(`UPDATE users SET role = 'admin'
-             WHERE id = (SELECT id FROM users ORDER BY id LIMIT 1)`);
+             WHERE id = (SELECT id FROM users WHERE is_guest = 0 ORDER BY id LIMIT 1)`);
   }
 }
 
@@ -664,7 +675,6 @@ ensureColumn('users', 'is_paused', 'INTEGER NOT NULL DEFAULT 0');
 // to admin by routes/auth.js. On an existing single-user install pre-dating
 // this column, backfill that lone user to admin so they retain control.
 ensureColumn('users', 'role', `TEXT NOT NULL DEFAULT 'user'`);
-backfillFirstAdmin();
 
 // FXNet public webchat: guest accounts. A guest is an ordinary user row with
 // is_guest=1 — auto-created on first visit when LURKER_PUBLIC_MODE is on, reusing
@@ -672,7 +682,10 @@ backfillFirstAdmin();
 // idle. It can be "claimed" into a permanent account (set a username + password
 // or passkey, flips this back to 0) while keeping all settings/history. Defaults
 // to 0 so every pre-existing account is a real account.
+// MUST be created before backfillFirstAdmin() runs — that function reads is_guest
+// to make sure a guest is never promoted to admin.
 ensureColumn('users', 'is_guest', 'INTEGER NOT NULL DEFAULT 0');
+backfillFirstAdmin();
 
 // Persist which rule matched each message so the highlights modal can read
 // from disk instead of scanning whatever happens to be loaded in client memory.
