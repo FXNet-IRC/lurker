@@ -39,6 +39,9 @@ export interface Network {
   connect_commands: string | null;
   position: number;
   created_at: string;
+  // Most recent browser IP that established/holds this connection (FXNet WEBIRC).
+  // NULL until a client IP is observed; then forwarded via WEBIRC on connect.
+  last_client_ip: string | null;
 }
 
 /** A row from the `channels` table. */
@@ -179,6 +182,29 @@ export function updateNetwork(
 
 export function deleteNetwork(id: number, userId: number): void {
   db.prepare('DELETE FROM networks WHERE id = ? AND user_id = ?').run(id, userId);
+}
+
+// Record the latest browser IP for a network so the next connect can forward it
+// to the IRCd via WEBIRC. Kept off createNetwork/updateNetwork's field maps on
+// purpose: this is observed transport state (never user-supplied), refreshed at
+// login / guest-create / WS upgrade. Scoped by user_id so it can't touch another
+// account's row. No-op when ip is empty.
+export function setNetworkClientIp(networkId: number, userId: number, ip: string | null): void {
+  if (!ip) return;
+  db.prepare('UPDATE networks SET last_client_ip = ? WHERE id = ? AND user_id = ?').run(
+    ip,
+    networkId,
+    userId,
+  );
+}
+
+// Refresh the WEBIRC client IP across all of a user's networks at once. Used at
+// login and WS-upgrade, where we learn a fresh browser IP but not a specific
+// network. The next (re)connect of each network forwards it. No-op when ip is
+// empty.
+export function setClientIpForAllUserNetworks(userId: number, ip: string | null): void {
+  if (!ip) return;
+  db.prepare('UPDATE networks SET last_client_ip = ? WHERE user_id = ?').run(ip, userId);
 }
 
 // One-time, idempotent wrap of any plaintext secret columns once an encryption

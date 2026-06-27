@@ -23,8 +23,11 @@ import {
   getPasswordHash,
   userHasPassword,
   setPasswordHash,
+  claimGuestUser,
 } from '../db/users.js';
 import { inviteStatus, consumeInvite } from '../db/invites.js';
+import { setClientIpForAllUserNetworks } from '../db/networks.js';
+import { normalizeIp } from '../utils/clientIp.js';
 import { isValidUsername } from '../utils/username.js';
 import {
   listForUser as listCredentialsForUser,
@@ -198,6 +201,7 @@ router.post(
 
     const { token: sessionToken } = createSession(user.id);
     res.cookie(SESSION_COOKIE, sessionToken, getCookieOptions());
+    setClientIpForAllUserNetworks(user.id, normalizeIp(req.ip));
     res.json({ user: { id: user.id, username: user.username, role: user.role } });
   }),
 );
@@ -228,6 +232,7 @@ router.post('/setup/password', (req: Request, res: Response) => {
   setPasswordHash(user.id, hashPassword(password as string));
   const { token: sessionToken } = createSession(user.id);
   res.cookie(SESSION_COOKIE, sessionToken, getCookieOptions());
+  setClientIpForAllUserNetworks(user.id, normalizeIp(req.ip));
   res.json({ user: { id: user.id, username: user.username, role: user.role } });
 });
 
@@ -364,6 +369,7 @@ router.post(
 
     const { token: sessionToken } = createSession(user.id);
     res.cookie(SESSION_COOKIE, sessionToken, getCookieOptions());
+    setClientIpForAllUserNetworks(user.id, normalizeIp(req.ip));
     res.json({ user: { id: user.id, username: user.username, role: user.role } });
   }),
 );
@@ -401,6 +407,7 @@ router.post('/invite/:token/password', (req: Request<{ token: string }>, res: Re
   setPasswordHash(user.id, hashPassword(password as string));
   const { token: sessionToken } = createSession(user.id);
   res.cookie(SESSION_COOKIE, sessionToken, getCookieOptions());
+  setClientIpForAllUserNetworks(user.id, normalizeIp(req.ip));
   res.json({ user: { id: user.id, username: user.username, role: user.role } });
 });
 
@@ -494,6 +501,7 @@ router.post(
 
     const { token: sessionToken } = createSession(user.id);
     res.cookie(SESSION_COOKIE, sessionToken, getCookieOptions());
+    setClientIpForAllUserNetworks(user.id, normalizeIp(req.ip));
     res.json({ user: { id: user.id, username: user.username, role: user.role } });
   }),
 );
@@ -520,6 +528,7 @@ router.post('/login/password', (req: Request, res: Response) => {
   }
   const { token: sessionToken } = createSession(user.id);
   res.cookie(SESSION_COOKIE, sessionToken, getCookieOptions());
+  setClientIpForAllUserNetworks(user.id, normalizeIp(req.ip));
   res.json({ user: { id: user.id, username: user.username, role: user.role } });
 });
 
@@ -546,6 +555,7 @@ router.get('/me', requireAuth, (req: Request, res: Response) => {
       username: req.user!.username,
       role: req.user!.role,
       is_paused: !!req.user!.is_paused,
+      is_guest: !!req.user!.is_guest,
     },
   });
 });
@@ -708,5 +718,156 @@ router.delete('/password', requireAuth, (req: Request, res: Response) => {
   setPasswordHash(req.user!.id, null);
   res.json({ ok: true, hasPassword: false });
 });
+
+// ---------- claim a guest account (authed guest → permanent) ----------
+//
+// A guest already holds a valid session, so claiming reuses the SAME user row:
+// we set a real username and a credential, then flip is_guest off. Because the
+// row is unchanged, every setting, network, draft and message carries over and
+// the existing session cookie stays valid — no re-login.
+
+// Validate the requested username for a claim. Returns an error message, or null
+// when it's a usable, available username. Shared by both claim paths.
+function validateClaimUsername(raw: unknown): string | null {
+  if (!isValidUsername(raw)) return 'invalid username';
+  if (findUserByUsername((raw as string).trim())) return 'username already exists';
+  return null;
+}
+
+router.post('/claim/password', requireAuth, (req: Request, res: Response) => {
+  if (!req.user!.is_guest) {
+    res.status(409).json({ error: 'not a guest account' });
+    return;
+  }
+  const username = (req.body?.username || '').trim();
+  const password: unknown = req.body?.password;
+  const usernameError = validateClaimUsername(username);
+  if (usernameError) {
+    res
+      .status(usernameError === 'username already exists' ? 409 : 400)
+      .json({ error: usernameError });
+    return;
+  }
+  if (!isValidPassword(password)) {
+    res.status(400).json({ error: passwordRequirementsMessage() });
+    return;
+  }
+  // claimGuestUser is scoped to is_guest=1, so it fails closed if the row was
+  // claimed concurrently between the guard above and here.
+  if (!claimGuestUser(req.user!.id, username)) {
+    res.status(409).json({ error: 'account already claimed' });
+    return;
+  }
+  setPasswordHash(req.user!.id, hashPassword(password as string));
+  res.json({ user: { id: req.user!.id, username, role: req.user!.role, is_guest: false } });
+});
+
+router.post(
+  '/claim/passkey/options',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response) => {
+    if (!req.user!.is_guest) {
+      res.status(409).json({ error: 'not a guest account' });
+      return;
+    }
+    const username = (req.body?.username || '').trim();
+    const usernameError = validateClaimUsername(username);
+    if (usernameError) {
+      res
+        .status(usernameError === 'username already exists' ? 409 : 400)
+        .json({ error: usernameError });
+      return;
+    }
+    const { rpID, rpName } = rpConfig();
+    const options = await generateRegistrationOptions({
+      rpName,
+      rpID,
+      // Use the requested username for the ceremony, but DON'T write it yet — the
+      // row is only claimed on a successful verify, so an abandoned ceremony
+      // leaves the guest intact (and reapable) rather than an orphaned, login-less
+      // permanent account.
+      userName: username,
+      userID: new Uint8Array(userIdToHandle(req.user!.id)),
+      userDisplayName: username,
+      attestationType: 'none',
+      authenticatorSelection: {
+        residentKey: 'required',
+        userVerification: 'preferred',
+      },
+    });
+    const token = saveChallenge({
+      purpose: 'claim-passkey',
+      challenge: options.challenge,
+      userId: req.user!.id,
+      pendingUsername: username,
+    });
+    setChallengeCookie(res, token);
+    res.json({ options });
+  }),
+);
+
+router.post(
+  '/claim/passkey/verify',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response) => {
+    if (!req.user!.is_guest) {
+      res.status(409).json({ error: 'not a guest account' });
+      return;
+    }
+    const token = req.signedCookies?.[CHALLENGE_COOKIE];
+    const entry = consumeChallenge(token);
+    clearChallengeCookie(res);
+    if (!entry || entry.purpose !== 'claim-passkey' || (entry.userId as number) !== req.user!.id) {
+      res.status(400).json({ error: 'no pending registration' });
+      return;
+    }
+    const username = entry.pendingUsername as string;
+    // Re-check availability at verify time — another account may have taken the
+    // name during the ceremony.
+    const usernameError = validateClaimUsername(username);
+    if (usernameError) {
+      res
+        .status(usernameError === 'username already exists' ? 409 : 400)
+        .json({ error: usernameError });
+      return;
+    }
+    const { rpID, expectedOrigin } = rpConfig();
+    let verification: VerifiedRegistrationResponse;
+    try {
+      verification = await verifyRegistrationResponse({
+        response: req.body?.response,
+        expectedChallenge: entry.challenge as string,
+        expectedOrigin,
+        expectedRPID: rpID,
+        requireUserVerification: false,
+      });
+    } catch (err) {
+      const e = err as { message?: string };
+      res.status(400).json({ error: e.message || 'verification failed' });
+      return;
+    }
+    if (!verification.verified || !verification.registrationInfo) {
+      res.status(400).json({ error: 'verification failed' });
+      return;
+    }
+    if (!claimGuestUser(req.user!.id, username)) {
+      res.status(409).json({ error: 'account already claimed' });
+      return;
+    }
+    const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo;
+    const label = (req.body?.label || '').toString().trim().slice(0, 64) || null;
+    insertCredential({
+      userId: req.user!.id,
+      credentialId: credential.id,
+      publicKey: Buffer.from(credential.publicKey),
+      counter: credential.counter,
+      transports: credential.transports || [],
+      deviceType: credentialDeviceType,
+      backedUp: credentialBackedUp,
+      label,
+    });
+    res.json({ user: { id: req.user!.id, username, role: req.user!.role, is_guest: false } });
+  }),
+);
 
 export default router;

@@ -68,6 +68,30 @@ describe('parseForcedNetworkConfig', () => {
     });
     expect(cfg.port).toBe(6697);
   });
+
+  it('leaves WEBIRC unconfigured by default', () => {
+    const cfg = parseForcedNetworkConfig({});
+    expect(cfg.webircPassword).toBe('');
+    // Gateway defaults to the network name even with no WEBIRC password.
+    expect(cfg.webircGateway).toBe('FXNet');
+  });
+
+  it('parses WEBIRC password and gateway', () => {
+    const cfg = parseForcedNetworkConfig({
+      LURKER_WEBIRC_PASSWORD: 's3cret',
+      LURKER_WEBIRC_GATEWAY: 'fxnet-web',
+    });
+    expect(cfg.webircPassword).toBe('s3cret');
+    expect(cfg.webircGateway).toBe('fxnet-web');
+  });
+
+  it('defaults the WEBIRC gateway to the network name when unset', () => {
+    const cfg = parseForcedNetworkConfig({
+      LURKER_FORCED_NETWORK_NAME: 'Example',
+      LURKER_WEBIRC_PASSWORD: 's3cret',
+    });
+    expect(cfg.webircGateway).toBe('Example');
+  });
 });
 
 describe('resolveConnectTarget', () => {

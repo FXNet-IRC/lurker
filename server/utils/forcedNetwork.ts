@@ -38,6 +38,16 @@ export interface ForcedNetworkConfig {
   verifyTls: boolean;
   /** Channels auto-joined on the seeded network. */
   channels: string[];
+  /**
+   * Shared secret sent in the WEBIRC command, matching the InspIRCd
+   * `<gateway type="webirc" password>` block. Empty disables WEBIRC.
+   */
+  webircPassword: string;
+  /**
+   * Gateway name sent as the WEBIRC `gateway` field, matching the IRCd's
+   * `<connect:webirc>` / extban gateway name. Defaults to the network name.
+   */
+  webircGateway: string;
 }
 
 /**
@@ -74,7 +84,20 @@ export function parseForcedNetworkConfig(
           .map((c) => c.trim())
           .filter(Boolean);
 
-  return { enabled: optedIn && host !== '', name, host, port, tls, verifyTls, channels };
+  const webircPassword = (env.LURKER_WEBIRC_PASSWORD ?? '').trim();
+  const webircGateway = (env.LURKER_WEBIRC_GATEWAY ?? '').trim() || name;
+
+  return {
+    enabled: optedIn && host !== '',
+    name,
+    host,
+    port,
+    tls,
+    verifyTls,
+    channels,
+    webircPassword,
+    webircGateway,
+  };
 }
 
 function isFalsey(raw: string | undefined): boolean {
@@ -108,6 +131,24 @@ export function isNetworkLockEnabled(): boolean {
 /** Reset the cache. Test-only — production reads the env exactly once. */
 export function resetForcedNetworkCacheForTests(): void {
   cached = null;
+}
+
+/** WEBIRC credentials to forward each user's real IP to the IRCd. */
+export interface WebircConfig {
+  password: string;
+  gateway: string;
+}
+
+/**
+ * WEBIRC config for this process, or null when unconfigured (no password). When
+ * null, connections send no WEBIRC command and behave exactly as before — so a
+ * misconfigured or opted-out deploy degrades to "no real-IP forwarding" rather
+ * than a broken registration handshake.
+ */
+export function getWebircConfig(): WebircConfig | null {
+  const cfg = getForcedNetworkConfig();
+  if (!cfg.webircPassword) return null;
+  return { password: cfg.webircPassword, gateway: cfg.webircGateway };
 }
 
 /** The destination + TLS settings irc-framework should dial for one connection. */

@@ -34,6 +34,19 @@ declare module 'irc-framework' {
      * — and therefore which identd — a connection appears to originate from.
      */
     outgoing_addr?: string;
+    /**
+     * When set, irc-framework sends the WEBIRC command before NICK/USER to
+     * forward the real client identity to a trusting IRCd (InspIRCd m_gateway).
+     * `username` is the gateway name; `address`/`hostname` are the client's real
+     * IP. See client.js — WEBIRC is emitted only when this option is present.
+     */
+    webirc?: {
+      password: string;
+      username: string;
+      hostname: string;
+      address: string;
+      options?: Record<string, string>;
+    };
   }
 
   /** Options passed to the Client constructor. */

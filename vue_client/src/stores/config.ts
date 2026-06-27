@@ -18,6 +18,10 @@ export const useConfigStore = defineStore('config', {
     // True when this instance binds every account to one network (FXNet lock):
     // the UI then hides add/remove-network and the destination fields.
     networkLock: false,
+    // True when anonymous guest access is enabled (FXNet public webchat): the
+    // router sends unauthenticated visitors to the join-as-guest landing rather
+    // than the login page.
+    publicMode: false,
     checked: false,
   }),
   getters: {
@@ -25,16 +29,22 @@ export const useConfigStore = defineStore('config', {
     isNode: (s): boolean => s.edition === 'node',
     // True when accounts are locked to a single network on this instance.
     isNetworkLocked: (s): boolean => s.networkLock,
+    // True when visitors can join the chat without an account.
+    isPublicMode: (s): boolean => s.publicMode,
   },
   actions: {
     async fetch(): Promise<Edition> {
       try {
-        const data = await api<{ edition?: string; networkLock?: boolean }>('/api/config');
+        const data = await api<{ edition?: string; networkLock?: boolean; publicMode?: boolean }>(
+          '/api/config',
+        );
         this.edition = data.edition === 'node' ? 'node' : 'standalone';
         this.networkLock = data.networkLock === true;
+        this.publicMode = data.publicMode === true;
       } catch (_err) {
         this.edition = 'standalone';
         this.networkLock = false;
+        this.publicMode = false;
       } finally {
         this.checked = true;
       }

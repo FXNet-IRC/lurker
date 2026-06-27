@@ -3,7 +3,7 @@
 
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireNonGuest } from '../middleware/auth.js';
 import { createToken, listForUser, revoke } from '../db/apiTokens.js';
 
 // Admin UI for managing per-user MCP/API bearer tokens. Sibling of bookmarks.ts:
@@ -14,6 +14,9 @@ import { createToken, listForUser, revoke } from '../db/apiTokens.js';
 
 const router = Router();
 router.use(requireAuth);
+// Throwaway guest accounts can't mint long-lived bearer tokens — claim a real
+// account first.
+router.use(requireNonGuest);
 
 const VALID_SCOPES = new Set(['read', 'read-write']);
 const MAX_NAME_LEN = 64;

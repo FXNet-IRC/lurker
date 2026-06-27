@@ -28,9 +28,11 @@ import apiTokensRouter from './routes/apiTokens.js';
 import configRouter from './routes/config.js';
 import nodeRouter from './routes/node.js';
 import provisionRouter from './routes/provision.js';
+import guestRouter from './routes/guest.js';
 import mcpRouter from './services/mcpServer.js';
 import { requireApiAuth } from './middleware/apiAuth.js';
 import { isNodeMode } from './utils/edition.js';
+import { trustProxyConfig } from './utils/clientIp.js';
 
 const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
   console.error('[lurker] error:', err);
@@ -46,6 +48,13 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
  */
 export function buildApp(sessionSecret: string): Express {
   const app = express();
+
+  // Honor X-Forwarded-For only when configured to sit behind a trusted proxy, so
+  // req.ip reflects the real browser IP we forward to the IRCd via WEBIRC. OFF by
+  // default — a directly-exposed instance must never trust client-set XFF (it
+  // would let anyone forge their IP). The FXNet deploy binds 127.0.0.1 behind
+  // nginx and sets LURKER_TRUST_PROXY=loopback. See utils/clientIp.ts.
+  app.set('trust proxy', trustProxyConfig());
 
   const corsOrigin = process.env.CORS_ORIGIN || 'https://irc.local.bradroot.me:5173';
   app.use(cors({ origin: corsOrigin, credentials: true }));
@@ -70,6 +79,10 @@ export function buildApp(sessionSecret: string): Express {
   // fails closed (503) until LURKER_PROVISION_SECRET is set, so an instance that
   // doesn't use the FXNet signup broker never exposes a usable surface here.
   app.use('/api/provision', provisionRouter);
+
+  // FXNet public webchat: anonymous guest sessions. Mounted unconditionally —
+  // the router fails closed (404) unless LURKER_PUBLIC_MODE is enabled.
+  app.use('/api/guest', guestRouter);
 
   // The HTTP API-token feature and the MCP server are the two ends of the same
   // bearer-token model: /api/api-tokens (session-cookie auth) mints the tokens,

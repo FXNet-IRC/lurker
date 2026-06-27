@@ -320,6 +320,7 @@ describe('tls certificate trust setting', () => {
         connect_commands: null,
         position: 0,
         created_at: new Date().toISOString(),
+        last_client_ip: null,
       },
       onEvent: () => {},
     });
@@ -379,6 +380,7 @@ describe('addPeerWatch live presence seed (#302)', () => {
         connect_commands: null,
         position: 0,
         created_at: new Date().toISOString(),
+        last_client_ip: null,
       },
       onEvent: () => {},
     });
@@ -437,6 +439,7 @@ describe('nick-regain MONITOR teardown gating (#384)', () => {
         connect_commands: null,
         position: 0,
         created_at: new Date().toISOString(),
+        last_client_ip: null,
       },
       onEvent: () => {},
     });
@@ -586,6 +589,7 @@ describe('refused-message handler routing (#283)', () => {
         connect_commands: null,
         position: 0,
         created_at: new Date().toISOString(),
+        last_client_ip: null,
       },
       onEvent: () => {},
     });
@@ -803,6 +807,7 @@ describe('built-in identd registration', () => {
         connect_commands: null,
         position: 0,
         created_at: new Date().toISOString(),
+        last_client_ip: null,
       },
       onEvent: () => {},
     });
@@ -902,6 +907,7 @@ describe('disconnect quit message (#324)', () => {
         connect_commands: null,
         position: 0,
         created_at: new Date().toISOString(),
+        last_client_ip: null,
       },
       onEvent: () => {},
     });
@@ -959,6 +965,7 @@ describe('self nick updates the input bar (#362)', () => {
         connect_commands: null,
         position: 0,
         created_at: new Date().toISOString(),
+        last_client_ip: null,
       },
       onEvent: () => {},
     });
@@ -1058,6 +1065,7 @@ describe('capability negotiation (#310)', () => {
         connect_commands: null,
         position: 0,
         created_at: new Date().toISOString(),
+        last_client_ip: null,
       },
       onEvent: () => {},
     });
@@ -1144,6 +1152,7 @@ describe('IRCv3 draft/multiline (#381)', () => {
         connect_commands: null,
         position: 0,
         created_at: new Date().toISOString(),
+        last_client_ip: null,
       },
       onEvent: () => {},
     });
@@ -1378,5 +1387,73 @@ describe('IRCv3 draft/multiline (#381)', () => {
       expect(conn.multilineLimits()).toBeNull();
       expect(conn.supportsMultiline()).toBe(false);
     });
+  });
+});
+
+describe('WEBIRC real-IP forwarding', () => {
+  function makeConn(last_client_ip: string | null): IrcConnection {
+    return new IrcConnection({
+      network: {
+        id: 1,
+        user_id: 1,
+        name: 'n',
+        host: 'irc.example.test',
+        port: 6697,
+        tls: 1,
+        trusted_certificates: 1,
+        nick: 'nick',
+        username: null,
+        realname: null,
+        server_password: null,
+        autoconnect: 1,
+        sasl_account: null,
+        sasl_password: null,
+        connect_commands: null,
+        position: 0,
+        created_at: new Date().toISOString(),
+        last_client_ip,
+      },
+      onEvent: () => {},
+    });
+  }
+
+  function connectWith(conn: IrcConnection): ConnectOptions {
+    conn.publish = vi.fn<(event: unknown) => void>();
+    const spy = vi.fn<(options: ConnectOptions) => void>();
+    conn.client.connect = spy;
+    conn.connect();
+    return spy.mock.calls[0][0];
+  }
+
+  afterEach(async () => {
+    delete process.env.LURKER_WEBIRC_PASSWORD;
+    delete process.env.LURKER_WEBIRC_GATEWAY;
+    delete process.env.LURKER_FORCED_NETWORK_NAME;
+    (await import('../utils/forcedNetwork.js')).resetForcedNetworkCacheForTests();
+  });
+
+  it('forwards the client IP when WEBIRC is configured and an IP is known', async () => {
+    process.env.LURKER_WEBIRC_PASSWORD = 'pw';
+    process.env.LURKER_WEBIRC_GATEWAY = 'fxnet-web';
+    (await import('../utils/forcedNetwork.js')).resetForcedNetworkCacheForTests();
+    const opts = connectWith(makeConn('203.0.113.8'));
+    expect(opts.webirc).toEqual({
+      password: 'pw',
+      username: 'fxnet-web',
+      hostname: '203.0.113.8',
+      address: '203.0.113.8',
+      options: {},
+    });
+  });
+
+  it('omits WEBIRC when no client IP is known', async () => {
+    process.env.LURKER_WEBIRC_PASSWORD = 'pw';
+    (await import('../utils/forcedNetwork.js')).resetForcedNetworkCacheForTests();
+    expect(connectWith(makeConn(null)).webirc).toBeUndefined();
+  });
+
+  it('omits WEBIRC when no password is configured even with an IP', async () => {
+    (await import('../utils/forcedNetwork.js')).resetForcedNetworkCacheForTests();
+    expect(connectWith(makeConn('203.0.113.8')).webirc).toBeUndefined();
   });
 });

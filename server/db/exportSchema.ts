@@ -52,6 +52,8 @@ const USERS_SKIPPED_COLUMNS: Record<string, string> = Object.freeze({
   last_seen_at: 'tracked locally by each instance',
   created_at: 'tracked locally by each instance',
   is_paused: 'account access state, owned by the local instance / control plane',
+  is_guest:
+    'ephemeral guest state, local to the public-webchat instance; an export is always a real account',
 });
 
 // scope values control how the exporter filters rows for a given userId.
@@ -83,7 +85,10 @@ export const EXPORT_TABLES = Object.freeze({
   },
 
   networks: {
-    mode: 'export',
+    // 'partial': last_client_ip is transient transport state (the most recent
+    // browser IP, used only to forward WEBIRC on this instance), so it's left out
+    // of the portable contract — see skippedColumns.
+    mode: 'partial',
     scope: 'user_id',
     section: 'data',
     pk: 'id',
@@ -108,6 +113,10 @@ export const EXPORT_TABLES = Object.freeze({
       'connect_commands',
       'position',
     ],
+    skippedColumns: {
+      last_client_ip:
+        'transient transport state (latest browser IP for WEBIRC); instance-local, not portable',
+    },
   },
 
   channels: {

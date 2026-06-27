@@ -11,6 +11,7 @@ import {
   listChannels,
   upsertChannel,
   deleteChannel,
+  setNetworkClientIp,
 } from '../db/networks.js';
 import { reopenBuffer } from '../db/closedBuffers.js';
 import { findUserById } from '../db/users.js';
@@ -111,7 +112,7 @@ class IrcManager extends EventEmitter {
   startNetwork(
     userId: number,
     networkId: number,
-    opts: { deferrable?: boolean } = {},
+    opts: { deferrable?: boolean; clientIp?: string } = {},
   ): IrcConnection | null {
     // Paused accounts never hold a live IRC connection. This single gate is the
     // linchpin of the pause feature: it covers boot-time autoconnect
@@ -120,6 +121,9 @@ class IrcManager extends EventEmitter {
     // which path is taken. The boundary guards (REST/WS) exist only to return a
     // clean "account paused" instead of a silent no-op.
     if (findUserById(userId)?.is_paused) return null;
+    // Stamp the latest browser IP onto the row BEFORE we read it, so the freshly
+    // built connection carries it into WEBIRC on connect (FXNet real-IP path).
+    if (opts.clientIp) setNetworkClientIp(networkId, userId, opts.clientIp);
     const network = getNetwork(networkId, userId);
     if (!network) return null;
     let conn = this.getConnection(userId, networkId);

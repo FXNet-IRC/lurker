@@ -21,6 +21,8 @@ import ignoreRulesService from './ignoreRulesService.js';
 import { parseIgnoreInput, maskToRuleInput } from './ignoreRuleInput.js';
 import { findSession } from '../db/sessions.js';
 import { findUserById, touchUserLastSeen } from '../db/users.js';
+import { setClientIpForAllUserNetworks } from '../db/networks.js';
+import { clientIpFromHeaders, shouldTrustProxy } from '../utils/clientIp.js';
 import {
   listMessages,
   listMessagesAround,
@@ -639,6 +641,13 @@ export function handleOpenBuffer(
 // addSocket/removeSocket); the registry just reads through it.
 const socketsByUser = new Map<number, Set<LurkerWebSocket>>();
 
+// True when the user has at least one live WS socket. The guest reaper consults
+// this to never delete a guest who still has an open tab, closing the
+// reap-while-active race.
+export function isUserConnected(userId: number): boolean {
+  return (socketsByUser.get(userId)?.size ?? 0) > 0;
+}
+
 function send(ws: LurkerWebSocket, payload: WsPayload): void {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
 }
@@ -1195,6 +1204,11 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // wants a base for relative parsing.
     const initialSinceId = parseSinceParam(req.url);
     touchUserLastSeen(user.id);
+    // Refresh the WEBIRC client IP from the browser's current connection. This
+    // raw upgrade bypasses Express' `trust proxy`, so resolve the IP ourselves
+    // (honoring XFF only when configured to trust a fronting proxy). The next
+    // (re)connect of the user's networks forwards it to the IRCd.
+    setClientIpForAllUserNetworks(user.id, clientIpFromHeaders(req, shouldTrustProxy()));
     wss.handleUpgrade(req, socket, head, (ws) => {
       const lurkerWs = ws as LurkerWebSocket;
       lurkerWs.userId = user.id;

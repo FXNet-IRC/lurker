@@ -93,6 +93,21 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction): v
   next();
 }
 
+// Stack on top of requireAuth. Returns 403 for ephemeral guest accounts, used to
+// fence off features that don't make sense for a throwaway identity — minting
+// long-lived API tokens, etc. A guest must claim a permanent account first.
+export function requireNonGuest(req: Request, res: Response, next: NextFunction): void {
+  if (!req.user) {
+    res.status(401).json({ error: 'unauthorized' });
+    return;
+  }
+  if (req.user.is_guest) {
+    res.status(403).json({ error: 'account required' });
+    return;
+  }
+  next();
+}
+
 // Read-only gate for paused accounts. Stack on top of requireAuth. GET/HEAD
 // reads fall through so a paused user can still browse their history; any
 // mutating method gets a clean 403. The authoritative block on IRC traffic is

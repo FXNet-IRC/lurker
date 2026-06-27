@@ -30,6 +30,8 @@ import {
   shutdownExportJobs,
 } from './services/exportJobs.js';
 import { startIgnoreSweeper, stopIgnoreSweeper } from './services/ignoreSweeper.js';
+import { startGuestReaper, stopGuestReaper } from './services/guestReaper.js';
+import { isPublicModeEnabled } from './utils/publicMode.js';
 
 const PORT = Number(process.env.PORT || 8010);
 // Optional bind address for the web/API server (HOST). Unset keeps upstream
@@ -93,6 +95,12 @@ startExportSweeper();
 // Prune expired -time ignore rules on an interval (#301).
 startIgnoreSweeper();
 
+// In public webchat mode, reap idle anonymous guest accounts on an interval.
+// No-op (never started) when LURKER_PUBLIC_MODE is off.
+if (isPublicModeEnabled()) {
+  startGuestReaper();
+}
+
 // In node edition, start reporting to the orchestrator (register on boot +
 // heartbeat on an interval). No-op in standalone or when unconfigured.
 startOrchestratorClient();
@@ -114,6 +122,7 @@ function shutdown(signal: string): void {
   stopIdentd();
   shutdownExportJobs();
   stopIgnoreSweeper();
+  stopGuestReaper();
   ircManager.shutdown();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 5000).unref();

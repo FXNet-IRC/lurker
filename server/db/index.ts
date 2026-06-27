@@ -644,6 +644,12 @@ ensureColumn('networks', 'connect_commands', 'TEXT');
 // create/reorder; ties fall back to id ASC so freshly migrated rows stay in
 // their original creation order. See schemaVersion < 6 backfill below.
 ensureColumn('networks', 'position', 'INTEGER NOT NULL DEFAULT 0');
+// FXNet WEBIRC: the most recent browser IP that established/holds this
+// connection, captured at login / guest-create / WS upgrade. Forwarded to the
+// IRCd via the WEBIRC command on connect so each user appears from their real IP
+// behind the shared gateway instead of everyone sharing the gateway's one IP.
+// NULL when unknown (then no WEBIRC is sent and behavior is exactly as before).
+ensureColumn('networks', 'last_client_ip', 'TEXT');
 ensureColumn('users', 'password_hash', 'TEXT');
 ensureColumn('users', 'last_seen_at', 'TEXT');
 // Account access state, orthogonal to role. A paused account keeps all its data
@@ -659,6 +665,14 @@ ensureColumn('users', 'is_paused', 'INTEGER NOT NULL DEFAULT 0');
 // this column, backfill that lone user to admin so they retain control.
 ensureColumn('users', 'role', `TEXT NOT NULL DEFAULT 'user'`);
 backfillFirstAdmin();
+
+// FXNet public webchat: guest accounts. A guest is an ordinary user row with
+// is_guest=1 — auto-created on first visit when LURKER_PUBLIC_MODE is on, reusing
+// all the per-user machinery (sessions, networks, settings), and reaped once
+// idle. It can be "claimed" into a permanent account (set a username + password
+// or passkey, flips this back to 0) while keeping all settings/history. Defaults
+// to 0 so every pre-existing account is a real account.
+ensureColumn('users', 'is_guest', 'INTEGER NOT NULL DEFAULT 0');
 
 // Persist which rule matched each message so the highlights modal can read
 // from disk instead of scanning whatever happens to be loaded in client memory.

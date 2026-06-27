@@ -7,17 +7,64 @@
   <section id="account" class="settings-pane">
     <h2>account</h2>
     <p v-if="auth.user && identityReady" class="account-identity">
-      Signed in as <strong>{{ identity }}</strong>
+      <template v-if="auth.isGuest">You're chatting as a <strong>guest</strong>.</template>
+      <template v-else
+        >Signed in as <strong>{{ identity }}</strong></template
+      >
     </p>
     <p v-if="config.isNode" class="section-desc">
       Manage your subscription and payment details on the <a href="/billing">billing</a> page.
+    </p>
+    <p v-else-if="auth.isGuest" class="section-desc">
+      Your nickname, settings and history live only on this temporary guest session and are removed
+      once you leave. Create an account to keep them and sign back in later.
     </p>
     <p v-else class="section-desc">
       You can sign in with a passkey, a password, or both. Removing your last sign-in method would
       lock you out, so it's blocked.
     </p>
 
-    <template v-if="!config.isNode">
+    <!-- Guest → permanent account claim. Keeps the same session row, so settings
+         and history carry over. -->
+    <template v-if="!config.isNode && auth.isGuest">
+      <h3 class="subhead">create an account</h3>
+      <p v-if="claimError" class="error inline">{{ claimError }}</p>
+      <form class="password-form" @submit.prevent="onClaimPassword">
+        <label>
+          <span>Username</span>
+          <input v-model="claimUsername" autocomplete="username" />
+        </label>
+        <label>
+          <span>Password</span>
+          <input
+            v-model="claimPassword"
+            type="password"
+            autocomplete="new-password"
+            minlength="8"
+          />
+        </label>
+        <div class="password-actions">
+          <button
+            class="btn-primary"
+            type="submit"
+            :disabled="claimBusy || !claimUsername.trim() || !claimPassword"
+          >
+            {{ claimBusy ? 'creating…' : 'create account' }}
+          </button>
+          <button
+            type="button"
+            class="link"
+            :disabled="claimBusy || !claimUsername.trim()"
+            title="create your account using a passkey instead of a password"
+            @click="onClaimPasskey"
+          >
+            use a passkey instead
+          </button>
+        </div>
+      </form>
+    </template>
+
+    <template v-if="!config.isNode && !auth.isGuest">
       <p v-if="passkeyError" class="error inline">{{ passkeyError }}</p>
 
       <h3 class="subhead">passkeys</h3>
@@ -142,6 +189,53 @@ const passwordNotice = ref('');
 const passwordBusy = ref(false);
 const currentPasswordInput = ref('');
 const newPasswordInput = ref('');
+
+// Guest → permanent account claim.
+const claimUsername = ref('');
+const claimPassword = ref('');
+const claimError = ref('');
+const claimBusy = ref(false);
+
+// After a successful claim the row is now a real account; load its (currently
+// empty) credential management so the just-set password/passkey shows.
+async function afterClaim() {
+  claimUsername.value = '';
+  claimPassword.value = '';
+  await Promise.all([refreshPasskeys(), refreshPasswordStatus()]);
+}
+
+async function onClaimPassword() {
+  claimError.value = '';
+  if (!claimUsername.value.trim() || !claimPassword.value) return;
+  claimBusy.value = true;
+  try {
+    await auth.claimWithPassword({
+      username: claimUsername.value.trim(),
+      password: claimPassword.value,
+    });
+    await afterClaim();
+  } catch (e: any) {
+    claimError.value = auth.error || e.message || 'could not create your account';
+  } finally {
+    claimBusy.value = false;
+  }
+}
+
+async function onClaimPasskey() {
+  claimError.value = '';
+  if (!claimUsername.value.trim()) return;
+  claimBusy.value = true;
+  try {
+    await auth.claimWithPasskey({ username: claimUsername.value.trim() });
+    await afterClaim();
+  } catch (e: any) {
+    if (e.name !== 'NotAllowedError') {
+      claimError.value = auth.error || e.message || 'could not create your account';
+    }
+  } finally {
+    claimBusy.value = false;
+  }
+}
 
 const canRemovePasskey = computed(() => {
   // Server blocks removing the last sign-in method. So removing a passkey is
@@ -283,7 +377,9 @@ async function signOut() {
     // Back/bfcache could use to flash the signed-in app back onto the screen.
     window.location.replace('/');
   } else {
-    router.replace('/login');
+    // On a public-webchat instance the entry point is the join-as-guest landing,
+    // not the sign-in page.
+    router.replace(config.isPublicMode ? '/welcome' : '/login');
   }
 }
 </script>

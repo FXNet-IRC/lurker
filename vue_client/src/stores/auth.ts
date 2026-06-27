@@ -15,6 +15,9 @@ export interface AuthUser {
   // disconnected from IRC and barred from sending. Seeded by /api/auth/me and
   // flipped live by the server's 'account-state' WS event (see setPaused).
   is_paused?: boolean;
+  // Ephemeral anonymous account (public webchat). Reaped once idle; can be
+  // claimed into a permanent account to keep settings/history.
+  is_guest?: boolean;
 }
 
 export interface SetupStatus {
@@ -40,6 +43,10 @@ export const useAuthStore = defineStore('auth', {
     // Whole-UI read-only gate. Components key their disabled/banner state off
     // this rather than poking at user?.is_paused directly.
     isPaused: (s): boolean => s.user?.is_paused === true,
+    // True for an anonymous guest session. Components use this to surface the
+    // "create an account to keep your settings" prompt and hide account-only
+    // affordances (passkey/password management lives in the claim flow instead).
+    isGuest: (s): boolean => s.user?.is_guest === true,
   },
   actions: {
     // Live flip from the server's 'account-state' WS event, so an open tab
@@ -155,6 +162,57 @@ export const useAuthStore = defineStore('auth', {
         return user as AuthUser;
       } catch (err: any) {
         this.error = friendlyError(err, 'login failed');
+        throw err;
+      }
+    },
+    // Join the public webchat with no account: the server creates an ephemeral
+    // guest, seeds the network, and connects. `nick` is optional — blank lets
+    // the server assign a Guest##### handle.
+    async startGuest(nick?: string) {
+      this.error = null;
+      try {
+        const { user } = await api('/api/guest', { method: 'POST', body: { nick } });
+        this.user = user;
+        this.checked = true;
+        return user as AuthUser;
+      } catch (err: any) {
+        this.error = friendlyError(err, 'could not start a guest session');
+        throw err;
+      }
+    },
+    // Claim the current guest session into a permanent account with a password.
+    // The server keeps the same row (and session), so all settings/history stay.
+    async claimWithPassword({ username, password }: { username?: string; password?: string } = {}) {
+      this.error = null;
+      try {
+        const { user } = await api('/api/auth/claim/password', {
+          method: 'POST',
+          body: { username, password },
+        });
+        this.user = user;
+        return user as AuthUser;
+      } catch (err: any) {
+        this.error = friendlyError(err, 'could not create your account');
+        throw err;
+      }
+    },
+    // Claim the current guest session into a permanent account with a passkey.
+    async claimWithPasskey({ username, label }: { username?: string; label?: string } = {}) {
+      this.error = null;
+      try {
+        const { options } = await api('/api/auth/claim/passkey/options', {
+          method: 'POST',
+          body: { username },
+        });
+        const response = await startRegistration({ optionsJSON: options });
+        const { user } = await api('/api/auth/claim/passkey/verify', {
+          method: 'POST',
+          body: { response, label },
+        });
+        this.user = user;
+        return user as AuthUser;
+      } catch (err: any) {
+        this.error = friendlyError(err, 'could not create your account');
         throw err;
       }
     },

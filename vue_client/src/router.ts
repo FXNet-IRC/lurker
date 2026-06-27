@@ -3,9 +3,11 @@
 
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router';
 import { useAuthStore } from './stores/auth.js';
+import { useConfigStore } from './stores/config.js';
 
 const routes: RouteRecordRaw[] = [
   { path: '/login', name: 'login', component: () => import('./views/Login.vue') },
+  { path: '/welcome', name: 'welcome', component: () => import('./views/Welcome.vue') },
   { path: '/invite/:token', name: 'invite', component: () => import('./views/InviteAccept.vue') },
   {
     path: '/',
@@ -28,9 +30,19 @@ const router = createRouter({
 
 router.beforeEach(async (to) => {
   const auth = useAuthStore();
+  const config = useConfigStore();
+  // Resolve config before deciding public-vs-login, otherwise the first
+  // navigation can misroute (the landing choice depends on publicMode).
+  if (!config.checked) await config.fetch();
   if (!auth.checked) await auth.fetchMe();
-  if (to.meta.requiresAuth && !auth.user) return { name: 'login', query: { next: to.fullPath } };
-  if (to.name === 'login' && auth.user) return { name: 'chat' };
+  if (to.meta.requiresAuth && !auth.user) {
+    // In public webchat mode, send anonymous visitors to the join-as-guest
+    // landing instead of the sign-in page.
+    const name = config.isPublicMode ? 'welcome' : 'login';
+    return { name, query: { next: to.fullPath } };
+  }
+  // Authenticated users have no business on the entry screens.
+  if ((to.name === 'login' || to.name === 'welcome') && auth.user) return { name: 'chat' };
 });
 
 export default router;

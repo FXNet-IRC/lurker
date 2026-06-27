@@ -20,7 +20,8 @@ services:
       # All persistent state — SQLite DB, session secret, uploads. Back this up.
       - ./data:/app/data
     env_file:
-      # Secrets only: LURKER_PROVISION_SECRET, SESSION_SECRET. See the example.
+      # Secrets only: LURKER_PROVISION_SECRET, SESSION_SECRET, LURKER_WEBIRC_PASSWORD.
+      # See the example.
       - .env.fxnet
     environment:
       - NODE_ENV=production
@@ -36,6 +37,29 @@ services:
       - LURKER_FORCED_NETWORK_TLS=1
       # Comma-separated channels auto-joined for new accounts.
       - LURKER_FORCED_NETWORK_CHANNELS=#chat,#help,#fxnet
+
+      # ───── Public webchat (optional accounts) ────────────────────────────
+      # Let visitors join with no account: an ephemeral guest is created, seeded
+      # with the forced network, and reaped once idle. Guests can claim a real
+      # account later to keep their settings/history.
+      - LURKER_PUBLIC_MODE=true
+      # Guests idle (no open tab) this many minutes are deleted (default 30).
+      - LURKER_GUEST_IDLE_MINUTES=30
+      # Max guest creations per client IP per hour (default 5).
+      - LURKER_GUEST_RATELIMIT_PER_IP=5
+
+      # ───── WEBIRC real-IP passthrough ────────────────────────────────────
+      # Forward each user's real browser IP to the IRCd via WEBIRC, so they are
+      # individually attributable/bannable instead of all sharing this gateway's
+      # IP. Requires a matching <gateway type="webirc"> block on InspIRCd that
+      # trusts this host + LURKER_WEBIRC_PASSWORD (set in .env.fxnet).
+      # The gateway name defaults to LURKER_FORCED_NETWORK_NAME; override here.
+      - LURKER_WEBIRC_GATEWAY=FXNet
+      # Trust the fronting reverse proxy's X-Forwarded-For so req.ip / the WS
+      # upgrade resolve the real client IP. The container binds 127.0.0.1 behind
+      # nginx, so `loopback` is correct here. NEVER enable this unless actually
+      # behind a trusted proxy — clients could otherwise spoof their IP.
+      - LURKER_TRUST_PROXY=loopback
 
       # ───── Per-user ident (single-user bans) ─────────────────────────────
       # Locked connections present a stable, unspoofable ident `lu<userId>`,

@@ -17,34 +17,10 @@ import {
   hashPassword,
 } from '../services/password.js';
 import { createUser, findUserByUsername, setPasswordHash, deleteUser } from '../db/users.js';
-import { createNetwork, upsertChannel } from '../db/networks.js';
-import { getForcedNetworkConfig } from '../utils/forcedNetwork.js';
+import { seedForcedNetwork } from '../services/networkSeed.js';
 
 const router = Router();
 router.use(requireProvisionAuth);
-
-/**
- * Seed the single locked FXNet network for a freshly provisioned account, with
- * the user's nick defaulting to their username and the configured channels
- * auto-joined. No-op when the lock is off (an unlocked instance has no forced
- * network to seed — the account simply starts with none).
- */
-function seedForcedNetwork(userId: number, username: string): void {
-  const cfg = getForcedNetworkConfig();
-  if (!cfg.enabled) return;
-  const network = createNetwork(userId, {
-    name: cfg.name,
-    host: cfg.host,
-    port: cfg.port,
-    tls: cfg.tls,
-    nick: username,
-    username,
-    realname: username,
-    autoconnect: true,
-  });
-  if (!network) return;
-  for (const channel of cfg.channels) upsertChannel(network.id, channel, true);
-}
 
 // Availability/validity probe for the signup form — lets the website surface
 // "username taken" before it asks the user to set a password.

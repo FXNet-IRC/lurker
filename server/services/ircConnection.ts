@@ -24,7 +24,11 @@ import { effectiveSetting } from './settingsService.js';
 import { IRC_VERSION, APP_VERSION } from '../utils/userAgent.js';
 import { findUserById } from '../db/users.js';
 import { isNodeMode } from '../utils/edition.js';
-import { resolveConnectTarget, isNetworkLockEnabled } from '../utils/forcedNetwork.js';
+import {
+  resolveConnectTarget,
+  isNetworkLockEnabled,
+  getWebircConfig,
+} from '../utils/forcedNetwork.js';
 import { deriveIdent, lockedAccountIdent } from '../utils/ident.js';
 import { registerIdent, unregisterIdent, isIdentdEnabled } from './identd.js';
 import { MESSAGE_MAX_BYTES, partitionMultiline, reassembleMultiline } from './messageSplit.js';
@@ -2090,11 +2094,33 @@ export class IrcConnection {
       nick: 'lurker',
       text: `Connecting to ${target.host}:${target.port}${proto}…`,
     });
+    // Forward the user's real browser IP to the IRCd via WEBIRC so each user is
+    // attributable behind our shared gateway IP, instead of everyone appearing
+    // from one address. irc-framework emits the WEBIRC command before NICK/USER
+    // only when this option is set; with no WEBIRC config or no observed client
+    // IP we omit it and behave exactly as before. The IP is transport state we
+    // observed (req.ip / socket), never user-supplied — the IRCd in turn trusts
+    // WEBIRC only from our gateway's address (its <gateway mask>).
+    const webircCfg = getWebircConfig();
+    const clientIp = this.network.last_client_ip || '';
+    const webirc =
+      webircCfg && clientIp
+        ? {
+            password: webircCfg.password,
+            username: webircCfg.gateway,
+            // We do no reverse DNS server-side, so send the IP as the hostname
+            // too; the IRCd resolves/cloaks as configured.
+            hostname: clientIp,
+            address: clientIp,
+            options: {},
+          }
+        : undefined;
     this.client.connect({
       host: target.host,
       port: target.port,
       tls: target.tls,
       rejectUnauthorized: target.rejectUnauthorized,
+      webirc,
       nick,
       // When locked, force the ident to the stable per-account token so the
       // IRCd records a unique, unspoofable ident (whether or not it queries our
