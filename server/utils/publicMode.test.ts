@@ -17,10 +17,30 @@ describe('parsePublicModeConfig', () => {
     expect(parsePublicModeConfig({ LURKER_PUBLIC_MODE: 'yes' }).enabled).toBe(false);
   });
 
-  it('applies default idle and rate-limit values', () => {
+  it('applies default idle, rate-limit and disconnect-grace values', () => {
     const cfg = parsePublicModeConfig({ LURKER_PUBLIC_MODE: 'true' });
     expect(cfg.idleMinutes).toBe(30);
     expect(cfg.rateLimitPerIp).toBe(5);
+    expect(cfg.disconnectGraceSeconds).toBe(60);
+  });
+
+  it('honors a custom disconnect grace, including 0 (immediate)', () => {
+    expect(
+      parsePublicModeConfig({ LURKER_GUEST_DISCONNECT_GRACE_SECONDS: '15' }).disconnectGraceSeconds,
+    ).toBe(15);
+    expect(
+      parsePublicModeConfig({ LURKER_GUEST_DISCONNECT_GRACE_SECONDS: '0' }).disconnectGraceSeconds,
+    ).toBe(0);
+  });
+
+  it('falls back to the default disconnect grace on garbage/negative', () => {
+    expect(
+      parsePublicModeConfig({ LURKER_GUEST_DISCONNECT_GRACE_SECONDS: 'soon' })
+        .disconnectGraceSeconds,
+    ).toBe(60);
+    expect(
+      parsePublicModeConfig({ LURKER_GUEST_DISCONNECT_GRACE_SECONDS: '-5' }).disconnectGraceSeconds,
+    ).toBe(60);
   });
 
   it('honors positive integer overrides', () => {

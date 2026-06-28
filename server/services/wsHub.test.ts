@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { setupTestDb } from '../test-utils/testApp.js';
 
 // setupTestDb sets DATABASE_PATH before any dynamic import touches db/index.js,
@@ -424,5 +424,66 @@ describe('system buffer delivery (#355)', () => {
     expect(buildSystemHistoryReply(u, { mode: 'after', afterId: -1 })).toMatchObject({
       kind: 'error',
     });
+  });
+});
+
+describe('guest disconnect on last socket close', () => {
+  let scheduleGuestDisconnect: typeof import('./wsHub.js').scheduleGuestDisconnect;
+  let cancelGuestDisconnect: typeof import('./wsHub.js').cancelGuestDisconnect;
+  let isUserConnected: typeof import('./wsHub.js').isUserConnected;
+  let createGuestUser: typeof import('../db/users.js').createGuestUser;
+  let createRealUser: typeof import('../db/users.js').createUser;
+  let findById: typeof import('../db/users.js').findUserById;
+  let resetPublicModeCacheForTests: typeof import('../utils/publicMode.js').resetPublicModeCacheForTests;
+
+  beforeAll(async () => {
+    ({ scheduleGuestDisconnect, cancelGuestDisconnect, isUserConnected } =
+      await import('./wsHub.js'));
+    ({
+      createGuestUser,
+      createUser: createRealUser,
+      findUserById: findById,
+    } = await import('../db/users.js'));
+    ({ resetPublicModeCacheForTests } = await import('../utils/publicMode.js'));
+    process.env.LURKER_PUBLIC_MODE = 'true';
+    process.env.LURKER_GUEST_DISCONNECT_GRACE_SECONDS = '60';
+    resetPublicModeCacheForTests();
+  });
+
+  afterAll(() => {
+    delete process.env.LURKER_PUBLIC_MODE;
+    delete process.env.LURKER_GUEST_DISCONNECT_GRACE_SECONDS;
+    resetPublicModeCacheForTests();
+    vi.useRealTimers();
+  });
+
+  it('tears a guest down after the grace once its last socket is gone', () => {
+    const guest = createGuestUser('disc-guest-1');
+    expect(isUserConnected(guest.id)).toBe(false); // no socket in this unit test
+    vi.useFakeTimers();
+    scheduleGuestDisconnect(guest.id);
+    expect(findById(guest.id)).toBeDefined(); // still there during grace
+    vi.advanceTimersByTime(60_000);
+    vi.useRealTimers();
+    expect(findById(guest.id)).toBeUndefined(); // disconnected + removed
+  });
+
+  it('does not tear down if cancelled within the grace (reconnect)', () => {
+    const guest = createGuestUser('disc-guest-2');
+    vi.useFakeTimers();
+    scheduleGuestDisconnect(guest.id);
+    cancelGuestDisconnect(guest.id); // e.g. a refreshed tab reconnected
+    vi.advanceTimersByTime(120_000);
+    vi.useRealTimers();
+    expect(findById(guest.id)).toBeDefined();
+  });
+
+  it('never tears down a real (non-guest) account', () => {
+    const real = createRealUser('disc-real');
+    vi.useFakeTimers();
+    scheduleGuestDisconnect(real.id);
+    vi.advanceTimersByTime(120_000);
+    vi.useRealTimers();
+    expect(findById(real.id)).toBeDefined();
   });
 });

@@ -14,6 +14,7 @@
 
 const DEFAULT_IDLE_MINUTES = 30;
 const DEFAULT_RATELIMIT_PER_IP = 5;
+const DEFAULT_DISCONNECT_GRACE_SECONDS = 60;
 
 export interface PublicModeConfig {
   /** Operator opted in (LURKER_PUBLIC_MODE=true). */
@@ -22,6 +23,13 @@ export interface PublicModeConfig {
   idleMinutes: number;
   /** Max guest creations allowed per client IP per hour. */
   rateLimitPerIp: number;
+  /**
+   * Seconds to wait after a guest's last browser socket closes before tearing
+   * down its IRC connection and deleting the row. A short grace absorbs page
+   * refreshes / brief network blips / mobile backgrounding so they don't drop
+   * the connection. 0 = disconnect immediately.
+   */
+  disconnectGraceSeconds: number;
 }
 
 /**
@@ -34,12 +42,25 @@ export function parsePublicModeConfig(env: Record<string, string | undefined>): 
     enabled,
     idleMinutes: positiveIntOr(env.LURKER_GUEST_IDLE_MINUTES, DEFAULT_IDLE_MINUTES),
     rateLimitPerIp: positiveIntOr(env.LURKER_GUEST_RATELIMIT_PER_IP, DEFAULT_RATELIMIT_PER_IP),
+    disconnectGraceSeconds: nonNegativeIntOr(
+      env.LURKER_GUEST_DISCONNECT_GRACE_SECONDS,
+      DEFAULT_DISCONNECT_GRACE_SECONDS,
+    ),
   };
 }
 
 function positiveIntOr(raw: string | undefined, fallback: number): number {
   const n = Number.parseInt((raw ?? '').trim(), 10);
   return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+// Like positiveIntOr but allows 0 (used for the disconnect grace, where 0 means
+// "disconnect immediately"). A blank/garbage/negative value falls back.
+function nonNegativeIntOr(raw: string | undefined, fallback: number): number {
+  const trimmed = (raw ?? '').trim();
+  if (trimmed === '') return fallback;
+  const n = Number.parseInt(trimmed, 10);
+  return Number.isInteger(n) && n >= 0 ? n : fallback;
 }
 
 let cached: PublicModeConfig | null = null;
@@ -63,6 +84,11 @@ export function guestIdleMinutes(): number {
 /** Max guest creations per client IP per hour. */
 export function guestRateLimit(): number {
   return getPublicModeConfig().rateLimitPerIp;
+}
+
+/** Seconds after a guest's last socket closes before its connection is torn down. */
+export function guestDisconnectGraceSeconds(): number {
+  return getPublicModeConfig().disconnectGraceSeconds;
 }
 
 /** Reset the cache. Test-only — production reads the env exactly once. */

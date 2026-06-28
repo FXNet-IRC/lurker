@@ -47,6 +47,11 @@ services:
       - LURKER_GUEST_IDLE_MINUTES=30
       # Max guest creations per client IP per hour (default 5).
       - LURKER_GUEST_RATELIMIT_PER_IP=5
+      # When a guest closes their last tab, wait this many seconds before
+      # disconnecting them from IRC and removing the guest (default 60). The
+      # grace absorbs page refreshes / brief network blips so they don't drop;
+      # a reconnect within the window cancels it. 0 = disconnect immediately.
+      - LURKER_GUEST_DISCONNECT_GRACE_SECONDS=60
 
       # ───── WEBIRC real-IP passthrough ────────────────────────────────────
       # Forward each user's real browser IP to the IRCd via WEBIRC, so they are

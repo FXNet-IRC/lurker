@@ -20,9 +20,10 @@ import { evaluateIgnores } from './ignoreMatch.js';
 import ignoreRulesService from './ignoreRulesService.js';
 import { parseIgnoreInput, maskToRuleInput } from './ignoreRuleInput.js';
 import { findSession } from '../db/sessions.js';
-import { findUserById, touchUserLastSeen } from '../db/users.js';
+import { findUserById, touchUserLastSeen, deleteUser } from '../db/users.js';
 import { setClientIpForAllUserNetworks } from '../db/networks.js';
 import { clientIpFromHeaders, shouldTrustProxy } from '../utils/clientIp.js';
+import { isPublicModeEnabled, guestDisconnectGraceSeconds } from '../utils/publicMode.js';
 import {
   listMessages,
   listMessagesAround,
@@ -648,6 +649,44 @@ export function isUserConnected(userId: number): boolean {
   return (socketsByUser.get(userId)?.size ?? 0) > 0;
 }
 
+// Pending "guest closed their browser → tear down soon" timers, keyed by user.
+// A short grace (guestDisconnectGraceSeconds) absorbs refreshes / blips; a
+// reconnect cancels it (addSocket). Unlike a real account's bouncer connection,
+// a guest is ephemeral, so once they're gone for good we drop their IRC
+// connection and row promptly instead of waiting for the idle reaper.
+const guestDisconnectTimers = new Map<number, NodeJS.Timeout>();
+
+export function cancelGuestDisconnect(userId: number): void {
+  const t = guestDisconnectTimers.get(userId);
+  if (t) {
+    clearTimeout(t);
+    guestDisconnectTimers.delete(userId);
+  }
+}
+
+export function scheduleGuestDisconnect(userId: number): void {
+  if (!isPublicModeEnabled()) return;
+  if (!findUserById(userId)?.is_guest) return; // real (or claimed) accounts persist
+  cancelGuestDisconnect(userId);
+  const tearDown = (): void => {
+    guestDisconnectTimers.delete(userId);
+    // Reconnected during the grace, or claimed an account meanwhile? Leave it.
+    if (isUserConnected(userId)) return;
+    if (!findUserById(userId)?.is_guest) return;
+    ircManager.disposeUser(userId, 'guest left');
+    deleteUser(userId); // FK cascade clears networks/messages/sessions/settings
+    systemLog.log({ scope: 'server', text: `Guest ${userId} left — disconnected and removed` });
+  };
+  const graceMs = guestDisconnectGraceSeconds() * 1000;
+  if (graceMs <= 0) {
+    tearDown();
+    return;
+  }
+  const t = setTimeout(tearDown, graceMs);
+  t.unref?.();
+  guestDisconnectTimers.set(userId, t);
+}
+
 function send(ws: LurkerWebSocket, payload: WsPayload): void {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
 }
@@ -838,6 +877,9 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
   }
 
   function addSocket(userId: number, ws: LurkerWebSocket): void {
+    // The user (re)opened a tab — cancel any pending guest teardown from a
+    // just-closed socket so a refresh / reconnect keeps the connection alive.
+    cancelGuestDisconnect(userId);
     let set = socketsByUser.get(userId);
     if (!set) {
       set = new Set();
@@ -855,7 +897,13 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     const set = socketsByUser.get(userId);
     if (!set) return;
     set.delete(ws);
-    if (set.size === 0) socketsByUser.delete(userId);
+    if (set.size === 0) {
+      socketsByUser.delete(userId);
+      // Last tab closed. For a guest, start the short grace before tearing down
+      // their IRC connection (cancelled if they reconnect). No-op for real
+      // accounts — their bouncer connection persists by design.
+      scheduleGuestDisconnect(userId);
+    }
     evaluatePresence(userId);
   }
 
