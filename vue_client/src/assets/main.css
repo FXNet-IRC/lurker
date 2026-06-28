@@ -7,16 +7,23 @@
    from settings.effective() once the store loads. Changing a default here
    without changing settingsRegistry.js will only affect the very-first paint. */
 :root {
-  /* Brad's iTerm theme (Monokai Pro variant): #212022 / #fcfcfa */
-  --bg: #212022;
-  --bg-soft: #2c2a2e;
-  --fg: #fcfcfa;
-  --fg-muted: #939293;
-  --accent: #a99dec;
-  --good: #b3db82;
-  --warn: #f9d978;
-  --bad: #ed6c89;
-  --border: #2c2a2e;
+  /* FXNet terminal theme — matches the fxnet.org typing theme: #191a1b warm-dark
+     background, #e7eae0 text, olive terminal-green accent (#79a617), deep-red
+     error (#a61717). bg-soft / muted / border / warn are derived to fill the
+     tokens that palette doesn't define. Keep in sync with
+     shared/settingsRegistry.ts look.color.* defaults; these are only the
+     very-first-paint values (useTheme rewrites :root from the settings store
+     once it loads). */
+  --bg: #191a1b;
+  --bg-soft: #242526;
+  --fg: #e7eae0;
+  --fg-muted: #797b75;
+  --accent: #79a617;
+  --link: #79a617;
+  --good: #79a617;
+  --warn: #c9a227;
+  --bad: #a61717;
+  --border: #2f3031;
 
   /* Buffer-list state colors. Match the registry defaults so first paint is
      consistent before settings load; useTheme() then overwrites them from
@@ -31,7 +38,7 @@
   --member-halfop: #78dce8;
   --member-voice: #b3db82;
 
-  --mono: 'Input Mono', 'Input', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --font-size: 14px;
   --font-weight: 400;
 

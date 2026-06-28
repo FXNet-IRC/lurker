@@ -99,10 +99,11 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     category: 'appearance',
     group: 'fonts',
     type: 'string',
-    default: "'Input Mono', 'Input', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    default: "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
     description:
       'Font family stack used everywhere in the UI. The first installed font wins. ' +
-      'Input Mono is the intended primary; the rest are system monospace fallbacks.',
+      'JetBrains Mono is the intended primary (matching fxnet.org); the rest are ' +
+      'system monospace fallbacks.',
   },
   {
     key: 'look.font.size',
@@ -159,14 +160,14 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'default rendering is what most users expect.',
   },
 
-  // ─── Core palette (Monokai Pro / Brad's iTerm theme) ───────────────────
+  // ─── Core palette (FXNet terminal theme — matches fxnet.org) ───────────
   {
     key: 'look.color.bg',
     label: 'Background',
     category: 'appearance',
     group: 'palette',
     type: 'color',
-    default: '#212022',
+    default: '#191a1b',
     description: 'Window background (every region uses this, like a CLI app).',
   },
   {
@@ -175,7 +176,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     category: 'appearance',
     group: 'palette',
     type: 'color',
-    default: '#2c2a2e',
+    default: '#242526',
     description: 'Slightly raised background used for hover and active-buffer highlight.',
   },
   {
@@ -184,7 +185,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     category: 'appearance',
     group: 'palette',
     type: 'color',
-    default: '#fcfcfa',
+    default: '#e7eae0',
     description: 'Default foreground / text color.',
   },
   {
@@ -193,7 +194,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     category: 'appearance',
     group: 'palette',
     type: 'color',
-    default: '#939293',
+    default: '#797b75',
     description: 'Muted text (timestamps, system events, secondary labels).',
   },
   {
@@ -202,7 +203,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     category: 'appearance',
     group: 'palette',
     type: 'color',
-    default: '#a99dec',
+    default: '#79a617',
     description: 'Primary accent (logo, active-buffer indicator, focused borders).',
   },
   {
@@ -211,10 +212,10 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     category: 'appearance',
     group: 'palette',
     type: 'color',
-    default: 'var(--fg)',
+    default: 'var(--accent)',
     description:
       'Color of clickable URL links inside chat messages. ' +
-      'Any CSS color value; defaults to the foreground color.',
+      'Any CSS color value; defaults to the accent color.',
   },
   {
     key: 'look.color.good',
@@ -222,7 +223,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     category: 'appearance',
     group: 'palette',
     type: 'color',
-    default: '#b3db82',
+    default: '#79a617',
     description: 'Positive / connected state.',
   },
   {
@@ -231,7 +232,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     category: 'appearance',
     group: 'palette',
     type: 'color',
-    default: '#f9d978',
+    default: '#c9a227',
     description: 'Warning / in-progress state (connecting, modified setting marker).',
   },
   {
@@ -240,7 +241,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     category: 'appearance',
     group: 'palette',
     type: 'color',
-    default: '#ed6c89',
+    default: '#a61717',
     description: 'Error / disconnected / destructive state.',
   },
   {
@@ -249,7 +250,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     category: 'appearance',
     group: 'palette',
     type: 'color',
-    default: '#38353b',
+    default: '#2f3031',
     description: 'Subtle horizontal/vertical separators between regions.',
   },
   {
