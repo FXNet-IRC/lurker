@@ -14,7 +14,8 @@
   >
     <span class="prompt"
       ><template v-if="!isMobile"
-        >{{ promptLabel }}<span v-if="awayLabel" class="away">&nbsp;{{ awayLabel }}</span
+        >{{ promptLabelNoModes }}<span v-if="promptModes" class="modes">{{ promptModes }}</span
+        ><span v-if="awayLabel" class="away">&nbsp;{{ awayLabel }}</span
         >&nbsp;</template
       ><span
         v-if="hasHistory"
@@ -56,6 +57,13 @@
       accept="image/*"
       class="file-hidden"
       @change="onFileSelected"
+    />
+    <input
+      ref="e2eImportInputEl"
+      type="file"
+      accept=".json,application/json"
+      class="file-hidden"
+      @change="onE2eImportFile"
     />
     <!-- The nick / emoji suggestion strips and the mIRC colour picker render
          inside StatusBar (they overlay it visually) — see useComposerOverlay
@@ -239,6 +247,8 @@ function combinedHighlights(
 const inputEl = ref<HTMLTextAreaElement | null>(null);
 const formEl = ref<HTMLElement | null>(null);
 const fileInputEl = ref<HTMLInputElement | null>(null);
+const e2eImportInputEl = ref<HTMLInputElement | null>(null);
+const e2eImportNetworkId = ref<number | null>(null);
 const dragOver = ref(false);
 const pickerOpen = ref(false);
 const pickerQuery = ref('');
@@ -411,12 +421,14 @@ const systemFeatures = computed(() => {
     autocapitalize: autocorrectOn ? 'sentences' : 'off',
   };
 });
-// Prompt identity (nick + channel prefix + user modes) and away marker — see
-// useSelfLabel. On mobile we don't render the prompt label inline here (the
-// template gates it on !isMobile so the input row stays just `>` + composer);
-// instead the modeless variant feeds the placeholder above, since the compact
-// status bar now shows network/channel rather than the self identity.
-const { promptLabel, promptLabelNoModes, awayLabel } = useSelfLabel();
+// Prompt identity (nick + channel prefix, then user modes) and away marker —
+// see useSelfLabel. The nick and the user-mode parens come back separately so
+// the prompt can accent-colour the nick but mute the modes (issue #415). On
+// mobile we don't render the prompt label inline here (the template gates it on
+// !isMobile so the input row stays just `>` + composer); instead the modeless
+// variant feeds the placeholder above, since the compact status bar now shows
+// network/channel rather than the self identity.
+const { promptLabelNoModes, promptModes, awayLabel } = useSelfLabel();
 const { isMobile } = useViewport();
 
 let typingState: string | null = null;
@@ -1180,9 +1192,7 @@ function onEmojiSelect(item: EmojiMatch): void {
   // re-sync the span via refreshPicker, but the async strip refresh leaves a
   // brief window). Mirrors the re-check maybeConvertShortcode already does;
   // on a mismatch, no-op rather than splice blind into the wrong span.
-  // allowEmpty: a desktop pick from the bare-`:` frequently-used set has an
-  // empty query, so the captured span is just the `:` — still valid.
-  const sc = emojiTokenStart >= 0 ? findActiveShortcode(value, emojiTokenEnd, true) : null;
+  const sc = emojiTokenStart >= 0 ? findActiveShortcode(value, emojiTokenEnd) : null;
   if (!sc || sc.start !== emojiTokenStart) {
     closeEmojiStrip();
     closeEmojiPicker();
@@ -1251,13 +1261,13 @@ function refreshPicker() {
 
   // An in-progress `:shortcode:` owns the suggester slot — it isn't a nick
   // token, and both emoji UIs and the nick picker/strip share one slot over the
-  // StatusBar. Desktop opens the vertical EmojiPicker (issue #348) the moment
-  // `:` is typed (empty query → a frequently-used set); mobile keeps the
-  // horizontal strip, gated at 2+ chars so a lone `:` — or an emoticon like
-  // `:)` — doesn't flash it.
+  // StatusBar. Both the desktop EmojiPicker (issue #348) and the mobile strip
+  // wait for a 2+ character query before opening, so a lone `:` or a one-char
+  // emoticon like `:D` / `:P` never pops the suggester — and Enter never
+  // silently swaps it for an emoji (issue #402).
   const emojiOnStrip = isMobile.value;
-  const shortcode = findActiveShortcode(value, cursor, !emojiOnStrip);
-  if (shortcode && (!emojiOnStrip || shortcode.name.length >= 2)) {
+  const shortcode = findActiveShortcode(value, cursor);
+  if (shortcode && shortcode.name.length >= 2) {
     closePicker();
     closeStrip();
     closeChannelPicker();
@@ -1681,6 +1691,43 @@ function onFileSelected(e: Event): void {
   uploads.upload(file, file.name).catch(() => {});
 }
 
+// `/e2e import` flow: read the chosen export file, confirm (it's destructive and
+// can change the account identity), then ship the JSON for the cell to validate
+// and replace the keyring. The networkId is carried from the command invocation.
+function onE2eImportFile(e: Event): void {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  const networkId = e2eImportNetworkId.value;
+  e2eImportNetworkId.value = null;
+  if (!file || networkId == null) return;
+  // Reject an oversized file before reading it (the server enforces the same cap;
+  // this just fails fast without freezing the tab on a huge/wrong file).
+  if (file.size > 4 * 1024 * 1024) {
+    toasts.push({
+      kind: 'error',
+      title: 'E2E import failed',
+      body: 'that file is too large to be a keyring export',
+    });
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const json = String(reader.result ?? '');
+    const ok = window.confirm(
+      'Import E2E keyring?\n\n' +
+        'This REPLACES this network’s encryption keyring (peers, sessions, settings) ' +
+        'and resets your account identity on ALL networks. It cannot be undone.',
+    );
+    if (!ok) return;
+    sendOrToast({ type: 'e2e-import', networkId, json }, 'e2e import');
+  };
+  reader.onerror = () => {
+    toasts.push({ kind: 'error', title: 'E2E import failed', body: 'could not read the file' });
+  };
+  reader.readAsText(file);
+}
+
 function onDragOver(e: DragEvent): void {
   if (!sendable.value) return;
   if (!Array.from(e.dataTransfer?.types || []).includes('Files')) return;
@@ -1964,6 +2011,8 @@ const COMMANDS_LINES = [
   '  /away [message]        — set away across every network (no arg clears)',
   '  /back                  — clear away',
   '  /whois <nick>          — query user info (renders in server buffer)',
+  '  /ctcp <nick> <type>    — CTCP query (VERSION/PING/TIME/CLIENTINFO/SOURCE)',
+  '  /ping [nick]           — CTCP ping a user for round-trip latency',
   '  /kick <nick> [reason]  — kick from current channel',
   '  /kickban <nick> [msg]  — kick and ban in one step',
   '  /op <nick…>            — give op (also /deop /voice /devoice /halfop /dehalfop)',
@@ -1996,6 +2045,12 @@ const COMMANDS_LINES = [
   '  /set <key> <value…>    — change a setting; /set (or /set ?) lists all keys',
   '  /get <key>             — read a setting back (output in the system buffer)',
   '  /raw <line>            — send a raw IRC line (alias: /quote)',
+  '  /e2e <sub>             — end-to-end encryption for a channel (experimental; /e2e help)',
+  '      on [#chan] [auto|normal|quiet]   ·   off [#chan]   ·   mode <auto|normal|quiet>',
+  '      handshake <nick>   ·   accept <nick>   ·   decline <nick>',
+  '      revoke <nick>   ·   unrevoke <nick>   ·   reverify <nick>   ·   verify <nick>',
+  '      rotate [#chan]   ·   forget [-all] <nick|handle>   ·   fingerprint   ·   status   ·   list [-all]',
+  '      autotrust <list | add <scope> <pattern> | remove <pattern>>   ·   export   ·   import',
   '  /commands              — this list',
   '  //text                 — send literal "/text" as a message (escape)',
 ];
@@ -2481,8 +2536,64 @@ function handleCommand(line: string, networkId: number | null, target: string): 
   }
 
   switch (verb) {
+    case 'e2e': {
+      // RPE2E (#382). `export`/`import` move keyring material across the
+      // client↔cell boundary, so they're handled here rather than via the
+      // server's buffer-oriented runE2eCommand: export downloads a file (never
+      // rendered — it holds the private key), import opens a file picker. Every
+      // other subcommand is a thin pass-through; the server parses it and
+      // publishes status back into this buffer (defaulting the channel).
+      const sub = (rest[0] || '').toLowerCase();
+      if (sub === 'export') {
+        return sendOrToast({ type: 'e2e-export', networkId }, line);
+      }
+      if (sub === 'import') {
+        e2eImportNetworkId.value = networkId;
+        e2eImportInputEl.value?.click();
+        return true;
+      }
+      return sendOrToast({ type: 'e2e', networkId, target, args: argLine }, line);
+    }
     case 'me':
       return ackedSend({ type: 'action', networkId, target, text: argLine }, argLine);
+    case 'ctcp': {
+      // /ctcp <nick> <type> [args] — send a CTCP query (#263). The cell frames
+      // and sends it, echoes locally, and routes the reply back to this buffer.
+      const who = rest[0];
+      const type = rest[1];
+      if (!who || !type) {
+        localInfo(networkId, target, 'usage: /ctcp <nick> <type> [args] — e.g. /ctcp bob VERSION');
+        return true;
+      }
+      const ctcpArgs = rest.slice(2).join(' ');
+      return sendOrToast(
+        {
+          type: 'ctcp',
+          networkId,
+          target: who,
+          issuingTarget: target,
+          ctcpType: type,
+          args: ctcpArgs,
+        },
+        line,
+      );
+    }
+    case 'ping': {
+      // /ping [nick] — CTCP PING for round-trip latency (#263). Defaults to the
+      // current DM peer when no nick is given — i.e. the active buffer is not a
+      // channel (any prefix #&!+, matching the server's isChannelContext) and not
+      // a pseudo-buffer (`:server:`/system), so /ping in an `&local` channel
+      // doesn't ping the whole channel.
+      const who = rest[0] || (target && !/^[#&!+:]/.test(target) ? target : '');
+      if (!who) {
+        localInfo(networkId, target, 'usage: /ping <nick> (a nick is only optional inside a DM)');
+        return true;
+      }
+      return sendOrToast(
+        { type: 'ctcp', networkId, target: who, issuingTarget: target, ctcpType: 'PING', args: '' },
+        line,
+      );
+    }
     case 'msg':
     case 'query': {
       const [who, ...msgParts] = rest;
@@ -2887,6 +2998,11 @@ function handleCommand(line: string, networkId: number | null, target: string): 
   /* Matches the textarea's intrinsic single-row height so the prompt and
      the first text line baseline-align before any growth. */
   line-height: 1.4;
+}
+/* User modes ride the accent-coloured nick but stay muted, matching the status
+   bar's channel name (accent) vs mode suffix (muted) treatment (issue #415). */
+.prompt .modes {
+  color: var(--fg-muted);
 }
 .prompt .away {
   color: var(--warn);

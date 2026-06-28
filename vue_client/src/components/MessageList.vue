@@ -62,20 +62,17 @@
                 ><NickRef
                   :nick="asRename(item).from"
                   interactive
-                  @click.stop.prevent="onNickMenu($event, asRename(item).from)"
-                  @contextmenu.stop.prevent="onNickMenu($event, asRename(item).from)" />
+                  @click.stop.prevent="onNickMenu($event, asRename(item).from)" />
                 →
                 <NickRef
                   :nick="asRename(item).to"
                   interactive
-                  @click.stop.prevent="onNickMenu($event, asRename(item).to)"
-                  @contextmenu.stop.prevent="onNickMenu($event, asRename(item).to)" /></template
+                  @click.stop.prevent="onNickMenu($event, asRename(item).to)" /></template
               ><template v-else
                 ><NickRef
                   :nick="asNick(item).nick"
                   interactive
-                  @click.stop.prevent="onNickMenu($event, asNick(item).nick)"
-                  @contextmenu.stop.prevent="
+                  @click.stop.prevent="
                     onNickMenu($event, asNick(item).nick)
                   " /></template></template
             ><template v-if="g.hidden > 0"
@@ -102,7 +99,6 @@
                 :show-prefix="showModePrefix"
                 interactive
                 @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
-                @contextmenu.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
             /></span>
           </div>
           <span class="body" :class="bodyClass(row.m)">
@@ -128,8 +124,7 @@
                 :modes="authorModes(row.m)"
                 :show-prefix="showModePrefix"
                 interactive
-                @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
-                @contextmenu.stop.prevent="onNickMenu($event, row.m?.nick, row.m)" /></template
+                @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)" /></template
             ><template v-else>{{ row.continuationAuthor ? '' : prefixText(row.m) }}</template></span
           >
           <span class="body" :class="bodyClass(row.m)">
@@ -146,7 +141,6 @@
                 :nick="row.m.nick ?? ''"
                 interactive
                 @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
-                @contextmenu.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
               />{{ eventHostSuffix(row.m) }} joined</template
             >
             <template v-else-if="row.m?.type === 'part'"
@@ -154,7 +148,6 @@
                 :nick="row.m.nick ?? ''"
                 interactive
                 @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
-                @contextmenu.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
               />{{ eventHostSuffix(row.m) }} left<template v-if="row.m.text">
                 (<LinkedText :text="row.m.text" />)</template
               ></template
@@ -164,7 +157,6 @@
                 :nick="row.m.nick ?? ''"
                 interactive
                 @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
-                @contextmenu.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
               />{{ eventHostSuffix(row.m) }} quit<template v-if="row.m.text">
                 (<LinkedText :text="row.m.text" />)</template
               ></template
@@ -174,14 +166,12 @@
                 :nick="row.m.kicked ?? ''"
                 interactive
                 @click.stop.prevent="onNickMenu($event, row.m?.kicked)"
-                @contextmenu.stop.prevent="onNickMenu($event, row.m?.kicked)"
               />
               kicked by
               <NickRef
                 :nick="row.m.nick ?? ''"
                 interactive
                 @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
-                @contextmenu.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
               /><template v-if="row.m.text">
                 (<LinkedText :text="row.m.text" />)</template
               ></template
@@ -191,14 +181,12 @@
                 :nick="row.m.nick ?? ''"
                 interactive
                 @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
-                @contextmenu.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
               />
               is now
               <NickRef
                 :nick="row.m.newNick ?? ''"
                 interactive
                 @click.stop.prevent="onNickMenu($event, row.m?.newNick, row.m)"
-                @contextmenu.stop.prevent="onNickMenu($event, row.m?.newNick, row.m)"
               />{{ eventHostSuffix(row.m) }}</template
             >
             <template v-else-if="row.m?.type === 'mode'"
@@ -206,8 +194,7 @@
               <NickRef
                 :nick="row.m.nick ?? ''"
                 interactive
-                @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
-                @contextmenu.stop.prevent="onNickMenu($event, row.m?.nick, row.m)" /><template
+                @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)" /><template
                 v-if="row.m.text"
                 >: <LinkedText :text="row.m.text" /></template
             ></template>
@@ -216,12 +203,17 @@
               <NickRef
                 :nick="row.m.nick ?? ''"
                 interactive
-                @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)"
-                @contextmenu.stop.prevent="onNickMenu($event, row.m?.nick, row.m)" /><template
+                @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)" /><template
                 v-if="row.m.text"
                 >: <LinkedText :text="row.m.text" /></template
             ></template>
-            <template v-else-if="row.m?.type === 'motd' || row.m?.type === 'system'"
+            <template
+              v-else-if="
+                row.m?.type === 'motd' ||
+                row.m?.type === 'system' ||
+                row.m?.type === 'e2e' ||
+                row.m?.type === 'ctcp'
+              "
               ><LinkedText :text="row.m.text ?? ''"
             /></template>
             <template v-else-if="row.m?.type === 'error'"
@@ -325,6 +317,11 @@ interface ChatMessage {
   // System-buffer lines (#355): the network this line is about, when any. The
   // prefix column resolves the network's current name from it.
   originNetworkId?: number | null;
+  // RPE2E (#382): this line rode the wire encrypted. Carried through from the
+  // server (extra JSON) for a future indicator — not rendered right now.
+  e2e?: boolean;
+  // Severity for `type: 'e2e'` status lines — drives the tag color.
+  level?: 'info' | 'warn';
   [key: string]: unknown;
 }
 
@@ -1035,6 +1032,13 @@ function prefixText(m: ChatMessage | undefined): string {
       // current name; other app-level lines (away/back, server lifecycle,
       // node, …) → "System".
       return systemNetworkName(m) ?? 'System';
+    case 'e2e':
+      // RPE2E status echoes get their own tag (not the generic "System") so the
+      // user can tell encryption lines apart at a glance (#382).
+      return 'E2E';
+    case 'ctcp':
+      // CTCP request/reply/echo status lines get their own tag (#263).
+      return 'CTCP';
     case 'error':
       return '!!';
     default:
@@ -1067,6 +1071,12 @@ function prefixClass(m: ChatMessage | undefined) {
     'action-marker': m?.type === 'action',
     italic: m?.type === 'action' && actionItalic.value,
     self: m?.self,
+    // A warn-level E2E line (TOFU warning, refused send) colors its tag like an
+    // error; info-level stays the calm E2E color.
+    'e2e-warn': m?.type === 'e2e' && m?.level === 'warn',
+    // A warn-level CTCP line (e.g. "/ctcp: this network isn't connected") reads
+    // as an error too; info-level stays muted (#263).
+    'ctcp-warn': m?.type === 'ctcp' && m?.level === 'warn',
     [`p-${m?.type}`]: true,
   };
 }
@@ -1302,8 +1312,19 @@ watch(
     // yet replaces that tail. Use the surviving tail to tell them apart, so a
     // capped buffer isn't misread as a re-snapshot (and force-scrolled to the
     // bottom) on every single message.
+    // ID-less (ephemeral) rows — /e2e and other server command echoes surfaced
+    // via publishEphemeral — carry `id === undefined`, so the id-presence test
+    // can't anchor on them. Fall back to structural signals around them:
+    //   • growth that isn't a prepend is an append — covers a new ephemeral tail
+    //     AND a real message arriving right after an ephemeral one (the latter
+    //     would otherwise match neither branch and fail to stick to bottom); and
+    //   • a same-length cap-evict whose OLD tail was id-less is still an append,
+    //     not a wholesale replace, so a reader scrolled up isn't yanked down.
+    const oldTailPresent = oldLastId != null && messages.value.some((m) => m.id === oldLastId);
     const appended =
-      lastChanged && oldLastId != null && messages.value.some((m) => m.id === oldLastId);
+      (lastChanged && oldTailPresent) ||
+      (grew && !firstChanged) ||
+      (lastChanged && oldLastId == null && newLen >= prevLen);
     // Pure prepend: anchor by element ID so re-flow from changing column
     // widths or differing message heights doesn't drift the math. With the
     // loading notice gone from the template, the OLD DOM and NEW DOM share
@@ -1386,7 +1407,9 @@ watch(
             type: tail.type,
             isDm: !tail.target.startsWith('#') && !tail.target.startsWith(':server:'),
           });
-        if (!tailIgnored) bumpNewBelow();
+        // Don't let an id-less ephemeral status echo (a /e2e line, the user's
+        // own command output) inflate the "N new ↓" unread count.
+        if (!tailIgnored && tail?.id != null) bumpNewBelow();
       }
     }
     ensureViewportFilled();
@@ -1769,14 +1792,28 @@ watch(
 .prefix.p-error {
   color: var(--bad);
 }
+/* RPE2E status tag (#382): the calm "E2E" lock-green for info, error-red when a
+   line is a warning (TOFU change, refused send). */
+.prefix.p-e2e {
+  color: var(--good);
+}
+.prefix.p-e2e.e2e-warn {
+  color: var(--bad);
+}
 .prefix.p-nick,
 .prefix.p-mode,
 .prefix.p-topic,
 .prefix.p-motd,
 .prefix.p-away,
 .prefix.p-back,
+/* CTCP request/reply/echo status (#263): informational, so muted like motd. */
+.prefix.p-ctcp,
 .prefix.p-cons {
   color: var(--fg-muted);
+}
+/* …except a warn-level CTCP line (failed send) colors its tag like an error. */
+.prefix.p-ctcp.ctcp-warn {
+  color: var(--bad);
 }
 /* "System" lines (#355) read as the full-strength foreground, not muted — the
    app speaking in its own voice. A network-tied system line overrides this with

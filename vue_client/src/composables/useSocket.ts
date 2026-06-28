@@ -22,6 +22,7 @@ import { useWhoisStore } from '../stores/whois.js';
 import { useBookmarksStore } from '../stores/bookmarks.js';
 import { useDataExportStore } from '../stores/dataExport.js';
 import { useToastsStore } from '../stores/toasts.js';
+import { downloadTextFile } from '../utils/download.js';
 import { notifyForEvent, playSound } from './useHighlightNotifier.js';
 
 export interface AckResult {
@@ -269,6 +270,8 @@ function applyEvent(event: any): void {
       buffers.pushMessage(event);
       break;
     }
+    case 'e2e': // RPE2E status line (#382) — same routing as a server notice.
+    case 'ctcp': // CTCP request/reply/echo status line (#263) — same routing.
     case 'motd':
     case 'error': {
       const decorated = { ...event, target: event.target || `:server:${event.networkId}` };
@@ -528,6 +531,47 @@ function handleMessage(raw: string): void {
   if (payload.kind === 'search-result') {
     const search = useSearchStore();
     search.applyResult(payload);
+    return;
+  }
+  if (payload.kind === 'e2eExport') {
+    // Response to `/e2e export` — download the JSON as a file rather than render
+    // it (it carries the private key). Reaches only the requesting tab.
+    if (payload.ok) {
+      const stamp = new Date().toISOString().slice(0, 10);
+      downloadTextFile(`lurker-e2e-keyring-${stamp}.json`, payload.json as string);
+      const c = (payload.counts as Record<string, number>) || {};
+      useToastsStore().push({
+        kind: 'info',
+        title: 'E2E keyring exported',
+        body: `Saved ${c.peers ?? 0} peer(s), ${c.incoming ?? 0} session(s). Keep this file private — it contains your private key.`,
+      });
+    } else {
+      useToastsStore().push({
+        kind: 'error',
+        title: 'E2E export failed',
+        body: String(payload.reason ?? 'unknown error'),
+      });
+    }
+    return;
+  }
+  if (payload.kind === 'e2eImport') {
+    if (payload.ok) {
+      const c = (payload.counts as Record<string, number>) || {};
+      const idNote = payload.identityChanged
+        ? ' Your account identity changed — peers will need to reverify you.'
+        : '';
+      useToastsStore().push({
+        kind: payload.identityChanged ? 'warn' : 'info',
+        title: 'E2E keyring imported',
+        body: `Replaced with ${c.peers ?? 0} peer(s), ${c.incoming ?? 0} session(s).${idNote}`,
+      });
+    } else {
+      useToastsStore().push({
+        kind: 'error',
+        title: 'E2E import failed',
+        body: String(payload.reason ?? 'unknown error'),
+      });
+    }
     return;
   }
   if (payload.kind === 'pins-changed') {

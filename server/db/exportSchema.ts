@@ -444,6 +444,47 @@ export const EXPORT_TABLES = Object.freeze({
       'system-buffer log (server lifecycle events + global notices); ' +
       'transient operational state rebuilt by the live instance, not portable user data',
   },
+
+  // RPE2E keyring (#382). Deliberately NOT in the bulk user data export. The
+  // export DECRYPTS at-rest secrets to plaintext for cross-instance portability
+  // (see exportService.ts) — so including these would drop the identity PRIVATE
+  // KEY into every routine "download my data" artifact. Unlike a rotatable IRC
+  // password, a leaked identity key lets someone impersonate you to every peer
+  // until you rotate it AND each peer re-verifies your new fingerprint — too
+  // high-consequence to bundle by default into an export most users take
+  // without even using E2E. Keyring portability is therefore a separate,
+  // explicitly-warned `/e2e export` (mirrors repartee's standalone keyring
+  // export) that MUST ship when E2E goes live, so migrating users keep their
+  // identity + trust pins rather than silently resetting them.
+  e2e_identity: {
+    mode: 'skip',
+    reason:
+      'E2E identity private key; cryptographic secret, exported via the dedicated /e2e export',
+  },
+  e2e_peers: {
+    mode: 'skip',
+    reason: 'E2E peer TOFU pins; part of the keyring, exported via the dedicated /e2e export',
+  },
+  e2e_incoming_sessions: {
+    mode: 'skip',
+    reason: 'E2E per-sender session keys; cryptographic secrets, exported via /e2e export',
+  },
+  e2e_outgoing_sessions: {
+    mode: 'skip',
+    reason: 'E2E per-channel session keys; cryptographic secrets, exported via /e2e export',
+  },
+  e2e_channel_config: {
+    mode: 'skip',
+    reason: 'E2E per-channel encryption policy; part of the keyring, exported via /e2e export',
+  },
+  e2e_autotrust: {
+    mode: 'skip',
+    reason: 'E2E autotrust rules; part of the keyring, exported via /e2e export',
+  },
+  e2e_outgoing_recipients: {
+    mode: 'skip',
+    reason: 'E2E key-distribution bookkeeping; transient keyring state, exported via /e2e export',
+  },
 });
 
 // Insertion order on import. Each table must come after every table it
