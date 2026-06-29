@@ -61,10 +61,16 @@ services:
       # The gateway name defaults to LURKER_FORCED_NETWORK_NAME; override here.
       - LURKER_WEBIRC_GATEWAY=FXNet
       # Trust the fronting reverse proxy's X-Forwarded-For so req.ip / the WS
-      # upgrade resolve the real client IP. The container binds 127.0.0.1 behind
-      # nginx, so `loopback` is correct here. NEVER enable this unless actually
-      # behind a trusted proxy — clients could otherwise spoof their IP.
-      - LURKER_TRUST_PROXY=loopback
+      # upgrade resolve the real client IP (the value forwarded over WEBIRC).
+      # Set this to the subnet the proxy reaches lurker FROM, as lurker sees it:
+      #   - behind a localhost-bound nginx:        loopback
+      #   - behind pangolin/Traefik over a docker  172.18.0.0/16  (the bridge
+      #     bridge (the FXNet deploy):             gateway, e.g. 172.18.0.1)
+      # If this doesn't match the real hop, lurker ignores X-Forwarded-For and
+      # forwards the bridge gateway IP (172.18.0.1) instead of the browser IP.
+      # NEVER widen this beyond the trusted proxy's hop and NEVER publish
+      # lurker's port directly, or clients could spoof X-Forwarded-For.
+      - LURKER_TRUST_PROXY=172.18.0.0/16
 
       # ───── Per-user ident (single-user bans) ─────────────────────────────
       # Locked connections present a stable, unspoofable ident `lu<userId>`,
