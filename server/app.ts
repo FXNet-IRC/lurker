@@ -32,6 +32,7 @@ import guestRouter from './routes/guest.js';
 import mcpRouter from './services/mcpServer.js';
 import { requireApiAuth } from './middleware/apiAuth.js';
 import { isNodeMode } from './utils/edition.js';
+import { isPublicModeEnabled } from './utils/publicMode.js';
 import { trustProxyConfig } from './utils/clientIp.js';
 
 const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
@@ -90,8 +91,14 @@ export function buildApp(sessionSecret: string): Express {
   // to their cell by the cp_session cookie, but a bearer client carries no such
   // cookie — so /mcp can't be addressed through the per-cell proxy, which makes
   // the tokens unusable there. Disable both in node edition (A7); A3 hides the
-  // matching UI. Standalone keeps them fully featured.
-  if (!isNodeMode()) {
+  // matching UI.
+  //
+  // FXNet: this is the AI-agent surface, which has no place on a public webchat —
+  // throwaway guests must never mint long-lived bearer tokens or reach the MCP
+  // server. So we also disable both when LURKER_PUBLIC_MODE is on, and hide the
+  // matching Settings tab (see categoryVisible / hideInPublicMode). A standalone,
+  // non-public self-hosted instance keeps them fully featured.
+  if (!isNodeMode() && !isPublicModeEnabled()) {
     app.use('/api/api-tokens', apiTokensRouter);
     app.use('/mcp', requireApiAuth, mcpRouter);
   }

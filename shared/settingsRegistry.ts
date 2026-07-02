@@ -89,6 +89,10 @@ export interface SettingCategory {
   adminOnly?: boolean;
   // As on BaseOption: hide the whole category in the hosted (node) edition.
   selfHostedOnly?: boolean;
+  // FXNet: hide the category when LURKER_PUBLIC_MODE is on. Used for the
+  // AI-agent API-tokens surface, which the server also refuses to mount in
+  // public mode (see app.ts) — guests must not mint bearer tokens.
+  hideInPublicMode?: boolean;
 }
 
 export const REGISTRY: readonly SettingOption[] = Object.freeze([
@@ -1462,8 +1466,15 @@ export const CATEGORIES: readonly SettingCategory[] = Object.freeze([
   { id: 'account', label: 'Account', kind: 'bespoke' },
   // Disabled in node edition: bearer clients can't be routed through the
   // per-cell proxy, so the server doesn't mount /api/api-tokens or /mcp there
-  // (A7). Hide the whole category in the hosted edition.
-  { id: 'api-tokens', label: 'API tokens', kind: 'bespoke', selfHostedOnly: true },
+  // (A7). Hide the whole category in the hosted edition. FXNet also hides it in
+  // public mode — the server refuses to mount the routes there (see app.ts).
+  {
+    id: 'api-tokens',
+    label: 'API tokens',
+    kind: 'bespoke',
+    selfHostedOnly: true,
+    hideInPublicMode: true,
+  },
   { id: 'data', label: 'Data', kind: 'bespoke' },
   { id: 'about', label: 'About', kind: 'bespoke' },
 ]);

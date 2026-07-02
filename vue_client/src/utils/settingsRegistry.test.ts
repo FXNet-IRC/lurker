@@ -28,6 +28,18 @@ describe('categoryVisible', () => {
     expect(categoryVisible(cat('appearance'), standalone)).toBe(true);
     expect(categoryVisible(cat('appearance'), node)).toBe(true);
   });
+
+  it('hides hideInPublicMode categories when public mode is on', () => {
+    // API tokens are the AI-agent surface — hidden on a public FXNet instance.
+    expect(categoryVisible(cat('api-tokens'), { isAdmin: true, isNode: false })).toBe(true);
+    expect(
+      categoryVisible(cat('api-tokens'), { isAdmin: true, isNode: false, isPublicMode: true }),
+    ).toBe(false);
+    // Ordinary categories are unaffected by public mode.
+    expect(
+      categoryVisible(cat('appearance'), { isAdmin: false, isNode: false, isPublicMode: true }),
+    ).toBe(true);
+  });
 });
 
 describe('optionVisible', () => {

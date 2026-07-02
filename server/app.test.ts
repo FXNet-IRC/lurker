@@ -16,6 +16,7 @@ const ctx = setupTestDb('app-gating');
 afterAll(() => ctx.cleanup());
 afterEach(() => {
   delete process.env.LURKER_EDITION;
+  delete process.env.LURKER_PUBLIC_MODE;
 });
 
 async function buildFor(edition: 'standalone' | 'node'): Promise<Express> {
@@ -77,6 +78,27 @@ describe('buildApp route gating by edition', () => {
     it('does not mount the orchestrator control surface /api/node', async () => {
       const app = await buildFor('standalone');
       const res = await request(app).get('/api/node/status');
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe('public mode (standalone edition)', () => {
+    // FXNet: the AI-agent API-token/MCP surface has no place on a public
+    // webchat — guests must not mint bearer tokens or reach the MCP server —
+    // so buildApp refuses to mount either when LURKER_PUBLIC_MODE=true.
+    it('does not mount /api/api-tokens', async () => {
+      process.env.LURKER_PUBLIC_MODE = 'true';
+      const app = await buildFor('standalone');
+      const res = await request(app).get('/api/api-tokens');
+      expect(res.status).toBe(404);
+    });
+
+    it('does not mount the MCP server at /mcp', async () => {
+      process.env.LURKER_PUBLIC_MODE = 'true';
+      const app = await buildFor('standalone');
+      const res = await request(app)
+        .post('/mcp')
+        .send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
       expect(res.status).toBe(404);
     });
   });

@@ -89,7 +89,13 @@ const BESPOKE_PANES: Record<string, Component> = {
 };
 
 const visibleCategories = computed(() =>
-  CATEGORIES.filter((c) => categoryVisible(c, { isAdmin: isAdmin.value, isNode: config.isNode })),
+  CATEGORIES.filter((c) =>
+    categoryVisible(c, {
+      isAdmin: isAdmin.value,
+      isNode: config.isNode,
+      isPublicMode: config.isPublicMode,
+    }),
+  ),
 );
 
 const firstCategoryId = computed(() => visibleCategories.value[0]?.id || 'appearance');
