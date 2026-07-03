@@ -13,6 +13,7 @@
 // unit-tested); the per-user gate reads the DB.
 
 import { CAPABILITY_DCC, userHasCapability } from '../db/userCapabilities.js';
+import { isPublicModeEnabled } from '../utils/publicMode.js';
 
 // Conventional truthy env values — trimmed + case-insensitive.
 const TRUTHY = new Set(['1', 'true', 'yes', 'on']);
@@ -25,8 +26,16 @@ export function parseDccEnabled(raw: string | undefined): boolean {
 }
 
 /** The cell-wide DCC master switch. Read live (not cached) so an operator flip
- *  — and tests — take effect without a process restart. */
+ *  — and tests — take effect without a process restart.
+ *
+ *  FXNet: DCC is forced OFF entirely in public webchat mode, regardless of
+ *  LURKER_DCC_ENABLED. Direct client-to-client transfers move arbitrary files
+ *  and expose/consume IPs — no place on an anonymous public instance — so we
+ *  hard-disable at the single gate every DCC entry point (route, CTCP wiring,
+ *  /dcc command) flows through, rather than trusting the operator to leave the
+ *  switch unset. A non-public self-hosted instance is unaffected. */
 export function dccMasterEnabled(): boolean {
+  if (isPublicModeEnabled()) return false;
   return parseDccEnabled(process.env.LURKER_DCC_ENABLED);
 }
 

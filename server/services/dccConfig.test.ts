@@ -8,6 +8,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { createUser } from '../db/users.js';
 import { CAPABILITY_DCC, setUserCapability } from '../db/userCapabilities.js';
+import { resetPublicModeCacheForTests } from '../utils/publicMode.js';
 import {
   dccAllowPrivateHosts,
   dccEnabledForUser,
@@ -39,6 +40,8 @@ describe('dcc gate', () => {
     delete process.env.LURKER_DCC_ENABLED;
     delete process.env.LURKER_DCC_MAX_FILE_MB;
     delete process.env.LURKER_DCC_ALLOW_PRIVATE_HOSTS;
+    delete process.env.LURKER_PUBLIC_MODE;
+    resetPublicModeCacheForTests();
   });
 
   it('reads the master switch live from LURKER_DCC_ENABLED', () => {
@@ -46,6 +49,18 @@ describe('dcc gate', () => {
     expect(dccMasterEnabled()).toBe(false);
     process.env.LURKER_DCC_ENABLED = '1';
     expect(dccMasterEnabled()).toBe(true);
+  });
+
+  it('is forced OFF in public mode even when LURKER_DCC_ENABLED is set', () => {
+    // FXNet: DCC has no place on an anonymous public webchat, so public mode
+    // hard-disables it at the gate — the operator switch and per-user grant
+    // cannot re-enable it.
+    process.env.LURKER_DCC_ENABLED = '1';
+    process.env.LURKER_PUBLIC_MODE = 'true';
+    resetPublicModeCacheForTests();
+    expect(dccMasterEnabled()).toBe(false);
+    setUserCapability(userId, CAPABILITY_DCC, true);
+    expect(dccEnabledForUser(userId)).toBe(false);
   });
 
   it('requires BOTH the master switch and a per-user grant', () => {
