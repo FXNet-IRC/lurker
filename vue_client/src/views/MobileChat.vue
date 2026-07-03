@@ -25,6 +25,17 @@
         <button class="icon" title="Recent uploads" @click="showUploads = true">
           <i class="fa-solid fa-paperclip"></i>
         </button>
+        <!-- Self-revealing DCC transfers button — see DesktopChat for rationale.
+             Warn-colored while an offer awaits a decision. -->
+        <button
+          v-if="dcc.hasAny || dcc.panelOpen"
+          class="icon dcc-btn"
+          :class="{ pending: dcc.pendingCount > 0 }"
+          :title="dccTitle"
+          @click="dcc.open()"
+        >
+          <i class="fa-solid fa-circle-down"></i>
+        </button>
         <button
           v-if="!config.isNetworkLocked"
           class="icon"
@@ -153,6 +164,7 @@
       @close="channelListModal.close()"
     />
     <RecentUploadsModal v-if="showUploads" @close="showUploads = false" />
+    <TransfersModal v-if="dcc.panelOpen" @close="dcc.close()" />
     <SearchModal
       v-if="showSearch"
       :scope="searchScope"
@@ -205,6 +217,7 @@ import BookmarksModal from '../components/BookmarksModal.vue';
 import TopicModal from '../components/TopicModal.vue';
 import ChannelListModal from '../components/ChannelListModal.vue';
 import RecentUploadsModal from '../components/RecentUploadsModal.vue';
+import TransfersModal from '../components/TransfersModal.vue';
 import SearchModal from '../components/SearchModal.vue';
 import NickNoteModal from '../components/NickNoteModal.vue';
 import ConfigureFriendModal from '../components/ConfigureFriendModal.vue';
@@ -212,6 +225,7 @@ import UserProfileModal from '../components/UserProfileModal.vue';
 import ImageViewerModal from '../components/ImageViewerModal.vue';
 import { useNickNotesStore } from '../stores/nickNotes.js';
 import { useFriendsStore } from '../stores/friends.js';
+import { useDccStore } from '../stores/dcc.js';
 import { useSearchStore } from '../stores/search.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useChannelListModal } from '../composables/useChannelListModal.js';
@@ -246,6 +260,10 @@ const menu = useContextMenu();
 const nickNotes = useNickNotesStore();
 const friends = useFriendsStore();
 const friendCount = computed(() => friends.contacts.length);
+const dcc = useDccStore();
+const dccTitle = computed(() =>
+  dcc.pendingCount > 0 ? `DCC transfers — ${dcc.pendingCount} awaiting approval` : 'DCC transfers',
+);
 const whois = useWhoisStore();
 
 function openSystemConsole() {
@@ -530,6 +548,11 @@ useChatBootstrap({ onJump: onJumpToMessage });
 }
 .icon:hover {
   color: var(--fg);
+}
+/* Transfers button turns warn-colored while an offer awaits a decision
+   (color-as-signal, no count badge — matches DesktopChat). */
+.icon.dcc-btn.pending {
+  color: var(--warn);
 }
 .icon.back {
   margin-left: -4px;

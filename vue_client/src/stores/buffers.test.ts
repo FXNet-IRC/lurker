@@ -237,3 +237,171 @@ describe('case-insensitive buffer identity (#327)', () => {
     expect(netBuffers(store)).toHaveLength(1);
   });
 });
+
+// Feeds the PWA app-icon badge (#451). The sum must track each buffer's
+// server-owned `highlighted` count and inherit applyReadState's active-buffer
+// suppression, so the focused conversation never inflates the badge.
+describe('totalHighlights', () => {
+  it('is zero with only the seeded system buffer', () => {
+    const store = useBuffersStore();
+    expect(store.totalHighlights).toBe(0);
+  });
+
+  it('sums highlighted across open buffers', () => {
+    const store = useBuffersStore();
+    store.replaceBacklog(1, '#a', [], undefined, undefined, undefined);
+    store.replaceBacklog(1, '#b', [], undefined, undefined, undefined);
+    store.applyReadState(1, '#a', { lastReadId: 0, unread: 5, highlights: 2 });
+    store.applyReadState(1, '#b', { lastReadId: 0, unread: 9, highlights: 3 });
+
+    expect(store.totalHighlights).toBe(5);
+  });
+
+  it('excludes the active buffer, whose highlighted is forced to 0', () => {
+    const store = useBuffersStore();
+    store.replaceBacklog(1, '#a', [], undefined, undefined, undefined);
+    store.replaceBacklog(1, '#b', [], undefined, undefined, undefined);
+    // User is sitting in #a, so its read-state echo is suppressed to 0.
+    h.activeKey = '1::#a';
+    store.applyReadState(1, '#a', { lastReadId: 0, unread: 5, highlights: 2 });
+    store.applyReadState(1, '#b', { lastReadId: 0, unread: 9, highlights: 3 });
+
+    expect(store.byKey('1::#a')!.highlighted).toBe(0);
+    expect(store.totalHighlights).toBe(3);
+  });
+});
+
+// Offline buffers now arrive as SHELLS (events:[], hasMoreOlder:true) that the
+// client hydrates on open. The empty-seed branch of replaceBacklog must honor
+// the server's explicit hasMoreOlder instead of the `length >= 50` heuristic,
+// or a zero-message shell would report hasMoreOlder:false and never lazy-load.
+describe('replaceBacklog empty-seed honors server hasMoreOlder', () => {
+  const ev = (id: number) => ({
+    networkId: 1,
+    target: '#full',
+    id,
+    type: 'message',
+    nick: 'bob',
+    body: 'x',
+  });
+
+  it('keeps a zero-message shell fetchable when the server sets hasMoreOlder', () => {
+    const store = useBuffersStore();
+    store.replaceBacklog(1, '#shell', [], undefined, undefined, false, { hasMoreOlder: true });
+    const buf = store.byKey('1::#shell')!;
+    expect(buf.messages).toHaveLength(0);
+    // Without honoring the flag this would be false (0 >= 50), stranding the shell.
+    expect(buf.hasMoreOlder).toBe(true);
+  });
+
+  it('falls back to the length heuristic when the server omits the flag', () => {
+    const store = useBuffersStore();
+    store.replaceBacklog(1, '#empty', [], undefined, undefined, undefined);
+    expect(store.byKey('1::#empty')!.hasMoreOlder).toBe(false);
+  });
+
+  it('honors an explicit hasMoreOlder:false even when the slice is long', () => {
+    const store = useBuffersStore();
+    const slice = Array.from({ length: 60 }, (_, i) => ev(i + 1));
+    // Server says there is nothing older; the old `length >= 50` heuristic would
+    // wrongly report true and offer a page-up that returns nothing.
+    store.replaceBacklog(1, '#full', slice, undefined, undefined, true, { hasMoreOlder: false });
+    const buf = store.byKey('1::#full')!;
+    expect(buf.messages.length).toBeGreaterThan(0);
+    expect(buf.hasMoreOlder).toBe(false);
+  });
+});
+
+// A fresh-connect shell (empty backlog frame + hasMoreOlder) can receive a live
+// line before the user opens it. `unseeded` (not messages.length) must decide
+// hydration so opening still fetches the real backlog and doesn't mark-read the
+// unshown gap.
+describe('shell unseeded lifecycle', () => {
+  const shellFrame = (store: ReturnType<typeof useBuffersStore>, target: string) =>
+    store.replaceBacklog(
+      1,
+      target,
+      [],
+      undefined,
+      { lastReadId: 1000, unread: 5, highlights: 0 },
+      true,
+      { hasMoreOlder: true },
+    );
+  const live = (target: string, id: number) => ({
+    networkId: 1,
+    target,
+    id,
+    type: 'message',
+    nick: 'bob',
+    body: 'x',
+  });
+
+  it('marks an empty shell frame unseeded but a real-content frame seeded', () => {
+    const store = useBuffersStore();
+    shellFrame(store, '#a');
+    expect(store.byKey('1::#a')!.unseeded).toBe(true);
+    store.replaceBacklog(1, '#b', [live('#b', 5)], undefined, undefined, true, {
+      hasMoreOlder: true,
+    });
+    expect(store.byKey('1::#b')!.unseeded).toBe(false);
+  });
+
+  it('stays unseeded when a live line arrives on the shell before open', () => {
+    const store = useBuffersStore();
+    shellFrame(store, '#a');
+    store.pushMessage(live('#a', 5002));
+    const buf = store.byKey('1::#a')!;
+    expect(buf.messages.length).toBe(1);
+    expect(buf.unseeded).toBe(true); // a stray live line does not hydrate it
+  });
+
+  it('on open, refetches the real backlog and does NOT mark-read the stray line', () => {
+    const store = useBuffersStore();
+    shellFrame(store, '#a');
+    store.pushMessage(live('#a', 5002));
+    vi.mocked(socketSend).mockClear();
+
+    store.activate(1, '#a');
+
+    const sends = vi.mocked(socketSend).mock.calls.map((c) => c[0] as Record<string, unknown>);
+    expect(sends).toContainEqual(
+      expect.objectContaining({ type: 'history', mode: 'latest', networkId: 1, target: '#a' }),
+    );
+    // The bug: without the unseeded guard, activate() would mark-read up to 5002,
+    // clearing unread for the whole unshown gap (1001..5001).
+    expect(sends.some((s) => s.type === 'mark-read')).toBe(false);
+  });
+
+  it('clears unseeded once applyLatestReplace hydrates it', () => {
+    const store = useBuffersStore();
+    shellFrame(store, '#a');
+    store.activate(1, '#a');
+    const token = store.byKey('1::#a')!.pendingHistoryToken;
+    store.applyLatestReplace(1, '#a', {
+      token,
+      events: [live('#a', 4998), live('#a', 4999), live('#a', 5000)],
+      hasMoreOlder: true,
+    });
+    expect(store.byKey('1::#a')!.unseeded).toBe(false);
+  });
+
+  it('seeds speakers from the history reply so autocomplete works on open, not just after live messages', () => {
+    const store = useBuffersStore();
+    shellFrame(store, '#a');
+    store.activate(1, '#a');
+    const token = store.byKey('1::#a')!.pendingHistoryToken;
+    // The connect snapshot no longer ships speakers, so opening the buffer (this
+    // reply) is where they must load — otherwise nick autocomplete is empty until
+    // someone talks. applyLatestReplace previously dropped payload.speakers.
+    store.applyLatestReplace(1, '#a', {
+      token,
+      events: [live('#a', 5000)],
+      hasMoreOlder: true,
+      speakers: [
+        { nick: 'Alice', lastTime: 1000 },
+        { nick: 'Bob', lastTime: 2000 },
+      ],
+    });
+    expect(Object.keys(store.byKey('1::#a')!.speakers).sort()).toEqual(['alice', 'bob']);
+  });
+});

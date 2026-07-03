@@ -174,6 +174,7 @@ export const EXPORT_TABLES = Object.freeze({
       'matched_rule_id',
       'alt',
       'from_ignored',
+      'mirrored',
     ],
   },
 
@@ -367,6 +368,14 @@ export const EXPORT_TABLES = Object.freeze({
     columns: ['user_id', 'network_id', 'nick', 'note', 'updated_at'],
   },
 
+  user_relay_bots: {
+    mode: 'export',
+    scope: 'user_id',
+    section: 'data',
+    fkRekey: { user_id: 'users', network_id: 'networks' },
+    columns: ['user_id', 'network_id', 'nick', 'pattern', 'created_at'],
+  },
+
   user_bookmarks: {
     mode: 'export',
     scope: 'user_id',
@@ -445,6 +454,21 @@ export const EXPORT_TABLES = Object.freeze({
       'transient operational state rebuilt by the live instance, not portable user data',
   },
 
+  dcc_transfers: {
+    mode: 'skip',
+    reason:
+      'DCC download-manager state (transfer lifecycle + instance-local destination paths ' +
+      'and received-byte progress); operational, not portable — the received files live on ' +
+      "the cell's disk (not in the export) and an in-flight transfer can't resume elsewhere",
+  },
+
+  user_capabilities: {
+    mode: 'skip',
+    reason:
+      'admin-granted per-user capability grants (e.g. DCC); instance/operator-owned account ' +
+      "state reassigned by the target instance's admin, not portable user data",
+  },
+
   // RPE2E keyring (#382). Deliberately NOT in the bulk user data export. The
   // export DECRYPTS at-rest secrets to plaintext for cross-instance portability
   // (see exportService.ts) — so including these would drop the identity PRIVATE
@@ -500,6 +524,7 @@ export const IMPORT_ORDER = Object.freeze([
   'user_settings',
   'ignored_masks',
   'user_nick_notes',
+  'user_relay_bots',
   'pinned_buffers',
   'nicklist_collapsed',
   'channel_notify_settings',

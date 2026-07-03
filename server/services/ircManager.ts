@@ -14,6 +14,7 @@ import {
   setNetworkClientIp,
 } from '../db/networks.js';
 import { reopenBuffer } from '../db/closedBuffers.js';
+import { DCC_ACTIVE_STATES, getDccTransfer, updateDccTransferState } from '../db/dccTransfers.js';
 import { findUserById } from '../db/users.js';
 import { getUserAwayState, writeAwayMarker, writeBackMarker } from '../db/userAwayState.js';
 import { listPinnedForUser } from '../db/pinnedBuffers.js';
@@ -28,6 +29,12 @@ import {
   getNote as getNickNoteRow,
 } from '../db/nickNotes.js';
 import type { NoteResult } from '../db/nickNotes.js';
+import {
+  listForUserGrouped as listRelayBotsGrouped,
+  setRelayBot as setRelayBotRow,
+  removeRelayBot as removeRelayBotRow,
+} from '../db/relayBots.js';
+import type { RelayBotResult } from '../db/relayBots.js';
 import {
   createContact,
   updateContactMeta,
@@ -274,6 +281,48 @@ class IrcManager extends EventEmitter {
 
   forgetChannel(userId: number, networkId: number, name: string): void {
     deleteChannel(networkId, name);
+  }
+
+  // DCC transfer actions (#270 phase 2). Each loads the user-scoped row, finds the
+  // connection for its network, and routes the action there (the connection holds
+  // the live receiver + the WS push). Accept needs a live connection (it dials the
+  // bot); reject/cancel fall back to a DB-only state flip when disconnected.
+  acceptDccTransfer(
+    userId: number,
+    transferId: number,
+  ): 'ok' | 'not-found' | 'not-connected' | 'not-pending' {
+    const row = getDccTransfer(userId, transferId);
+    if (!row) return 'not-found';
+    // Only an unsolicited offer still awaiting a decision can be accepted. A row
+    // that already moved on (receiving/completed/…) would be a silent no-op in
+    // acceptPendingDcc, so reject it here and let the route surface a 409 rather
+    // than a misleading 200 that looks successful to a stale client.
+    if (row.state !== 'pending_approval') return 'not-pending';
+    const conn = this.getConnection(userId, row.network_id);
+    if (!conn) return 'not-connected';
+    conn.acceptPendingDcc(row);
+    return 'ok';
+  }
+
+  rejectDccTransfer(userId: number, transferId: number): boolean {
+    const row = getDccTransfer(userId, transferId);
+    if (!row) return false;
+    const conn = this.getConnection(userId, row.network_id);
+    // The connected path applies its own state guard; the disconnected DB-only
+    // fallback must mirror it so a late reject can't clobber a terminal row.
+    if (conn) conn.rejectDcc(transferId);
+    else if (row.state === 'pending_approval' || row.state === 'requested')
+      updateDccTransferState(transferId, 'rejected');
+    return true;
+  }
+
+  cancelDccTransfer(userId: number, transferId: number): boolean {
+    const row = getDccTransfer(userId, transferId);
+    if (!row) return false;
+    const conn = this.getConnection(userId, row.network_id);
+    if (conn) conn.cancelDcc(transferId);
+    else if (DCC_ACTIVE_STATES.has(row.state)) updateDccTransferState(transferId, 'cancelled');
+    return true;
   }
 
   // Long messages need to be split: irc-framework breaks anything past ~350
@@ -623,6 +672,7 @@ class IrcManager extends EventEmitter {
     const notifyByNetwork = listChannelNotifyForUser(userId);
     const ignoresByNetwork = ignoresGrouped(userId);
     const notesByNetwork = listNickNotesGrouped(userId);
+    const relayBotsByNetwork = listRelayBotsGrouped(userId);
     // Attach the per-network user-preference blobs to a base snapshot. Shared by
     // the live-connection and offline branches so both shapes stay identical.
     const withExtras = <T extends { networkId: number }>(snap: T) => {
@@ -634,6 +684,7 @@ class IrcManager extends EventEmitter {
         channelNotify: notifyByNetwork.get(networkId) || {},
         ignoredMasks: ignoresByNetwork.get(networkId) || [],
         nickNotes: notesByNetwork.get(networkId) || [],
+        relayBots: relayBotsByNetwork.get(networkId) || [],
       };
     };
     const live = this.listConnections(userId);
@@ -700,6 +751,22 @@ class IrcManager extends EventEmitter {
 
   getNickNote(userId: number, networkId: number, nick: string): NoteResult | null {
     return getNickNoteRow({ userId, networkId, nick });
+  }
+
+  // Mark/unmark a relay bot (#277). Returns the stored row when marked, or null
+  // after clearing the mark — the verb maps that to `marked`.
+  setRelayBot(
+    userId: number,
+    networkId: number,
+    nick: string,
+    marked: boolean,
+    pattern: string,
+  ): RelayBotResult | null {
+    if (!marked) {
+      removeRelayBotRow({ userId, networkId, nick });
+      return null;
+    }
+    return setRelayBotRow({ userId, networkId, nick, pattern });
   }
 
   listContacts(userId: number): ContactRecord[] {

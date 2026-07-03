@@ -21,6 +21,7 @@ import {
   isServerBufferDeniedNumeric,
   joinRejectionMessage,
   joinRejectionMessageByTag,
+  resolveChannelContext,
   sendRejectionTargetKind,
   sendRejectionText,
   outgoingAddr,
@@ -296,6 +297,61 @@ describe('canonicalChannelTarget (#268)', () => {
     expect(canonicalChannelTarget('SomeNick', channels)).toBe('SomeNick');
     expect(canonicalChannelTarget(':server:7', channels)).toBe(':server:7');
     expect(canonicalChannelTarget(undefined, channels)).toBeUndefined();
+  });
+});
+
+describe('resolveChannelContext (#439)', () => {
+  // Joined set: keyed lowercase, .name holds the case we joined with.
+  const channels = new Map([['#christian', { name: '#Christian' }]]);
+
+  it('redirects via the +draft/channel-context tag to the joined channel (canonical case)', () => {
+    expect(
+      resolveChannelContext({ '+draft/channel-context': '#CHRISTIAN' }, 'hello', channels),
+    ).toBe('#Christian');
+  });
+
+  it('redirects via a leading [#chan] body prefix, tolerating (), <>, {}', () => {
+    expect(resolveChannelContext(undefined, '[#christian] welcome', channels)).toBe('#Christian');
+    expect(resolveChannelContext(undefined, '(#christian) hi', channels)).toBe('#Christian');
+    expect(resolveChannelContext(undefined, '<#christian> hi', channels)).toBe('#Christian');
+    expect(resolveChannelContext(undefined, '{#christian} hi', channels)).toBe('#Christian');
+  });
+
+  it('prefers the tag over a conflicting body prefix', () => {
+    // Body names a channel we are NOT in; the tag names one we are — tag wins.
+    expect(
+      resolveChannelContext({ '+draft/channel-context': '#christian' }, '[#elsewhere] x', channels),
+    ).toBe('#Christian');
+  });
+
+  it('returns null when the referenced channel is not joined (no buffer fabrication)', () => {
+    expect(resolveChannelContext({ '+draft/channel-context': '#elsewhere' }, 'x', channels)).toBe(
+      null,
+    );
+    expect(resolveChannelContext(undefined, '[#elsewhere] x', channels)).toBe(null);
+  });
+
+  it('returns null when there is no usable context', () => {
+    expect(resolveChannelContext(undefined, 'just a normal notice', channels)).toBe(null);
+    expect(resolveChannelContext(undefined, 'a [#christian] mid-line mention', channels)).toBe(
+      null,
+    );
+    expect(resolveChannelContext({}, undefined, channels)).toBe(null);
+    // A bracketed token without a channel sigil is not a context prefix.
+    expect(resolveChannelContext(undefined, '[info] something', channels)).toBe(null);
+  });
+
+  it('only resolves `#` channels, not `&`/`!`/`+` (matches Lurker routing)', () => {
+    // Even when "joined" to a non-# channel, channel-context must not redirect to
+    // it — Lurker routes `&`/`!`/`+` targets as non-channels.
+    const withLocal = new Map([
+      ['#christian', { name: '#Christian' }],
+      ['&local', { name: '&local' }],
+    ]);
+    expect(resolveChannelContext({ '+draft/channel-context': '&local' }, 'x', withLocal)).toBe(
+      null,
+    );
+    expect(resolveChannelContext(undefined, '[&local] hi', withLocal)).toBe(null);
   });
 });
 
@@ -1455,5 +1511,195 @@ describe('WEBIRC real-IP forwarding', () => {
   it('omits WEBIRC when no password is configured even with an IP', async () => {
     (await import('../utils/forcedNetwork.js')).resetForcedNetworkCacheForTests();
     expect(connectWith(makeConn('203.0.113.8')).webirc).toBeUndefined();
+  });
+});
+
+// Inbound channel INVITE (#261): surface "you've been invited" as an actionable
+// ephemeral + a durable system-buffer line; ignore invite-notify echoes for
+// other people. publishEphemeral/logNet are stubbed to assert routing without a
+// DB or live socket.
+describe('inbound INVITE handler (#261)', () => {
+  function makeConn(): IrcConnection {
+    return new IrcConnection({
+      network: {
+        id: 1,
+        user_id: 1,
+        name: 'n',
+        host: 'irc.example.test',
+        port: 6697,
+        tls: 1,
+        trusted_certificates: 1,
+        nick: 'me',
+        username: null,
+        realname: null,
+        server_password: null,
+        autoconnect: 1,
+        sasl_account: null,
+        sasl_password: null,
+        connect_commands: null,
+        position: 0,
+        created_at: new Date().toISOString(),
+        last_client_ip: null,
+      },
+      onEvent: () => {},
+    });
+  }
+
+  it('publishes an actionable invite event + system line when WE are invited', () => {
+    const conn = makeConn();
+    conn.client.user.nick = 'me';
+    const publishEphemeral = vi.fn<(event: unknown) => void>();
+    const logNet = vi.fn<(text: string, level?: string) => void>();
+    conn.publishEphemeral = publishEphemeral;
+    conn.logNet = logNet;
+
+    conn.client.emit('invite', { nick: 'alice', invited: 'me', channel: '#secret' });
+
+    expect(publishEphemeral).toHaveBeenCalledTimes(1);
+    expect(publishEphemeral).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'invite',
+        // Routed via the server pseudo-buffer so the wsHub closed-buffer guard
+        // can't drop an invite to a channel we'd previously closed.
+        target: ':server:1',
+        channel: '#secret',
+        from: 'alice',
+      }),
+    );
+    expect(logNet).toHaveBeenCalledWith('alice invited you to #secret');
+  });
+
+  it('does not toast for an invite-notify echo about someone else (channel line only)', () => {
+    const conn = makeConn();
+    conn.client.user.nick = 'me';
+    const publish = vi.fn<(event: unknown) => void>();
+    const publishEphemeral = vi.fn<(event: unknown) => void>();
+    const logNet = vi.fn<(text: string, level?: string) => void>();
+    conn.publish = publish;
+    conn.publishEphemeral = publishEphemeral;
+    conn.logNet = logNet;
+
+    conn.client.emit('invite', { nick: 'alice', invited: 'bob', channel: '#secret' });
+
+    // Surfaced as a channel line (covered in detail elsewhere), never as a toast
+    // or a "you've been invited" system line — that's only for invites to us.
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publishEphemeral).not.toHaveBeenCalled();
+    expect(logNet).not.toHaveBeenCalled();
+  });
+
+  it('matches the invited nick case-insensitively', () => {
+    const conn = makeConn();
+    conn.client.user.nick = 'Me';
+    const publishEphemeral = vi.fn<(event: unknown) => void>();
+    conn.publishEphemeral = publishEphemeral;
+    conn.logNet = vi.fn<(text: string, level?: string) => void>();
+
+    conn.client.emit('invite', { nick: 'alice', invited: 'mE', channel: '#secret' });
+
+    expect(publishEphemeral).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops a malformed invite missing the channel', () => {
+    const conn = makeConn();
+    conn.client.user.nick = 'me';
+    const publishEphemeral = vi.fn<(event: unknown) => void>();
+    conn.publishEphemeral = publishEphemeral;
+    conn.logNet = vi.fn<(text: string, level?: string) => void>();
+
+    conn.client.emit('invite', { nick: 'alice', invited: 'me' });
+
+    expect(publishEphemeral).not.toHaveBeenCalled();
+  });
+});
+
+// Outbound /invite confirmation (RPL_INVITING 341 -> 'invited') and op-visibility
+// invite-notify lines (#261). Both render a persisted "X invited Y" channel line
+// via publish(); the self-echo is deduped against the 341 line.
+describe('invite channel lines + dedup (#261)', () => {
+  function makeConn(): IrcConnection {
+    return new IrcConnection({
+      network: {
+        id: 1,
+        user_id: 1,
+        name: 'n',
+        host: 'irc.example.test',
+        port: 6697,
+        tls: 1,
+        trusted_certificates: 1,
+        nick: 'me',
+        username: null,
+        realname: null,
+        server_password: null,
+        autoconnect: 1,
+        sasl_account: null,
+        sasl_password: null,
+        connect_commands: null,
+        position: 0,
+        created_at: new Date().toISOString(),
+        last_client_ip: null,
+      },
+      onEvent: () => {},
+    });
+  }
+
+  it('renders our own /invite as a channel line from RPL_INVITING (341)', () => {
+    const conn = makeConn();
+    conn.client.user.nick = 'me';
+    const publish = vi.fn<(event: unknown) => void>();
+    conn.publish = publish;
+
+    // irc-framework emits 'invited' for 341 with { nick: invited, channel }.
+    conn.client.emit('invited', { nick: 'bob', channel: '#secret' });
+
+    expect(publish).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'invite', target: '#secret', nick: 'me', invited: 'bob' }),
+    );
+  });
+
+  it('renders a third party invite-notify as a channel line', () => {
+    const conn = makeConn();
+    conn.client.user.nick = 'me';
+    conn.upsertChannel('#secret');
+    const publish = vi.fn<(event: unknown) => void>();
+    conn.publish = publish;
+
+    conn.client.emit('invite', { nick: 'alice', invited: 'bob', channel: '#secret' });
+
+    expect(publish).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'invite', target: '#secret', nick: 'alice', invited: 'bob' }),
+    );
+  });
+
+  it('suppresses the invite-notify echo of our OWN invite (deduped against 341)', () => {
+    const conn = makeConn();
+    conn.client.user.nick = 'me';
+    const publish = vi.fn<(event: unknown) => void>();
+    const publishEphemeral = vi.fn<(event: unknown) => void>();
+    conn.publish = publish;
+    conn.publishEphemeral = publishEphemeral;
+
+    // Our own INVITE, echoed back via invite-notify (inviter === us).
+    conn.client.emit('invite', { nick: 'me', invited: 'bob', channel: '#secret' });
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(publishEphemeral).not.toHaveBeenCalled();
+  });
+
+  it('still routes an invite TO us as the actionable toast, not a channel line', () => {
+    const conn = makeConn();
+    conn.client.user.nick = 'me';
+    const publish = vi.fn<(event: unknown) => void>();
+    const publishEphemeral = vi.fn<(event: unknown) => void>();
+    conn.publish = publish;
+    conn.publishEphemeral = publishEphemeral;
+    conn.logNet = vi.fn<(text: string, level?: string) => void>();
+
+    conn.client.emit('invite', { nick: 'alice', invited: 'me', channel: '#secret' });
+
+    expect(publish).not.toHaveBeenCalled(); // not a channel line
+    expect(publishEphemeral).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'invite', target: ':server:1', channel: '#secret' }),
+    );
   });
 });

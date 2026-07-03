@@ -3,7 +3,12 @@
 
 import IRC, { ircLineParser } from 'irc-framework';
 import type { Client as IrcClient } from 'irc-framework';
-import { insertMessage, hasMessageForTarget, listBufferTargets } from '../db/messages.js';
+import {
+  insertMessage,
+  hasMessageForTarget,
+  hasConversationForTarget,
+  listBufferTargets,
+} from '../db/messages.js';
 import type { Network } from '../db/networks.js';
 import { upsertChannel } from '../db/networks.js';
 import { isClosed as isBufferClosed } from '../db/closedBuffers.js';
@@ -49,6 +54,33 @@ import {
   parseCtcp,
   type CtcpReplyConfig,
 } from './ctcp.js';
+import fs from 'fs';
+import path from 'path';
+import {
+  crc32Hex,
+  formatBytes,
+  formatDccOfferLine,
+  isBlockedDccHost,
+  parseCrcFromFilename,
+  parseDcc,
+} from './dcc.js';
+import type { DccAccept, DccSend } from './dcc.js';
+import { dccAllowPrivateHosts, dccEnabledForUser, dccMaxFileBytes } from './dccConfig.js';
+import { hasFreeSpaceFor, resolveDccDestination } from './dccPaths.js';
+import { DccReceiver } from './dccReceiver.js';
+import {
+  type DccTransferRow,
+  DCC_ACTIVE_STATES,
+  findArmedRequest,
+  findResumableTransfer,
+  getDccTransfer,
+  insertDccTransfer,
+  markDccCompleted,
+  markDccFailed,
+  markDccReceiving,
+  updateDccReceivedBytes,
+  updateDccTransferState,
+} from '../db/dccTransfers.js';
 import { getChannelConfig as getE2eChannelConfig } from '../db/e2e.js';
 import type { ChannelMode } from '../db/e2e.js';
 import { randomBytes } from 'node:crypto';
@@ -87,6 +119,16 @@ const NON_PERSISTED_TYPES = new Set([
   // publishEphemeral — never persisted (#263).
   'ctcp',
 ]);
+
+// Diagnostic: a single synchronous IRC-event handler (NAMES/WHO member-list
+// rebuild + serialize + fan-out) slower than this is logged. On a reconnect the
+// server replays NAMES/WHO for every auto-rejoined channel; on big channels each
+// is O(members), and the burst is what shows up as an [event-loop] stall with no
+// [wsHub] snapshot line. Console-only. Env-tunable / 0 disables.
+const IRC_HANDLER_WARN_MS = (() => {
+  const raw = Number(process.env.LURKER_IRC_HANDLER_WARN_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 50;
+})();
 
 // Forget an outbound CTCP request we never got a reply to after a minute, so the
 // routing map can't grow unbounded.
@@ -150,6 +192,10 @@ interface EnrichedEvent extends IrcEvent {
   alt?: boolean;
   matched?: boolean;
   matchedRuleId?: number | null;
+  // Hide-level ignore verdict, stamped at persist time. Callers that surface a
+  // secondary copy of the event (e.g. the closed-buffer NOTICE mirror) read this
+  // so they don't leak an ignored sender's text past the ignore filter (#439).
+  fromIgnored?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +212,11 @@ function extractExtras(event: IrcEvent): Record<string, unknown> | null {
   switch (event.type) {
     case 'kick':
       extras = { kicked: event.kicked };
+      break;
+    case 'invite':
+      // The invited nick — `nick` (the standard actor column) holds the
+      // inviter. Persisted so the "X invited Y" channel line round-trips (#261).
+      extras = { invited: event.invited };
       break;
     case 'nick':
       extras = { newNick: event.newNick };
@@ -260,6 +311,22 @@ export class IrcConnection {
   // Last time we surfaced an undecryptable-E2E hint per (channel,peer,kind), to
   // collapse a multi-chunk message's per-chunk hints into one (#382). epoch ms.
   private readonly e2eHintAt = new Map<string, number>();
+  // Active DCC downloads (#270), keyed by dcc_transfers.id, so their sockets
+  // aren't GC'd mid-transfer and can be cancelled on dispose.
+  private readonly dccReceivers = new Map<number, DccReceiver>();
+  // Resumes awaiting the sender's DCC ACCEPT, keyed by nick|filename. Each holds
+  // a timeout so a bot that never accepts fails the transfer cleanly.
+  private readonly dccPendingResume = new Map<
+    string,
+    {
+      transferId: number;
+      nick: string;
+      offer: DccSend;
+      destPath: string;
+      startOffset: number;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
   useMonitor: boolean;
   monitorLimit: number;
   pendingMonitorSeed: boolean;
@@ -447,7 +514,11 @@ export class IrcConnection {
     return { ...event, target };
   }
 
-  publish(event: IrcEvent): void {
+  // Returns the enriched, persisted event so callers can read server-stamped
+  // fields (e.g. the `fromIgnored` verdict the closed-buffer NOTICE mirror needs).
+  // Typed `| void` rather than `| undefined` so the many `() => void` test spies
+  // that stand in for publish stay assignable.
+  publish(event: IrcEvent): EnrichedEvent | void {
     if (this.disposed) return;
     event = this.normalizeChannelTarget(event);
     const time = (event.time as string | undefined) || new Date().toISOString();
@@ -500,14 +571,17 @@ export class IrcConnection {
         matchedRuleId,
         userhost: (event.userhost as string | null | undefined) ?? null,
         fromIgnored,
+        mirrored: event.mirrored as boolean | undefined,
       });
       enriched.id = id;
       enriched.alt = alt;
       enriched.matched = matchedRuleId != null;
       enriched.matchedRuleId = matchedRuleId;
+      enriched.fromIgnored = fromIgnored;
     }
 
     this.onEvent(enriched);
+    return enriched;
   }
 
   publishEphemeral(event: IrcEvent): void {
@@ -680,6 +754,10 @@ export class IrcConnection {
         for (const target of listBufferTargets(this.network.id)) {
           if (!isDmTargetName(target)) continue;
           if (isBufferClosed(this.network.user_id, this.network.id, target)) continue;
+          // A notice-only buffer (NickServ/ChanServ, #439) is not a real DM —
+          // don't seed it into MONITOR or it consumes presence slots and shows a
+          // bogus presence dot for a service. Track only actual conversations.
+          if (!hasConversationForTarget(this.network.id, target)) continue;
           this.addPeerReason(target.toLowerCase(), 'dm', null);
         }
       } catch (e) {
@@ -966,6 +1044,27 @@ export class IrcConnection {
     });
     c.on('connecting', () => this.setState('connecting'));
 
+    // Diagnostic: irc-framework fires 'ping timeout' when it hasn't seen data
+    // from the server for `ping_timeout` seconds (120s default) — then it QUITs
+    // and auto-reconnects with NO socket error, so the disconnect otherwise
+    // surfaces as a bare "Disconnected" with no cause. A ping timeout on a
+    // healthy network usually means WE stopped reading the socket, i.e. the
+    // event loop was starved by synchronous work (see eventLoopMonitor); when
+    // every network times out together on a client connect, that's the tell.
+    // Surface it so the cause isn't invisible. Deliberately does NOT publish() a
+    // notice (which inserts a message row + fanOuts to every socket): a
+    // loop-stall trips this on EVERY live network at once, so a publish per
+    // network would be a synchronous DB-write + fan-out burst on the recovery
+    // ticks — exactly the write amplification we're trying to avoid on the stall
+    // path. logNet is a single lightweight systemLog line (visible in the app's
+    // system buffer), and console.warn lands in `docker logs` next to the
+    // [event-loop] stall line for correlation.
+    c.on('ping timeout', () => {
+      const text = `Ping timeout — no data from ${this.network.host} for the timeout window; reconnecting. If every network did this at once, the server event loop stalled (check logs for [event-loop]).`;
+      this.logNet(text, 'warn');
+      console.warn(`[irc] ping timeout on network ${this.network.id} (${this.network.host})`);
+    });
+
     // Built-in identd: the moment the raw socket connects, register this
     // connection's full 4-tuple (both addresses + both ports) → this user's ident
     // so the identd server (services/identd.ts) can answer the IRC server's :113
@@ -1104,25 +1203,41 @@ export class IrcConnection {
       if (isServer) target = `:server:${this.network.id}`;
       else if (targetIsChannel) target = eventTarget;
       else if (isNotice) {
-        // NOTICE routing: keep replies inside an active conversation if the
-        // user has one open (e.g. they /msg'd ChanServ and ChanServ is
-        // NOTICE'ing back — those belong in the ChanServ buffer), but route
-        // unsolicited NOTICEs (NickServ cloak alert on connect, server-wide
-        // wallops, oper notices) to the server buffer the way IRCCloud and
-        // most modern clients do. "Active" = there's history for that
-        // target on this network AND the user hasn't explicitly closed it.
-        // IRC nicks are case-insensitive at the protocol layer but the DB
-        // stores whatever case the buffer was created with, so match
-        // case-insensitively and use the persisted casing as the routing
-        // target so we don't accidentally split history across "ChanServ"
-        // and "chanserv".
-        const dmLower = (eventNick as string).toLowerCase();
-        const existingTarget = listBufferTargets(this.network.id).find(
-          (t) => t.toLowerCase() === dmLower,
+        // A NOTICE addressed to us persists to the sender's buffer (its natural
+        // home), like a PRIVMSG — so the buffer surfaces on first notice and the
+        // history lives in the right place. Open/closed is a client display
+        // concern: the wsHub fan-out drops live delivery to a buffer the user has
+        // closed (closed stays closed — a notice never reopens it, see
+        // DM_ELIGIBLE_TYPES), and the closed-buffer mirror below persists a
+        // durable copy in the server buffer so the notice isn't lost.
+        //   - EXCEPTION 1: a channel-context hint (the IRCv3 +draft/channel-context
+        //     tag, or a leading "[#chan]" body prefix) for a channel we're in
+        //     routes the notice to that channel.
+        //   - EXCEPTION 2: a notice NOT addressed to our nick (e.g. to an `&`/`!`/`+`
+        //     local channel, which Lurker routes as a non-channel, or a STATUSMSG
+        //     target) has no DM home — surface it in the server buffer rather than
+        //     fabricating a bogus DM with the sender.
+        const ctx = resolveChannelContext(
+          event.tags as Record<string, string> | undefined,
+          eventMessage,
+          this.channels,
         );
-        const hasOpenDm =
-          existingTarget && !isBufferClosed(this.network.user_id, this.network.id, existingTarget);
-        target = hasOpenDm ? existingTarget : `:server:${this.network.id}`;
+        if (ctx) {
+          target = ctx;
+        } else if (
+          eventTarget &&
+          this.currentNick &&
+          eventTarget.toLowerCase() === this.currentNick.toLowerCase()
+        ) {
+          // Fold to an existing buffer's casing so a reply sourced as "ChanServ"
+          // doesn't fork history from a "chanserv" buffer the user started (#289).
+          const nickLower = (eventNick as string).toLowerCase();
+          target =
+            listBufferTargets(this.network.id).find((t) => t.toLowerCase() === nickLower) ??
+            (eventNick as string);
+        } else {
+          target = `:server:${this.network.id}`;
+        }
       } else target = eventNick as string;
 
       const type =
@@ -1193,7 +1308,7 @@ export class IrcConnection {
         }
       }
 
-      this.publish({
+      const published = this.publish({
         type,
         target,
         nick,
@@ -1202,12 +1317,42 @@ export class IrcConnection {
         self: false,
         userhost: buildUserhost(event),
         ...(e2eFlag ? { e2e: true } : {}),
-      });
+      }) as EnrichedEvent | undefined;
+      // If a notice's home buffer is one the user has closed, the wsHub fan-out
+      // drops its live delivery — so without this the notice would be invisible
+      // until the buffer is reopened. Persist a SECOND copy in the server buffer
+      // (a durable mirror, not a transient emit) so it's visible there for every
+      // client, including one that was offline when it arrived — an ephemeral copy
+      // would never reach a reconnecting or mobile client. The real copy still
+      // lives in the closed home buffer for when it's reopened; `:server:` targets
+      // bypass the closed-buffer fan-out guard and are excluded from search, so the
+      // duplicate doesn't double up search results. Skip ignored senders
+      // (`fromIgnored`): the home copy is ignore-flagged and client-filtered, so
+      // mirroring the raw text would bypass the ignore list (a harassment vector).
+      if (
+        isNotice &&
+        !isServer &&
+        target !== this.serverTarget() &&
+        !published?.fromIgnored &&
+        isBufferClosed(this.network.user_id, this.network.id, target)
+      ) {
+        this.publish({
+          type: 'notice',
+          target: this.serverTarget(),
+          nick,
+          text: bodyText,
+          kind: eventType,
+          self: false,
+          mirrored: true,
+        });
+      }
       // An incoming PRIVMSG (not NOTICE) is the moment this nick becomes a
       // tracked DM peer — add them via trackDmPeer so MONITOR + fires too.
-      // NOTICEs go to the server buffer above, so there's no DM peer to
-      // track for them. Channel chatter still flips presence only for peers
-      // we already track.
+      // A NOTICE now opens a buffer under the sender's nick too, but we
+      // deliberately don't start presence-tracking for notice senders: they're
+      // overwhelmingly services/bots (NickServ, ChanServ, oper notices) that
+      // shouldn't consume MONITOR slots or show a presence dot. Channel chatter
+      // still flips presence only for peers we already track.
       if (eventNick && !isServer && !targetIsChannel && !isNotice) {
         this.trackDmPeer(eventNick);
       }
@@ -1383,6 +1528,58 @@ export class IrcConnection {
         }
         this.publish({ type: 'channel-parted', target: channel });
       }
+    });
+
+    c.on('invite', (event: Record<string, unknown>) => {
+      // irc-framework parses an inbound INVITE as { nick: inviter, invited:
+      // target nick, channel }. Three cases land here (#261):
+      const inviter = event.nick as string | undefined;
+      const invited = event.invited as string | undefined;
+      const rawChannel = event.channel as string | undefined;
+      if (!inviter || !rawChannel || !invited) return;
+      const me = c.user?.nick;
+      const meLower = me?.toLowerCase();
+      const channel = canonicalChannelTarget(rawChannel, this.channels) ?? rawChannel;
+
+      // (1) Someone invited US → actionable toast + durable system line. Routed
+      // through the server pseudo-buffer, not the channel: we're not in the
+      // channel (that's the point of an invite), and if we'd previously closed
+      // its buffer the wsHub closed-buffer guard would drop an ephemeral
+      // targeted at it. The client toast reads `channel`/`from`, never `target`.
+      if (meLower && invited.toLowerCase() === meLower) {
+        this.publishEphemeral({
+          type: 'invite',
+          target: this.serverTarget(),
+          channel,
+          from: inviter,
+          userhost: buildUserhost(event),
+        });
+        this.logNet(`${inviter} invited you to ${channel}`);
+        return;
+      }
+
+      // (2) Our OWN invite, echoed back to us via the invite-notify cap. The
+      // RPL_INVITING (341) 'invited' handler already renders the channel line,
+      // so drop the echo to avoid a duplicate.
+      if (meLower && inviter.toLowerCase() === meLower) return;
+
+      // (3) invite-notify op-visibility: a third party invited someone to a
+      // channel we're in → persisted channel line "inviter invited invited".
+      this.publish({ type: 'invite', target: channel, nick: inviter, invited });
+    });
+
+    c.on('invited', (event: Record<string, unknown>) => {
+      // RPL_INVITING (341): the server confirms OUR /invite was relayed.
+      // irc-framework gives { nick: the invited nick, channel }. Render the same
+      // persisted channel line as the op-visibility path, attributed to us — so
+      // the confirmation shows up in the channel rather than the server buffer,
+      // and the invite-notify self-echo above is deduped against it (#261).
+      const invited = event.nick as string | undefined;
+      const rawChannel = event.channel as string | undefined;
+      const me = c.user?.nick;
+      if (!invited || !rawChannel || !me) return;
+      const channel = canonicalChannelTarget(rawChannel, this.channels) ?? rawChannel;
+      this.publish({ type: 'invite', target: channel, nick: me, invited });
     });
 
     c.on('quit', (event: Record<string, unknown>) => {
@@ -1625,6 +1822,7 @@ export class IrcConnection {
     });
 
     c.on('userlist', (event: Record<string, unknown>) => {
+      const tHandler = Date.now();
       const eventChannel = event.channel as string;
       const eventUsers = (event.users as Record<string, unknown>[]) || [];
       const ch = this.upsertChannel(eventChannel);
@@ -1665,9 +1863,18 @@ export class IrcConnection {
       } catch (_) {
         /* ignore */
       }
+      const ms = Date.now() - tHandler;
+      if (IRC_HANDLER_WARN_MS > 0 && ms >= IRC_HANDLER_WARN_MS) {
+        console.warn(
+          `[irc] NAMES(userlist) for ${eventChannel} took ${ms}ms (${ch.members.size} members) ` +
+            `on network ${this.network.id} — synchronous member rebuild + fan-out; a burst of ` +
+            `these across auto-rejoined channels is the reconnect [event-loop] stall`,
+        );
+      }
     });
 
     c.on('wholist', (event: Record<string, unknown>) => {
+      const tHandler = Date.now();
       const eventTarget = event.target as string | undefined;
       const targetKey = eventTarget?.toLowerCase() ?? '';
       const users = (event.users as Record<string, unknown>[]) || [];
@@ -1724,12 +1931,21 @@ export class IrcConnection {
           changed = true;
         }
       }
-      if (!changed) return;
-      this.publish({
-        type: 'names',
-        target: ch.name,
-        members: Array.from(ch.members.values()).map(memberSnapshot),
-      });
+      if (changed) {
+        this.publish({
+          type: 'names',
+          target: ch.name,
+          members: Array.from(ch.members.values()).map(memberSnapshot),
+        });
+      }
+      const ms = Date.now() - tHandler;
+      if (IRC_HANDLER_WARN_MS > 0 && ms >= IRC_HANDLER_WARN_MS) {
+        console.warn(
+          `[irc] WHO(wholist) for ${ch.name} took ${ms}ms (${ch.members.size} members) ` +
+            `on network ${this.network.id} — synchronous away/host backfill${changed ? ' + fan-out' : ''}; ` +
+            `part of the reconnect burst`,
+        );
+      }
     });
 
     // Per-user away/back. away-notify drives the non-self events; self events
@@ -2204,6 +2420,10 @@ export class IrcConnection {
   // RPL_MONOFFLINE from the server — no separate WHOIS probe needed.
   probePresence(nick: string | undefined | null): void {
     if (!nick || !isDmTargetName(nick)) return;
+    // Opening a notice-only buffer (a service like NickServ, #439) must not start
+    // MONITOR tracking — only probe presence for targets we have a real
+    // conversation with. Friends are tracked separately at hydrate time.
+    if (!hasConversationForTarget(this.network.id, nick)) return;
     this.trackDmPeer(nick);
   }
 
@@ -2374,6 +2594,13 @@ export class IrcConnection {
     if (isDmTargetName(target)) this.trackDmPeer(target);
     this.noteUserSend(target);
     this.client.say(target, text);
+    // Arm AFTER the send, and never let a DB hiccup in arming break delivery of
+    // the user's actual message.
+    try {
+      this.maybeArmDcc(target, text);
+    } catch {
+      /* arming is best-effort */
+    }
   }
   action(target: string, text: string): void {
     if (isDmTargetName(target)) this.trackDmPeer(target);
@@ -2507,10 +2734,424 @@ export class IrcConnection {
     // can't burn a peer's budget and suppress its legitimate probes.
     if (!type) return;
     if (!this.ctcpLimiter.allowIncoming(this.ctcpPeerKey(event))) return;
+    // DCC rides CTCP but is never an auto-reply type. When DCC is enabled for
+    // this user, hand the offer to the download manager instead of the generic
+    // probe path; when disabled, fall through so it surfaces as an ordinary
+    // unsupported CTCP ("requested CTCP DCC (no reply)"), unchanged from today.
+    if (type === 'DCC' && dccEnabledForUser(this.network.user_id)) {
+      // DCC handling (parse + DB writes + socket setup) must never throw out of
+      // the CTCP event path and disrupt the connection.
+      try {
+        this.handleInboundDccRequest(nick, args, event);
+      } catch {
+        /* malformed offer / transient DB error — drop it, keep the connection */
+      }
+      return;
+    }
     const config = this.ctcpReplyConfig();
     const reply = buildCtcpReply(type, args, config, this.ctcpTemplateVars(config));
     if (reply !== null) this.client.ctcpResponse(nick, type, reply);
     this.routeCtcpStatus(event, formatCtcpRequestLine(nick, type, reply));
+  }
+
+  // Arm-on-trigger (#270): when the user sends an `XDCC SEND #n` to a bot (a DM
+  // target), record a `requested` row so the bot's eventual DCC SEND offer is
+  // matched + auto-accepted (findArmedRequest). The row survives a slow bot queue
+  // — it just waits. A trigger typed in a channel doesn't arm (you message the
+  // bot directly). Gated like every DCC entry point.
+  private maybeArmDcc(target: string, text: string): void {
+    if (this.disposed || !isDmTargetName(target)) return;
+    // Anchored at the start (after optional whitespace) so an `xdcc send #n`
+    // mentioned mid-sentence in ordinary conversation doesn't arm an auto-accept.
+    const m = /^\s*xdcc\s+(?:send|get)\s+(#?\d+)/i.exec(text);
+    if (!m) return;
+    if (!dccEnabledForUser(this.network.user_id)) return;
+    const pack = m[1].startsWith('#') ? m[1] : `#${m[1]}`;
+    insertDccTransfer(this.network.user_id, {
+      network_id: this.network.id,
+      peer_nick: target,
+      filename: `XDCC ${pack}`, // placeholder until the real offer arrives
+      advertised_size: 0,
+      state: 'requested',
+      trigger_text: text,
+    });
+  }
+
+  // Route an inbound DCC SEND offer (#270): if it matches a request the user
+  // armed, auto-accept and start the download; otherwise record it as
+  // `pending_approval` for the (phase 2) Accept/Reject UI. Non-SEND subtypes
+  // (CHAT/ACCEPT/RESUME) and malformed bodies surface the generic probe line so
+  // the user still sees something arrived. Rate-limited upstream by the shared
+  // CTCP per-peer limiter.
+  private handleInboundDccRequest(
+    nick: string,
+    args: string,
+    event: Record<string, unknown>,
+  ): void {
+    const parsed = parseDcc(args);
+    if (parsed.kind === 'accept') {
+      this.handleDccAccept(nick, parsed);
+      return;
+    }
+    if (parsed.kind !== 'send') {
+      this.routeCtcpStatus(event, formatCtcpRequestLine(nick, 'DCC', null));
+      return;
+    }
+    const offer = parsed;
+    const armed = findArmedRequest(this.network.user_id, this.network.id, nick);
+    if (armed) {
+      this.acceptDccOffer(armed.id, nick, offer);
+      return;
+    }
+    // Unsolicited: nothing auto-lands. Record for the Accept/Reject UI, keeping
+    // the offer's host/port so the user can accept (dial it) later.
+    const id = insertDccTransfer(this.network.user_id, {
+      network_id: this.network.id,
+      peer_nick: nick,
+      filename: offer.filename,
+      advertised_size: offer.size,
+      state: 'pending_approval',
+      passive: offer.passive,
+      token: offer.token,
+      peer_host: offer.host,
+      peer_port: offer.port,
+    });
+    this.routeCtcpStatus(event, formatDccOfferLine(nick, offer));
+    this.publishDcc(id);
+  }
+
+  // Accept an armed offer and stream it to disk via the receive engine. Active
+  // DCC only for now (the cell dials the bot); passive/reverse is a follow-up.
+  // DB progress writes + status lines are throttled so neither the single SQLite
+  // connection nor the buffer gets hammered on a fast/large transfer.
+  private acceptDccOffer(transferId: number, nick: string, offer: DccSend): void {
+    if (offer.passive) {
+      updateDccTransferState(transferId, 'failed', 'passive DCC not yet supported');
+      this.surfaceCtcp(nick, `DCC: passive transfer from ${nick} not yet supported`);
+      return;
+    }
+    // SSRF guard: the host is attacker-controlled and the cell dials it directly,
+    // so refuse loopback/link-local/private/reserved addresses (a self-hoster can
+    // opt back in for a LAN bot via LURKER_DCC_ALLOW_PRIVATE_HOSTS).
+    if (!dccAllowPrivateHosts() && isBlockedDccHost(offer.host)) {
+      updateDccTransferState(transferId, 'failed', `blocked address ${offer.host}`);
+      this.surfaceCtcp(
+        nick,
+        `DCC: refusing "${offer.filename}" — sender address ${offer.host} is private/reserved`,
+      );
+      return;
+    }
+    // Require a real advertised size (so the receiver can bound the write) and
+    // honor an operator per-file cap.
+    if (offer.size <= 0) {
+      updateDccTransferState(transferId, 'failed', 'offer has no advertised size');
+      this.surfaceCtcp(nick, `DCC: refusing "${offer.filename}" — no advertised file size`);
+      return;
+    }
+    const cap = dccMaxFileBytes();
+    if (cap > 0 && offer.size > cap) {
+      updateDccTransferState(transferId, 'failed', `exceeds ${formatBytes(cap)} limit`);
+      this.surfaceCtcp(
+        nick,
+        `DCC: refusing "${offer.filename}" (${formatBytes(offer.size)}) — over the ${formatBytes(cap)} limit`,
+      );
+      return;
+    }
+    // Resume only continues OUR OWN tracked incomplete transfer of this file (a
+    // prior failed/stalled/orphaned-receiving row whose partial is still on disk
+    // and shorter than the offer) — never an arbitrary same-named leftover, which
+    // could otherwise get this bot's bytes appended onto an unrelated prefix.
+    let destPath: string;
+    let startOffset = 0;
+    const prior = findResumableTransfer(this.network.user_id, this.network.id, offer.filename);
+    const partialSize =
+      prior?.destination_path && fs.existsSync(prior.destination_path)
+        ? fs.statSync(prior.destination_path).size
+        : 0;
+    if (prior?.destination_path && partialSize > 0 && partialSize < offer.size) {
+      destPath = prior.destination_path;
+      startOffset = partialSize;
+    } else {
+      try {
+        const username = findUserById(this.network.user_id)?.username || 'user';
+        destPath = resolveDccDestination(username, offer.filename);
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : String(e);
+        updateDccTransferState(transferId, 'failed', reason);
+        this.surfaceCtcp(nick, `DCC: cannot start "${offer.filename}" — ${reason}`);
+        return;
+      }
+    }
+    // Disk check is on the REMAINING bytes (a resume only fetches size - partial);
+    // the receiver also caps writes at the advertised size, so it's the ceiling.
+    if (!hasFreeSpaceFor(path.dirname(destPath), offer.size - startOffset)) {
+      updateDccTransferState(transferId, 'failed', 'insufficient disk space');
+      this.surfaceCtcp(
+        nick,
+        `DCC: refusing "${offer.filename}" (${formatBytes(offer.size)}) — not enough free disk space`,
+      );
+      return;
+    }
+    const expectedCrc = parseCrcFromFilename(offer.filename);
+    markDccReceiving(transferId, {
+      filename: offer.filename,
+      advertised_size: offer.size,
+      destination_path: destPath,
+      passive: offer.passive,
+      token: offer.token,
+      crc_expected: expectedCrc,
+      received_bytes: startOffset,
+    });
+    this.publishDcc(transferId);
+    if (startOffset > 0) {
+      // A partial exists — ask the bot to resume from there and wait for its
+      // DCC ACCEPT before connecting (handleDccAccept starts the receiver).
+      this.surfaceCtcp(
+        nick,
+        `DCC: resuming "${offer.filename}" from ${formatBytes(startOffset)} / ${formatBytes(offer.size)}…`,
+      );
+      this.requestDccResume(transferId, nick, offer, destPath, startOffset);
+    } else {
+      this.surfaceCtcp(
+        nick,
+        `DCC: downloading "${offer.filename}" (${formatBytes(offer.size)}) from ${nick}…`,
+      );
+      this.startDccReceiver(transferId, nick, offer, destPath, 0, expectedCrc);
+    }
+  }
+
+  private dccResumeKey(nick: string, filename: string): string {
+    // Fold case on both halves: a bot may echo the filename in different case in
+    // its DCC ACCEPT than the SEND offer used, and the ACCEPT lookup must match.
+    return `${nick.toLowerCase()}|${filename.toLowerCase()}`;
+  }
+
+  // Send DCC RESUME for a partial and arm a timeout; the receiver isn't started
+  // until the sender's DCC ACCEPT arrives (handleDccAccept).
+  private requestDccResume(
+    transferId: number,
+    nick: string,
+    offer: DccSend,
+    destPath: string,
+    startOffset: number,
+  ): void {
+    const key = this.dccResumeKey(nick, offer.filename);
+    const prior = this.dccPendingResume.get(key);
+    if (prior) {
+      // A newer resume for the same file supersedes the prior one — leave its row
+      // resumable (stalled) rather than orphaning it forever in 'receiving'.
+      clearTimeout(prior.timer);
+      updateDccTransferState(prior.transferId, 'stalled', 'superseded by a newer resume');
+    }
+    const timer = setTimeout(() => {
+      this.dccPendingResume.delete(key);
+      markDccFailed(transferId, startOffset, 'resume not accepted by sender');
+      this.surfaceCtcp(nick, `DCC: "${offer.filename}" — sender did not accept resume`);
+      this.publishDcc(transferId);
+    }, 15_000);
+    this.dccPendingResume.set(key, { transferId, nick, offer, destPath, startOffset, timer });
+    // Mirror the offer's filename quoting so the bot matches it.
+    const fn = offer.filename.includes(' ') ? `"${offer.filename}"` : offer.filename;
+    this.client.ctcpRequest(nick, 'DCC', 'RESUME', fn, String(offer.port), String(startOffset));
+  }
+
+  // The sender accepted our resume: start receiving (appending) from our partial.
+  private handleDccAccept(nick: string, accept: DccAccept): void {
+    const key = this.dccResumeKey(nick, accept.filename);
+    const pending = this.dccPendingResume.get(key);
+    if (!pending) return; // unsolicited / stale ACCEPT
+    // Confirm the ACCEPT is for our pending offer (the port it echoes must match)
+    // BEFORE consuming the pending entry — a stray/mismatched ACCEPT must not clear
+    // the timer or fail a still-valid pending resume.
+    if (accept.port !== pending.offer.port) return;
+    clearTimeout(pending.timer);
+    this.dccPendingResume.delete(key);
+    // We asked to resume from exactly our partial's size; the sender must echo it.
+    // Any other position (a buggy or malicious ACCEPT) would mean appending at the
+    // wrong offset — and the position is attacker-controlled — so refuse it rather
+    // than truncate/extend the file to match.
+    if (accept.position !== pending.startOffset) {
+      markDccFailed(
+        pending.transferId,
+        pending.startOffset,
+        `sender accepted an unexpected resume position (${accept.position})`,
+      );
+      this.surfaceCtcp(nick, `DCC: "${accept.filename}" — sender accepted a bad resume position`);
+      return;
+    }
+    this.startDccReceiver(
+      pending.transferId,
+      pending.nick,
+      pending.offer,
+      pending.destPath,
+      pending.startOffset,
+      parseCrcFromFilename(pending.offer.filename),
+    );
+  }
+
+  // Build + start the receive engine for a transfer (fresh: startOffset 0;
+  // resume: startOffset > 0, appending). Wires throttled progress, completion
+  // (with CRC verdict), and failure back to the row + status buffer.
+  private startDccReceiver(
+    transferId: number,
+    nick: string,
+    offer: DccSend,
+    destPath: string,
+    startOffset: number,
+    expectedCrc: string | null,
+  ): void {
+    const resumed = startOffset > 0;
+    let lastDbAt = 0;
+    let lastLineAt = Date.now();
+    const receiver = new DccReceiver({
+      host: offer.host,
+      port: offer.port,
+      size: offer.size,
+      destPath,
+      startOffset,
+      onProgress: (received) => {
+        const now = Date.now();
+        if (now - lastDbAt >= 3000) {
+          lastDbAt = now;
+          updateDccReceivedBytes(transferId, received);
+          this.publishDcc(transferId); // live progress to the Transfers view
+        }
+        if (offer.size > 0 && now - lastLineAt >= 8000) {
+          lastLineAt = now;
+          this.surfaceCtcp(
+            nick,
+            `DCC: "${offer.filename}" ${formatBytes(received)} / ${formatBytes(offer.size)}`,
+          );
+        }
+      },
+      onDone: (received, crc) => {
+        this.dccReceivers.delete(transferId);
+        // A resume only re-checksummed the tail, so we don't claim ok/mismatch on
+        // the whole file — completion already verified the size. A fresh transfer
+        // checks the filename CRC.
+        const actual = crc32Hex(crc);
+        const status = resumed
+          ? 'unverified'
+          : expectedCrc == null
+            ? 'absent'
+            : actual === expectedCrc
+              ? 'ok'
+              : 'mismatch';
+        markDccCompleted(transferId, received, resumed ? null : actual, status);
+        const badge =
+          status === 'ok'
+            ? ' ✓ CRC verified'
+            : status === 'mismatch'
+              ? ` ⚠ CRC MISMATCH (got ${actual}, expected ${expectedCrc})`
+              : status === 'unverified'
+                ? ' (resumed — size verified)'
+                : '';
+        this.surfaceCtcp(
+          nick,
+          `DCC: completed "${offer.filename}" (${formatBytes(received)}) → ${destPath}${badge}`,
+        );
+        this.publishDcc(transferId);
+      },
+      onError: (err, received) => {
+        this.dccReceivers.delete(transferId);
+        // A user-initiated cancel surfaces as a distinct 'cancelled' state, not a
+        // failure (cancel() settles with this exact message).
+        if (err.message === 'cancelled') {
+          updateDccTransferState(transferId, 'cancelled');
+          this.surfaceCtcp(nick, `DCC: cancelled "${offer.filename}"`);
+        } else {
+          markDccFailed(transferId, received, err.message);
+          this.surfaceCtcp(nick, `DCC: failed "${offer.filename}" — ${err.message}`);
+        }
+        this.publishDcc(transferId);
+      },
+    });
+    this.dccReceivers.set(transferId, receiver);
+    receiver.start();
+  }
+
+  // Push a transfer row to ALL the user's clients (user-scoped, not buffer-scoped)
+  // so the Transfers view updates live. wsHub forwards a type:'dcc-transfer' event
+  // as a { kind: 'dcc-transfer' } frame (#270 phase 2).
+  private publishDcc(transferId: number): void {
+    if (this.disposed) return;
+    const transfer = getDccTransfer(this.network.user_id, transferId);
+    if (!transfer) return;
+    this.onEvent({
+      type: 'dcc-transfer',
+      userId: this.network.user_id,
+      networkId: this.network.id,
+      time: new Date().toISOString(),
+      transfer,
+    } as unknown as EnrichedEvent);
+  }
+
+  // Accept a previously-recorded unsolicited offer (pending_approval): rebuild the
+  // offer from the stored row and run the normal accept path. The offer may be
+  // stale (the bot stopped listening) — that surfaces as a connect failure.
+  acceptPendingDcc(row: DccTransferRow): void {
+    if (this.disposed) return;
+    // Only an unsolicited offer still awaiting a decision can be accepted; a row
+    // that already moved on (receiving/terminal) is a no-op.
+    if (row.state !== 'pending_approval') return;
+    // A pending row recorded before the peer_host/peer_port columns existed (or
+    // whose address didn't decode) can't be dialed. Fail it VISIBLY rather than
+    // silently no-op — otherwise the API returns 200 and the UI shows the Accept
+    // doing nothing, with the row stuck pending forever.
+    if (row.peer_host == null || row.peer_port == null) {
+      updateDccTransferState(row.id, 'failed', 'offer is missing its address — cannot reconnect');
+      this.publishDcc(row.id);
+      return;
+    }
+    this.acceptDccOffer(row.id, row.peer_nick, {
+      kind: 'send',
+      filename: row.filename,
+      host: row.peer_host,
+      port: row.peer_port,
+      size: row.advertised_size,
+      token: row.token,
+      passive: row.passive === 1,
+    });
+  }
+
+  // Reject a pending offer (no download). Guarded to the offer states so a late
+  // /dcc reject can't clobber a row that already completed/failed/cancelled.
+  rejectDcc(transferId: number): void {
+    const row = getDccTransfer(this.network.user_id, transferId);
+    if (!row || (row.state !== 'pending_approval' && row.state !== 'requested')) return;
+    updateDccTransferState(transferId, 'rejected');
+    this.publishDcc(transferId);
+  }
+
+  // Cancel a transfer: abort the live receiver if one is running (its onError
+  // marks 'cancelled'), otherwise flip a still-active row to 'cancelled'.
+  cancelDcc(transferId: number): void {
+    const receiver = this.dccReceivers.get(transferId);
+    if (receiver) {
+      receiver.cancel();
+      return; // onError → 'cancelled' + publishDcc
+    }
+    // No live receiver yet — but the transfer may be in the RESUME wait window
+    // (requestDccResume armed a timer and a pending entry, with the receiver only
+    // starting on the bot's DCC ACCEPT). Tear that down, or the timer would fire
+    // markDccFailed over our 'cancelled', or a late ACCEPT would start the
+    // download after the user cancelled it.
+    this.clearPendingResume(transferId);
+    const row = getDccTransfer(this.network.user_id, transferId);
+    if (!row || !DCC_ACTIVE_STATES.has(row.state)) return; // don't clobber a terminal row
+    updateDccTransferState(transferId, 'cancelled');
+    this.publishDcc(transferId);
+  }
+
+  // Drop any armed DCC RESUME wait for this transfer (clear its timeout + pending
+  // entry). The map is keyed by nick|filename, so find the entry by transferId.
+  private clearPendingResume(transferId: number): void {
+    for (const [key, pending] of this.dccPendingResume) {
+      if (pending.transferId !== transferId) continue;
+      clearTimeout(pending.timer);
+      this.dccPendingResume.delete(key);
+      return;
+    }
   }
 
   // Surface an inbound CTCP reply (a peer answered a query we sent), routed back
@@ -3293,6 +3934,17 @@ export class IrcConnection {
     this.disposed = true;
     this.stopLagPinger();
     this.cancelPendingConnectCommands();
+    // Abort any in-flight DCC downloads (their sockets are independent of the IRC
+    // socket, so they'd otherwise outlive this connection) and drop resume timers.
+    for (const receiver of this.dccReceivers.values()) receiver.cancel();
+    this.dccReceivers.clear();
+    for (const pending of this.dccPendingResume.values()) {
+      clearTimeout(pending.timer);
+      // The row is mid-resume ('receiving') with no receiver to fail it — mark it
+      // stalled so it isn't orphaned and can be resumed on reconnect.
+      updateDccTransferState(pending.transferId, 'stalled', 'interrupted while awaiting resume');
+    }
+    this.dccPendingResume.clear();
     try {
       this.client.quit(reason);
     } catch (_) {
@@ -3548,6 +4200,37 @@ export function canonicalChannelTarget(
   if (typeof target !== 'string' || !target.startsWith('#')) return target;
   const known = channels.get(target.toLowerCase());
   return known ? known.name : target;
+}
+
+// Matches a conventional "[#chan] …" channel-context body prefix, also tolerating
+// (#chan), <#chan>, {#chan}. Restricted to `#` to match Lurker's routing, which
+// treats only `#` as a channel (`&`/`!`/`+` are routed as non-channels); the
+// captured name is validated against the joined set before use, and brackets
+// aren't required to pair since the joined-channel check is the real gate.
+const CHANNEL_CONTEXT_PREFIX = /^\s*[[(<{]\s*(#[^\])>}\s]+)\s*[\])>}]/;
+
+// A nick-addressed NOTICE sometimes belongs in a channel rather than a DM with
+// the sender: services announce per-channel info to your nick (Atheme ENTRYMSG,
+// ChanServ welcome) either via the IRCv3 +draft/channel-context client tag or a
+// conventional "[#chan] …" body prefix. Mirrors weechat's notice_welcome_redirect
+// and irssi's notice_channel_context: redirect to the referenced channel, but ONLY
+// when it's a `#` channel we're currently joined to (so a stray tag/prefix can't
+// fabricate a buffer), returning its canonical (joined) casing. The tag wins over
+// the body prefix. Returns null when there's no usable, joined `#`-channel context.
+export function resolveChannelContext(
+  tags: Record<string, string> | undefined,
+  body: string | undefined,
+  channels: Map<string, { name: string }>,
+): string | null {
+  const joinedChannel = (name: string | undefined): string | null => {
+    if (!name || !name.startsWith('#')) return null;
+    const known = channels.get(name.toLowerCase());
+    return known ? known.name : null;
+  };
+  const tagged = joinedChannel(tags?.['+draft/channel-context']);
+  if (tagged) return tagged;
+  const match = typeof body === 'string' ? body.match(CHANNEL_CONTEXT_PREFIX) : null;
+  return match ? joinedChannel(match[1]) : null;
 }
 
 export function joinRejectionMessage(numeric: string): string | null {

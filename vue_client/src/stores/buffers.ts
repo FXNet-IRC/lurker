@@ -165,6 +165,13 @@ export interface Buffer {
   liveDuringDetach: number;
   pendingHistoryToken: number | null;
   pendingRefetch: boolean;
+  // Set when the server shipped this buffer as an unhydrated SHELL (a backlog
+  // frame with no message rows but hasMoreOlder=true — the fresh-connect
+  // optimization). Distinct from `messages.length === 0` because a live line can
+  // arrive on a shell before the user opens it: activate() must still fetch the
+  // real backlog (and must NOT mark-read to that stray line) until a proper
+  // hydrate (reattachToLive → applyLatestReplace) clears the flag.
+  unseeded: boolean;
   modes?: string;
 }
 
@@ -229,6 +236,9 @@ function makeBuffer(networkId: number | string | null, target: string): Buffer {
     // ships backlog unsolicited via sendSnapshot, so there's no other
     // automatic source of history once the slice has been wiped).
     pendingRefetch: false,
+    // A brand-new buffer created locally (e.g. before any frame arrives) is not
+    // a server shell; replaceBacklog sets this true when a shell frame lands.
+    unseeded: false,
   };
 }
 
@@ -259,6 +269,14 @@ export const useBuffersStore = defineStore('buffers', {
   getters: {
     list: (state) => Object.values(state.buffers),
     byKey: (state) => (k: string) => state.buffers[k] || null,
+    // App-wide highlight total — the sum of every buffer's server-owned
+    // `highlighted` count: channel mentions, every unread DM, and notable system
+    // lines (see the server's computeUnreadFor). The active buffer always reads
+    // 0 (applyReadState/activate force it), so the focused conversation never
+    // inflates the total. Drives the PWA app-icon badge (#451); reactive for
+    // free since the per-buffer counts are kept authoritative by the server.
+    totalHighlights: (state) =>
+      Object.values(state.buffers).reduce((sum, b) => sum + (b.highlighted || 0), 0),
     // True only while a buffer for (networkId, target) is live in the store,
     // resolved case-insensitively (#327) like its findByTarget/findDm siblings.
     // A closed buffer is dropped entirely (see drop()), so this is how callers
@@ -411,9 +429,14 @@ export const useBuffersStore = defineStore('buffers', {
       const existingMaxId = buf.messages[buf.messages.length - 1]?.id ?? 0;
       if (existingMaxId === 0) {
         // Initial seed (first connect, or a brand-new buffer we hadn't seen
-        // pre-flap). Take the backlog wholesale.
+        // pre-flap). Take the backlog wholesale. Prefer the server's explicit
+        // hasMoreOlder (computed from a real "is there older history?" check)
+        // and fall back to the length heuristic only when it's absent. This is
+        // also what keeps an offline SHELL frame (events:[], hasMoreOlder:true)
+        // fetchable: without it, `[].length >= 50` would be false and activate()
+        // would never lazy-load the buffer on open.
         buf.messages = filtered.slice(-MAX_PER_BUFFER);
-        buf.hasMoreOlder = filtered.length >= 50;
+        buf.hasMoreOlder = opts.hasMoreOlder ?? filtered.length >= 50;
       } else if (opts.reset) {
         // The resume gap exceeded the server's cap, so it sent a fresh latest
         // slice instead of the missed-since-cursor rows. Appending would splice
@@ -448,6 +471,15 @@ export const useBuffersStore = defineStore('buffers', {
             combined.length > MAX_PER_BUFFER ? combined.slice(-MAX_PER_BUFFER) : combined;
         }
       }
+      // Track shell state independently of messages.length. Real backlog content
+      // seeds the buffer; an empty frame with hasMoreOlder (a shell) marks it
+      // unhydrated — but only if it's empty or already a shell, so re-shelling an
+      // already-loaded buffer (an isFreshNetwork re-snapshot) doesn't un-hydrate
+      // it, and a stray live line arriving on a shell before open doesn't clear
+      // the flag. activate() reads this (not messages.length) to decide whether
+      // to fetch the real backlog on open.
+      if (filtered.length > 0) buf.unseeded = false;
+      else if (existingMaxId === 0 || buf.unseeded) buf.unseeded = buf.hasMoreOlder;
       buf.oldestId = buf.messages[0]?.id ?? null;
       if (speakers !== undefined) this.seedSpeakers(networkId, target, speakers);
       if (readState) this.applyReadState(networkId, target, readState);
@@ -475,6 +507,7 @@ export const useBuffersStore = defineStore('buffers', {
       buf.oldestId = first?.id ?? buf.oldestId;
       buf.hasMoreOlder = !!hasMoreOlder;
       buf.loadingHistory = false;
+      buf.unseeded = false;
       if (speakers !== undefined) this.seedSpeakers(networkId, target, speakers);
     },
     // Symmetric to prependHistory but appends. Used by the 'after' mode
@@ -528,7 +561,15 @@ export const useBuffersStore = defineStore('buffers', {
     // by applyAroundSlice — a second loadAround (or a reattach) before the
     // first response lands mints a new token, so the stale response is
     // discarded on arrival.
-    loadAround(networkId: number | string, target: string, anchorId: number, halfLimit = 100) {
+    // Returns the request token so a caller (useJumpToMessage) can correlate the
+    // eventual applyAroundSlice, or null if the socket was closed and nothing was
+    // sent — in which case no response will ever arrive to scroll to.
+    loadAround(
+      networkId: number | string,
+      target: string,
+      anchorId: number,
+      halfLimit = 100,
+    ): number | null {
       const buf = ensureBuffer(this, networkId, target);
       const token = nextHistoryToken();
       const wasDetached = buf.detached;
@@ -552,7 +593,9 @@ export const useBuffersStore = defineStore('buffers', {
         buf.loadingHistory = false;
         buf.pendingHistoryToken = null;
         buf.detached = wasDetached;
+        return null;
       }
+      return token;
     },
     // Token-guarded replace for the 'around' response. A mismatched token
     // means a fresher request superseded this one — drop the stale slice
@@ -620,6 +663,14 @@ export const useBuffersStore = defineStore('buffers', {
       buf.liveDuringDetach = 0;
       buf.pendingHistoryToken = null;
       buf.loadingHistory = false;
+      // Fully hydrated now (this reply is the shell's real backlog) — clear the
+      // shell flag so activate() stops trying to refetch it.
+      buf.unseeded = false;
+      // Seed the recent-speaker map from the reply so nick autocomplete works the
+      // moment you open a channel — not only after someone speaks. This is the
+      // primary place speakers load now (the connect snapshot no longer ships
+      // them); seedSpeakers merges, so it composes with recordSpeaker's live map.
+      if (payload.speakers !== undefined) this.seedSpeakers(networkId, target, payload.speakers);
       // We're back on live: advance the read pointer to the new tail in the
       // same way activate() does on focus-in. Server clamps with MAX(), so
       // sending mark-read against the latest known id is idempotent.
@@ -967,7 +1018,14 @@ export const useBuffersStore = defineStore('buffers', {
       // Skip while detached — the visible "tail" is some historical row,
       // not the live present. Marking up to that row would advance the
       // server's read pointer past messages the user hasn't seen.
-      if (!buf.detached) {
+      //
+      // Also skip while unseeded: a shell that received a stray live line before
+      // open has that one line as its "tail", but the real backlog (including
+      // everything between lastReadId and that line) hasn't loaded yet. Marking
+      // up to the stray line would clear unread for messages the user never saw.
+      // The reattachToLive fired below does its own mark-read against the real
+      // tail once hydrated.
+      if (!buf.detached && !buf.unseeded) {
         const lastMsg = buf.messages[buf.messages.length - 1];
         const lastId = lastMsg?.id ?? 0;
         if (lastId > buf.lastReadId) {
@@ -992,7 +1050,7 @@ export const useBuffersStore = defineStore('buffers', {
         this.reattachToLive(networkId, canonTarget);
       } else if (
         networkId != null &&
-        buf.messages.length === 0 &&
+        (buf.messages.length === 0 || buf.unseeded) &&
         buf.hasMoreOlder &&
         !buf.detached &&
         !buf.loadingHistory

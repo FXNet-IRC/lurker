@@ -19,6 +19,9 @@ let countNewer: typeof import('./messages.js').countNewer;
 let countHighlightsNewer: typeof import('./messages.js').countHighlightsNewer;
 let listUserHighlights: typeof import('./messages.js').listUserHighlights;
 let maxIdForBuffer: typeof import('./messages.js').maxIdForBuffer;
+let hasConversationForTarget: typeof import('./messages.js').hasConversationForTarget;
+let listSpeakers: typeof import('./messages.js').listSpeakers;
+let listBufferTargets: typeof import('./messages.js').listBufferTargets;
 
 beforeAll(async () => {
   ({ createUser } = await import('./users.js'));
@@ -32,6 +35,9 @@ beforeAll(async () => {
     countHighlightsNewer,
     listUserHighlights,
     maxIdForBuffer,
+    hasConversationForTarget,
+    listSpeakers,
+    listBufferTargets,
   } = await import('./messages.js'));
 });
 
@@ -67,6 +73,109 @@ function event(networkId: number, target: string, type: string, nick: string | n
 function altsFor(networkId: number, target: string) {
   return listMessages(networkId, target, { limit: 1000 }).map((m) => m.alt);
 }
+
+describe('hasConversationForTarget (#439)', () => {
+  it('is true only when a non-notice message exists for the target', () => {
+    const user = createUser('conv-target');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'conv-target',
+    });
+    // Notice-only buffer (a service) → not a conversation.
+    chat(net!.id, 'NickServ', 'NickServ', 'you are now identified', 'notice');
+    expect(hasConversationForTarget(net!.id, 'NickServ')).toBe(false);
+    // A real PRIVMSG promotes it to a conversation; an ACTION counts too.
+    chat(net!.id, 'bob', 'bob', 'hey there');
+    expect(hasConversationForTarget(net!.id, 'bob')).toBe(true);
+    chat(net!.id, 'carol', 'carol', 'waves', 'action');
+    expect(hasConversationForTarget(net!.id, 'carol')).toBe(true);
+    // Case-insensitive match; unknown target is false.
+    expect(hasConversationForTarget(net!.id, 'BOB')).toBe(true);
+    expect(hasConversationForTarget(net!.id, 'nobody')).toBe(false);
+  });
+});
+
+describe('listBufferTargets (loose-index-scan)', () => {
+  let seq = 0;
+  function net() {
+    const user = createUser(`bt-${++seq}`);
+    return createNetwork(user.id, { name: 'n', host: 'h', port: 6697, tls: true, nick: 'me' })!.id;
+  }
+
+  it('returns the distinct targets, sorted, deduped across many rows', () => {
+    const n = net();
+    // Interleave several targets with duplicates; the scan must return each once.
+    for (let i = 0; i < 30; i++) {
+      chat(n, '#zeta', 'a', 'x');
+      chat(n, '#alpha', 'b', 'y');
+      chat(n, 'dave', 'dave', 'z');
+    }
+    chat(n, ':server:1', 'lurker', 'notice');
+    // Binary collation: '#'(0x23) < ':'(0x3A) < 'a' < 'd'.
+    expect(listBufferTargets(n)).toEqual(['#alpha', '#zeta', ':server:1', 'dave']);
+  });
+
+  it('returns [] for a network with no messages', () => {
+    expect(listBufferTargets(net())).toEqual([]);
+  });
+});
+
+describe('listSpeakers', () => {
+  // Deterministic unique user per network — no Math.random (reproducible, no
+  // rare collision flake).
+  let seq = 0;
+  function net() {
+    const user = createUser(`spk-${++seq}`);
+    return createNetwork(user.id, { name: 'n', host: 'h', port: 6697, tls: true, nick: 'me' })!.id;
+  }
+
+  it('returns recent distinct speakers, case-folded, excluding self and non-chat', () => {
+    const n = net();
+    chat(n, '#c', 'Alice', 'hi');
+    chat(n, '#c', 'alice', 'again'); // same speaker, divergent case → one entry
+    chat(n, '#c', 'Bob', 'yo');
+    event(n, '#c', 'join', 'Carol'); // non-chat → not a speaker
+    insertMessage({
+      networkId: n,
+      target: '#c',
+      time: new Date().toISOString(),
+      type: 'message',
+      nick: 'me',
+      text: 'self line',
+      self: true, // our own line → excluded
+    });
+    const nicks = listSpeakers(n, '#c').map((s) => s.nick.toLowerCase());
+    expect(new Set(nicks)).toEqual(new Set(['alice', 'bob']));
+  });
+
+  it('bounds the scan to the recent window — older speakers outside it drop off', () => {
+    const n = net();
+    chat(n, '#c', 'oldtimer', 'first'); // oldest chat line
+    for (let i = 0; i < 5; i++) chat(n, '#c', `recent${i}`, 'x');
+    // With a scan window of 3, only the 3 newest rows are considered, so
+    // 'oldtimer' (6 rows back) is excluded even though it's real chat history.
+    const nicks = listSpeakers(n, '#c', 20, 3).map((s) => s.nick);
+    expect(nicks).not.toContain('oldtimer');
+    // Unbounded (default window) still finds it.
+    expect(listSpeakers(n, '#c').map((s) => s.nick)).toContain('oldtimer');
+  });
+
+  it('window counts CHAT rows only — an event flood does not starve speakers', () => {
+    const n = net();
+    chat(n, '#c', 'speaker', 'hi'); // one chat line...
+    for (let i = 0; i < 8; i++) event(n, '#c', 'join', `joiner${i}`); // ...then a join flood
+    // Window of 2. The filters run INSIDE the window, so the 8 joins are skipped
+    // rather than filling it; the one chat row still lands in-window. If the
+    // filters ran AFTER the id-DESC LIMIT (the netsplit-starvation bug), a window
+    // of 2 would be [join7, join6] → filtered to empty → no speaker.
+    const nicks = listSpeakers(n, '#c', 20, 2).map((s) => s.nick);
+    expect(nicks).toContain('speaker');
+    expect(nicks.some((x) => x.startsWith('joiner'))).toBe(false);
+  });
+});
 
 describe('messages.alt parity', () => {
   it('alternates alt for chat-shaped types within a buffer', () => {
@@ -148,6 +257,41 @@ describe('messages.alt parity', () => {
 });
 
 describe('searchMessages', () => {
+  it('excludes mirrored server-buffer copies but keeps the real copy (#439)', () => {
+    const user = createUser('search-mirror');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'search-mirror',
+    });
+    // The real copy in the sender's (closed) buffer, plus the mirrored duplicate
+    // in the server buffer — same text. Search must return only the real one.
+    insertMessage({
+      networkId: net!.id,
+      target: 'NickServ',
+      time: new Date().toISOString(),
+      type: 'notice',
+      nick: 'NickServ',
+      text: 'your unique-cloak-token is set',
+      self: false,
+    });
+    insertMessage({
+      networkId: net!.id,
+      target: `:server:${net!.id}`,
+      time: new Date().toISOString(),
+      type: 'notice',
+      nick: 'NickServ',
+      text: 'your unique-cloak-token is set',
+      self: false,
+      mirrored: true,
+    });
+    const hits = searchMessages(user.id, { query: 'unique-cloak-token' });
+    expect(hits).toHaveLength(1);
+    expect(hits[0].target).toBe('NickServ');
+  });
+
   it('matches free text against message bodies', () => {
     const user = createUser('search-text');
     const net = createNetwork(user.id, {
@@ -626,6 +770,27 @@ describe('from_ignored excludes ignored senders from unread/highlight counts', (
     chatWith(net.id, { nick: 'spammer', ignored: true });
     chatWith(net.id, { nick: 'bob' });
     expect(countNewer(net.id, '#ig', 0)).toBe(2);
+  });
+
+  it('countNewer stops at the cap (exact below it) so a deep unread range is not scanned', () => {
+    const user = createUser('cap-count');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'me',
+    })!;
+    for (let i = 0; i < 5; i++) chat(net.id, '#cap', 'alice', `m${i}`);
+    // Below the cap → exact.
+    expect(countNewer(net.id, '#cap', 0)).toBe(5);
+    // At/over the cap → returns the cap, not the true count (the client renders
+    // both as ">999", so it's invisible; the point is the scan stops early).
+    expect(countNewer(net.id, '#cap', 0, 3)).toBe(3);
+    // Guard: a non-positive cap must NOT become SQLite's `LIMIT -1` (unbounded) —
+    // it falls back to the default, so the count is still bounded (here, all 5).
+    expect(countNewer(net.id, '#cap', 0, -1)).toBe(5);
+    expect(countNewer(net.id, '#cap', 0, 0)).toBe(5);
   });
 
   it('countHighlightsNewer excludes from_ignored rows even when they matched a rule', () => {

@@ -54,6 +54,16 @@ export function listEnabledForUser(userId: number): PushSubscription[] {
     .filter((s): s is PushSubscription => s !== null);
 }
 
+// Cheap "does this user have any push device?" probe — a single indexed lookup,
+// no row projection. Lets the push path skip the work it would otherwise do
+// (e.g. computing the app-icon badge total) for users who never subscribed,
+// since deliver() would no-op on an empty subscription set anyway.
+export function hasEnabledForUser(userId: number): boolean {
+  return !!db
+    .prepare('SELECT 1 FROM push_subscriptions WHERE user_id = ? AND enabled = 1 LIMIT 1')
+    .get(userId);
+}
+
 export function listAllForUser(userId: number): PushSubscription[] {
   return (
     db

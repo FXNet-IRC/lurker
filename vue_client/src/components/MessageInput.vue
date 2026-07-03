@@ -137,6 +137,8 @@ import { useNetworksStore, type Network } from '../stores/networks.js';
 import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
 import { parseNetworkCommand } from '../lib/commands/network.js';
 import { splitSetArgs, coerceSettingValue, formatSettingValue } from '../lib/commands/settings.js';
+import { parseRelayCommand } from '../lib/commands/relay.js';
+import { parseDccCommand } from '../lib/commands/dcc.js';
 import { formatColumns } from '../lib/commands/output.js';
 import { REGISTRY, getOption, optionVisible, CATEGORIES } from '../utils/settingsRegistry.js';
 import type { SettingOption } from '../../../shared/settingsRegistry.js';
@@ -147,8 +149,10 @@ import { useInputHistoryStore } from '../stores/inputHistory.js';
 import { useDraftStore } from '../stores/drafts.js';
 import { useSettingsStore } from '../stores/settings.js';
 import { useUploadsStore, onInsertUrl } from '../stores/uploads.js';
+import { useDccStore, percentReceived, type DccTransfer } from '../stores/dcc.js';
 import { useToastsStore } from '../stores/toasts.js';
 import { useIgnoresStore, type IgnoreEntry } from '../stores/ignores.js';
+import { useRelayBotsStore } from '../stores/relayBots.js';
 import { useHighlightRulesStore, type HighlightRule } from '../stores/highlightRules.js';
 import { parseIgnoreArgs } from '../../../shared/parseIgnore.js';
 import { parseHighlightArgs } from '../../../shared/parseHighlight.js';
@@ -206,8 +210,10 @@ const drafts = useDraftStore();
 const settings = useSettingsStore();
 const config = useConfigStore();
 const uploads = useUploadsStore();
+const dcc = useDccStore();
 const toasts = useToastsStore();
 const ignores = useIgnoresStore();
+const relayBots = useRelayBotsStore();
 const highlightRules = useHighlightRulesStore();
 const chanlist = useChanlistStore();
 const channelListModal = useChannelListModal();
@@ -525,6 +531,7 @@ function publishComposing(raw: string): void {
 }
 
 function sendTyping(networkId: number, target: string, state: string): void {
+  if (!settings.effective('chat.send_typing_notifications')) return;
   socketSend({ type: 'typing', networkId, target, state });
 }
 
@@ -2036,12 +2043,18 @@ const COMMANDS_LINES = [
   '      opts: -network -mask -full -regexp -matchcase -channels <#a,#b>',
   '      e.g. /highlight QUACK!   ·   /highlight -mask bob!*@*   ·   /highlight -network -regexp qu+ack',
   '  /unhighlight <index|text> — remove a highlight (index from /highlight list; alias: /dehilight)',
+  '  /relay [list]          — list, mark, or unmark relay/bridge bots on this network',
+  '      e.g. /relay add relaybot   ·   /relay add bridge <{nick}> {message}   ·   /relay remove relaybot',
+  '      custom template mirrors the bot order with {source}/{nick}/{message} placeholders',
+  '      e.g. reversed: /relay add eyebot <{nick}> [{source}] {message}',
   '  /network [list]        — manage networks (alias: /net); runs from the system buffer',
   '      add [-host <addr>] [-port <n>] [-tls|-notls] [-nick <n>] [-user <u>] [-realname <name>]',
   '          [-sasl_username <u>] [-sasl_password <p>] [-password <serverpass>]',
   "          [-autosendcmd '<cmds>'] [-channel <#chan>] [-auto|-noauto] <name>",
   '      modify <name> [-flags…]   ·   remove <name>   ·   move <name> <position>',
   '      connect <name>   ·   disconnect <name>   (Lurker folds irssi /server into these)',
+  '  /dcc [list]            — DCC downloads: list, or accept/reject/cancel <id>',
+  '      e.g. /dcc   ·   /dcc accept 3   ·   /dcc reject 3   ·   /dcc cancel 3',
   '  /set <key> <value…>    — change a setting; /set (or /set ?) lists all keys',
   '  /get <key>             — read a setting back (output in the system buffer)',
   '  /raw <line>            — send a raw IRC line (alias: /quote)',
@@ -2129,6 +2142,92 @@ function ackedSend(payload: Record<string, unknown>, body: string): boolean {
 // /ignore and /unignore operate on the per-user ignore list (global by default;
 // `-network` scopes to the active network), so they're network-agnostic and run
 // from the system buffer too — networkId is null there.
+// /relay (#277) — mark, unmark, or list relay/bridge bots on this network. The
+// store writes go over WS and echo back through `relay-bot-updated`, so the
+// confirmation here is optimistic-but-authoritative just like /ignore.
+function runRelay(argLine: string, networkId: number, target: string): boolean {
+  const cmd = parseRelayCommand(argLine);
+  if (cmd.kind === 'error') {
+    localInfo(networkId, target, `/relay: ${cmd.message}`);
+    return true;
+  }
+  if (cmd.kind === 'list') {
+    const list = relayBots.listForNetwork(networkId);
+    if (!list.length) {
+      localInfo(networkId, target, 'no relay bots marked on this network. /relay add <nick>');
+      return true;
+    }
+    localInfo(networkId, target, `relay bots (${list.length}):`);
+    for (const { nick, pattern } of list) {
+      localInfo(networkId, target, `  ${nick}${pattern ? `  — ${pattern}` : ''}`);
+    }
+    return true;
+  }
+  if (cmd.kind === 'add') {
+    relayBots.setRelay(networkId, cmd.nick, true, cmd.pattern);
+    localInfo(
+      networkId,
+      target,
+      `marked ${cmd.nick} as a relay bot${cmd.pattern ? ` (pattern: ${cmd.pattern})` : ''}.`,
+    );
+    return true;
+  }
+  relayBots.setRelay(networkId, cmd.nick, false);
+  localInfo(networkId, target, `unmarked ${cmd.nick} as a relay bot.`);
+  return true;
+}
+
+// /dcc (#270) — the slash-command surface over the DCC download manager. `list`
+// opens the Transfers view and echoes the current transfers into the buffer
+// (slash-command-first: the GUI is a view over the same core); accept/reject/
+// cancel act on one transfer by id and report the resulting state. User-wide, so
+// networkId may be null (running from the system buffer). The store writes go
+// over REST and the authoritative row echoes back through both the response and
+// the live `dcc-transfer` frame, so the output here is settled, not optimistic.
+async function runDcc(argLine: string, networkId: number | null, target: string): Promise<void> {
+  const cmd = parseDccCommand(argLine);
+  if (cmd.kind === 'error') {
+    localInfo(networkId, target, `/dcc: ${cmd.message}`);
+    return;
+  }
+  if (cmd.kind === 'list') {
+    dcc.panelOpen = true;
+    try {
+      const rows = await dcc.load();
+      if (!rows.length) {
+        localInfo(networkId, target, 'no DCC transfers.');
+        return;
+      }
+      localInfo(networkId, target, `transfers (${rows.length}):`);
+      for (const line of formatColumns(rows.map(dccListRow))) {
+        localInfo(networkId, target, `  ${line}`);
+      }
+    } catch (e: any) {
+      localInfo(networkId, target, `/dcc: ${e?.message || 'failed to load'}`);
+    }
+    return;
+  }
+  // accept / reject / cancel — the parser guarantees a numeric id here. They all
+  // route through the store's shared act() path.
+  const verb = cmd.kind;
+  try {
+    const t = await dcc.act(cmd.id, verb);
+    localInfo(
+      networkId,
+      target,
+      t ? `/dcc ${verb}: #${t.id} ${t.filename} — ${t.state}` : `/dcc ${verb}: #${cmd.id} done`,
+    );
+  } catch (e: any) {
+    localInfo(networkId, target, `/dcc ${verb}: ${e?.message || 'failed'}`);
+  }
+}
+
+// One row for the /dcc list output: "#3  movie.mkv  receiving  alice  42%".
+function dccListRow(t: DccTransfer): string[] {
+  const pct = t.advertised_size > 0 ? `${percentReceived(t)}%` : '';
+  return [`#${t.id}`, t.filename, t.state, t.peer_nick, pct];
+}
+
 function runIgnore(argLine: string, networkId: number | null, target: string): boolean {
   const args = argLine.trim();
   if (!args) {
@@ -2527,6 +2626,13 @@ function handleCommand(line: string, networkId: number | null, target: string): 
     case 'get':
       runGet(argLine, networkId, target);
       return true;
+    case 'dcc':
+      // DCC download manager (#270). User-wide (transfers aren't tied to the
+      // active buffer), so it runs from anywhere including the system buffer.
+      // REST-backed + async, so fire-and-forget like /network; it reports into
+      // the buffer when it settles.
+      void runDcc(argLine, networkId, target);
+      return true;
   }
 
   // Everything else acts on a specific network/buffer.
@@ -2554,6 +2660,10 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       }
       return sendOrToast({ type: 'e2e', networkId, target, args: argLine }, line);
     }
+    case 'relay':
+      // Mark/unmark/list relay bots on this network (#277). Network-scoped: a
+      // relay mark is per-(network, nick), so it needs an active network.
+      return runRelay(argLine, networkId, target);
     case 'me':
       return ackedSend({ type: 'action', networkId, target, text: argLine }, argLine);
     case 'ctcp': {
@@ -2695,6 +2805,32 @@ function handleCommand(line: string, networkId: number | null, target: string): 
         { type: 'raw', networkId, line: `KICK ${channel} ${nick}${trailer}` },
         line,
       );
+    }
+    case 'invite': {
+      // /invite <nick>             (in a channel buffer → invite to it)
+      // /invite <nick> <#chan>     (anywhere)
+      // /invite <#chan> <nick>     (channel-first, mirroring /kick)
+      let channel;
+      let nick;
+      if (rest[0] && rest[0].startsWith('#')) {
+        channel = rest[0];
+        nick = rest[1];
+      } else {
+        nick = rest[0];
+        channel =
+          rest[1] && rest[1].startsWith('#') ? rest[1] : isChannelTarget(target) ? target : null;
+      }
+      if (!nick) {
+        localInfo(networkId, target, 'usage: /invite <nick> [#channel]');
+        return true;
+      }
+      if (!channel) {
+        localInfo(networkId, target, 'usage: /invite <nick> [#channel] — no channel context');
+        return true;
+      }
+      // Wire order is INVITE <nick> <channel> (note: irc-framework's own
+      // .invite() flips the args — we build the raw line directly so it can't).
+      return sendOrToast({ type: 'raw', networkId, line: `INVITE ${nick} ${channel}` }, line);
     }
     case 'topic': {
       // /topic                        — request current topic (server buffer)

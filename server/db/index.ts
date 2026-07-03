@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import Database from 'better-sqlite3';
+import { foldMutedIntoIgnoreRules } from './migrateMutedFold.js';
 import path from 'path';
 import fs from 'fs';
 import { isNodeMode } from '../utils/edition.js';
@@ -304,6 +305,58 @@ function migrate() {
     CREATE INDEX IF NOT EXISTS idx_upload_history_user
       ON upload_history(user_id, id DESC);
 
+    -- Per-user feature capabilities, admin-granted. A generic (user_id,
+    -- capability) store rather than a one-off column so the forthcoming per-user
+    -- admin control panel can manage every gated feature uniformly; 'dcc' (the
+    -- DCC download manager, #270) is the first entry. Absence of a row means the
+    -- capability is OFF — capabilities are opt-in, granted by an operator.
+    CREATE TABLE IF NOT EXISTS user_capabilities (
+      user_id INTEGER NOT NULL,
+      capability TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (user_id, capability),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    -- Server-side DCC (Direct Client-to-Client) file transfers — the receive side
+    -- of the XDCC download manager (#270). One row per offered/accepted transfer.
+    -- The IRC connection lives on the cell, so the bytes land here on disk
+    -- (destination_path) and stream to the browser on demand; nothing about a
+    -- transfer touches the message tables. state drives the download-manager UI
+    -- (see DccTransferState in db/dccTransfers.ts). advertised_size/received_bytes
+    -- are 64-bit (SQLite INTEGER) so files over 4 GiB stay exact. peer_nick
+    -- collates NOCASE so an inbound offer matches the trigger we sent regardless
+    -- of how the bot cases its nick.
+    CREATE TABLE IF NOT EXISTS dcc_transfers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      network_id INTEGER NOT NULL,
+      peer_nick TEXT NOT NULL COLLATE NOCASE,
+      direction TEXT NOT NULL DEFAULT 'recv',
+      filename TEXT NOT NULL,
+      advertised_size INTEGER NOT NULL,
+      received_bytes INTEGER NOT NULL DEFAULT 0,
+      destination_path TEXT,
+      state TEXT NOT NULL,
+      passive INTEGER NOT NULL DEFAULT 0,
+      token INTEGER,
+      peer_host TEXT,
+      peer_port INTEGER,
+      trigger_text TEXT,
+      crc_expected TEXT,
+      crc_actual TEXT,
+      crc_status TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_dcc_transfers_user
+      ON dcc_transfers(user_id, id DESC);
+
     -- Per-(network, nick) presence state for DM peers. Single row per peer
     -- holding only the most recent transition event (state) and when it
     -- happened (state_at). state is one of: online, offline, away, back.
@@ -433,6 +486,24 @@ function migrate() {
     );
     CREATE INDEX IF NOT EXISTS idx_user_nick_notes_user_net
       ON user_nick_notes(user_id, network_id);
+
+    -- Per-(user, network, nick) relay-bot marks (#277). A marked nick is a
+    -- relay / bridge bot; the client re-attributes its messages to the speaker
+    -- embedded in the envelope, e.g. [Discord] <alice> hi. Row presence is the
+    -- mark; the pattern column is an optional custom template (empty = built-in
+    -- defaults). Same NOCASE / per-network keying as notes.
+    CREATE TABLE IF NOT EXISTS user_relay_bots (
+      user_id INTEGER NOT NULL,
+      network_id INTEGER NOT NULL,
+      nick TEXT NOT NULL COLLATE NOCASE,
+      pattern TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (user_id, network_id, nick),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_relay_bots_user_net
+      ON user_relay_bots(user_id, network_id);
 
     -- Friends / watch-list. A "contact" is a person, network-agnostic: it carries
     -- the display name and the per-contact "toast me when they come online" flag.
@@ -733,11 +804,11 @@ if (columnExists('peer_presence_state', 'offline_datetime')) {
 // marker. Nullable; only meaningful when state='away'.
 ensureColumn('peer_presence_state', 'away_message', 'TEXT');
 
-// Per-channel "mute" for the buffer list: suppresses the plain-unread signal
-// (count + row color + off-screen unread arrow) for this channel without
-// touching highlights or notifications. Display-only — the server stores and
-// syncs it but never acts on it. Sits in channel_notify_settings alongside
-// notify_always; a row now persists if EITHER flag is set (see channelNotify.ts).
+// DEPRECATED (issue #359): the per-channel display-only `muted` flag was folded
+// into the ignore engine as a NOUNREAD+NONOTIFY rule (mute now silences
+// notifications too). The column is retained (always written 0) so older images
+// still satisfy the schema; the boot migration below converts any lingering
+// muted=1 rows into ignore rules. No new code reads or sets it.
 ensureColumn('channel_notify_settings', 'muted', 'INTEGER NOT NULL DEFAULT 0');
 
 ensureColumn('messages', 'extra', 'TEXT');
@@ -810,6 +881,12 @@ ensureColumn('messages', 'alt', 'INTEGER NOT NULL DEFAULT 0');
 // they remain visible/countable, matching pre-fix behavior.
 ensureColumn('messages', 'from_ignored', 'INTEGER NOT NULL DEFAULT 0');
 
+// Marks a server-buffer copy of a closed-buffer NOTICE (#439). The real copy
+// lives in the sender's buffer; this duplicate is surfaced in the server buffer
+// so a notice to a closed buffer isn't invisible. Excluded from search so it
+// doesn't double up its real copy. Old rows default to 0 (not a mirror).
+ensureColumn('messages', 'mirrored', 'INTEGER NOT NULL DEFAULT 0');
+
 // Per-(user, buffer) /clear marker. cleared_before_message_id is the highest
 // message id hidden from the live view; messages with id > it remain visible.
 // cleared_at is the wall-clock time the user issued /clear (shown in the
@@ -837,6 +914,12 @@ ensureColumn('upload_history', 'synced_to_cp', 'INTEGER NOT NULL DEFAULT 0');
 // (so the owner sees a "removed by moderation" tombstone instead of a dead
 // image), but the bytes are gone from storage. Standalone never sets it.
 ensureColumn('upload_history', 'removed', 'INTEGER NOT NULL DEFAULT 0');
+
+// The offer's address/port, persisted so an unsolicited DCC SEND recorded as
+// pending_approval can be accepted later (the user clicks Accept seconds/minutes
+// after the bot offered). #270 phase 2.
+ensureColumn('dcc_transfers', 'peer_host', 'TEXT');
+ensureColumn('dcc_transfers', 'peer_port', 'INTEGER');
 
 // Schema versioning lets us retire one-shot recovery blocks once every
 // production DB has run through them. Bump SCHEMA_VERSION when adding a new
@@ -1258,6 +1341,18 @@ if (schemaVersion < 11) {
       db.pragma(`foreign_keys = ${prevFk ? 'ON' : 'OFF'}`);
     }
   }
+}
+
+// Issue #359: fold the old display-only per-channel `muted` flag into the ignore
+// engine (see migrateMutedFold.ts). Runs after the ignored_masks rebuild above so
+// the table is in its final shape. Best-effort — a failure leaves muted=1 rows to
+// retry on the next boot.
+try {
+  foldMutedIntoIgnoreRules(db);
+} catch (err) {
+  // Log rather than swallow: the self-gating retry masks a deterministic bug as
+  // a transient failure, so surface it or a broken fold vanishes silently.
+  console.warn('[db] muted→ignore fold migration failed (will retry next boot):', err);
 }
 
 // Issue #355: buffer_reads.network_id must be nullable so the app-scoped system

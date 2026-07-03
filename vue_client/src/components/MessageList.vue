@@ -84,7 +84,13 @@
           >
         </span>
       </div>
-      <div v-else class="line" :class="rowClass(row)" :data-msg-id="row.m?.id ?? null">
+      <div
+        v-else
+        class="line"
+        :class="rowClass(row)"
+        :data-msg-id="row.m?.id ?? null"
+        @click="onMessageRowClick($event, row.m)"
+      >
         <template v-if="compactMode && row.m?.type === 'message'">
           <!-- Compact-mode message rows (IRCCloud-style): nick on its own
              head line above the body; body row carries the body and a
@@ -102,7 +108,12 @@
             /></span>
           </div>
           <span class="body" :class="bodyClass(row.m)">
-            <RenderSegments
+            <span
+              v-if="row.m?.relaySource && !row.continuationAuthor"
+              class="relay-via"
+              :title="'Relayed via ' + row.m.relayBot"
+              >[{{ relayLabel(row.m) }}]</span
+            ><RenderSegments
               :segments="textSegments(row.m)"
               :self-color="selfColor"
               :network-id="buffer?.networkId ?? null"
@@ -128,7 +139,12 @@
             ><template v-else>{{ row.continuationAuthor ? '' : prefixText(row.m) }}</template></span
           >
           <span class="body" :class="bodyClass(row.m)">
-            <RenderSegments
+            <span
+              v-if="row.m?.relaySource && !row.continuationAuthor"
+              class="relay-via"
+              :title="'Relayed via ' + row.m.relayBot"
+              >[{{ relayLabel(row.m) }}]</span
+            ><RenderSegments
               v-if="hasInlineText(row.m)"
               :segments="textSegments(row.m)"
               :self-color="selfColor"
@@ -176,6 +192,17 @@
                 (<LinkedText :text="row.m.text" />)</template
               ></template
             >
+            <template v-else-if="row.m?.type === 'invite'"
+              ><NickRef
+                :nick="row.m.nick ?? ''"
+                interactive
+                @click.stop.prevent="onNickMenu($event, row.m?.nick, row.m)" />
+              invited
+              <NickRef
+                :nick="row.m.invited ?? ''"
+                interactive
+                @click.stop.prevent="onNickMenu($event, row.m?.invited)"
+            /></template>
             <template v-else-if="row.m?.type === 'nick'"
               ><NickRef
                 :nick="row.m.nick ?? ''"
@@ -222,7 +249,7 @@
           </span>
         </template>
         <div
-          v-if="eligibleForActions(row.m)"
+          v-if="hoverActions && eligibleForActions(row.m)"
           class="row-actions"
           role="group"
           aria-label="Message actions"
@@ -262,6 +289,7 @@ import { useBuffersStore, type BufferMember } from '../stores/buffers.js';
 import { useSettingsStore } from '../stores/settings.js';
 import { useIgnoresStore } from '../stores/ignores.js';
 import { useHighlightRulesStore } from '../stores/highlightRules.js';
+import { useRelayBotsStore } from '../stores/relayBots.js';
 import { socketSend } from '../composables/useSocket.js';
 import { useNickColors } from '../composables/useNickColors.js';
 import { useViewport } from '../composables/useViewport.js';
@@ -283,6 +311,7 @@ import {
 import { consolidateRows } from '../utils/consolidate.js';
 import type { ConsolidationGroup, NickEntry, RenameEntry } from '../../../shared/consolidate.js';
 import { collapseDisplay } from '../utils/collapseDisplay.js';
+import { parseRelayMessage } from '../../../shared/parseRelay.js';
 import NickRef from './NickRef.vue';
 import LinkedText from './LinkedText.vue';
 import RenderSegments from './RenderSegments.vue';
@@ -295,6 +324,8 @@ import type {
 } from '../composables/useMessageActions.js';
 import { useMemberActions } from '../composables/useMemberActions.js';
 import type { MemberContext, MemberLike } from '../composables/useMemberActions.js';
+import { useContextMenu, type ContextMenuItem } from '../composables/useContextMenu.js';
+import { useWhoisStore } from '../stores/whois.js';
 import { addressNick } from '../composables/useComposerOverlay.js';
 import { setViewedBuffer } from '../composables/useViewedBuffer.js';
 
@@ -313,6 +344,7 @@ interface ChatMessage {
   matched?: unknown;
   newNick?: string;
   kicked?: string;
+  invited?: string;
   userhost?: string;
   // System-buffer lines (#355): the network this line is about, when any. The
   // prefix column resolves the network's current name from it.
@@ -322,6 +354,13 @@ interface ChatMessage {
   e2e?: boolean;
   // Severity for `type: 'e2e'` status lines — drives the tag color.
   level?: 'info' | 'warn';
+  // Relay-bot re-attribution (#277). When set, this row was authored by a nick
+  // the user marked as a relay bot: `nick`/`text` have been swapped to the
+  // embedded speaker, `relayBot` holds the bot's real nick (the actual IRC
+  // entity), and `relaySource` is the `[source]` tag when the envelope had one.
+  // These exist only on the per-render display clone, never on the stored row.
+  relayBot?: string;
+  relaySource?: string | null;
   [key: string]: unknown;
 }
 
@@ -375,10 +414,20 @@ const buffers = useBuffersStore();
 const settings = useSettingsStore();
 const ignores = useIgnoresStore();
 const highlights = useHighlightRulesStore();
+const relayBots = useRelayBotsStore();
 const nicks = useNickColors();
-const { isMobile } = useViewport();
+const { isMobile, canHover } = useViewport();
 
 const actionItalic = computed(() => !!settings.effective('look.action.italic'));
+// Hover action bar toggle (#392). Off → the bar never renders and a left-click
+// on a message opens the action menu instead (onMessageRowClick). Always off on
+// touch via the CSS reveal media query, where tap opens the menu regardless.
+const hoverActions = computed(() => !!settings.effective('look.message.hover_actions'));
+// The message whose action menu is open — set when a tap (touch) or, with the
+// hover bar toggled off, a click (desktop) opens it (onMessageRowClick). Gives
+// the row a `selected` background so users with no hover can see which message
+// the menu targets (#392). Cleared when the menu closes.
+const selectedMessageId = ref<number | null>(null);
 const selfColor = computed<string | null>(
   () => (settings.effective('look.nick.self_color') as string | undefined) ?? null,
 );
@@ -536,6 +585,7 @@ function rowClass(row: RenderRow) {
     highlight: !!row.highlight && !row.nohilight,
     'cont-author': !!row.continuationAuthor,
     'cont-time': !!row.continuationTime,
+    selected: m?.id != null && m.id === selectedMessageId.value,
   };
 }
 
@@ -598,12 +648,52 @@ function runAction(key: MessageActionKey, m: ChatMessage | undefined | null): vo
   messageActions.run(key, m as any, actionContext);
 }
 
+// Click/tap → message action menu (#392). The entry point whenever the hover
+// action bar isn't doing the job: always on touch (no hover), and on desktop
+// when the bar is toggled off — otherwise there'd be no way to reach the actions
+// there. When the bar IS on (desktop default), a left-click stays a plain text
+// click and the bar is the affordance. Right-click is always left to the
+// browser's native menu (desktop users expect that).
+function onMessageRowClick(e: MouseEvent, m: ChatMessage | undefined | null): void {
+  if (canHover.value && hoverActions.value) return;
+  if (!eligibleForActions(m)) return;
+  // Clicks on a link follow the link; clicks on a nick are handled by NickRef
+  // (which stops propagation), so they never reach here.
+  if ((e.target as Element | null)?.closest('a')) return;
+  // Don't pop the menu out from under a text selection (drag-select on desktop,
+  // long-press select on touch) — let the user keep/copy their selection.
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return;
+  selectedMessageId.value = m?.id ?? null;
+  // Pass the row as the trigger so a second tap on the same message toggles its
+  // menu closed (matches the nick menu), instead of just reopening it.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  messageActions.openMenu(
+    m as any,
+    actionContext,
+    e.clientX,
+    e.clientY,
+    e.currentTarget as Element,
+  );
+}
+
 // ─── Nick interactivity (#238) + mode-prefix glyph (#376) ──────────────────
 // Message-list nicks behave exactly like their nicklist entry: a tap (or
 // right-click / long-press) opens the shared member-action menu — Reply, Copy
 // Nickname, whois, DM, note, friend, ignore, and op-gated kick/ban/op/voice.
 // The menu and ignore modal are owned here, mirroring MemberList's pattern.
 const memberActions = useMemberActions();
+const contextMenu = useContextMenu();
+const whois = useWhoisStore();
+
+// Clear the selected-message highlight (declared up top) whenever the shared
+// context menu closes — tap an item, tap outside, or Escape (#392).
+watch(
+  () => contextMenu.state.open,
+  (open) => {
+    if (!open) selectedMessageId.value = null;
+  },
+);
 
 const showModePrefix = computed(() => !!settings.effective('look.nick.show_mode_prefix'));
 
@@ -666,12 +756,64 @@ function nickMenuContext(): MemberContext {
 // Omit it for nicks where the message's userhost belongs to someone else (e.g.
 // the kicked user in a kick line).
 function onNickMenu(e: MouseEvent, nick: string | undefined, m?: ChatMessage): void {
-  if (!nick || !buffer.value) return;
+  if (!buffer.value) return;
+  // Nicks open on left-click, so pass the clicked element as the trigger:
+  // re-clicking the same name toggles its menu closed, like the kebab menus.
+  const trigger = (e.currentTarget as Element | null) ?? null;
+  // Relay virtual speaker (#277): the displayed author is the embedded speaker,
+  // not a real IRC user, so the full member menu (DM, ignore, kick, ban) is
+  // meaningless. Give it a trimmed menu aimed at the relayed nick instead.
+  if (m?.relayBot && nick && buffer.value.networkId != null) {
+    openRelayNickMenu(nick, m.relayBot, buffer.value.networkId, e.clientX, e.clientY, trigger);
+    return;
+  }
+  if (!nick) return;
   // Prefer the live member (modes for op-gating, host for a clean ban mask);
   // fall back to the message's own userhost so a departed speaker stays
   // actionable.
   const member: MemberLike = nickMember(nick) ?? { nick, ...parseUserHost(m?.userhost) };
-  memberActions.openMenuFor(member, nickMenuContext(), e.clientX, e.clientY);
+  memberActions.openMenuFor(member, nickMenuContext(), e.clientX, e.clientY, trigger);
+}
+
+// Context menu for a relayed virtual speaker (#277). Only the actions that make
+// sense for a name with no IRC presence: address them in a reply (the bridge
+// carries it back the other way) and copy the name — both targeting the relayed
+// nick. View Profile, by contrast, opens the relay *bot's* profile: it's the
+// only real IRC entity here, so its whois actually resolves.
+function openRelayNickMenu(
+  nick: string,
+  bot: string,
+  networkId: number,
+  x: number,
+  y: number,
+  triggerEl: Element | null = null,
+): void {
+  const items: ContextMenuItem[] = [
+    { label: `Reply to ${nick}`, icon: 'fa-solid fa-reply', onClick: () => addressNick(nick) },
+    {
+      label: 'Copy Nickname',
+      icon: 'fa-regular fa-copy',
+      onClick: () => {
+        navigator.clipboard?.writeText(nick).catch(() => {});
+      },
+    },
+    { divider: true },
+    {
+      label: 'View Profile…',
+      icon: 'fa-solid fa-id-card',
+      onClick: () => whois.openViewer(networkId, bot),
+    },
+  ];
+  contextMenu.open(items, x, y, triggerEl);
+}
+
+// The "via" affordance shown next to a re-attributed relay line (#277): the
+// `[source]` platform tag. Only rendered when the envelope actually carried a
+// source (the template gates on relaySource), so a bare `<nick> message` relay
+// shows no tag and the re-attributed nick just reads as the speaker. The title
+// (set in the template) still names the bot, so provenance is one hover away.
+function relayLabel(m: ChatMessage | undefined): string {
+  return m?.relaySource || '';
 }
 
 // A coloured nick mention inside message text (emitted by RenderSegments). The
@@ -932,8 +1074,38 @@ const renderRows = computed((): RenderRow[] => {
       out.push({ divider: 'unread', key: 'unread-divider' });
       dividerInserted = true;
     }
+    // Relay-bot re-attribution (#277). If this line's author is a nick the user
+    // marked as a relay/bridge bot, parse its `[source] <nick> message` envelope
+    // and display the embedded speaker as the author instead. Display-only: we
+    // push a shallow clone so the stored row keeps the bot's nick/text (unmark
+    // restores the raw view instantly). Coloring, author-continuation collapse,
+    // and the body all key off the clone, so a relayed user gets their own
+    // colour and consecutive lines from the same person collapse naturally.
+    // Highlights/ignores ran above on the raw line — the bot's full text is a
+    // superset of the embedded text, so a ping inside it still fires. Restricted
+    // to plain messages: relays bridge speech as PRIVMSG, and action/notice
+    // re-attribution would tangle with their special body rendering.
+    let mDisplay = m;
+    if (
+      m.type === 'message' &&
+      m.nick &&
+      !m.self &&
+      networkId &&
+      relayBots.isRelay(networkId, m.nick)
+    ) {
+      const parsed = parseRelayMessage(m.text ?? '', relayBots.patternFor(networkId, m.nick));
+      if (parsed) {
+        mDisplay = {
+          ...m,
+          nick: parsed.nick,
+          text: parsed.text,
+          relayBot: m.nick,
+          relaySource: parsed.source,
+        };
+      }
+    }
     out.push({
-      m,
+      m: mDisplay,
       alt: STRIPED_TYPES.has(m.type) && !!m.alt,
       key,
       nohilight: rowNohilight,
@@ -1026,6 +1198,7 @@ function prefixText(m: ChatMessage | undefined): string {
     case 'mode':
     case 'topic':
     case 'motd':
+    case 'invite':
       return '--';
     case 'system':
       // System-buffer log lines (#355). Tied to a network → that network's
@@ -1289,9 +1462,63 @@ watch([() => awayState.value?.since, () => awayState.value?.backAt], async (next
   scrollToBottom();
 });
 
+// Bump the "N new ↓" unread counter for a live append that landed below a
+// scrolled-up reader — unless the new tail is from an ignored sender (they
+// won't see it scroll into view, so "1 new ↓" pointing at nothing is
+// confusing) or is an id-less ephemeral status echo (a /e2e line, the user's
+// own command output), which shouldn't inflate the count.
+function maybeBumpNewBelow() {
+  const tail = messages.value[messages.value.length - 1] as ChatMessage | undefined;
+  const nid = buffer.value?.networkId;
+  const tailIgnored =
+    tail &&
+    !tail.self &&
+    tail.nick &&
+    nid &&
+    ignores.isHidden(nid, {
+      nick: tail.nick,
+      userhost: tail.userhost ?? null,
+      target: tail.target,
+      text: tail.text ?? '',
+      type: tail.type,
+      isDm: !tail.target.startsWith('#') && !tail.target.startsWith(':server:'),
+    });
+  if (!tailIgnored && tail?.id != null) bumpNewBelow();
+}
+
+// Re-pin the viewport so the row with `anchorId` keeps its on-screen position
+// across the reflow this watcher tick triggers: capture its offsetTop BEFORE
+// nextTick, restore scrollTop after. `useHeightFallback` decides what happens
+// when the anchor row can't be measured after the reflow. A pure PREPEND only
+// adds content above the viewport, so a scrollHeight-delta correction is a safe
+// best-effort there. A CAP-EVICT also adds a row BELOW the viewport, so that
+// same formula would over-scroll by the appended row's height — pass false and
+// leave scrollTop untouched (at most one row of drift for that event, never a
+// downward jump). Anchoring by element id keeps re-flow from changing column
+// widths or differing message heights from drifting the math.
+async function pinAnchorRow(el: HTMLElement, anchorId: number, useHeightFallback: boolean) {
+  const anchor = el.querySelector(`[data-msg-id="${anchorId}"]`) as HTMLElement | null;
+  const anchorOldTop = anchor ? anchor.offsetTop : null;
+  const oldScrollTop = el.scrollTop;
+  const oldScrollHeight = el.scrollHeight;
+  await nextTick();
+  const anchorNew =
+    anchorOldTop != null
+      ? (el.querySelector(`[data-msg-id="${anchorId}"]`) as HTMLElement | null)
+      : null;
+  if (anchorNew) {
+    el.scrollTop = anchorNew.offsetTop - (anchorOldTop! - oldScrollTop);
+  } else if (useHeightFallback) {
+    el.scrollTop = el.scrollHeight - oldScrollHeight + oldScrollTop;
+  }
+}
+
 // Watch the messages array shape so we can react to:
 //   - prepend (older history): pin the OLD first row's viewport position.
 //   - replace (wholesale snapshot): snap to bottom.
+//   - cap-evict while scrolled up: a live append at MAX_PER_BUFFER also
+//     splices the oldest row off the FRONT, so pin the new first row's
+//     viewport position the same way a prepend does (#448).
 //   - live push: snap to bottom IF the user is already pinned there.
 watch(
   [
@@ -1331,20 +1558,7 @@ watch(
     // the same set of [data-msg-id] elements with stable identity above
     // and below the prepend boundary.
     if (firstChanged && !lastChanged && grew && oldFirstId != null) {
-      const anchor = el.querySelector(`[data-msg-id="${oldFirstId}"]`) as HTMLElement | null;
-      const anchorOldTop = anchor ? anchor.offsetTop : null;
-      const oldScrollTop = el.scrollTop;
-      const oldScrollHeight = el.scrollHeight;
-      await nextTick();
-      const anchorNew =
-        anchorOldTop != null
-          ? (el.querySelector(`[data-msg-id="${oldFirstId}"]`) as HTMLElement | null)
-          : null;
-      if (anchorNew) {
-        el.scrollTop = anchorNew.offsetTop - (anchorOldTop! - oldScrollTop);
-      } else {
-        el.scrollTop = el.scrollHeight - oldScrollHeight + oldScrollTop;
-      }
+      await pinAnchorRow(el, oldFirstId, true);
       ensureViewportFilled();
       return;
     }
@@ -1358,6 +1572,25 @@ watch(
     const filledFromEmpty = prevLen === 0 && newLen > 0;
     const replaced = (firstChanged && lastChanged && !appended) || filledFromEmpty;
     const isDetached = !!buffer.value?.detached;
+    // Cap-evict while scrolled up: the buffer was at MAX_PER_BUFFER, so this
+    // live append also spliced the oldest row(s) off the FRONT (above the
+    // viewport). That shrinks content above the read position; with
+    // overflow-anchor disabled the browser won't compensate, so without this
+    // the rows the user is reading drift upward one message-height per
+    // arrival (#448). Anchor on the surviving new-front row and re-pin
+    // scrollTop after the reflow. Only when NOT pinned to the bottom — a pinned
+    // reader is scrolling along with the live tail, and the append branch below
+    // already follows it down. useHeightFallback is false: unlike a prepend,
+    // this event also adds a row below the viewport, so if the new-front row
+    // isn't measurable (e.g. a history prepend landed in the same flush and put
+    // an unseen row at the front), leave scrollTop alone rather than let the
+    // prepend-style fallback over-scroll and jump the view.
+    if (appended && firstChanged && !stickToBottom.value && !isDetached && newFirstId != null) {
+      await pinAnchorRow(el, newFirstId, false);
+      maybeBumpNewBelow();
+      ensureViewportFilled();
+      return;
+    }
     await nextTick();
     if (replaced) {
       if (isDetached) {
@@ -1376,41 +1609,22 @@ watch(
       ensureViewportFilled();
       return;
     }
-    // Live append (new message arrived) — including the case where the
-    // buffer was at its cap and the oldest row was evicted. When the user is
-    // pinned, scroll along; otherwise track the unread-below count so the
-    // status bar can surface "[N new ↓]". Skip the bump entirely when the
-    // newly-arrived tail is from an ignored sender; the user wouldn't see
-    // it scrolling into view anyway, and "1 new ↓" pointing at nothing is
-    // confusing.
+    // Live append (new message arrived) that did NOT evict from the front —
+    // a cap-evict while scrolled up is handled by the anchored branch above
+    // and returned early, and a cap-evict while pinned scrolls along here.
+    // When the user is pinned, scroll along; otherwise content was added only
+    // below the viewport, so the current scrollTop still points at the row
+    // they were reading — just track the unread-below count so the status bar
+    // can surface "[N new ↓]" (maybeBumpNewBelow skips ignored/ephemeral
+    // tails so the badge never points at a row that won't scroll into view).
     //
     // Pager-driven appends (mode='after' response while detached) share this
     // shape — same `appended` test passes. We let them through without any
-    // scroll adjustment: content was added below the viewport, the user's
-    // current scrollTop still points at the row they were reading, and
-    // bumpNewBelow would be misleading since these aren't live events.
+    // scroll adjustment for the same reason, and isDetached gates out the
+    // bump since these aren't live events.
     if (appended && !isDetached) {
       if (stickToBottom.value) scrollToBottom();
-      else {
-        const tail = messages.value[messages.value.length - 1] as ChatMessage | undefined;
-        const nid = buffer.value?.networkId;
-        const tailIgnored =
-          tail &&
-          !tail.self &&
-          tail.nick &&
-          nid &&
-          ignores.isHidden(nid, {
-            nick: tail.nick,
-            userhost: tail.userhost ?? null,
-            target: tail.target,
-            text: tail.text ?? '',
-            type: tail.type,
-            isDm: !tail.target.startsWith('#') && !tail.target.startsWith(':server:'),
-          });
-        // Don't let an id-less ephemeral status echo (a /e2e line, the user's
-        // own command output) inflate the "N new ↓" unread count.
-        if (!tailIgnored && tail?.id != null) bumpNewBelow();
-      }
+      else maybeBumpNewBelow();
     }
     ensureViewportFilled();
   },
@@ -1616,19 +1830,34 @@ function scrollByPage(direction: number) {
 
 defineExpose({ scrollByPage });
 
+// Budget (in animation frames, ~1s at 60fps) for the target row to mount before
+// we give up. On a cold-start deep link or a large around-slice the row often
+// isn't painted on the first tick; a single querySelector would silently abandon
+// the jump, which is the main reason a *delivered* jump fails to scroll on mobile.
+const SCROLL_RETRY_FRAMES = 60;
+
 watch(
   () => props.pendingScrollId,
   async (id) => {
     if (id == null) return;
     await nextTick();
-    const el = scroller.value;
-    if (!el) return;
-    const target = el.querySelector(`[data-msg-id="${id}"]`);
-    if (!target) return;
-    stickToBottom.value = false;
-    target.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    target.classList.add('scroll-target');
-    setTimeout(() => target.classList.remove('scroll-target'), 1500);
+    let attempts = 0;
+    const tryScroll = () => {
+      // A newer jump superseded this one — abandon the stale retry loop.
+      if (props.pendingScrollId !== id) return;
+      const el = scroller.value;
+      if (!el) return;
+      const target = el.querySelector(`[data-msg-id="${id}"]`);
+      if (!target) {
+        if (attempts++ < SCROLL_RETRY_FRAMES) requestAnimationFrame(tryScroll);
+        return;
+      }
+      stickToBottom.value = false;
+      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      target.classList.add('scroll-target');
+      setTimeout(() => target.classList.remove('scroll-target'), 1500);
+    };
+    tryScroll();
   },
 );
 </script>
@@ -1683,11 +1912,19 @@ watch(
 .line:hover {
   background: var(--bg-soft);
 }
-/* Override only the alt-row background on hover — not its text color. The
-   `.line.alt` selector outweighs `.line:hover`, so the hover background needs
-   restating here, but the alt foreground (--alt-fg) stays put: hover is a
-   background-only cue and shouldn't shift the text color under the cursor. */
-.message-list:not(.compact) .line.alt:hover {
+/* The row whose tap-opened action menu is open (touch). Same background as
+   hover, but authored without `:hover` so it survives the build's hover gating
+   (#115) and shows on touch — where there's no hover, this is the only cue for
+   which message the menu targets (#392). */
+.line.selected {
+  background: var(--bg-soft);
+}
+/* Override only the alt-row background on hover/selected — not its text color.
+   The `.line.alt` selector outweighs `.line:hover` / `.line.selected`, so the
+   background needs restating here, but the alt foreground (--alt-fg) stays put:
+   it's a background-only cue and shouldn't shift the text color. */
+.message-list:not(.compact) .line.alt:hover,
+.message-list:not(.compact) .line.alt.selected {
   background: var(--bg-soft);
 }
 
@@ -1695,10 +1932,12 @@ watch(
    toolbar — same card treatment as the toast stack (bg + border + drop
    shadow) — anchored to the top-right of the line, floating just above it so
    the bar barely overlaps the top edge instead of covering the message text.
-   Mobile reaches it via the same sticky-:hover path the old kebab used: iOS
-   Safari's sticky :hover makes the first tap on a row reveal the bar, and a
-   second tap hits an action. Long-press is left to the browser's native
-   text-callout so users can still select message text. */
+   Desktop only: the build wraps every `:hover` rule in `@media (hover: hover)`
+   (#115), so on touch this reveal simply doesn't exist — the bar never shows
+   and the old sticky-:hover two-tap never fires. When the bar is hidden (touch,
+   or toggled off on desktop), the same actions are reached by clicking/tapping a
+   message — see onMessageRowClick; right-click stays the native browser menu.
+   The bar can also be turned off via look.message.hover_actions. */
 .row-actions {
   position: absolute;
   /* Sit the bar fully above the row, then nudge down a few px so its bottom
@@ -1719,8 +1958,14 @@ watch(
   pointer-events: none;
   z-index: var(--z-base);
 }
-.line:hover .row-actions,
+/* Keyboard a11y reveal stays unconditional so focus-within works everywhere.
+   The hover reveal below is authored plain; the build gates it behind
+   `@media (hover: hover)` (#115) so it never fires on touch. */
 .row-actions:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+.line:hover .row-actions {
   opacity: 1;
   pointer-events: auto;
 }
@@ -1828,6 +2073,15 @@ watch(
   white-space: pre-wrap;
   word-break: break-word;
   padding-left: 1ch;
+}
+/* Relay-bot origin tag (#277): the bracketed [source] before the re-attributed
+   text — mirrors how the bot framed the line, so it reads as provenance rather
+   than part of the message. Muted, no glyph; font size stays uniform per house
+   style. */
+.relay-via {
+  color: var(--fg-muted);
+  margin-right: 1ch;
+  white-space: nowrap;
 }
 /* Vertical separator between the nick and body columns. Drawn from .body
    so it stretches the full height of the body cell — including wrapped

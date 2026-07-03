@@ -16,6 +16,7 @@
     >
       <template v-for="(item, i) in state.items" :key="i">
         <div v-if="item.divider" class="divider" role="separator"></div>
+        <div v-else-if="item.heading" class="heading" role="presentation">{{ item.heading }}</div>
         <button
           v-else
           type="button"
@@ -81,19 +82,31 @@ function activate(item: ContextMenuItem): void {
 function onWindowPointerDown(e: PointerEvent): void {
   if (!state.open) return;
   if (menuEl.value && menuEl.value.contains(e.target as Node)) return;
-  // Re-clicking the same trigger should close (toggle behavior). Without
-  // swallowing the event, the trigger's own @click handler runs next and
-  // immediately reopens the menu on the same gesture.
-  if (state.triggerEl && state.triggerEl.contains(e.target as Node)) {
-    e.preventDefault();
-    e.stopPropagation();
-    menu.close();
-    return;
-  }
+  // Leave a pointerdown on the opening trigger alone: its own click handler
+  // fires next and re-calls open() with the same triggerEl, which toggles the
+  // menu closed (see useContextMenu). Closing here would race that click and
+  // reopen the menu — pointerdown can't cancel the click that follows.
+  if (state.triggerEl && state.triggerEl.contains(e.target as Node)) return;
   menu.close();
 }
 function onWindowKey(e: KeyboardEvent): void {
   if (state.open && e.key === 'Escape') menu.close();
+}
+// Close on a user-driven scroll gesture (wheel / touch drag) — the menu is
+// pinned to fixed cursor/anchor coords, so once the user scrolls the content
+// underneath it, it would float detached. We deliberately listen for the
+// *gesture* (wheel/touchmove), NOT the 'scroll' event: a busy channel's
+// auto-scroll on each new message fires 'scroll' programmatically and would
+// otherwise slam the menu shut mid-interaction. A gesture that starts inside the
+// menu itself (e.g. scrolling a long menu) is ignored.
+function onWindowUserScroll(e: Event): void {
+  if (!state.open) return;
+  // e.target on a captured wheel/touchmove is normally the element under the
+  // pointer, but guard the non-Node case (window/document) so contains() can't
+  // throw. A non-Node target is never inside the menu, so fall through to close.
+  const t = e.target;
+  if (t instanceof Node && menuEl.value?.contains(t)) return;
+  menu.close();
 }
 function onWindowResize(): void {
   if (state.open) menu.close();
@@ -114,12 +127,14 @@ watch(
       window.addEventListener('pointerdown', onWindowPointerDown, true);
       window.addEventListener('keydown', onWindowKey);
       window.addEventListener('resize', onWindowResize);
-      window.addEventListener('scroll', onWindowResize, true);
+      window.addEventListener('wheel', onWindowUserScroll, { capture: true, passive: true });
+      window.addEventListener('touchmove', onWindowUserScroll, { capture: true, passive: true });
     } else {
       window.removeEventListener('pointerdown', onWindowPointerDown, true);
       window.removeEventListener('keydown', onWindowKey);
       window.removeEventListener('resize', onWindowResize);
-      window.removeEventListener('scroll', onWindowResize, true);
+      window.removeEventListener('wheel', onWindowUserScroll, true);
+      window.removeEventListener('touchmove', onWindowUserScroll, true);
     }
   },
 );
@@ -128,7 +143,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointerdown', onWindowPointerDown, true);
   window.removeEventListener('keydown', onWindowKey);
   window.removeEventListener('resize', onWindowResize);
-  window.removeEventListener('scroll', onWindowResize, true);
+  window.removeEventListener('wheel', onWindowUserScroll, true);
+  window.removeEventListener('touchmove', onWindowUserScroll, true);
 });
 </script>
 
@@ -203,6 +219,17 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
   color: var(--fg-muted);
   transform: translateY(1px);
+}
+.heading {
+  /* A muted group label above a radio group (e.g. "Notifications"). Uppercased
+     with letter-spacing so it reads as a header without changing font-size (the
+     app keeps a single type size — hierarchy comes from color/weight/spacing). */
+  padding: var(--space-3) var(--space-7) var(--space-2);
+  color: var(--fg-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  user-select: none;
 }
 .divider {
   height: 1px;

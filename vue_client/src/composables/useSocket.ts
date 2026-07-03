@@ -17,10 +17,12 @@ import { useNicklistCollapseStore } from '../stores/nicklistCollapse.js';
 import { useChannelNotifyStore } from '../stores/channelNotify.js';
 import { useIgnoresStore } from '../stores/ignores.js';
 import { useNickNotesStore } from '../stores/nickNotes.js';
+import { useRelayBotsStore } from '../stores/relayBots.js';
 import { useFriendsStore } from '../stores/friends.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useBookmarksStore } from '../stores/bookmarks.js';
 import { useDataExportStore } from '../stores/dataExport.js';
+import { useDccStore } from '../stores/dcc.js';
 import { useToastsStore } from '../stores/toasts.js';
 import { downloadTextFile } from '../utils/download.js';
 import { notifyForEvent, playSound } from './useHighlightNotifier.js';
@@ -191,6 +193,29 @@ function applyEvent(event: any): void {
         ttlMs: 6000,
       });
       break;
+    case 'invite': {
+      // Two shapes share this type (#261). A persisted channel line ("X invited
+      // Y", target = the channel) renders inline like a join/kick. The inbound
+      // "you've been invited" event is ephemeral, targets the server
+      // pseudo-buffer, and carries channel/from — surface it as an actionable
+      // toast with a one-click Join. The durable record for the latter lives in
+      // the system buffer (logged server-side), so the long TTL is just a
+      // convenience window, not the only chance to act.
+      if (typeof event.target === 'string' && event.target.startsWith('#')) {
+        buffers.pushMessage(event);
+        break;
+      }
+      const channel = event.channel as string;
+      const from = event.from as string;
+      useToastsStore().push({
+        kind: 'notify',
+        title: `Invitation to ${channel}`,
+        body: `${from} invited you`,
+        ttlMs: 15000,
+        action: { label: 'Join', onClick: () => buffers.joinOrActivate(event.networkId, channel) },
+      });
+      break;
+    }
     case 'channel-parted':
       // Keep the buffer around so the user can still scroll history; just
       // mark it un-joined so it renders dimmed in the buffer list. /close
@@ -328,12 +353,14 @@ function applySnapshot(snapshot: any[], globalIgnores: any[] = []): void {
   const channelNotify = useChannelNotifyStore();
   const ignores = useIgnoresStore();
   const nickNotes = useNickNotesStore();
+  const relayBots = useRelayBotsStore();
   networks.applySnapshot(snapshot);
   pins.applySnapshot(snapshot);
   nicklistCollapse.applySnapshot(snapshot);
   channelNotify.applySnapshot(snapshot);
   ignores.applySnapshot(snapshot, globalIgnores);
   nickNotes.applySnapshot(snapshot);
+  relayBots.applySnapshot(snapshot);
   // Highlight rules aren't in the snapshot; load them now so client-side
   // render-time highlight evaluation (#349) works app-wide, not just after the
   // settings pane has been opened.
@@ -394,6 +421,12 @@ function handleMessage(raw: string): void {
 
   if (payload.kind === 'snapshot') {
     applySnapshot(payload.networks, payload.globalIgnores || []);
+    // Fresh connect ships channel/DM buffers as empty shells (no message rows),
+    // so their ids never advance our cursor. The server hands us the current
+    // global max here as our "caught up to now" mark, so the next reconnect's
+    // ?since pulls only genuinely-new events rather than re-gap-filling history
+    // the shells intentionally omitted. Present on fresh connects only.
+    if (typeof payload.cursor === 'number') trackSeenId(payload.cursor);
     return;
   }
   if (payload.kind === 'backlog') {
@@ -417,6 +450,11 @@ function handleMessage(raw: string): void {
       buffers.applyAroundSlice(payload.networkId, payload.target, payload);
     } else if (mode === 'latest') {
       buffers.applyLatestReplace(payload.networkId, payload.target, payload);
+      // The 'latest' reply is also how a fresh-connect SHELL hydrates on open;
+      // it carries inputHistory so up-arrow recall is restored (shells omit it).
+      if (payload.inputHistory) {
+        useInputHistoryStore().seed(payload.networkId, payload.target, payload.inputHistory);
+      }
     } else if (mode === 'after') {
       buffers.appendHistory(
         payload.networkId,
@@ -588,7 +626,6 @@ function handleMessage(raw: string): void {
     const channelNotify = useChannelNotifyStore();
     channelNotify.applyChange(payload.networkId, payload.target, {
       notifyAlways: !!payload.notifyAlways,
-      muted: !!payload.muted,
     });
     return;
   }
@@ -600,6 +637,18 @@ function handleMessage(raw: string): void {
   if (payload.kind === 'nick-note-updated') {
     const nickNotes = useNickNotesStore();
     nickNotes.applyUpdate(payload.networkId, payload.nick, payload.note || '', payload.updatedAt);
+    return;
+  }
+  if (payload.kind === 'relay-bot-updated') {
+    const relayBots = useRelayBotsStore();
+    relayBots.applyUpdate(payload.networkId, payload.nick, !!payload.marked, payload.pattern || '');
+    return;
+  }
+  if (payload.kind === 'dcc-transfer') {
+    // Live DCC transfer state change (#270 phase 2) — user-scoped, not a buffer
+    // message. Upsert the row into the Transfers store; this also self-reveals
+    // the Transfers affordance the first time an offer lands.
+    useDccStore().applyTransfer(payload.transfer);
     return;
   }
   if (payload.kind === 'contacts-snapshot') {

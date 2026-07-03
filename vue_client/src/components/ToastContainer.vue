@@ -10,7 +10,7 @@
         v-for="t in toasts.items"
         :key="t.id"
         class="toast"
-        :class="[`kind-${t.kind}`, { clickable: !!t.networkId }]"
+        :class="[`kind-${t.kind}`, { clickable: !!t.networkId && !!t.target }]"
         @click="onClick(t)"
       >
         <div class="row">
@@ -20,6 +20,9 @@
           </button>
         </div>
         <div v-if="t.body" class="body">{{ t.body }}</div>
+        <div v-if="t.action" class="actions">
+          <button class="action" @click.stop="onAction(t)">{{ t.action.label }}</button>
+        </div>
       </div>
     </div>
   </Teleport>
@@ -29,21 +32,36 @@
 import { useToastsStore } from '../stores/toasts.js';
 import type { Toast } from '../stores/toasts.js';
 import { useBuffersStore } from '../stores/buffers.js';
+import { emitJumpIntent } from '../composables/useJumpIntent.js';
 
 const toasts = useToastsStore();
 const buffers = useBuffersStore();
 
 function onClick(t: Toast) {
   if (!t.networkId || !t.target) return;
-  // The buffer can be closed between the toast firing and the user clicking
-  // it; activating would recreate an empty shell. Replace the toast with a
-  // "closed" notice instead.
-  if (!buffers.isOpen(t.networkId, t.target)) {
-    toasts.dismiss(t.id);
+  if (t.messageId != null) {
+    // A specific message → scroll to it via the shared jump pipeline (#444). The
+    // active chat shell subscribes through useChatBootstrap and runs the jump.
+    emitJumpIntent({
+      kind: 'jump',
+      networkId: t.networkId,
+      target: t.target,
+      messageId: t.messageId,
+    });
+  } else if (!buffers.isOpen(t.networkId, t.target)) {
+    // A message-less toast (join failure, unknown command, info) whose buffer has
+    // since closed: activating would recreate an empty shell, so show a notice
+    // instead — the pre-#444 behavior. The jump pipeline's guards don't fit here;
+    // they'd reject a :server: target or recreate a parted channel.
     toasts.push({ kind: 'info', title: 'Buffer is closed', body: '', ttlMs: 4000 });
-    return;
+  } else {
+    buffers.activate(t.networkId, t.target);
   }
-  buffers.activate(t.networkId, t.target);
+  toasts.dismiss(t.id);
+}
+
+function onAction(t: Toast) {
+  toasts.runAction(t.id);
   toasts.dismiss(t.id);
 }
 </script>
@@ -135,6 +153,24 @@ function onClick(t: Toast) {
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+.actions {
+  display: flex;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+.action {
+  background: var(--toast-accent, var(--accent));
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--bg);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  padding: var(--space-2) var(--space-5);
+}
+.action:hover {
+  filter: brightness(1.08);
 }
 @keyframes toast-in {
   from {

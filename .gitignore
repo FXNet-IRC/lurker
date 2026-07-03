@@ -8,7 +8,12 @@ npm-debug.log*
 
 # SQLite database files
 data/
+data2/
 *.db
+
+# Generated session-signing secret — never commit it, whatever data dir it lands
+# in (server regenerates one if absent).
+session-secret.key
 *.db-journal
 *.db-shm
 *.db-wal
@@ -16,6 +21,9 @@ data/
 # Build output
 vue_client/dist/
 coverage/
+
+# Local DCC download dir used for QA (LURKER_DCC_DIR); never commit received files
+dcc-downloads/
 
 # Docs site (VitePress) build artifacts
 docs/.vitepress/dist/

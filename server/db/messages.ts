@@ -19,6 +19,7 @@ interface MessageRow {
   alt: number;
   matched_rule_id: number | null;
   from_ignored: number;
+  mirrored: number;
 }
 
 /** A raw message row joined with network_name. */
@@ -42,6 +43,9 @@ export interface MessageEvent {
   matched: boolean;
   matchedRuleId: number | null;
   fromIgnored: boolean;
+  // A duplicate of a closed-buffer NOTICE surfaced in the server buffer (#439).
+  // Excluded from search/highlights so it doesn't double up its real copy.
+  mirrored: boolean;
   [key: string]: unknown;
 }
 
@@ -65,6 +69,7 @@ export interface MessageInput {
   matchedRuleId?: number | null;
   userhost?: string | null;
   fromIgnored?: boolean;
+  mirrored?: boolean;
 }
 
 /** Buffer summary row for MCP list_buffers. */
@@ -85,9 +90,9 @@ export interface MaxIdByBufferRow {
 // Non-striped types pass through with alt=0; the value is meaningless for them
 // and the client never reads it.
 const insertStmt = db.prepare(`
-  INSERT INTO messages (network_id, target, time, type, nick, text, kind, self, extra, matched_rule_id, userhost, from_ignored, alt)
+  INSERT INTO messages (network_id, target, time, type, nick, text, kind, self, extra, matched_rule_id, userhost, from_ignored, mirrored, alt)
   VALUES (
-    @networkId, @target, @time, @type, @nick, @text, @kind, @self, @extra, @matchedRuleId, @userhost, @fromIgnored,
+    @networkId, @target, @time, @type, @nick, @text, @kind, @self, @extra, @matchedRuleId, @userhost, @fromIgnored, @mirrored,
     CASE WHEN @type IN ('message', 'action', 'notice')
          THEN 1 - COALESCE(
            (SELECT alt FROM messages
@@ -116,6 +121,7 @@ export function insertMessage(row: MessageInput): { id: number | bigint; alt: bo
     matchedRuleId: row.matchedRuleId ?? null,
     userhost: row.userhost ?? null,
     fromIgnored: row.fromIgnored ? 1 : 0,
+    mirrored: row.mirrored ? 1 : 0,
   });
   const id = result.lastInsertRowid;
   const altRow = altByIdStmt.get(id) as { alt: number } | undefined;
@@ -138,6 +144,7 @@ function rowToEvent(row: MessageRow): MessageEvent {
     matched: row.matched_rule_id != null,
     matchedRuleId: row.matched_rule_id,
     fromIgnored: row.from_ignored === 1,
+    mirrored: row.mirrored === 1,
   };
   if (row.extra) {
     try {
@@ -242,12 +249,37 @@ export function listRecentForBuffers(
   return out;
 }
 
+// Distinct buffer targets (channels/DMs/:server:) that have history on a network
+// — the sidebar's buffer list. Called several times per connect snapshot (per
+// network, in the online loop / offline frames / app-badge total), so it's on
+// the hot path — hence the module-scoped prepared statement.
+//
+// A plain `SELECT DISTINCT target` visits EVERY message row: SQLite reads the
+// whole (network_id, target, id) index and de-dupes in the output rather than
+// seeking past duplicate targets, so it scaled with the network's ENTIRE history
+// and was the dominant snapshot cost on a deep buffer. This is a recursive "loose
+// index scan" (skip-scan): it seeks to the smallest target, then repeatedly to
+// the next target strictly greater, so it's O(distinct targets) index seeks — a
+// ~75x speedup measured on 50k rows / 8 targets, and far more on real history.
+//
+// The `IS NOT NULL` guards are LOAD-BEARING, not defensive: `min(target)` returns
+// NULL for a network with no messages, and the recursive subquery returns NULL
+// once no larger target exists — that NULL sentinel is what terminates the
+// recursion (via `WHERE t.target IS NOT NULL`) and is filtered from the output.
+const listBufferTargetsStmt = db.prepare(`
+  WITH RECURSIVE t(target) AS (
+    SELECT min(target) FROM messages WHERE network_id = ?
+    UNION ALL
+    SELECT (SELECT min(target) FROM messages WHERE network_id = ? AND target > t.target)
+    FROM t
+    WHERE t.target IS NOT NULL
+  )
+  SELECT target FROM t WHERE target IS NOT NULL ORDER BY target
+`);
 export function listBufferTargets(networkId: number): string[] {
-  return (
-    db
-      .prepare('SELECT DISTINCT target FROM messages WHERE network_id = ? ORDER BY target')
-      .all(networkId) as Array<{ target: string }>
-  ).map((r) => r.target);
+  return (listBufferTargetsStmt.all(networkId, networkId) as Array<{ target: string }>).map(
+    (r) => r.target,
+  );
 }
 
 // Per-(network, target) summary for the MCP list_buffers verb. Aggregates
@@ -276,6 +308,19 @@ export function maxIdByBuffer(networkId: number): MaxIdByBufferRow[] {
     .all(networkId) as MaxIdByBufferRow[];
 }
 
+// MAX(id) across the whole messages table, or 0 when empty. message ids are a
+// single global monotonic sequence, so this is a safe "caught up to now" cursor
+// value: a fresh (shell) connect ships no message rows, so we hand the client
+// this so its next reconnect's ?since only pulls genuinely-new events rather
+// than re-gap-filling everything. Not user-scoped by design — it's only a
+// threshold number (>= any of the caller's own ids), never row data.
+export function maxMessageId(): number {
+  const row = db.prepare('SELECT MAX(id) AS maxId FROM messages').get() as
+    | { maxId: number | null }
+    | undefined;
+  return row?.maxId || 0;
+}
+
 // MAX(id) for a single buffer, or 0 when the buffer has no rows. Used by
 // /clear to anchor the marker at the current tail.
 export function maxIdForBuffer(networkId: number, target: string): number {
@@ -297,6 +342,20 @@ export function hasMessageForTarget(networkId: number, target: string): boolean 
   return !!row;
 }
 
+// Whether a target has a real (non-notice) conversation — at least one PRIVMSG or
+// ACTION. NOTICE-only buffers (services like NickServ/ChanServ, which now get a
+// buffer of their own, #439) are NOT conversations: presence-tracking keys off
+// this so services don't consume MONITOR slots or show a presence dot.
+export function hasConversationForTarget(networkId: number, target: string): boolean {
+  if (!networkId || !target) return false;
+  const row = db
+    .prepare(
+      "SELECT 1 FROM messages WHERE network_id = ? AND target = ? COLLATE NOCASE AND type IN ('message', 'action') LIMIT 1",
+    )
+    .get(networkId, target);
+  return !!row;
+}
+
 export function countOlder(networkId: number, target: string, beforeId: number): number {
   return (
     db
@@ -314,16 +373,45 @@ export function countOlder(networkId: number, target: string, beforeId: number):
 export const COUNTABLE_TYPES = new Set(['message', 'action', 'notice']);
 const COUNTABLE_TYPES_SQL = `('${[...COUNTABLE_TYPES].join("','")}')`;
 
-export function countNewer(networkId: number, target: string, afterId: number): number {
+// Unread badges cap their display at ">999" (client BufferList.unreadLabel), so
+// the exact count past that is never shown — yet an unbounded COUNT scans the
+// buffer's ENTIRE unread range (every row with id > the read pointer), which is
+// the dominant per-buffer cost of a connect snapshot on a deep buffer with a low
+// read pointer. Cap the count at UNREAD_COUNT_CAP: the inner ORDER BY id DESC +
+// LIMIT lets SQLite walk idx_messages_buffer(network_id, target, id DESC) and
+// stop once that many countable rows are found. Any value >= the cap renders
+// identically (">999"); below the cap it's still exact.
+//
+// NOTE: computeUnreadFor treats a DM's unread AS its highlight count (DMs are
+// inherently mentions), so a DM with >cap unread has its highlight count — and
+// thus its contribution to the PWA app-icon badge total — capped here too. That
+// is intended and invisible: both the sidebar badge and the OS app badge collapse
+// past ~999 anyway, and keeping DM highlights exact would mean reintroducing the
+// unbounded scan for DMs. Channel highlights are exact (their own indexed count).
+export const UNREAD_COUNT_CAP = 1000;
+export function countNewer(
+  networkId: number,
+  target: string,
+  afterId: number,
+  cap = UNREAD_COUNT_CAP,
+): number {
+  // Guard: a non-positive / non-integer cap would become SQLite's `LIMIT -1`
+  // (= no limit) and silently reintroduce the unbounded scan — fall back to the
+  // default instead.
+  const lim = Number.isInteger(cap) && cap > 0 ? cap : UNREAD_COUNT_CAP;
   return (
     db
       .prepare(
-        `SELECT COUNT(*) AS n FROM messages
-     WHERE network_id = ? AND target = ? AND id > ?
-       AND type IN ${COUNTABLE_TYPES_SQL}
-       AND from_ignored = 0`,
+        `SELECT COUNT(*) AS n FROM (
+           SELECT 1 FROM messages
+           WHERE network_id = ? AND target = ? AND id > ?
+             AND type IN ${COUNTABLE_TYPES_SQL}
+             AND from_ignored = 0
+           ORDER BY id DESC
+           LIMIT ?
+         )`,
       )
-      .get(networkId, target, afterId || 0) as { n: number }
+      .get(networkId, target, afterId || 0, lim) as { n: number }
   ).n;
 }
 
@@ -438,6 +526,11 @@ export function searchMessages(
     'n.user_id = ?',
     `m.type IN ${COUNTABLE_TYPES_SQL}`,
     'm.from_ignored = 0',
+    // Skip server-buffer mirror duplicates of closed-buffer NOTICEs (#439) so a
+    // mirrored notice doesn't surface twice — its real copy in the sender's
+    // buffer is the searchable one. Genuine server-buffer notices (mirrored = 0)
+    // stay searchable.
+    'm.mirrored = 0',
   ];
   const params: (string | number)[] = [userId];
 
@@ -491,15 +584,36 @@ export function searchMessages(
   }));
 }
 
+// Autocomplete speakers, derived from message history. This is now called when
+// the user OPENS a buffer (the 'history' latest reply seeds nick completion) — the
+// connect snapshot no longer ships speakers — so it's one buffer at a time, not
+// every buffer at once. Still, bound the work to the most recent
+// SPEAKER_SCAN_WINDOW *chat* rows, THEN group, so it's O(window) regardless of how
+// deep the buffer is. The window is small: autocomplete only cares about the last
+// handful of speakers, and the client keeps building the list live via
+// recordSpeaker as the conversation continues. The filters live INSIDE the
+// windowed subquery on purpose: SQLite walks the tail of idx_messages_buffer(
+// network_id, target, id DESC) applying them, so a burst of non-chat rows (a
+// netsplit's join/quit flood) is skipped rather than eating the window and
+// starving the speaker set. (Backfilled CHATHISTORY isn't a concern: those batches
+// are dropped, not inserted, so id order tracks time order — see ircConnection.ts.)
+const SPEAKER_SCAN_WINDOW = 300;
 const listSpeakersStmt = db.prepare(`
+  -- Exactly one MAX() aggregate, so SQLite takes the bare (non-grouped) \`nick\`
+  -- from the same row that supplied MAX(time) — i.e. the most-recent casing,
+  -- consistent with last_time. (SQLite's documented min/max bare-column rule.)
   SELECT nick, MAX(time) AS last_time
-  FROM messages
-  WHERE network_id = ?
-    AND target = ?
-    AND type IN ('message', 'action')
-    AND self = 0
-    AND nick IS NOT NULL
-    AND nick <> ''
+  FROM (
+    SELECT nick, time
+    FROM messages
+    WHERE network_id = ? AND target = ?
+      AND type IN ('message', 'action')
+      AND self = 0
+      AND nick IS NOT NULL
+      AND nick <> ''
+    ORDER BY id DESC
+    LIMIT ?
+  )
   GROUP BY LOWER(nick)
   ORDER BY last_time DESC
   LIMIT ?
@@ -508,10 +622,17 @@ const listSpeakersStmt = db.prepare(`
 export function listSpeakers(
   networkId: number,
   target: string,
-  limit = 128,
+  // Recent distinct speakers for nick autocomplete. Currently-present users
+  // already come from the channel member list (NAMES); this only adds people who
+  // spoke recently and have since left, so a small count is plenty.
+  limit = 20,
+  scanWindow = SPEAKER_SCAN_WINDOW,
 ): Array<{ nick: string; lastTime: number }> {
   return (
-    listSpeakersStmt.all(networkId, target, limit) as Array<{ nick: string; last_time: string }>
+    listSpeakersStmt.all(networkId, target, scanWindow, limit) as Array<{
+      nick: string;
+      last_time: string;
+    }>
   )
     .map((r) => ({ nick: r.nick, lastTime: Date.parse(r.last_time) || 0 }))
     .filter((s) => s.lastTime > 0);

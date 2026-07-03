@@ -5,6 +5,7 @@ import webpush from 'web-push';
 import type { PushSubscription } from '../db/pushSubscriptions.js';
 import {
   listEnabledForUser,
+  hasEnabledForUser,
   deleteById,
   touchSubscription,
   getMeta,
@@ -36,6 +37,13 @@ function ensureVapid(): void {
 export function getPublicKey(): string | null {
   ensureVapid();
   return publicKey;
+}
+
+// True if the user has at least one enabled push subscription. Lets callers
+// skip building a push payload (e.g. computing the app-icon badge total) when
+// deliver() would no-op on an empty subscription set anyway.
+export function hasSubscriptions(userId: number): boolean {
+  return hasEnabledForUser(userId);
 }
 
 export async function deliver(

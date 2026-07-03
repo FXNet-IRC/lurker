@@ -586,6 +586,19 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     description: 'Render /me action messages in italics.',
   },
   {
+    key: 'look.message.hover_actions',
+    label: 'Show hover action bar on messages',
+    category: 'appearance',
+    group: 'misc',
+    type: 'bool',
+    default: true,
+    description:
+      'Show the floating action toolbar (reply, copy, bookmark, ignore) when ' +
+      'hovering a message on desktop. When off, click a message to open the same ' +
+      'actions as a menu instead. No effect on touch devices, where the bar is ' +
+      'never shown and tapping a message always opens the menu.',
+  },
+  {
     key: 'look.buffer.time_format',
     label: 'Message timestamp format',
     category: 'appearance',
@@ -753,6 +766,18 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'until you press Send a second time. Messages that would split into ' +
       'three or more lines always require confirmation regardless of this ' +
       'setting. /me actions never split — they are blocked outright.',
+  },
+  {
+    key: 'chat.send_typing_notifications',
+    label: 'Send typing notifications',
+    category: 'chat',
+    group: 'composing',
+    type: 'bool',
+    default: true,
+    description:
+      'Let other clients see when you are typing (IRCv3 +typing tag). Off stops ' +
+      'this client from sending typing/paused/done notifications while you compose ' +
+      "a message. Doesn't affect seeing other people's typing indicators.",
   },
 
   // ─── Smart filter (join/part/quit/nick noise) ─────────────────────────

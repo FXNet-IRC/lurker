@@ -55,6 +55,19 @@ describe('getPublicKey', () => {
   });
 });
 
+describe('hasSubscriptions', () => {
+  it('reflects whether the user has an enabled push subscription', () => {
+    const u = createUser('push-has-sub');
+    expect(pushService.hasSubscriptions(u.id)).toBe(false);
+    pushDb.upsertSubscription(u.id, {
+      endpoint: 'https://example.test/hassub',
+      p256dh: 'k',
+      auth: 'a',
+    });
+    expect(pushService.hasSubscriptions(u.id)).toBe(true);
+  });
+});
+
 describe('deliver', () => {
   it('returns {sent:0, dropped:0} when the user has no subscriptions', async () => {
     const result = await pushService.deliver(bob.id, { title: 'hi' });

@@ -12,17 +12,23 @@ let createUser: typeof import('../db/users.js').createUser;
 let createNetwork: typeof import('../db/networks.js').createNetwork;
 let insertMessage: typeof import('../db/messages.js').insertMessage;
 let closeBuffer: typeof import('../db/closedBuffers.js').closeBuffer;
+let reopenBuffer: typeof import('../db/closedBuffers.js').reopenBuffer;
 let isClosed: typeof import('../db/closedBuffers.js').isClosed;
 let setClearedState: typeof import('../db/bufferReads.js').setClearedState;
+let setReadState: typeof import('../db/bufferReads.js').setReadState;
+let computeTotalHighlights: typeof import('./wsHub.js').computeTotalHighlights;
 let buildBufferBacklog: typeof import('./wsHub.js').buildBufferBacklog;
+let buildBufferShell: typeof import('./wsHub.js').buildBufferShell;
 let buildResumeSlice: typeof import('./wsHub.js').buildResumeSlice;
 let buildOfflineBacklogFrames: typeof import('./wsHub.js').buildOfflineBacklogFrames;
+let maxMessageId: typeof import('../db/messages.js').maxMessageId;
 let handleOpenBuffer: typeof import('./wsHub.js').handleOpenBuffer;
 let sweepWsHeartbeat: typeof import('./wsHub.js').sweepWsHeartbeat;
 let buildSystemBacklog: typeof import('./wsHub.js').buildSystemBacklog;
 let systemLineToEvent: typeof import('./wsHub.js').systemLineToEvent;
 let buildSystemHistoryReply: typeof import('./wsHub.js').buildSystemHistoryReply;
 let startChanlistRefresh: typeof import('./wsHub.js').startChanlistRefresh;
+let DM_ELIGIBLE_TYPES: typeof import('./wsHub.js').DM_ELIGIBLE_TYPES;
 let chanlist: typeof import('../db/chanlist.js');
 let systemMessages: typeof import('../db/systemMessages.js').default;
 
@@ -32,11 +38,13 @@ let networkId: number;
 beforeAll(async () => {
   ({ createUser } = await import('../db/users.js'));
   ({ createNetwork } = await import('../db/networks.js'));
-  ({ insertMessage } = await import('../db/messages.js'));
-  ({ closeBuffer, isClosed } = await import('../db/closedBuffers.js'));
-  ({ setClearedState } = await import('../db/bufferReads.js'));
+  ({ insertMessage, maxMessageId } = await import('../db/messages.js'));
+  ({ closeBuffer, reopenBuffer, isClosed } = await import('../db/closedBuffers.js'));
+  ({ setClearedState, setReadState } = await import('../db/bufferReads.js'));
   ({
+    computeTotalHighlights,
     buildBufferBacklog,
+    buildBufferShell,
     buildResumeSlice,
     buildOfflineBacklogFrames,
     handleOpenBuffer,
@@ -45,6 +53,7 @@ beforeAll(async () => {
     systemLineToEvent,
     buildSystemHistoryReply,
     startChanlistRefresh,
+    DM_ELIGIBLE_TYPES,
   } = await import('./wsHub.js'));
   chanlist = await import('../db/chanlist.js');
   systemMessages = (await import('../db/systemMessages.js')).default;
@@ -151,8 +160,27 @@ describe('buildResumeSlice', () => {
     // The gap, oldest-first — exactly the rows after the cursor.
     expect((slice.events[0] as { id: number }).id).toBe(ids[0]);
     expect((slice.events.at(-1) as { id: number }).id).toBe(ids.at(-1));
-    // A non-reset frame doesn't drive hasMoreOlder (the client keeps its own).
-    expect(slice.hasMoreOlder).toBe(false);
+    // hasMoreOlder reflects whether older-than-the-gap rows exist. Here m0 sits
+    // below the gap, so it's true. A LOADED buffer ignores this (it appends),
+    // but a buffer held only as an empty shell empty-seeds from this frame and
+    // would be stranded unopenable if we reported false.
+    expect(slice.hasMoreOlder).toBe(true);
+  });
+
+  it('reports hasMoreOlder for an empty gap so a shell is not stranded', () => {
+    // A buffer with history but no rows past the cursor (nothing new since the
+    // client last saw it). The resume frame carries events:[], but the buffer
+    // still has older history — a shell client empty-seeds from this frame and
+    // must be told so, or activate()'s lazy-fetch (gated on hasMoreOlder) never
+    // fires and the buffer shows empty forever.
+    seed('#resumeEmptyGap', 'a');
+    seed('#resumeEmptyGap', 'b');
+    const tail = seed('#resumeEmptyGap', 'c');
+    // Cursor at the tail → the gap (id > tail) is empty.
+    const slice = buildResumeSlice(userId, networkId, '#resumeEmptyGap', tail);
+    expect(slice.events.length).toBe(0);
+    expect(slice.reset).toBe(false);
+    expect(slice.hasMoreOlder).toBe(true);
   });
 
   it('resets to the latest slice when the gap overflows the cap (issue #205)', () => {
@@ -178,11 +206,43 @@ describe('buildResumeSlice', () => {
   });
 });
 
+describe('buildBufferShell', () => {
+  it('ships a message-free, lazy-loadable shell with a correct unread badge', () => {
+    seed('#shellchan', 'a');
+    seed('#shellchan', 'b');
+    // Unread reflects the two seeded lines (no read pointer set), so the sidebar
+    // badge is right even though we ship zero message rows.
+    const shell = buildBufferShell(userId, networkId, '#shellchan', true);
+    expect(shell.kind).toBe('backlog');
+    expect((shell.events as unknown[]).length).toBe(0);
+    // speakers/inputHistory are OMITTED (not []): the client applies both under a
+    // presence guard, so an empty array would wipe existing state on a re-snapshot
+    // (isFreshNetwork). Absent keys make the client preserve what it has.
+    expect(shell.inputHistory).toBeUndefined();
+    expect(shell.speakers).toBeUndefined();
+    // hasMoreOlder gates the client's open-time lazy fetch — must be true.
+    expect(shell.hasMoreOlder).toBe(true);
+    expect(shell.unread).toBe(2);
+    // joined is caller-supplied (online membership vs offline parted).
+    expect(shell.joined).toBe(true);
+    expect(buildBufferShell(userId, networkId, '#shellchan', false).joined).toBe(false);
+  });
+});
+
+describe('maxMessageId (fresh-connect cursor)', () => {
+  it('returns the global max message id, tracking new inserts', () => {
+    const before = maxMessageId();
+    const id = seed('#cursor', 'x');
+    expect(maxMessageId()).toBeGreaterThanOrEqual(id);
+    expect(maxMessageId()).toBeGreaterThan(before);
+  });
+});
+
 describe('buildOfflineBacklogFrames', () => {
   // Tests run with no live IRC connection, so every network is "offline" — the
   // exact case a paused/disconnected user hits. Each test uses a fresh network
   // so it doesn't depend on history seeded by sibling tests.
-  it('ships persisted buffers for a network with no live connection', () => {
+  it('ships offline channel/DM buffers as lazy-load shells; the server buffer stays real', () => {
     const net = createNetwork(userId, {
       name: 'offnet',
       host: 'h',
@@ -205,6 +265,7 @@ describe('buildOfflineBacklogFrames', () => {
     seedOff('#offline', 'a');
     seedOff('#offline', 'b');
     seedOff('dave', 'dm');
+    seedOff(`:server:${offId}`, 'server notice');
 
     const byTarget = new Map(
       buildOfflineBacklogFrames(userId)
@@ -212,15 +273,29 @@ describe('buildOfflineBacklogFrames', () => {
         .map((f) => [f.target as string, f]),
     );
 
-    // Channel history is shipped, marked parted (no live connection tracks it).
+    // Channel ships as a SHELL: no message rows, no input history, but marked
+    // hasMoreOlder so the client hydrates it on open — and the unread badge is
+    // still correct (both seeded lines are unread) without touching the body.
     const chan = byTarget.get('#offline')!;
     expect(chan.kind).toBe('backlog');
-    expect((chan.events as unknown[]).length).toBe(2);
+    expect((chan.events as unknown[]).length).toBe(0);
+    expect(chan.hasMoreOlder).toBe(true);
+    expect(chan.unread).toBe(2);
+    // inputHistory/speakers are omitted (not []) so a re-snapshot can't wipe them.
+    expect(chan.inputHistory).toBeUndefined();
+    // Channels are parted (no live connection tracks them).
     expect(chan.joined).toBe(false);
-    // DM buffers have no join concept → reported joined so they never dim.
-    expect(byTarget.get('dave')!.joined).toBe(true);
-    // The uncloseable server pseudo-buffer is always present.
-    expect(byTarget.has(`:server:${offId}`)).toBe(true);
+
+    // DM buffers are shells too, but have no join concept → reported joined.
+    const dm = byTarget.get('dave')!;
+    expect((dm.events as unknown[]).length).toBe(0);
+    expect(dm.hasMoreOlder).toBe(true);
+    expect(dm.joined).toBe(true);
+
+    // The server pseudo-buffer is NOT shelled: it ships its real recent slice so
+    // the disconnect reason is visible without opening it.
+    const server = byTarget.get(`:server:${offId}`)!;
+    expect((server.events as unknown[]).length).toBe(1);
   });
 
   it('skips a closed buffer but never the server pseudo-buffer', () => {
@@ -248,6 +323,17 @@ describe('buildOfflineBacklogFrames', () => {
       .map((f) => f.target);
     expect(targets).not.toContain('#hidden');
     expect(targets).toContain(`:server:${offId}`);
+  });
+});
+
+describe('DM_ELIGIBLE_TYPES (#439)', () => {
+  it('excludes notice so a notice never reopens a closed buffer', () => {
+    // The fan-out guard reopens a closed buffer on a DM-eligible event. NOTICE
+    // must not be in this set: a notice to a buffer the user closed has to stay
+    // closed (it's surfaced transiently in the server buffer instead).
+    expect(DM_ELIGIBLE_TYPES.has('message')).toBe(true);
+    expect(DM_ELIGIBLE_TYPES.has('action')).toBe(true);
+    expect(DM_ELIGIBLE_TYPES.has('notice')).toBe(false);
   });
 });
 
@@ -532,5 +618,67 @@ describe('startChanlistRefresh (issue #396)', () => {
       .rows.map((r) => r.channel);
     expect(names).toEqual(['#a', '#b']);
     expect(names).not.toContain('#gone');
+  });
+});
+
+// Drives the PWA app-icon badge (#451). Uses its own user/network so the shared
+// per-file DB seeded by the other suites doesn't perturb the totals.
+describe('computeTotalHighlights', () => {
+  it('counts every buffer with history (even never-opened ones), respects read pointers, excludes closed', () => {
+    const u = createUser('badger').id;
+    const net = createNetwork(u, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'badger',
+    })!.id;
+    const ins = (target: string, text: string) =>
+      Number(
+        insertMessage({
+          networkId: net,
+          target,
+          time: new Date().toISOString(),
+          type: 'message',
+          nick: 'bob',
+          text,
+          self: false,
+        }).id,
+      );
+
+    // The system-buffer term is constant for this user across the test (we never
+    // add notable system lines), so assert deltas against this baseline rather
+    // than absolute totals — keeps the test immune to the shared per-file DB and
+    // any global (user_id NULL) system messages other suites seeded.
+    const base = computeTotalHighlights(u);
+
+    // Never-opened DM (no read pointer). The client counts these from
+    // lastReadId 0, so the badge total must too — this is the regression that
+    // made the push badge vanish for buffers the user hadn't opened yet.
+    ins('frank', 'hey');
+    ins('frank', 'you around?');
+    expect(computeTotalHighlights(u)).toBe(base + 2);
+
+    // Never-opened channel, plain lines, no highlight-rule match → adds 0.
+    ins('#noise', 'chatter');
+    ins('#noise', 'more chatter');
+    expect(computeTotalHighlights(u)).toBe(base + 2);
+
+    // DM 'dave': read the first line, then two more arrive → contributes 2.
+    const d1 = ins('dave', 'one');
+    setReadState(u, net, 'dave', d1);
+    ins('dave', 'two');
+    const d3 = ins('dave', 'three');
+    expect(computeTotalHighlights(u)).toBe(base + 4); // frank 2 + dave 2
+
+    // Closed buffers are excluded — the client drops them from its store.
+    closeBuffer(u, net, 'frank');
+    expect(computeTotalHighlights(u)).toBe(base + 2);
+    reopenBuffer(u, net, 'frank');
+    expect(computeTotalHighlights(u)).toBe(base + 4);
+
+    // Reading dave up to its newest line clears its contribution.
+    setReadState(u, net, 'dave', d3);
+    expect(computeTotalHighlights(u)).toBe(base + 2);
   });
 });
