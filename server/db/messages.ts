@@ -70,6 +70,11 @@ export interface MessageInput {
   userhost?: string | null;
   fromIgnored?: boolean;
   mirrored?: boolean;
+  // Server-buffer notability (#470). Defaults to notable (true); pass false for
+  // Lurker's own connection-status notices so they render in the server buffer
+  // but don't mark it unread. Read by countServerBufferUnread (the :server: unread
+  // count) and countHighlightsNewer (which excludes notable=0 lines from highlights).
+  notable?: boolean;
 }
 
 /** Buffer summary row for MCP list_buffers. */
@@ -90,9 +95,9 @@ export interface MaxIdByBufferRow {
 // Non-striped types pass through with alt=0; the value is meaningless for them
 // and the client never reads it.
 const insertStmt = db.prepare(`
-  INSERT INTO messages (network_id, target, time, type, nick, text, kind, self, extra, matched_rule_id, userhost, from_ignored, mirrored, alt)
+  INSERT INTO messages (network_id, target, time, type, nick, text, kind, self, extra, matched_rule_id, userhost, from_ignored, mirrored, notable, alt)
   VALUES (
-    @networkId, @target, @time, @type, @nick, @text, @kind, @self, @extra, @matchedRuleId, @userhost, @fromIgnored, @mirrored,
+    @networkId, @target, @time, @type, @nick, @text, @kind, @self, @extra, @matchedRuleId, @userhost, @fromIgnored, @mirrored, @notable,
     CASE WHEN @type IN ('message', 'action', 'notice')
          THEN 1 - COALESCE(
            (SELECT alt FROM messages
@@ -122,6 +127,8 @@ export function insertMessage(row: MessageInput): { id: number | bigint; alt: bo
     userhost: row.userhost ?? null,
     fromIgnored: row.fromIgnored ? 1 : 0,
     mirrored: row.mirrored ? 1 : 0,
+    // Default notable=1; only an explicit `false` (Lurker's status notices) is 0.
+    notable: row.notable === false ? 0 : 1,
   });
   const id = result.lastInsertRowid;
   const altRow = altByIdStmt.get(id) as { alt: number } | undefined;
@@ -235,6 +242,84 @@ export function hasOlderRow(networkId: number, target: string, id: number): bool
 }
 export function hasNewerRow(networkId: number, target: string, id: number): boolean {
   return hasNewerThan(networkId, target, id);
+}
+
+// --- IRCv3 draft/chathistory window queries --------------------------------
+
+// Only replayable conversation rows count toward a chathistory window/limit:
+// joins/parts/quits/nick/mode/topic events and mirrored server-buffer dupes are
+// excluded, so a `limit` of N yields up to N real messages (a window full of a
+// netsplit's QUITs must not come back as an empty batch — that would make a
+// client think it reached the start of history and stop paging). Matches what
+// playbackLines will actually emit onto the wire.
+const CHATHISTORY_MSG_FILTER = `type IN ('message', 'action', 'notice') AND mirrored = 0 AND text IS NOT NULL AND text != ''`;
+
+// Windowed history fetch for CHATHISTORY. `lower`/`upper` are exclusive ISO time
+// bounds (null = unbounded on that side). `newestFirst` takes the `limit` from
+// the recent end of the window (BEFORE/LATEST) vs the old end (AFTER); the
+// result is ALWAYS returned oldest-first (the batch must be chronological).
+//
+// Ordered by `time` (id as a stable tie-breaker for same-millisecond rows), NOT
+// by id: chathistory is a timestamp-semantic API and a client pages by the
+// returned lines' @time, so window selection and ordering must follow time.
+// These usually coincide (id is assigned in receive order), but a chained/ZNC
+// upstream that replays its buffer as live PRIVMSGs with old server-time tags
+// (stored as event.time) breaks that — old-time rows get fresh, high ids. The
+// time sort is unindexed, but this is an on-demand path with a bounded LIMIT.
+export function loadHistoryWindow(
+  networkId: number,
+  target: string,
+  lower: string | null,
+  upper: string | null,
+  limit: number,
+  { newestFirst = false }: { newestFirst?: boolean } = {},
+): MessageEvent[] {
+  const conds = ['network_id = ?', 'target = ?', CHATHISTORY_MSG_FILTER];
+  const params: (string | number)[] = [networkId, target];
+  if (lower !== null) {
+    conds.push('time > ?');
+    params.push(lower);
+  }
+  if (upper !== null) {
+    conds.push('time < ?');
+    params.push(upper);
+  }
+  params.push(limit);
+  const dir = newestFirst ? 'DESC' : 'ASC';
+  const rows = db
+    .prepare(
+      `SELECT * FROM messages WHERE ${conds.join(' AND ')}
+       ORDER BY time ${dir}, id ${dir} LIMIT ?`,
+    )
+    .all(...params) as MessageRow[];
+  const events = rows.map(rowToEvent);
+  return newestFirst ? events.toReversed() : events;
+}
+
+// Buffers with real message activity inside a time window (exclusive), newest
+// first, for CHATHISTORY TARGETS. Excludes :server: pseudo-buffers and applies
+// the same message filter (a buffer whose only in-window rows are JOINs isn't
+// "active"). The two bounds may arrive in either order; we normalize.
+export function listActiveTargetsInWindow(
+  networkId: number,
+  isoA: string,
+  isoB: string,
+  limit: number,
+): BufferSummary[] {
+  const [lo, hi] = isoA <= isoB ? [isoA, isoB] : [isoB, isoA];
+  return db
+    .prepare(
+      `SELECT target, MAX(time) AS lastMessageAt
+         FROM messages
+        WHERE network_id = ?
+          AND target NOT LIKE ':server:%'
+          AND ${CHATHISTORY_MSG_FILTER}
+          AND time > ? AND time < ?
+        GROUP BY target
+        ORDER BY lastMessageAt DESC
+        LIMIT ?`,
+    )
+    .all(networkId, lo, hi, limit) as BufferSummary[];
 }
 
 export function listRecentForBuffers(
@@ -364,12 +449,14 @@ export function countOlder(networkId: number, target: string, beforeId: number):
   ).n;
 }
 
-// Types that count as "real content" for the unread badge. Membership churn
-// (join/part/quit/kick/nick/mode/topic), MOTD, away markers, and server
-// errors are all persisted for the buffer log but shouldn't bump the badge —
-// the live unread path in useSocket.applyEvent uses the same allowlist, and
-// we need the SQL paths to match so backlog/read-state recomputes don't snap
-// the count to an inflated number.
+// Types that count as "real content" for the unread badge in a channel or DM.
+// Membership churn (join/part/quit/kick/nick/mode/topic), MOTD, and away markers
+// are persisted for the buffer log but don't bump the badge. `error` is excluded
+// HERE but the `:server:` buffer does count it (see SERVER_COUNTABLE_TYPES /
+// typeCountsForUnread below) — a killed/banned/disconnect line should badge the
+// server tab. The client no longer mirrors any allowlist: unread is driven purely
+// by the server's read-state broadcast (whose trigger uses typeCountsForUnread),
+// so this set only has to stay in sync with the count queries in this file.
 export const COUNTABLE_TYPES = new Set(['message', 'action', 'notice']);
 const COUNTABLE_TYPES_SQL = `('${[...COUNTABLE_TYPES].join("','")}')`;
 
@@ -389,15 +476,39 @@ const COUNTABLE_TYPES_SQL = `('${[...COUNTABLE_TYPES].join("','")}')`;
 // past ~999 anyway, and keeping DM highlights exact would mean reintroducing the
 // unbounded scan for DMs. Channel highlights are exact (their own indexed count).
 export const UNREAD_COUNT_CAP = 1000;
-export function countNewer(
+
+// The server pseudo-buffer also counts `error` lines (killed/banned/connection
+// failures, and the QUIT-echo disconnect line — all SHOULD badge it), which
+// countNewer's type set omits. Derived from COUNTABLE_TYPES so the paths can't
+// drift.
+const SERVER_COUNTABLE_TYPES = new Set([...COUNTABLE_TYPES, 'error']);
+const SERVER_COUNTABLE_TYPES_SQL = `('${[...SERVER_COUNTABLE_TYPES].join("','")}')`;
+
+// Does an event of `type` count toward `target`'s unread badge? This is the same
+// rule countNewer / countServerBufferUnread apply, exposed so the live read-state
+// broadcast trigger (wsHub) can tell whether an event changed the count without
+// re-implementing it. Crucially a `:server:` 'error' counts here — otherwise its
+// badge wouldn't refresh until the next ordinary countable event landed (a
+// reconnect's "Connecting…" notice), which is the delayed-badge bug (#470).
+export function typeCountsForUnread(target: string, type: string): boolean {
+  return target.startsWith(':server:')
+    ? SERVER_COUNTABLE_TYPES.has(type)
+    : COUNTABLE_TYPES.has(type);
+}
+
+// Shared unread-count core for countNewer and countServerBufferUnread. Both need
+// the same cap guard and the same ORDER BY id DESC LIMIT index walk; they differ
+// only in the countable type set and whether the notability filter applies. Kept
+// as one body so the LIMIT-guard invariant (a bad cap must not become SQLite's
+// unbounded `LIMIT -1`) lives in exactly one place.
+function countUnreadRows(
   networkId: number,
   target: string,
   afterId: number,
-  cap = UNREAD_COUNT_CAP,
+  typesSql: string,
+  notableOnly: boolean,
+  cap: number,
 ): number {
-  // Guard: a non-positive / non-integer cap would become SQLite's `LIMIT -1`
-  // (= no limit) and silently reintroduce the unbounded scan — fall back to the
-  // default instead.
   const lim = Number.isInteger(cap) && cap > 0 ? cap : UNREAD_COUNT_CAP;
   return (
     db
@@ -405,7 +516,8 @@ export function countNewer(
         `SELECT COUNT(*) AS n FROM (
            SELECT 1 FROM messages
            WHERE network_id = ? AND target = ? AND id > ?
-             AND type IN ${COUNTABLE_TYPES_SQL}
+             AND type IN ${typesSql}
+             ${notableOnly ? 'AND notable = 1' : ''}
              AND from_ignored = 0
            ORDER BY id DESC
            LIMIT ?
@@ -415,10 +527,38 @@ export function countNewer(
   ).n;
 }
 
+export function countNewer(
+  networkId: number,
+  target: string,
+  afterId: number,
+  cap = UNREAD_COUNT_CAP,
+): number {
+  return countUnreadRows(networkId, target, afterId, COUNTABLE_TYPES_SQL, false, cap);
+}
+
+// Unread count for a `:server:` pseudo-buffer (#470). Differs from countNewer in
+// two ways: it also counts `error` rows (a killed/banned/connection-failed line
+// SHOULD mark the server buffer unread — those are type 'error', which countNewer
+// excludes), and it counts only `notable = 1` rows so Lurker's own routine
+// connection-status notices (connecting/reconnecting/nick-status/monitor-limit,
+// stamped notable=0 at publish) don't. Genuine inbound notices/messages and
+// closed-buffer NOTICE mirrors are notable by default, so they still badge.
+export function countServerBufferUnread(
+  networkId: number,
+  target: string,
+  afterId: number,
+  cap = UNREAD_COUNT_CAP,
+): number {
+  return countUnreadRows(networkId, target, afterId, SERVER_COUNTABLE_TYPES_SQL, true, cap);
+}
+
 // Cheap indexed count of unread highlights since `afterId`. Uses the partial
 // idx_messages_matched index — the old scan+decorate approach was replaced
 // once match state moved to insert time. Ignored senders are excluded so the
-// red highlight pip doesn't fire for someone the user can't see.
+// red highlight pip doesn't fire for someone the user can't see. notable=0 lines
+// are excluded too (#470): a Lurker status notice that happens to match a self-
+// nick rule ("Reclaimed nick <you>.") must not highlight the server buffer when
+// it's deliberately not even counted as unread.
 export function countHighlightsNewer(networkId: number, target: string, afterId: number): number {
   return (
     db
@@ -426,7 +566,8 @@ export function countHighlightsNewer(networkId: number, target: string, afterId:
         `SELECT COUNT(*) AS n FROM messages
      WHERE network_id = ? AND target = ? AND id > ?
        AND matched_rule_id IS NOT NULL
-       AND from_ignored = 0`,
+       AND from_ignored = 0
+       AND notable = 1`,
       )
       .get(networkId, target, afterId || 0) as { n: number }
   ).n;

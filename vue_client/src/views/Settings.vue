@@ -71,7 +71,7 @@ const config = useConfigStore();
 const route = useRoute();
 const router = useRouter();
 
-const isAdmin = computed(() => auth.user?.role === 'admin');
+const isAdmin = computed(() => auth.isAdmin);
 const error = ref('');
 
 // One component per bespoke category. Registry-driven categories all share
@@ -94,6 +94,7 @@ const visibleCategories = computed(() =>
       isAdmin: isAdmin.value,
       isNode: config.isNode,
       isPublicMode: config.isPublicMode,
+      newAdminPanel: config.newAdminPanel,
     }),
   ),
 );

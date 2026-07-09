@@ -5,164 +5,262 @@
 
 <template>
   <div class="buffer-list-frame">
-    <nav
-      ref="scroller"
-      class="buffer-list"
-      :class="{ 'unread-bold': unreadBold }"
-      @scroll="scheduleRecompute"
-    >
-      <!-- LURKER: the system buffer (#355) as a real top-of-list row. The status
-           light tracks the Lurker connection; the collapse control sits in the
-           corner — always visible (not hover-gated), but yielding the corner to
-           the unread/highlight badge when there is one. (Settings lives in the
-           sidebar footer.) -->
-      <div class="net system-net">
-        <div
-          class="net-head"
-          :class="{ active: isSystemActive }"
-          title="Open Lurker system buffer"
-          @click="selectSystem"
+    <!-- LURKER: the system buffer (#355) as a proper fixed header — it does not
+         scroll with the list (the list scrolls beneath it), matching the pinned
+         sidebar footer. Corner controls: + adds a network, << collapses the
+         sidebar; both always visible (not hover-gated). When the row itself has
+         an unread/highlight badge the + yields the corner to it (the << stays);
+         hovering brings the + back. -->
+    <div class="net system-net">
+      <div
+        class="net-head"
+        :class="{ active: isSystemActive }"
+        title="Open Lurker system buffer"
+        @click="selectSystem"
+      >
+        <span
+          class="indicator"
+          :class="lurkerConnected ? 'good' : 'bad'"
+          :title="lurkerConnected ? 'Connected to Lurker' : 'Disconnected from Lurker'"
+        ></span>
+        <span class="name">LURKER</span>
+        <span
+          v-if="systemHighlights > 0 && showHighlightBadge"
+          class="badge highlight"
+          title="unread"
+          >●</span
         >
-          <span
-            class="indicator"
-            :class="lurkerConnected ? 'good' : 'bad'"
-            :title="lurkerConnected ? 'Connected to Lurker' : 'Disconnected from Lurker'"
-          ></span>
-          <span class="name">LURKER</span>
-          <span
-            v-if="systemHighlights > 0 && showHighlightBadge"
-            class="badge highlight"
-            title="unread"
-            >●</span
+        <span v-if="systemUnread > 0" class="badge">{{ unreadLabel(systemUnread) }}</span>
+        <div class="net-actions">
+          <button
+            type="button"
+            class="net-action net-add"
+            title="Add network"
+            aria-label="Add network"
+            @click.stop="openAddNetwork"
+            @contextmenu.stop.prevent
           >
-          <span v-if="systemUnread > 0" class="badge">{{ unreadLabel(systemUnread) }}</span>
-          <div class="net-actions">
-            <button
-              type="button"
-              class="net-action"
-              title="Hide channel list"
-              aria-label="Hide channel list"
-              @click.stop="collapseSidebar"
-              @contextmenu.stop.prevent
-            >
-              <i class="fa-solid fa-angles-left"></i>
-            </button>
-          </div>
+            <i class="fa-solid fa-plus"></i>
+          </button>
+          <button
+            v-if="showAdminEntry"
+            type="button"
+            class="net-action net-admin"
+            title="Admin panel"
+            aria-label="Admin panel"
+            @click.stop="openAdmin"
+            @contextmenu.stop.prevent
+          >
+            <i class="fa-solid fa-shield-halved"></i>
+          </button>
+          <button
+            type="button"
+            class="net-action net-settings"
+            title="Settings"
+            aria-label="Settings"
+            @click.stop="openSettings"
+            @contextmenu.stop.prevent
+          >
+            <i class="fa-solid fa-gear"></i>
+          </button>
+          <button
+            type="button"
+            class="net-action"
+            title="Hide channel list"
+            aria-label="Hide channel list"
+            @click.stop="collapseSidebar"
+            @contextmenu.stop.prevent
+          >
+            <i class="fa-solid fa-angles-left"></i>
+          </button>
         </div>
       </div>
+    </div>
 
-      <!-- FRIENDS pseudo-network: a cross-network gathering of DM shortcuts. The
+    <div class="buffer-list-scroll">
+      <nav
+        ref="scroller"
+        class="buffer-list"
+        :class="{ 'unread-bold': unreadBold }"
+        @scroll="scheduleRecompute"
+      >
+        <!-- FRIENDS pseudo-network: a cross-network gathering of DM shortcuts. The
            header opens the compilation feed (:friends:); each row opens that
            friend's DM on their primary network. -->
-      <div v-if="friends.contacts.length || isFriendsActive" class="net friends-net">
-        <div
-          class="net-head"
-          :class="{ active: isFriendsActive }"
-          title="Open Friends feed"
-          @click="selectFriends"
-        >
-          <span class="indicator" :class="friendsPresence" :title="friendsStatusTitle"></span>
-          <span class="name">FRIENDS</span>
-        </div>
-        <ul v-if="friends.contacts.length" class="channels">
-          <li
-            v-for="c in friends.contacts"
-            :key="c.id"
-            :class="friendRowClasses(c)"
-            :title="`Open DM with ${c.displayName}`"
-            @click="openFriendDm(c)"
-            @contextmenu.prevent="openFriendActions($event, c)"
+        <div v-if="friends.contacts.length || isFriendsActive" class="net friends-net">
+          <div
+            class="net-head"
+            :class="{ active: isFriendsActive }"
+            title="Open Friends feed"
+            @click="selectFriends"
           >
-            <span class="label">{{ c.displayName }}</span>
+            <span class="indicator" :class="friendsPresence" :title="friendsStatusTitle"></span>
+            <span class="name">FRIENDS</span>
+            <div class="net-actions">
+              <button
+                type="button"
+                class="net-action net-add"
+                title="Add friend"
+                aria-label="Add friend"
+                @click.stop="friends.openEditorNew()"
+                @contextmenu.stop.prevent
+              >
+                <i class="fa-solid fa-plus"></i>
+              </button>
+            </div>
+          </div>
+          <ul v-if="friends.contacts.length" class="channels">
+            <li
+              v-for="c in friends.contacts"
+              :key="c.id"
+              :class="friendRowClasses(c)"
+              :title="`Open DM with ${c.displayName}`"
+              @click="openFriendDm(c)"
+              @contextmenu.prevent="openFriendActions($event, c)"
+            >
+              <span class="label">{{ c.displayName }}</span>
+              <span
+                v-if="friendHighlights(c) > 0 && showHighlightBadge"
+                class="badge highlight"
+                title="unread highlight"
+                >●</span
+              >
+              <span v-if="friendUnread(c) > 0" class="badge">{{
+                unreadLabel(friendUnread(c))
+              }}</span>
+              <button
+                type="button"
+                class="row-actions"
+                title="Edit friend"
+                aria-label="Edit friend"
+                @click.stop="friends.openEditorForContact(c)"
+                @contextmenu.stop.prevent
+              >
+                <i class="fa-solid fa-user-pen"></i>
+              </button>
+            </li>
+          </ul>
+        </div>
+
+        <div v-for="net in networks.networks" :key="net.id" class="net">
+          <div
+            class="net-head"
+            :class="netHeadClasses(net.id)"
+            :title="`Open ${net.name} server buffer`"
+            @click="select(net.id, serverTarget(net.id))"
+            @contextmenu.prevent="
+              networkActions.onNetworkContextMenu(net, $event.clientX, $event.clientY)
+            "
+          >
+            <span class="indicator" :class="stateClass(net.id)"></span>
+            <span class="name">{{ net.name }}</span>
             <span
-              v-if="friendHighlights(c) > 0 && showHighlightBadge"
+              v-if="serverHighlights(net.id) > 0 && showHighlightBadge"
               class="badge highlight"
-              title="unread highlight"
+              :title="`${serverHighlights(net.id)} highlight${serverHighlights(net.id) === 1 ? '' : 's'}`"
               >●</span
             >
-            <span v-if="friendUnread(c) > 0" class="badge">{{ unreadLabel(friendUnread(c)) }}</span>
-            <button
-              type="button"
-              class="row-actions"
-              title="Friend actions"
-              aria-label="Friend actions"
-              @click.stop="openFriendActions($event, c)"
-              @contextmenu.stop.prevent
+            <span
+              v-if="countFor(serverUnread(net.id), serverHighlights(net.id)) > 0"
+              class="badge"
+              >{{ unreadLabel(countFor(serverUnread(net.id), serverHighlights(net.id))) }}</span
             >
-              <i class="fa-solid fa-ellipsis-vertical"></i>
-            </button>
-          </li>
-        </ul>
-      </div>
-
-      <div v-for="net in networks.networks" :key="net.id" class="net">
-        <div
-          class="net-head"
-          :class="netHeadClasses(net.id)"
-          :title="`Open ${net.name} server buffer`"
-          @click="select(net.id, serverTarget(net.id))"
-          @contextmenu.prevent="
-            networkActions.onNetworkContextMenu(net, $event.clientX, $event.clientY)
-          "
-        >
-          <span class="indicator" :class="stateClass(net.id)"></span>
-          <span class="name">{{ net.name }}</span>
-          <span
-            v-if="serverHighlights(net.id) > 0 && showHighlightBadge"
-            class="badge highlight"
-            :title="`${serverHighlights(net.id)} highlight${serverHighlights(net.id) === 1 ? '' : 's'}`"
-            >●</span
-          >
-          <span v-if="countFor(serverUnread(net.id), serverHighlights(net.id)) > 0" class="badge">{{
-            unreadLabel(countFor(serverUnread(net.id), serverHighlights(net.id)))
-          }}</span>
-          <div v-if="!hasUnreadIndicator(serverBuf(net.id))" class="net-actions">
-            <button
-              type="button"
-              class="net-action"
-              :disabled="!isNetworkConnected(net)"
-              title="Channel List"
-              aria-label="Channel list"
-              @click.stop="networkActions.openChannelList(net)"
-              @contextmenu.stop.prevent
-            >
-              <i class="fa-solid fa-hashtag"></i>
-            </button>
-            <button
-              type="button"
-              class="net-action"
-              title="Network options"
-              aria-label="Network options"
-              @click.stop="networkActions.openMenuFromButton(net, $event.currentTarget as Element)"
-              @contextmenu.stop.prevent
-            >
-              <i class="fa-solid fa-ellipsis-vertical"></i>
-            </button>
+            <div class="net-actions">
+              <button
+                type="button"
+                class="net-action net-add"
+                :disabled="!isNetworkConnected(net)"
+                title="Add channel"
+                aria-label="Add channel"
+                @click.stop="joinChannelModal.open(net.id)"
+                @contextmenu.stop.prevent
+              >
+                <i class="fa-solid fa-plus"></i>
+              </button>
+              <button
+                type="button"
+                class="net-action"
+                title="Network options"
+                aria-label="Network options"
+                @click.stop="
+                  networkActions.openMenuFromButton(net, $event.currentTarget as Element)
+                "
+                @contextmenu.stop.prevent
+              >
+                <i class="fa-solid fa-ellipsis-vertical"></i>
+              </button>
+            </div>
           </div>
-        </div>
 
-        <!-- Touch delay (200ms, touch-only) so a quick swipe over the pinned
+          <!-- Touch delay (200ms, touch-only) so a quick swipe over the pinned
              section scrolls the channel list instead of starting a reorder.
              Press-and-hold still initiates drag — the iOS/Discord/Slack
              reorder convention. touchStartThreshold cancels the pending drag
              if the finger moves more than 5px during the delay, so scroll
              intent is recognised early. Desktop mouse drag stays instant. -->
-        <draggable
-          v-if="(pinnedBufsByNet[net.id] || []).length"
-          :list="pinnedBufsByNet[net.id]"
-          item-key="target"
-          tag="ul"
-          class="channels pinned"
-          :animation="120"
-          ghost-class="drag-ghost"
-          :delay="200"
-          :delay-on-touch-only="true"
-          :touch-start-threshold="5"
-          @start="dragging = true"
-          @end="onPinDragEnd(net.id)"
-        >
-          <template #item="{ element: buf }">
+          <draggable
+            v-if="(pinnedBufsByNet[net.id] || []).length"
+            :list="pinnedBufsByNet[net.id]"
+            item-key="target"
+            tag="ul"
+            class="channels pinned"
+            :animation="120"
+            ghost-class="drag-ghost"
+            :delay="200"
+            :delay-on-touch-only="true"
+            :touch-start-threshold="5"
+            @start="dragging = true"
+            @end="onPinDragEnd(net.id)"
+          >
+            <template #item="{ element: buf }">
+              <li
+                :class="rowClasses(buf, net.id)"
+                :title="dmTitle(buf)"
+                @click="select(net.id, buf.target)"
+                @contextmenu.prevent="onBufferContextMenu($event, buf)"
+              >
+                <span class="label">{{ labelFor(buf) }}</span>
+                <span
+                  v-if="hasDraft(buf)"
+                  class="badge draft"
+                  title="unsent draft"
+                  aria-label="unsent draft"
+                  ><i class="fa-solid fa-pencil"></i
+                ></span>
+                <span
+                  v-if="buf.highlighted > 0 && showHighlightBadge"
+                  class="badge highlight"
+                  :title="`${buf.highlighted} highlight${buf.highlighted === 1 ? '' : 's'}`"
+                  >●</span
+                >
+                <span v-if="displayCount(buf) > 0" class="badge">{{
+                  unreadLabel(displayCount(buf))
+                }}</span>
+                <button
+                  v-if="!isServerBuffer(buf)"
+                  type="button"
+                  class="row-actions"
+                  title="Actions"
+                  aria-label="Buffer actions"
+                  @click.stop="onRowActionsClick($event, buf)"
+                  @contextmenu.stop.prevent
+                >
+                  <i class="fa-solid fa-ellipsis-vertical"></i>
+                </button>
+              </li>
+            </template>
+          </draggable>
+
+          <div
+            v-if="(pinnedBufsByNet[net.id] || []).length && unpinnedBufs(net.id).length"
+            class="pin-divider"
+            aria-hidden="true"
+          ></div>
+
+          <ul v-if="unpinnedBufs(net.id).length" class="channels">
             <li
+              v-for="buf in unpinnedBufs(net.id)"
+              :key="buf.target"
               :class="rowClasses(buf, net.id)"
               :title="dmTitle(buf)"
               @click="select(net.id, buf.target)"
@@ -186,7 +284,7 @@
                 unreadLabel(displayCount(buf))
               }}</span>
               <button
-                v-if="!isServerBuffer(buf) && !hasUnreadIndicator(buf)"
+                v-if="!isServerBuffer(buf)"
                 type="button"
                 class="row-actions"
                 title="Actions"
@@ -197,77 +295,31 @@
                 <i class="fa-solid fa-ellipsis-vertical"></i>
               </button>
             </li>
-          </template>
-        </draggable>
-
-        <div
-          v-if="(pinnedBufsByNet[net.id] || []).length && unpinnedBufs(net.id).length"
-          class="pin-divider"
-          aria-hidden="true"
-        ></div>
-
-        <ul v-if="unpinnedBufs(net.id).length" class="channels">
-          <li
-            v-for="buf in unpinnedBufs(net.id)"
-            :key="buf.target"
-            :class="rowClasses(buf, net.id)"
-            :title="dmTitle(buf)"
-            @click="select(net.id, buf.target)"
-            @contextmenu.prevent="onBufferContextMenu($event, buf)"
-          >
-            <span class="label">{{ labelFor(buf) }}</span>
-            <span
-              v-if="hasDraft(buf)"
-              class="badge draft"
-              title="unsent draft"
-              aria-label="unsent draft"
-              ><i class="fa-solid fa-pencil"></i
-            ></span>
-            <span
-              v-if="buf.highlighted > 0 && showHighlightBadge"
-              class="badge highlight"
-              :title="`${buf.highlighted} highlight${buf.highlighted === 1 ? '' : 's'}`"
-              >●</span
-            >
-            <span v-if="displayCount(buf) > 0" class="badge">{{
-              unreadLabel(displayCount(buf))
-            }}</span>
-            <button
-              v-if="!isServerBuffer(buf) && !hasUnreadIndicator(buf)"
-              type="button"
-              class="row-actions"
-              title="Actions"
-              aria-label="Buffer actions"
-              @click.stop="onRowActionsClick($event, buf)"
-              @contextmenu.stop.prevent
-            >
-              <i class="fa-solid fa-ellipsis-vertical"></i>
-            </button>
-          </li>
-        </ul>
-      </div>
-      <p v-if="!networks.networks.length" class="empty">
-        No networks yet — add one with the + button.
-      </p>
-    </nav>
-    <button
-      v-if="unreadAbove"
-      type="button"
-      class="unread-edge top"
-      :class="{ 'is-highlight': highlightAbove }"
-      title="Unread buffers above — click to scroll into view"
-      aria-label="Scroll to unread buffers above"
-      @click="scrollToUnread('up')"
-    ></button>
-    <button
-      v-if="unreadBelow"
-      type="button"
-      class="unread-edge bottom"
-      :class="{ 'is-highlight': highlightBelow }"
-      title="Unread buffers below — click to scroll into view"
-      aria-label="Scroll to unread buffers below"
-      @click="scrollToUnread('down')"
-    ></button>
+          </ul>
+        </div>
+        <p v-if="!networks.networks.length" class="empty">
+          No networks yet — add one with the + button.
+        </p>
+      </nav>
+      <button
+        v-if="unreadAbove"
+        type="button"
+        class="unread-edge top"
+        :class="{ 'is-highlight': highlightAbove }"
+        title="Unread buffers above — click to scroll into view"
+        aria-label="Scroll to unread buffers above"
+        @click="scrollToUnread('up')"
+      ></button>
+      <button
+        v-if="unreadBelow"
+        type="button"
+        class="unread-edge bottom"
+        :class="{ 'is-highlight': highlightBelow }"
+        title="Unread buffers below — click to scroll into view"
+        aria-label="Scroll to unread buffers below"
+        @click="scrollToUnread('down')"
+      ></button>
+    </div>
   </div>
 </template>
 
@@ -282,6 +334,7 @@ import {
   ref,
   watch,
 } from 'vue';
+import { useRouter } from 'vue-router';
 import draggable from 'vuedraggable';
 import { useNetworksStore, type Network, type PeerPresenceEntry } from '../stores/networks.js';
 import { useBuffersStore, type Buffer } from '../stores/buffers.js';
@@ -292,8 +345,12 @@ import { useDraftStore } from '../stores/drafts.js';
 import { usePinsStore } from '../stores/pins.js';
 import { useIgnoresStore } from '../stores/ignores.js';
 import { useSettingsStore } from '../stores/settings.js';
+import { useAuthStore } from '../stores/auth.js';
+import { useConfigStore } from '../stores/config.js';
 import { useBufferActions } from '../composables/useBufferActions.js';
 import { useNetworkActions } from '../composables/useNetworkActions.js';
+import { useNetworkEditor } from '../composables/useNetworkEditor.js';
+import { useJoinChannelModal } from '../composables/useJoinChannelModal.js';
 import { useContextMenu } from '../composables/useContextMenu.js';
 import {
   isPeerOffline as derivePeerOffline,
@@ -307,9 +364,37 @@ const drafts = useDraftStore();
 const pins = usePinsStore();
 const ignores = useIgnoresStore();
 const settings = useSettingsStore();
+const auth = useAuthStore();
+const config = useConfigStore();
 const bufferActions = useBufferActions();
 const networkActions = useNetworkActions();
+const networkEditor = useNetworkEditor();
+const joinChannelModal = useJoinChannelModal();
 const friendMenu = useContextMenu();
+const router = useRouter();
+
+// The + in the LURKER header opens the add-network editor (the button moved off
+// the sidebar footer — #411). The modal itself is rendered by the chat shell
+// (Desktop/MobileChat), which already watches networkEditor.isOpen.
+function openAddNetwork(): void {
+  networkEditor.open();
+}
+
+// The LURKER header's sliders is the app-scoped "settings" affordance — the
+// system buffer's scope is the whole app, so its settings are the global ones
+// (#411). Moved here off the sidebar footer; the collapsed rail keeps its own
+// copy since this header is unmounted while collapsed (see DesktopChat).
+function openSettings(): void {
+  router.push('/settings').catch((err) => console.error('[BufferList] open settings failed', err));
+}
+
+// The shield next to the gear opens the dedicated admin panel — admin-only, and
+// only when the instance enabled it (LURKER_NEW_ADMIN_PANEL). With the flag off,
+// admin controls stay in Settings and this button never renders.
+const showAdminEntry = computed(() => config.newAdminPanel && auth.isAdmin);
+function openAdmin(): void {
+  router.push('/admin').catch((err) => console.error('[BufferList] open admin failed', err));
+}
 
 function isNetworkConnected(net: Network): boolean {
   return networks.states[net.id]?.state === 'connected';
@@ -365,15 +450,6 @@ function displayCount(buf: Buffer): number {
   if (mode === 'full') return buf.unread;
   if (mode === 'highlights') return buf.highlighted;
   return 0;
-}
-
-// Hover-revealed kebab lives in the same right-edge slot as the unread/
-// highlight badges. When the row has unread state, the badge wins — the
-// kebab stays hidden so it doesn't overlay the indicator the user is
-// scanning for. Right-click on the row still opens the same action menu.
-function hasUnreadIndicator(buf: Buffer | null): boolean {
-  if (!buf) return false;
-  return (buf.highlighted > 0 && showHighlightBadge.value) || displayCount(buf) > 0;
 }
 
 // Per-network local mirror of the pinned buffer list, kept as concrete buffer
@@ -504,7 +580,8 @@ function onBufferContextMenu(e: MouseEvent, buf: Buffer): void {
   bufferActions.openMenuFor(buf, e.clientX, e.clientY);
 }
 
-// Hover three-dots affordance — opens the same menu anchored to the button.
+// The per-row kebab (channel/DM rows) — opens the buffer's context menu anchored
+// to the button, the same menu a right-click on the row gives.
 function onRowActionsClick(e: MouseEvent, buf: Buffer): void {
   bufferActions.openMenuFromButton(buf, e.currentTarget as Element);
 }
@@ -793,23 +870,12 @@ function scrollActiveIntoZone(behavior: ScrollBehavior): void {
   const elRect = el.getBoundingClientRect();
   const rowH = elRect.height;
   if (rowH <= 0) return;
-  // The LURKER row (.system-net) is sticky-pinned to the top on desktop, so
-  // buffers scroll *under* it — the usable top of the viewport is below it, not
-  // at scRect.top. Without this inset, upward nav parks the active row 3 rows
-  // below scRect.top but the sticky header hides the topmost ~row, so the top
-  // stays cramped while the (unobstructed) bottom looks fine (#388). The formula
-  // also covers mobile, where .system-net is inline: it insets only by however
-  // much the row actually overlaps the top, and clamps to 0 once it scrolls off.
-  const sticky = sc.querySelector<HTMLElement>('.system-net');
-  const topInset = sticky ? Math.max(0, sticky.getBoundingClientRect().bottom - scRect.top) : 0;
-  // When the active row IS the sticky LURKER row and it's pinned at the top
-  // (topInset > 0), it's already fully visible, so selecting the system buffer
-  // must not move the list. Without this the math below treats the pinned header
-  // as sitting above the zone and yanks the list back to the top. On mobile the
-  // row is inline and can scroll off (topInset === 0), so we fall through and
-  // reveal it normally.
-  if (sticky && topInset > 0 && sticky.contains(el)) return;
-  const topEdge = scRect.top + topInset;
+  // The LURKER row now lives in a fixed header *outside* this scroller (#411), so
+  // the scroller's own top is the usable top of the viewport — no sticky-header
+  // inset to subtract anymore. The system buffer's header can never be `.active`
+  // inside `sc` (it isn't a descendant), so the query above returns null for it
+  // and we've already bailed; no special-case needed here.
+  const topEdge = scRect.top;
   const bottomEdge = scRect.bottom;
   // Never demand more room than centering would, so a viewport too short for the
   // full zone degrades to "centered" instead of fighting between the two edges.
@@ -869,10 +935,18 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-/* The frame is the component root: a non-scrolling, positioned box that holds
-   the scrollable nav plus the absolutely-pinned out-of-view unread bars. It
-   takes the flex slot the .buffer-list used to occupy in the sidebar. */
+/* The frame is the component root: a column of [fixed LURKER header] + [scroll
+   region]. The header never scrolls (#411); the scroll region holds the
+   scrollable nav plus the absolutely-pinned out-of-view unread bars. */
 .buffer-list-frame {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* Positioned wrapper so the out-of-view unread bars pin to the top/bottom of the
+   scroll viewport (below the fixed header), not the whole frame. */
+.buffer-list-scroll {
   flex: 1;
   min-height: 0;
   position: relative;
@@ -883,8 +957,8 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  /* No top padding: the LURKER row is always first and sits flush at the top so
-     it lines up with the topic bar across the sidebar boundary (#355). */
+  /* No top padding: the first network group sits flush under the fixed LURKER
+     header so it lines up with the topic bar across the sidebar boundary. */
   padding: 0 0 var(--space-2);
 }
 /* IRCCloud-style affordance: a thin accent bar pinned to the top or bottom
@@ -951,34 +1025,25 @@ onBeforeUnmount(() => {
   border-top: 1px solid var(--border);
   margin-top: var(--space-2);
 }
-/* The LURKER row is the sidebar's header — size it to the topic bar beside it:
+/* The LURKER row is the sidebar's header — a real fixed header now (#411): it's
+   a flex child of the frame that sits above the scroll region and never scrolls,
+   the same way the sidebar footer is pinned. Size it to the topic bar beside it:
    strip the group padding so it sits flush, give its head the topic bar's 8px
    block padding, and cap it with a 1px rule that lines up with the topic
    divider. (#355) */
 .system-net {
   padding: 0;
   border-bottom: 1px solid var(--border);
+  background: var(--bg);
 }
 .system-net .net-head {
   padding-block: var(--space-4);
-}
-/* The next group draws its own top separator via `.net + .net`; drop it here so
-   it doesn't double up with the LURKER row's bottom rule. */
-.system-net + .net {
-  border-top: none;
-  margin-top: 0;
-}
-/* Desktop only: pin the LURKER row as a fixed header so the networks/buffers
-   scroll under it. (Mobile keeps it inline — it has its own top bar.) Needs an
-   opaque background matching the sidebar (which inherits --bg) so scrolling rows
-   don't show through, and a z-index above them. */
-@media (min-width: 769px) {
-  .system-net {
-    position: sticky;
-    top: 0;
-    z-index: var(--z-base);
-    background: var(--bg);
-  }
+  /* Trim the right padding to var(--space-2) so the always-visible inline
+     + / gear / << line up with the absolutely-positioned + that the network /
+     FRIENDS headers reveal at right: var(--space-2). Without this the LURKER
+     controls, being in normal flow, end at the wider var(--space-5) content edge
+     and read ~6px too far left. (#411) */
+  padding-inline-end: var(--space-2);
 }
 .net-head {
   display: flex;
@@ -1006,15 +1071,25 @@ onBeforeUnmount(() => {
   border-left-color: var(--accent);
 }
 
-/* Hover action buttons on network rows — mirrors .channels .row-actions pattern. */
+/* Network-row header actions (+ add channel/network/friend, kebab). Hidden by
+   default and revealed only when the row is engaged — hovered, selected
+   (active), or keyboard-focused (#411) — so the corner stays quiet. At rest it
+   shows the unread/highlight badge (or nothing); when the actions appear the
+   badge steps aside so the two never stack.
+   pointer-events:none while hidden is essential, not cosmetic: the actions are
+   absolutely positioned over the badge, so an opacity:0 (but still hit-testable)
+   overlay would swallow taps meant for the row. On a touch device in desktop
+   layout (iPad, width>768) there's no hover, so without this a tap on a network
+   row's right edge could fire "add channel"/options instead of opening it. */
 .net-actions {
   position: absolute;
   right: var(--space-2);
   top: 50%;
   transform: translateY(-50%);
   display: flex;
-  background: var(--bg-soft);
+  background: none;
   opacity: 0;
+  pointer-events: none;
   transition: opacity 80ms linear;
 }
 .net-action {
@@ -1026,9 +1101,28 @@ onBeforeUnmount(() => {
   font: inherit;
   line-height: 1;
 }
+/* Reveal triggers. Selected (active) and keyboard focus work on every device;
+   hover is desktop-only (gated below) so touch doesn't get a sticky-hover
+   reveal. Each also hides the badge so it doesn't sit under the actions. */
+.net-head.active .net-actions,
+.net-head:focus-within .net-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* Only the network/FRIENDS headers hide their badge when the actions reveal —
+   their actions are absolute and would overlap it. The LURKER header keeps its
+   actions inline and always-visible (below), so its count never needs to hide. */
+.net:not(.system-net) .net-head.active .badge,
+.net:not(.system-net) .net-head:focus-within .badge {
+  visibility: hidden;
+}
 @media (hover: hover) {
   .net-head:hover .net-actions {
     opacity: 1;
+    pointer-events: auto;
+  }
+  .net:not(.system-net) .net-head:hover .badge {
+    visibility: hidden;
   }
   .net-head:hover .net-action:disabled {
     opacity: 0.35;
@@ -1036,9 +1130,6 @@ onBeforeUnmount(() => {
   .net-action:hover {
     color: var(--fg);
   }
-}
-.net-actions:focus-within {
-  opacity: 1;
 }
 .net-action:disabled {
   pointer-events: none;
@@ -1049,23 +1140,48 @@ onBeforeUnmount(() => {
   }
 }
 
-/* LURKER row (#355): the settings cog is always visible, not hover-gated like
-   the other network rows. When an unread/highlight badge is present it takes
-   the corner and the cog steps aside — the badge is the more important signal,
-   and the cog returns the moment the buffer is read. */
+/* LURKER header (#411): its actions ride the normal flex flow (static, not
+   absolute) so they sit beside the unread count without overlapping it (which is
+   also why the count never has to step aside here). The container stays visible
+   because the << collapse control is a persistent affordance — but the + (add
+   network) and gear (settings) reveal only on hover / selection / focus, like
+   the other headers' actions. */
 .system-net .net-actions {
+  position: static;
+  transform: none;
   opacity: 1;
-  /* Flat (no chip): the cog is always visible here, so unlike the other rows'
-     hover-revealed actions there's no row content to mask behind it. */
-  background: none;
+  pointer-events: auto;
 }
-.system-net .net-head:has(.badge) .net-actions {
-  display: none;
+/* On pointer (hover-capable) devices, declutter the header: hide the + and gear
+   until the row is hovered, selected, or focused. Touch devices have no hover to
+   reveal them (and display:none would make them unfocusable, so :focus-within
+   couldn't help either) — so there the whole block is skipped and they stay
+   visible. The collapse << is always visible on every device regardless. */
+@media (hover: hover) {
+  .system-net .net-add,
+  .system-net .net-settings {
+    display: none;
+  }
+  .system-net .net-head:hover .net-add,
+  .system-net .net-head:hover .net-settings,
+  .system-net .net-head.active .net-add,
+  .system-net .net-head.active .net-settings,
+  .system-net .net-head:focus-within .net-add,
+  .system-net .net-head:focus-within .net-settings {
+    display: inline-flex;
+  }
 }
 
 .name {
   flex: 1;
   color: var(--fg);
+  /* Ellipsize like .label so a long network name clips instead of wrapping the
+     row to two lines or running under the revealed + / kebab glyphs. min-width:0
+     lets the flex item shrink below its content width so the ellipsis engages. */
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .indicator {
   width: 7px;
@@ -1194,13 +1310,14 @@ onBeforeUnmount(() => {
   color: var(--fg-muted);
 }
 
-/* Hover three-dots: absolute-positioned so it doesn't displace badges on
-   hover-in. Briefly overlays the rightmost badges while the cursor is on
-   the row — that's the moment the user is reaching for the menu, so the
-   badges have already done their job. Background matches the row's hover
-   shade so the overlay reads as part of the row, not floating chrome.
-   Hidden on touch breakpoints; mobile uses the topic-bar cog (channels/
-   DMs) or single-tap (members) instead. */
+/* Per-row settings affordance (the sliders on channel/DM rows, the kebab on
+   friend rows). Absolute so it overlays the badges rather than displacing them.
+   Same reveal model as the header + buttons (#411): hidden at rest, surfaced
+   when the row is hovered, selected (active), or keyboard-focused, with the
+   badge stepping aside so the two never stack. Background matches the row's
+   hover/active shade so the overlay reads as part of the row. Hidden on phones
+   (mobile uses the topic-bar cog / single-tap); on tablets the active row and
+   long-press cover it. */
 .channels .row-actions {
   position: absolute;
   right: var(--space-2);
@@ -1214,22 +1331,34 @@ onBeforeUnmount(() => {
   font: inherit;
   line-height: 1;
   opacity: 0;
+  /* pointer-events:none while hidden so the invisible overlay can't swallow taps
+     on the row's right edge — on iPad (width>768) an inactive row's control
+     never reveals, and long-press on the row opens the same menu, so it must
+     never be tappable in its own right. */
+  pointer-events: none;
   transition: opacity 80ms linear;
 }
-/* Reveal the row-actions button on hover (desktop) or keyboard focus (a11y).
-   No touch path here on purpose — long-press fires `contextmenu` on the row,
-   which already opens the same buffer-actions menu, so iPad users reach
-   identical functionality without paying the sticky-hover two-tap tax. */
+/* Reveal on select (active) or keyboard focus — works on every device. */
+.channels li.active .row-actions,
+.channels .row-actions:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+.channels li.active .badge {
+  visibility: hidden;
+}
+/* Reveal on hover — desktop only, so touch doesn't get a sticky-hover reveal. */
 @media (hover: hover) {
   .channels li:hover .row-actions {
     opacity: 1;
+    pointer-events: auto;
+  }
+  .channels li:hover .badge {
+    visibility: hidden;
   }
   .channels .row-actions:hover {
     color: var(--fg);
   }
-}
-.channels .row-actions:focus-visible {
-  opacity: 1;
 }
 @media (max-width: 768px) {
   .channels .row-actions {

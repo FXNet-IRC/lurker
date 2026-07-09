@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import db from './index.js';
-import { encryptSecret, decryptSecret, isEncrypted, hasSecretKey } from '../utils/secretCrypto.js';
+import { encryptSecret, decryptSecret } from '../utils/secretCrypto.js';
 import { ENCRYPTED_NETWORK_COLUMNS } from './exportSchema.js';
 
 // The list of encrypted network-secret columns lives in db/exportSchema.ts (a
 // db-singleton-free module) so the worker-safe export builder can import it
-// without pulling this module's db connection into a worker. Re-exported here
-// for the callers that have always reached for it via db/networks.js.
-export { ENCRYPTED_NETWORK_COLUMNS };
+// without pulling this module's db connection into a worker. Used below by the
+// read-decrypt and write-encrypt chokepoints.
 
 // Decrypt the secret columns on a freshly-read row, in place. No-op for legacy
 // plaintext and when no key is configured (decryptSecret passes those through).
@@ -51,6 +50,8 @@ export interface Channel {
   name: string;
   joined: number;
   created_at: string;
+  // The +k channel key (decrypted on read), or null for a keyless channel.
+  key: string | null;
 }
 
 /** Fields accepted when creating or updating a network. */
@@ -166,7 +167,7 @@ export function updateNetwork(
       let value: unknown = fields[key];
       if (key === 'tls' || key === 'autoconnect' || key === 'trusted_certificates')
         value = value ? 1 : 0;
-      else if ((ENCRYPTED_NETWORK_COLUMNS as readonly string[]).includes(key)) {
+      else if (ENCRYPTED_NETWORK_COLUMNS.includes(key)) {
         value = encryptSecret(value as string | null);
       }
       params.push(value);
@@ -207,44 +208,10 @@ export function setClientIpForAllUserNetworks(userId: number, ip: string | null)
   db.prepare('UPDATE networks SET last_client_ip = ? WHERE user_id = ?').run(ip, userId);
 }
 
-// One-time, idempotent wrap of any plaintext secret columns once an encryption
-// key is configured. The chokepoint above encrypts rows written after the key
-// is set; this catches rows that predate it (or arrive plaintext via import) so
-// no cleartext secret lingers in the next Litestream backup. No-op without a key
-// (every self-host). Safe to run on every boot — the isEncrypted() guard skips
-// already-wrapped values, so a fully-encrypted table does zero writes. Called
-// once from server boot (server/server.ts), after the schema is ready and
-// before IRC connects.
-export function backfillEncryptNetworkSecrets(): { scanned: number; encrypted: number } {
-  if (!hasSecretKey()) return { scanned: 0, encrypted: 0 };
-  const cols = ENCRYPTED_NETWORK_COLUMNS;
-  const rows = db.prepare(`SELECT id, ${cols.join(', ')} FROM networks`).all() as Array<
-    Record<string, string | null> & { id: number }
-  >;
-  const update = db.prepare(
-    `UPDATE networks SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`,
-  );
-  let encrypted = 0;
-  const tx = db.transaction(() => {
-    for (const row of rows) {
-      let dirty = false;
-      const next = cols.map((col) => {
-        const v = row[col];
-        if (typeof v === 'string' && v !== '' && !isEncrypted(v)) {
-          dirty = true;
-          return encryptSecret(v);
-        }
-        return v;
-      });
-      if (dirty) {
-        update.run(...next, row.id);
-        encrypted += 1;
-      }
-    }
-  });
-  tx();
-  return { scanned: rows.length, encrypted };
-}
+// The at-rest backfill that wraps any plaintext secret columns once a key is
+// configured (networks, channels, and the e2e keyring) is now schema-driven and
+// lives in db/secretBackfill.ts (backfillEncryptColumns), replacing the
+// per-table siblings that used to live here.
 
 // Rewrite the sidebar order for one user. The caller must supply exactly the
 // user's current set of network ids (no adds, no drops); the function returns
@@ -275,26 +242,60 @@ export function reorderNetworks(userId: number, ids: unknown[]): number[] | null
   return [...numericIds];
 }
 
+// Decrypt the channel key in place. No-op for legacy plaintext / no key.
+function decryptChannel<T extends Channel | undefined>(row: T): T {
+  if (row) row.key = decryptSecret(row.key);
+  return row;
+}
+
 export function listChannels(networkId: number): Channel[] {
-  return db
-    .prepare('SELECT * FROM channels WHERE network_id = ? ORDER BY name')
-    .all(networkId) as Channel[];
+  return (
+    db
+      .prepare('SELECT * FROM channels WHERE network_id = ? ORDER BY name')
+      .all(networkId) as Channel[]
+  ).map((row) => decryptChannel(row)!);
 }
 
 export function upsertChannel(
   networkId: number,
   name: string,
   joined: boolean | number,
+  key?: string | null,
 ): Channel | undefined {
-  db.prepare(
-    `
-    INSERT INTO channels (network_id, name, joined) VALUES (?, ?, ?)
-    ON CONFLICT (network_id, name) DO UPDATE SET joined = excluded.joined
-  `,
-  ).run(networkId, name, joined ? 1 : 0);
-  return db
-    .prepare('SELECT * FROM channels WHERE network_id = ? AND name = ?')
-    .get(networkId, name) as Channel | undefined;
+  // key === undefined means "don't touch the stored key" — most callers (NAMES,
+  // reopen, part/kick) don't know it and must not clobber a key set at join.
+  // A provided value (string or null) is written, so an explicit null clears it.
+  if (key === undefined) {
+    db.prepare(
+      `
+      INSERT INTO channels (network_id, name, joined) VALUES (?, ?, ?)
+      ON CONFLICT (network_id, name) DO UPDATE SET joined = excluded.joined
+    `,
+    ).run(networkId, name, joined ? 1 : 0);
+  } else {
+    db.prepare(
+      `
+      INSERT INTO channels (network_id, name, joined, key) VALUES (?, ?, ?, ?)
+      ON CONFLICT (network_id, name) DO UPDATE SET joined = excluded.joined, key = excluded.key
+    `,
+    ).run(networkId, name, joined ? 1 : 0, encryptSecret(key));
+  }
+  return decryptChannel(
+    db.prepare('SELECT * FROM channels WHERE network_id = ? AND name = ?').get(networkId, name) as
+      | Channel
+      | undefined,
+  );
+}
+
+// Update just the stored +k key for a channel (from a live MODE +k/-k), matched
+// case-insensitively since the MODE target case may differ from the joined name.
+// `null` clears it (on -k). No-op if the channel row doesn't exist.
+export function setChannelKey(networkId: number, name: string, key: string | null): void {
+  db.prepare('UPDATE channels SET key = ? WHERE network_id = ? AND name = ? COLLATE NOCASE').run(
+    encryptSecret(key),
+    networkId,
+    name,
+  );
 }
 
 export function deleteChannel(networkId: number, name: string): void {

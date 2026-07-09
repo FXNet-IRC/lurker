@@ -22,20 +22,36 @@
         <i class="fa-solid fa-angles-right"></i>
       </button>
       <div ref="footEl" class="sidebar-foot" :class="{ 'foot-wrapped': footWrapped }">
-        <button class="link" @click="openSettings" title="Settings">
+        <!-- Settings and Add-network normally live in the LURKER header (#411),
+             but that header is unmounted while the sidebar is collapsed, so the
+             rail offers them here instead — collapsed-only to avoid duplicating
+             the header controls when expanded. -->
+        <button v-if="!showChannels" class="link" @click="openSettings" title="Settings">
           <i class="fa-solid fa-gear"></i>
         </button>
-        <button class="link" @click="showSearch = true" title="Search messages">
+        <button
+          v-if="!showChannels && showAdminEntry"
+          class="link"
+          @click="openAdmin"
+          title="Admin panel"
+          aria-label="Admin panel"
+        >
+          <i class="fa-solid fa-shield-halved"></i>
+        </button>
+        <button v-if="!showChannels" class="link" @click="openAddNetwork" title="Add network">
+          <i class="fa-solid fa-plus"></i>
+        </button>
+        <button class="link" @click="openSearch(false)" title="Search messages">
           <i class="fa-solid fa-magnifying-glass"></i>
         </button>
-        <button class="link" @click="showHighlights = true" title="Highlights">
-          <i class="fa-solid fa-bell"></i>
+        <button class="link" @click="openHighlights(false)" title="Highlights">
+          <i class="fa-regular fa-bell"></i>
         </button>
         <button class="link" @click="showBookmarks = true" title="Saved messages">
-          <i class="fa-solid fa-bookmark"></i>
+          <i class="fa-regular fa-bookmark"></i>
         </button>
         <button class="link" @click="showUploads = true" title="Recent uploads">
-          <i class="fa-solid fa-paperclip"></i>
+          <i class="fa-solid fa-arrow-up-from-bracket"></i>
         </button>
         <!-- Self-revealing: DCC is off for almost everyone, so the Transfers
              button only appears once a transfer exists (or the panel is open).
@@ -48,7 +64,7 @@
           @click="dcc.open()"
           :title="dccTitle"
         >
-          <i class="fa-solid fa-circle-down"></i>
+          <i class="fa-solid fa-download"></i>
         </button>
         <button
           v-if="!config.isNetworkLocked"
@@ -61,33 +77,36 @@
       </div>
     </aside>
 
-    <header v-if="isVirtual" class="topic">
-      <div class="topic-meta">
-        <span class="buffer">{{ bufferLabel }}</span>
-      </div>
-      <div v-if="isFriendsBuffer" class="topic-actions">
+    <!-- Topic bar: always rendered so the back/forward history controls (#411)
+         are present in every state, even before any buffer is selected. The nav
+         cluster is anchored at the far left, left of the buffer title; the meta
+         (name + topic) and per-buffer actions render conditionally beside it. -->
+    <header class="topic">
+      <div class="topic-nav">
         <button
           type="button"
-          class="link"
-          title="Add friend"
-          aria-label="Add friend"
-          @click="friends.openEditorNew()"
+          class="link nav-btn"
+          title="Back"
+          aria-label="Back"
+          :disabled="!navHistory.canBack"
+          @click="navHistory.back()"
         >
-          <i class="fa-solid fa-person-circle-plus"></i>
+          <i class="fa-solid fa-angle-left"></i>
         </button>
-        <span
-          class="member-count"
-          :title="`${friendCount} ${friendCount === 1 ? 'friend' : 'friends'}`"
+        <button
+          type="button"
+          class="link nav-btn"
+          title="Forward"
+          aria-label="Forward"
+          :disabled="!navHistory.canForward"
+          @click="navHistory.forward()"
         >
-          <i class="fa-solid fa-users"></i> {{ friendCount }}
-        </span>
+          <i class="fa-solid fa-angle-right"></i>
+        </button>
       </div>
-    </header>
-    <header v-else-if="active" class="topic">
       <div class="topic-meta">
-        <span class="buffer">{{ bufferLabel }}</span>
-        <template v-if="topic">
-          <span class="sep">│</span>
+        <span v-if="isVirtual || active" class="buffer">{{ bufferLabel }}</span>
+        <template v-if="active && topic">
           <button
             type="button"
             class="topic-text"
@@ -99,68 +118,122 @@
         </template>
       </div>
       <div class="topic-actions">
-        <template v-if="isServerBuffer">
-          <button
-            type="button"
-            class="link"
-            title="Channel list"
-            aria-label="Channel list"
-            @click="active && channelListModal.open(active.networkId)"
-          >
-            <i class="fa-solid fa-hashtag"></i>
-          </button>
-          <button
-            type="button"
-            class="link"
-            :title="serverConnectActionLabel"
-            :aria-label="serverConnectActionLabel"
-            @click="toggleServerConnection"
-          >
-            <i :class="serverConnectActionIcon"></i>
-          </button>
-          <button class="link" title="Edit network" @click="editActiveNetwork">
-            <i class="fa-solid fa-gear"></i>
-          </button>
+        <template v-if="isVirtual">
+          <template v-if="isFriendsBuffer">
+            <button
+              type="button"
+              class="link"
+              title="Add friend"
+              aria-label="Add friend"
+              @click="friends.openEditorNew()"
+            >
+              <i class="fa-solid fa-person-circle-plus"></i>
+            </button>
+            <span
+              class="member-count"
+              :title="`${friendCount} ${friendCount === 1 ? 'friend' : 'friends'}`"
+            >
+              <i class="fa-solid fa-users"></i> {{ friendCount }}
+            </span>
+          </template>
         </template>
-        <template v-else-if="isDmHeader">
-          <button
-            type="button"
-            class="link"
-            title="View profile"
-            aria-label="View profile"
-            @click="openDmProfile"
-          >
-            <i class="fa-solid fa-id-card"></i>
-          </button>
-          <button
-            type="button"
-            class="link"
-            :title="dmNoteLabel"
-            :aria-label="dmNoteLabel"
-            @click="openDmNote"
-          >
-            <i class="fa-solid fa-note-sticky"></i>
-          </button>
-        </template>
-        <template v-else-if="isChannel">
-          <button
-            class="link"
-            :title="showMembers ? 'Hide members' : 'Show members'"
-            :aria-label="showMembers ? 'Hide members' : 'Show members'"
-            @click="toggleMembers"
-          >
-            <i class="fa-solid fa-users"></i>
-          </button>
-          <span
-            v-if="memberCount != null"
-            class="member-count"
-            :title="`${memberCount} ${memberCount === 1 ? 'user' : 'users'} in channel`"
-            >{{ memberCount }}</span
-          >
+        <template v-else-if="active">
+          <!-- Search & highlights scoped to this buffer (channels/DMs only) —
+               parity with the mobile topic bar. The server buffer has no
+               per-buffer scope, so it's excluded. -->
+          <template v-if="!isServerBuffer">
+            <button
+              type="button"
+              class="link"
+              title="Search this buffer"
+              aria-label="Search this buffer"
+              @click="openSearch(true)"
+            >
+              <i class="fa-solid fa-magnifying-glass"></i>
+            </button>
+            <button
+              type="button"
+              class="link"
+              title="Highlights in this buffer"
+              aria-label="Highlights in this buffer"
+              @click="openHighlights(true)"
+            >
+              <i class="fa-regular fa-bell"></i>
+            </button>
+          </template>
+          <template v-if="isServerBuffer">
+            <button
+              type="button"
+              class="link"
+              title="Join channel"
+              aria-label="Join channel"
+              :disabled="serverConnectionState !== 'connected'"
+              @click="active && joinChannelModal.open(active.networkId)"
+            >
+              <i class="fa-solid fa-plus"></i>
+            </button>
+            <button
+              type="button"
+              class="link"
+              title="Channel list"
+              aria-label="Channel list"
+              @click="active && channelListModal.open(active.networkId)"
+            >
+              <i class="fa-solid fa-hashtag"></i>
+            </button>
+            <button
+              type="button"
+              class="link"
+              :title="serverConnectActionLabel"
+              :aria-label="serverConnectActionLabel"
+              @click="toggleServerConnection"
+            >
+              <i :class="serverConnectActionIcon"></i>
+            </button>
+            <button class="link" title="Edit network" @click="editActiveNetwork">
+              <i class="fa-solid fa-gear"></i>
+            </button>
+          </template>
+          <template v-else-if="isDmHeader">
+            <button
+              type="button"
+              class="link"
+              title="View profile"
+              aria-label="View profile"
+              @click="openDmProfile"
+            >
+              <i class="fa-solid fa-id-card"></i>
+            </button>
+            <button
+              type="button"
+              class="link"
+              :title="dmNoteLabel"
+              :aria-label="dmNoteLabel"
+              @click="openDmNote"
+            >
+              <i class="fa-solid fa-note-sticky"></i>
+            </button>
+          </template>
+          <template v-else-if="isChannel">
+            <button
+              class="link"
+              :title="showMembers ? 'Hide members' : 'Show members'"
+              :aria-label="showMembers ? 'Hide members' : 'Show members'"
+              @click="toggleMembers"
+            >
+              <i class="fa-solid fa-users"></i>
+            </button>
+            <span
+              v-if="memberCount != null"
+              class="member-count"
+              :title="`${memberCount} ${memberCount === 1 ? 'user' : 'users'} in channel`"
+              >{{ memberCount }}</span
+            >
+          </template>
         </template>
       </div>
     </header>
-    <div v-if="active || isVirtual" class="topic-divider"></div>
+    <div class="topic-divider"></div>
 
     <FriendsOverview v-if="renderMode === 'overview'" @view-activity="onViewActivity" />
     <MessageList v-else ref="messageListRef" :pending-scroll-id="pendingScrollId" />
@@ -175,6 +248,7 @@
     />
     <HighlightsModal
       v-if="showHighlights"
+      :scope="highlightScope"
       @close="showHighlights = false"
       @jump="onJumpToMessage"
     />
@@ -190,10 +264,20 @@
       :network-id="channelListModal.networkId!"
       @close="channelListModal.close()"
     />
+    <JoinChannelModal
+      v-if="joinChannelModal.isOpen && joinChannelModal.networkId !== null"
+      :network-id="joinChannelModal.networkId!"
+      @close="joinChannelModal.close()"
+    />
     <RecentUploadsModal v-if="showUploads" @close="showUploads = false" />
     <TransfersModal v-if="dcc.panelOpen" @close="dcc.close()" />
     <QuickSwitcher v-if="showSwitcher" @close="showSwitcher = false" />
-    <SearchModal v-if="showSearch" @close="showSearch = false" @jump="onJumpToMessage" />
+    <SearchModal
+      v-if="showSearch"
+      :scope="searchScope"
+      @close="showSearch = false"
+      @jump="onJumpToMessage"
+    />
     <KeyboardHelpModal v-if="showKbdHelp" @close="showKbdHelp = false" />
     <ImageViewerModal
       v-if="imageModal.isOpen && imageModal.url !== null"
@@ -228,7 +312,9 @@ import { useNetworksStore } from '../stores/networks.js';
 import { useConfigStore } from '../stores/config.js';
 import { useChatBootstrap } from '../composables/useChatBootstrap.js';
 import { useActiveBuffer } from '../composables/useActiveBuffer.js';
+import { useBufferSearchScope } from '../composables/useBufferSearchScope.js';
 import { useSettingsStore } from '../stores/settings.js';
+import { useAuthStore } from '../stores/auth.js';
 import BufferList from '../components/BufferList.vue';
 import MessageList from '../components/MessageList.vue';
 import FriendsOverview from '../components/FriendsOverview.vue';
@@ -241,6 +327,7 @@ import BookmarksModal from '../components/BookmarksModal.vue';
 import LinkedText from '../components/LinkedText.vue';
 import TopicModal from '../components/TopicModal.vue';
 import ChannelListModal from '../components/ChannelListModal.vue';
+import JoinChannelModal from '../components/JoinChannelModal.vue';
 import RecentUploadsModal from '../components/RecentUploadsModal.vue';
 import TransfersModal from '../components/TransfersModal.vue';
 import QuickSwitcher from '../components/QuickSwitcher.vue';
@@ -255,12 +342,13 @@ import { useNicklistCollapseStore } from '../stores/nicklistCollapse.js';
 import { useNickNotesStore } from '../stores/nickNotes.js';
 import { useFriendsStore } from '../stores/friends.js';
 import { useDccStore } from '../stores/dcc.js';
-import { useSearchStore } from '../stores/search.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useChannelListModal } from '../composables/useChannelListModal.js';
+import { useJoinChannelModal } from '../composables/useJoinChannelModal.js';
 import { useImageModal } from '../composables/useImageModal.js';
 import { useNetworkEditor } from '../composables/useNetworkEditor.js';
 import { useJumpToMessage } from '../composables/useJumpToMessage.js';
+import { useNavHistoryStore } from '../stores/navHistory.js';
 
 const networks = useNetworksStore();
 const config = useConfigStore();
@@ -295,6 +383,7 @@ const {
 } = useActiveBuffer();
 
 const settings = useSettingsStore();
+const auth = useAuthStore();
 const nicklistCollapse = useNicklistCollapseStore();
 const nickNotes = useNickNotesStore();
 const friends = useFriendsStore();
@@ -306,23 +395,28 @@ const dccTitle = computed(() =>
 const whois = useWhoisStore();
 
 const channelListModal = reactive(useChannelListModal());
+const joinChannelModal = reactive(useJoinChannelModal());
 const imageModal = reactive(useImageModal());
 const networkEditor = reactive(useNetworkEditor());
-const showHighlights = ref(false);
+const navHistory = useNavHistoryStore();
 const showBookmarks = ref(false);
 const showTopic = ref(false);
 const showUploads = ref(false);
 const showSwitcher = ref(false);
-const showSearch = ref(false);
 const showKbdHelp = ref(false);
 const pendingScrollId = ref<number | null>(null);
 
-// "View activity" from the Friends overview: open Search with the scoped query
-// (from:<nick> on:<network>) and run it immediately.
-function onViewActivity(query: string) {
-  useSearchStore().runQuery(query);
-  showSearch.value = true;
-}
+// Search & Highlights modal state + per-buffer `in:/on:` scoping, shared with
+// MobileChat (#496).
+const {
+  showSearch,
+  showHighlights,
+  searchScope,
+  highlightScope,
+  openSearch,
+  openHighlights,
+  onViewActivity,
+} = useBufferSearchScope();
 const messageInputRef = ref<{ focus: () => void } | null>(null);
 const messageListRef = ref<{ scrollByPage: (dir: number) => void } | null>(null);
 
@@ -334,6 +428,7 @@ const anyModalOpen = computed(
     showBookmarks.value ||
     showTopic.value ||
     channelListModal.isOpen ||
+    joinChannelModal.isOpen ||
     imageModal.isOpen ||
     showUploads.value ||
     dcc.panelOpen ||
@@ -350,7 +445,7 @@ useKeyboardShortcuts({
     showKbdHelp.value = true;
   },
   onOpenSearch: () => {
-    showSearch.value = true;
+    openSearch(false);
   },
   onTypeAhead: () => {
     if (anyModalOpen.value || !active.value) return;
@@ -494,6 +589,15 @@ function openSettings() {
   router.push('/settings');
 }
 
+// Admin panel entry (collapsed-rail twin of the BufferList header shield):
+// admin-only, and only when the instance enabled LURKER_NEW_ADMIN_PANEL.
+const showAdminEntry = computed(() => config.newAdminPanel && auth.isAdmin);
+function openAdmin() {
+  router.push('/admin');
+}
+
+// Collapsed-rail add-network (the expanded affordance is the LURKER header's +,
+// which is unmounted with the sidebar).
 function openAddNetwork() {
   networkEditor.open();
 }
@@ -665,6 +769,15 @@ useChatBootstrap({ onJump: onJumpToMessage });
 .link:hover {
   color: var(--fg);
 }
+/* Disabled topic-bar link (e.g. Join channel while the network is disconnected):
+   dimmed and non-interactive, and it must not brighten on hover. */
+.link:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.link:disabled:hover {
+  color: var(--accent);
+}
 /* Transfers button: while an unsolicited offer awaits a decision the glyph
    turns warn-colored to draw the eye (color-as-signal, no count badge). */
 .dcc-btn.pending {
@@ -696,9 +809,27 @@ useChatBootstrap({ onJump: onJumpToMessage });
   padding: var(--space-4) var(--space-6);
   display: flex;
   align-items: baseline;
-  justify-content: space-between;
+  gap: var(--space-4);
   white-space: nowrap;
   overflow: hidden;
+}
+/* Back/forward history controls (#411), anchored at the far left of the bar,
+   left of the buffer title. Same accent icon buttons as the rest of the bar;
+   disabled (dimmed, non-interactive) when there's nowhere to go that way. */
+.topic-nav {
+  display: flex;
+  align-items: baseline;
+  /* Match .topic-actions' gap so the back/forward pair is spaced like every
+     other button pair in the bar, not tighter. */
+  gap: var(--space-4);
+  flex-shrink: 0;
+}
+.nav-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.nav-btn:disabled:hover {
+  color: var(--accent);
 }
 .topic-divider {
   grid-area: divider;
@@ -707,9 +838,6 @@ useChatBootstrap({ onJump: onJumpToMessage });
 }
 .topic .buffer {
   color: var(--accent);
-}
-.topic .sep {
-  color: var(--border);
 }
 .topic .topic-text {
   color: var(--fg-muted);
@@ -751,15 +879,20 @@ useChatBootstrap({ onJump: onJumpToMessage });
   grid-area: input;
 }
 
-/* Two-group layout for the topic bar: .topic-meta (name + │ + topic text)
-   sits left, .topic-actions (buffer/network/channel buttons) sits right.
+/* Two-group layout for the topic bar: .topic-meta (name + topic text, spaced
+   by the 2ch gap — wider than the 1ch bar convention to give the name and
+   topic breathing room now that the │ divider is gone) sits left,
+   .topic-actions (buffer/network/channel buttons) sits right.
    .topic uses justify-content:space-between to split them. .topic-meta
    shrinks first via min-width:0 + topic-text ellipsis, so the action
    cluster stays anchored to the right edge. */
 .topic-meta {
   display: flex;
   align-items: baseline;
-  gap: 1ch;
+  gap: 2ch;
+  /* flex:1 so the meta absorbs the free space and keeps the action cluster
+     anchored to the right edge; min-width:0 lets the topic text ellipsis. */
+  flex: 1;
   min-width: 0;
   overflow: hidden;
 }

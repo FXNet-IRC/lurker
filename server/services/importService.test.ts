@@ -576,12 +576,12 @@ describe('importFromZipBuffer — roundtrip', () => {
     expect(msg).toBeDefined();
   });
 
-  it('imports a pre-#439 archive whose messages omit the mirrored column', async () => {
-    // A backup taken before messages.mirrored existed has no `mirrored` key in
-    // messages.ndjson. mirrored is NOT NULL DEFAULT 0, but a column default does
-    // NOT apply when the importer binds an explicit NULL for a missing key — so
-    // without the import-side fallback the insert fails with a NOT NULL
-    // constraint and aborts the entire restore.
+  it('imports an older archive whose messages omit late-added NOT NULL columns (mirrored #439, notable #470)', async () => {
+    // A backup taken before messages.mirrored / messages.notable existed has no
+    // such key in messages.ndjson. Both are NOT NULL DEFAULT-ed, but a column
+    // default does NOT apply when the importer binds an explicit NULL for a
+    // missing key — so without the import-side fallback the insert fails with a
+    // NOT NULL constraint and aborts the entire restore.
     const { alice } = seedAlice();
     const buf = await exportToBuffer(alice.id, { includeMessages: true });
     const yauzl = await import('yauzl');
@@ -613,7 +613,7 @@ describe('importFromZipBuffer — roundtrip', () => {
       });
     });
 
-    // Strip `mirrored` from every messages row to mimic a pre-#439 archive.
+    // Strip `mirrored` and `notable` from every messages row to mimic an older archive.
     const msgsKey = [...entries.keys()].find((k) => k.endsWith('messages.ndjson'));
     expect(msgsKey).toBeDefined();
     const stripped = entries
@@ -624,6 +624,7 @@ describe('importFromZipBuffer — roundtrip', () => {
       .map((l) => {
         const row = JSON.parse(l);
         delete row.mirrored;
+        delete row.notable;
         return JSON.stringify(row);
       })
       .join('\n');
@@ -641,14 +642,16 @@ describe('importFromZipBuffer — roundtrip', () => {
     );
     await importFromZipBuffer(olive.id, rebuilt);
 
-    // Restore succeeds and the messages land with mirrored defaulted to 0.
+    // Restore succeeds and the messages land with mirrored defaulted to 0 and
+    // notable defaulted to 1 (old history predates the notability model → counts).
     const rows = db
       .prepare(
-        'SELECT m.mirrored FROM messages m JOIN networks n ON n.id = m.network_id WHERE n.user_id = ?',
+        'SELECT m.mirrored, m.notable FROM messages m JOIN networks n ON n.id = m.network_id WHERE n.user_id = ?',
       )
-      .all(olive.id) as Array<{ mirrored: number }>;
+      .all(olive.id) as Array<{ mirrored: number; notable: number }>;
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.every((r) => r.mirrored === 0)).toBe(true);
+    expect(rows.every((r) => r.notable === 1)).toBe(true);
   });
 
   it('rejects an archive without a manifest', async () => {
@@ -710,12 +713,30 @@ type AnyTableDef = {
   blobColumns?: string[];
 };
 
+// Columns re-derived on the target instance rather than round-tripped verbatim,
+// so they legitimately differ from the source and must be excluded from the
+// payload comparison. `ignored_masks` is the only table re-inserted through a
+// service on import (ignoreRulesService.add, for regex/expiry validation — see
+// importService), and that path lets the DB stamp `created_at` at import time
+// instead of preserving the original. Every other table round-trips created_at
+// via the positional insert, so this exclusion is deliberately table-scoped —
+// widening it would mask a real regression elsewhere. (Comparing created_at
+// here is also what made this test flaky: alice's seed time and bob's import
+// time differ whenever the clock ticks a second mid-run.)
+// `satisfies` keeps the keys checked against the real table registry — a
+// mistyped table name is a compile error rather than a silently-ineffective
+// exclusion (which would let the flake back in) — while the `Record<string, …>`
+// annotation keeps it indexable by the arbitrary `table` string below.
+const VOLATILE_COLUMNS: Record<string, string[]> = {
+  ignored_masks: ['created_at'],
+} satisfies Partial<Record<keyof typeof EXPORT_TABLES, string[]>>;
+
 // Columns that legitimately differ between the source and target accounts.
 // Per-table FK-rekey columns are taken from the registry; PKs of
 // autoincrement tables also differ; matched_rule_id can legitimately turn
 // to NULL on import if its rule wasn't carried over (it shouldn't here).
-function projectionFor(_table: string, def: AnyTableDef): string[] {
-  const skip = new Set<string>();
+function projectionFor(table: string, def: AnyTableDef): string[] {
+  const skip = new Set<string>(VOLATILE_COLUMNS[table] ?? []);
   if (def.pk) skip.add(def.pk);
   if (def.fkRekey) for (const col of Object.keys(def.fkRekey)) skip.add(col);
   const blobColumns = def.blobColumns ?? [];
@@ -930,6 +951,15 @@ describe('importFromZipBuffer — end-to-end equivalence', () => {
 
     // BLOBs aren't in the column projection — verify separately.
     expect(blobsFor(bob.id)).toEqual(blobsFor(alice.id));
+
+    // created_at for ignored_masks is excluded from the payload diff above
+    // (VOLATILE_COLUMNS) because import re-stamps it. Assert it's still
+    // populated on the imported side rather than dropped/null.
+    const bobMaskTimes = db
+      .prepare('SELECT created_at FROM ignored_masks WHERE user_id = ?')
+      .all(bob.id) as Array<{ created_at: string | null }>;
+    expect(bobMaskTimes.length).toBeGreaterThan(0);
+    expect(bobMaskTimes.every((r) => !!r.created_at)).toBe(true);
 
     // Structural FK sanity: every per-network row in bob's tables must
     // point at one of bob's networks, not alice's.

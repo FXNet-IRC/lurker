@@ -10,7 +10,7 @@ import {
   listBufferTargets,
 } from '../db/messages.js';
 import type { Network } from '../db/networks.js';
-import { upsertChannel } from '../db/networks.js';
+import { upsertChannel, setChannelKey } from '../db/networks.js';
 import { isClosed as isBufferClosed } from '../db/closedBuffers.js';
 import { listTargetsForNetwork as listFriendTargetsForNetwork } from '../db/contacts.js';
 import * as chanlistDb from '../db/chanlist.js';
@@ -180,6 +180,9 @@ interface AwayState {
 interface IrcEvent {
   type: string;
   target?: string;
+  // Server-buffer notability (#470). Pass false on Lurker's own status notices
+  // so they render but don't mark the server buffer unread; omitted = notable.
+  notable?: boolean;
   [key: string]: unknown;
 }
 
@@ -387,6 +390,11 @@ export class IrcConnection {
   // of issuing buffers, so two concurrent same-type queries to one nick route
   // their replies back in order. Bounded + TTL-pruned on access.
   ctcpOutstanding: Map<string, Array<{ issuingTarget: string; sentAt: number }>>;
+  // The raw 001–005 registration burst as the server sent it, captured by the
+  // 'raw' handler (reset on each 001). The bouncer replays these verbatim
+  // (nick-rewritten) to IRC clients that attach mid-session, so they see the
+  // network's real ISUPPORT tokens instead of a synthesized approximation.
+  registrationLines: string[];
 
   constructor({ network, onEvent }: { network: Network; onEvent: (event: EnrichedEvent) => void }) {
     this.network = network;
@@ -466,6 +474,7 @@ export class IrcConnection {
     this.multilineBatches = new Map();
     this.ctcpLimiter = new RateLimiter();
     this.ctcpOutstanding = new Map();
+    this.registrationLines = [];
     this.bind();
   }
 
@@ -572,6 +581,7 @@ export class IrcConnection {
         userhost: (event.userhost as string | null | undefined) ?? null,
         fromIgnored,
         mirrored: event.mirrored as boolean | undefined,
+        notable: event.notable as boolean | undefined,
       });
       enriched.id = id;
       enriched.alt = alt;
@@ -666,7 +676,25 @@ export class IrcConnection {
       } catch (_) {
         return;
       }
-      if (isServerBufferDeniedNumeric((msg?.command || '').toString())) return;
+      const rawCommand = (msg?.command || '').toString();
+      // Capture the registration burst for bouncer attach-time replay. 001
+      // starts a fresh burst (each (re)registration replaces the last), and
+      // the follow-on 002–005 lines are only appended once a burst has begun
+      // so a stray mid-session numeric can't graft onto a stale burst. The
+      // raw line keeps its trailing CR; strip it so replay consumers get a
+      // clean single-line payload.
+      const burstLine = event.line.replace(/[\r\n]+$/, '');
+      if (rawCommand === '001') this.registrationLines = [burstLine];
+      else if (
+        this.registrationLines.length > 0 &&
+        (rawCommand === '002' ||
+          rawCommand === '003' ||
+          rawCommand === '004' ||
+          rawCommand === '005')
+      ) {
+        this.registrationLines.push(burstLine);
+      }
+      if (isServerBufferDeniedNumeric(rawCommand)) return;
       // formatUnknownNumeric only renders 3-digit numerics (it strips the
       // leading recipient-nick param), so PRIVMSG/JOIN/NOTICE/etc. naturally
       // fall through and never pollute the server buffer.
@@ -786,6 +814,7 @@ export class IrcConnection {
           type: 'notice',
           target: this.serverTarget(),
           nick: 'lurker',
+          notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
           text: `Connected as ${registeredNick} (configured nick ${this.network.nick} was unavailable).`,
         });
         // Defer the MONITOR + handshake until ISUPPORT tells us the server
@@ -867,6 +896,13 @@ export class IrcConnection {
       this.useMonitor = false;
       this.monitorLimit = 0;
       this.pendingMonitorSeed = false;
+      // Safety-net presence sweep. The primary one runs in 'socket close',
+      // which fires on every disconnect (including auto-reconnect blips), so it
+      // has almost always swept already by the time this terminal 'close'
+      // fires. This covers any clean-close path that somehow skipped it;
+      // markAllPeersOffline is idempotent and disposed-guarded, so the double
+      // call is a no-op.
+      this.markAllPeersOffline();
       this.setState('disconnected');
     });
 
@@ -881,6 +917,7 @@ export class IrcConnection {
           type: 'notice',
           target: this.serverTarget(),
           nick: 'lurker',
+          notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
           text: `Nick ${requested} is already in use.`,
         });
         return;
@@ -1007,6 +1044,21 @@ export class IrcConnection {
     // log line.
     c.on('socket close', (err: Record<string, unknown>) => {
       this.setState('disconnected');
+      // Our socket to this network just dropped — from our vantage point every
+      // peer we track here is now unreachable, so mark them all offline. This is
+      // the fix for the "stuck online" gap on networks without MONITOR: if a
+      // peer quit while we were disconnected we never saw their QUIT, but our own
+      // disconnect is a discontinuity we DO observe, so we stop asserting a stale
+      // 'online'. 'socket close' (not 'close') is the hook: irc-framework
+      // auto-reconnects a blip internally and emits only 'socket close' +
+      // 'reconnecting' — it reserves 'close' for a terminal give-up/dispose
+      // (connection.js:111 always fires 'socket close'; :141 fires 'close' only
+      // when it won't retry), so sweeping in 'close' alone would miss the common
+      // reconnect. On reconnect the peers we can still observe are re-lit
+      // (MONITOR re-seed + WHO-on-join); the rest stay honestly offline. No
+      // came-online suppression — a reconnect re-firing "came online" for peers
+      // still around is the honest signal, and toasts are already rate-limited.
+      this.markAllPeersOffline();
       // Release this socket's identd mapping (a reconnect re-registers via the
       // 'raw socket connected' handler above and gets a fresh handle).
       unregisterIdent(this.identdId);
@@ -1039,6 +1091,7 @@ export class IrcConnection {
         type: 'notice',
         target: this.serverTarget(),
         nick: 'lurker',
+        notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
         text,
       });
     });
@@ -1647,6 +1700,7 @@ export class IrcConnection {
               type: 'notice',
               target: this.serverTarget(),
               nick: 'lurker',
+              notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
               text: `Reclaimed nick ${this.regainNick}.`,
             });
           }
@@ -1750,6 +1804,7 @@ export class IrcConnection {
       // the snapshot keeps current modes after page reload.
       let memberModesChanged = false;
       let chanModesChanged = false;
+      const listModes = this.listModes();
       if (ch) {
         for (const m of eventModes) {
           if (!m || !m.mode) continue;
@@ -1766,16 +1821,23 @@ export class IrcConnection {
             memberModesChanged = true;
             continue;
           }
-          // Channel-level flag mode (no param, or list-type mode like +b that
-          // we don't surface in the status bar). We only track flag modes
-          // (no param) so +b/+e/+I bans don't pollute the (+...) display.
-          if (!m.param) {
+          // Channel-level flag mode (or parameter mode like +k/+l). We track
+          // them to surface them in the status bar, but exclude list-type modes
+          // (bans/exceptions/quiets) so their masks don't pollute the display.
+          if (!listModes.has(letter)) {
             if (sign === '+' && !ch.modes.has(letter)) {
               ch.modes.add(letter);
               chanModesChanged = true;
             } else if (sign === '-' && ch.modes.delete(letter)) {
               chanModesChanged = true;
             }
+          }
+          // Keep the persisted +k key current so a live key change survives a
+          // reconnect (see resolveKeyModeChange for the value-less / masked-key
+          // guards that stop an on-join mode burst from wiping the real key).
+          if (letter === 'k') {
+            const change = resolveKeyModeChange(sign, m.param);
+            if (change) setChannelKey(this.network.id, ch.name, change.key);
           }
         }
       }
@@ -1806,11 +1868,12 @@ export class IrcConnection {
       if (!eventChannel || !eventModes) return;
       const ch = this.channels.get(eventChannel.toLowerCase());
       if (!ch) return;
+      const listModes = this.listModes();
       const next = new Set<string>();
       for (const m of eventModes) {
-        if (!m || !m.mode || m.param) continue;
+        if (!m || !m.mode) continue;
         const letter = m.mode.replace(/^[+-]/, '');
-        if (!letter) continue;
+        if (!letter || listModes.has(letter)) continue;
         next.add(letter);
       }
       const before = [...ch.modes].toSorted().join('');
@@ -1907,13 +1970,23 @@ export class IrcConnection {
         const m = ch.members.get((u.nick as string).toLowerCase());
         if (!m) continue;
         const next = !!u.away;
-        // Bridge the WHO away flag to the DM/friend presence rail for tracked
-        // peers. away-notify keeps presence live, but it doesn't fire on join —
-        // so without this a friend who's away when we (re)connect and share a
-        // channel would read as online. The transition gates in markPeerEvent
-        // make this idempotent: 'away' sets away; 'back' only clears a stale
-        // away and otherwise no-ops, so it never disturbs online/offline.
-        this.markPeerEvent(u.nick as string, next ? 'away' : 'back');
+        // Bridge the WHO snapshot to the DM/friend presence rail for tracked
+        // peers. away-notify doesn't fire on join, so this is where a peer we
+        // share a channel with gets (re-)established — critically on reconnect,
+        // where markAllPeersOffline has just forced every tracked peer offline
+        // and a friend still sitting in a channel we rejoin must be promoted
+        // back to online here (the server sends existing occupants via NAMES,
+        // not JOIN, so the 'join' handler never fires for them). 'away' sets
+        // away; for a present, non-away member 'online' promotes an
+        // offline/unknown row while 'back' clears a stale away. Each call is
+        // gated to its valid prior state, so at most one writes and an
+        // already-online peer is left untouched.
+        if (next) {
+          this.markPeerEvent(u.nick as string, 'away');
+        } else {
+          this.markPeerEvent(u.nick as string, 'online');
+          this.markPeerEvent(u.nick as string, 'back');
+        }
         if (m.away !== next) {
           m.away = next;
           changed = true;
@@ -2216,6 +2289,26 @@ export class IrcConnection {
     this.publishPeerPresence(canonical, next, cameOnline);
   }
 
+  // Mark every tracked peer on this network offline — called when our own
+  // socket drops (see the 'socket close' handler). trackedPeers is still
+  // populated at close time (it's only cleared/re-hydrated on the next
+  // 'registered'), so we can walk it directly. markPeerEvent's per-state gate
+  // keeps this a no-op for peers already offline, so a flap doesn't churn
+  // timestamps.
+  markAllPeersOffline(): void {
+    // Skip during dispose. dispose() sets disposed=true right before tearing the
+    // socket down, and on a *deletion* dispose the network row — and its
+    // peer_presence_state rows, via ON DELETE CASCADE — can already be gone by
+    // the time the async socket close fires. A writePeerState here would then
+    // hit a foreign-key violation and throw inside the close listener. This is
+    // the same reason publish()/publishEphemeral() gate on disposed; see
+    // ircManager.disposeNetwork/disposeUser (and the note at ircManager.ts:679).
+    if (this.disposed) return;
+    for (const nick of this.trackedPeers.keys()) {
+      this.markPeerEvent(nick, 'offline');
+    }
+  }
+
   // Bulk-seed the MONITOR watch list from the tracked DM peers set. Called
   // once per connection from the 'server options' handler, after ISUPPORT
   // confirms MONITOR is supported. Batches nicks into 'MONITOR + n1,n2,…'
@@ -2242,6 +2335,7 @@ export class IrcConnection {
         type: 'notice',
         target: this.serverTarget(),
         nick: 'lurker',
+        notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
         text: `MONITOR limit (${this.monitorLimit}) reached; live presence skipped for ${overflow} nick${overflow === 1 ? '' : 's'}.`,
       });
     }
@@ -2338,6 +2432,7 @@ export class IrcConnection {
         type: 'notice',
         target: this.serverTarget(),
         nick: 'lurker',
+        notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
         text: `MONITOR limit (${this.monitorLimit}) reached; live presence skipped for ${nick}.`,
       });
       return true;
@@ -2465,6 +2560,21 @@ export class IrcConnection {
     });
   }
 
+  // List-type channel modes (CHANMODES group A) carry a mask param — bans,
+  // ban/invite exceptions, and quiets on ircds that model them as a list — that
+  // we don't surface in the status bar. We read the set from the server's
+  // ISUPPORT CHANMODES so it's correct per-ircd, falling back to the RFC
+  // defaults before 005 has been parsed (`??`, so a server that legitimately
+  // declares an empty group A keeps its empty set rather than the default).
+  // This is the same categorisation weechat/irssi/gamja use. Parameter modes
+  // like +k/+l are NOT list modes, so they still land in the (+...) display.
+  // Member-prefix modes (o/v/h, plus q/a where an ircd uses them as prefixes)
+  // are filtered earlier by isPrefixMode(), so they never reach this set.
+  private listModes(): Set<string> {
+    const chanmodes = this.client.network?.options?.CHANMODES as string[] | undefined;
+    return new Set((chanmodes?.[0] ?? 'beI').split(''));
+  }
+
   publishLag(): void {
     this.publish({
       type: 'lag',
@@ -2525,6 +2635,7 @@ export class IrcConnection {
       type: 'notice',
       target: this.serverTarget(),
       nick: 'lurker',
+      notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
       text: `Connecting to ${target.host}:${target.port}${proto}…`,
     });
     // Forward the user's real browser IP to the IRCd via WEBIRC so each user is
@@ -2584,8 +2695,13 @@ export class IrcConnection {
     });
   }
 
-  join(channel: string): void {
-    this.client.join(channel);
+  join(channel: string, key?: string): void {
+    // Only a string is a valid channel key. Guard against a non-string sneaking
+    // in from an untrusted ws/HTTP join payload — irc-framework's raw serialiser
+    // calls .match() on the last arg, so a numeric key throws a TypeError that,
+    // with no global uncaught handler (see wsHub sendSnapshot backstop), would
+    // drop the whole (shared, on hosted) process.
+    this.client.join(channel, typeof key === 'string' ? key : undefined);
   }
   part(channel: string, reason?: string): void {
     this.client.part(channel, reason);
@@ -3857,6 +3973,12 @@ export class IrcConnection {
     // eslint-disable-next-line no-control-regex
     this.client.raw(line.replace(/[\u000d\u000a\u0000]/g, ''));
   }
+  // Whether the network negotiated IRCv3 message-tags. Client-only tags
+  // (+typing, +draft/react, …) and TAGMSG only mean anything to a server that
+  // speaks it; forwarding them to one that doesn't yields ERR_UNKNOWNCOMMAND.
+  supportsMessageTags(): boolean {
+    return (this.client.network?.cap?.enabled || []).includes('message-tags');
+  }
   sendTyping(target: string, state: string): void {
     // +typing is a client-only tag carried over TAGMSG, which only exists when
     // the server negotiated the message-tags capability. Networks that don't
@@ -3864,7 +3986,7 @@ export class IrcConnection {
     // ERR_UNKNOWNCOMMAND, which our 'irc error' handler surfaces as a toast —
     // so an ungated send spams an error on each keystroke. Typing indicators
     // are a best-effort nicety; no cap, no send.
-    if (!(this.client.network?.cap?.enabled || []).includes('message-tags')) return;
+    if (!this.supportsMessageTags()) return;
     // Suppress typing TAGMSGs to a target the server has refused our messages to
     // (a +R/+M channel needing a registered nick to speak, a +R user, ...).
     // Every typing TAGMSG to it bounces as another send rejection; we learned it
@@ -4049,6 +4171,22 @@ function isPrefixMode(letter: string): boolean {
   return PREFIX_MODES.has(letter);
 }
 
+// Decide how a channel +k / -k MODE change should update the persisted key.
+// Returns null for "leave the stored key alone" — the two cases that must NOT
+// touch it are (a) a +k echoed WITHOUT its value (common in the on-join mode
+// burst) and (b) a masked +k where the server sends the key as `*` to hide it
+// from non-ops. Either would otherwise clobber the real key we stored at join
+// time, so the channel would fail to auto-rejoin on the next reconnect. -k
+// clears; +k with a real value sets. Pure + exported so the guard is unit-tested.
+export function resolveKeyModeChange(
+  sign: string,
+  param: string | undefined,
+): { key: string | null } | null {
+  if (sign === '-') return { key: null };
+  if (sign === '+' && param && param !== '*') return { key: param };
+  return null;
+}
+
 // Pure helper for the pre-registration nick-fallback ladder. The configured
 // nick is attempt -1 (already tried by `connect()` itself); on each subsequent
 // ERR_NICKNAMEINUSE we ask for index 0..N-1 here. Digits-only, no underscore
@@ -4121,6 +4259,11 @@ const SERVER_BUFFER_DENIED_NUMERICS = new Set<string>([
   '352',
   '315',
   '354',
+  // RPL_NAMREPLY/RPL_ENDOFNAMES — the server sends NAMES on every join; the
+  // nicklist is the pretty surface (rebuilt from the parsed 'userlist' event),
+  // so the raw per-batch lines are a redundant flood in the server buffer.
+  '353',
+  '366',
   // RPL_MON* — MONITOR presence, surfaced by the presence rail, not the buffer.
   '730',
   '731',

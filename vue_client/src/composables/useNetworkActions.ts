@@ -4,16 +4,19 @@
 import type { ContextMenuItem } from './useContextMenu.js';
 import { useContextMenu } from './useContextMenu.js';
 import { useChannelListModal } from './useChannelListModal.js';
+import { useJoinChannelModal } from './useJoinChannelModal.js';
 import { useNetworkEditor } from './useNetworkEditor.js';
 import { useNotifyLadder } from './useNotifyLadder.js';
 import { useNetworksStore, type Network } from '../stores/networks.js';
 
 // Buffer-list action logic for network rows. Analogous to useBufferActions for
-// channel/DM rows. Opens the channel list modal or a two-item overflow menu
-// (Edit Network + Disconnect/Reconnect) anchored to a button or cursor position.
+// channel/DM rows. Builds the network context menu — Join Channel / Channel List,
+// Edit Network / Disconnect·Reconnect, and the notification ladder — anchored to
+// a button (the header kebab) or a cursor position (right-click / long-press).
 export function useNetworkActions() {
   const menu = useContextMenu();
   const channelListModal = useChannelListModal();
+  const joinChannelModal = useJoinChannelModal();
   const networkEditor = useNetworkEditor();
   const notify = useNotifyLadder();
   const networks = useNetworksStore();
@@ -28,6 +31,21 @@ export function useNetworkActions() {
   function buildItems(net: Network): ContextMenuItem[] {
     const isConnected = networks.states[net.id]?.state === 'connected';
     return [
+      // Channel actions first — the common reason to reach for a network's menu.
+      // Join needs a live connection; the channel list is still browsable from
+      // cache while disconnected, so only Join is gated.
+      {
+        label: 'Join Channel…',
+        icon: 'fa-solid fa-plus',
+        disabled: !isConnected,
+        onClick: () => joinChannelModal.open(net.id),
+      },
+      {
+        label: 'Channel List…',
+        icon: 'fa-solid fa-hashtag',
+        onClick: () => channelListModal.open(net.id),
+      },
+      { divider: true },
       {
         label: 'Edit Network',
         icon: 'fa-solid fa-gear',
@@ -56,9 +74,5 @@ export function useNetworkActions() {
     menu.open(buildItems(net), x, y);
   }
 
-  function openChannelList(net: Network): void {
-    channelListModal.open(net.id);
-  }
-
-  return { openMenuFromButton, onNetworkContextMenu, openChannelList };
+  return { openMenuFromButton, onNetworkContextMenu };
 }

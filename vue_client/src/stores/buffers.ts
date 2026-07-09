@@ -863,7 +863,7 @@ export const useBuffersStore = defineStore('buffers', {
     // a second buffer for a different-cased name. Returns false only when a
     // JOIN had to be sent but the socket was closed, so the caller can surface
     // an offline toast.
-    joinOrActivate(networkId: number | string, channel: string): boolean {
+    joinOrActivate(networkId: number | string, channel: string, key?: string): boolean {
       // forNetwork compares networkId with === against the numeric
       // Buffer.networkId, so coerce a numeric-string id first — otherwise an
       // existing buffer wouldn't match and we'd send a duplicate JOIN.
@@ -876,13 +876,30 @@ export const useBuffersStore = defineStore('buffers', {
         // it immediately. Re-send JOIN if we're not currently in it.
         this.activate(nid, existing.target);
         if (existing.joined) return true;
-        return socketSend({ type: 'join', networkId: nid, channel: existing.target });
+        return socketSend({ type: 'join', networkId: nid, channel: existing.target, key });
       }
       // Brand-new channel: don't open optimistically (#260). Join and wait for
       // the channel-joined confirmation; requestJoin focuses on success and
       // toasts on rejection.
-      const ok = socketSend({ type: 'join', networkId: nid, channel });
+      const ok = socketSend({ type: 'join', networkId: nid, channel, key });
       if (ok) this.requestJoin(nid, channel);
+      return ok;
+    },
+    // "Join a channel from a button" — the shared path behind JoinChannelModal
+    // and the channel-list browser. joinOrActivate returns false only when a
+    // JOIN had to go out over a closed socket; surface that as an offline toast
+    // so the click isn't a silent no-op. Returns joinOrActivate's result.
+    joinOrToast(networkId: number | string, target: string): boolean {
+      const ok = this.joinOrActivate(networkId, target);
+      if (!ok) {
+        useToastsStore().push({
+          kind: 'warn',
+          title: 'Not connected',
+          body: `Can't join ${target} while disconnected.`,
+          networkId: typeof networkId === 'string' ? Number(networkId) : networkId,
+          ttlMs: 5000,
+        });
+      }
       return ok;
     },
     setJoined(networkId: number | string, target: string, joined: boolean) {

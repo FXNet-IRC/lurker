@@ -17,6 +17,8 @@ let isClosed: typeof import('../db/closedBuffers.js').isClosed;
 let setClearedState: typeof import('../db/bufferReads.js').setClearedState;
 let setReadState: typeof import('../db/bufferReads.js').setReadState;
 let computeTotalHighlights: typeof import('./wsHub.js').computeTotalHighlights;
+let eachUserBufferTarget: typeof import('./wsHub.js').eachUserBufferTarget;
+let ircManager: typeof import('./ircManager.js').default;
 let buildBufferBacklog: typeof import('./wsHub.js').buildBufferBacklog;
 let buildBufferShell: typeof import('./wsHub.js').buildBufferShell;
 let buildResumeSlice: typeof import('./wsHub.js').buildResumeSlice;
@@ -41,8 +43,10 @@ beforeAll(async () => {
   ({ insertMessage, maxMessageId } = await import('../db/messages.js'));
   ({ closeBuffer, reopenBuffer, isClosed } = await import('../db/closedBuffers.js'));
   ({ setClearedState, setReadState } = await import('../db/bufferReads.js'));
+  ircManager = (await import('./ircManager.js')).default;
   ({
     computeTotalHighlights,
+    eachUserBufferTarget,
     buildBufferBacklog,
     buildBufferShell,
     buildResumeSlice,
@@ -112,6 +116,31 @@ describe('buildBufferBacklog', () => {
   it('reports a non-channel buffer (DM) as joined', () => {
     seed('carol', 'hi');
     expect(buildBufferBacklog(userId, networkId, 'carol').joined).toBe(true);
+  });
+
+  it('server buffer unread counts notable lines only, and includes errors (#470)', () => {
+    const target = `:server:${networkId}`;
+    const putServer = (type: string, opts: { nick?: string; notable?: boolean } = {}) =>
+      insertMessage({
+        networkId,
+        target,
+        time: new Date().toISOString(),
+        type,
+        nick: opts.nick ?? 'server',
+        text: 'x',
+        self: false,
+        notable: opts.notable,
+      });
+    putServer('notice', { nick: 'lurker', notable: false }); // "Connecting…" — not unread
+    putServer('notice', { nick: 'lurker', notable: false }); // "Reconnecting…" — not unread
+    putServer('notice', { nick: 'NickServ' }); // inbound notice → unread
+    putServer('error'); // killed/banned → unread (countNewer would drop this)
+
+    const frame = buildBufferBacklog(userId, networkId, target);
+    // All 4 lines render in the buffer...
+    expect((frame.events as unknown[]).length).toBe(4);
+    // ...but only the inbound notice + the error mark it unread.
+    expect(frame.unread).toBe(2);
   });
 
   it('counts every unread DM line as a highlight (yellow row treatment, like the system buffer)', () => {
@@ -680,5 +709,165 @@ describe('computeTotalHighlights', () => {
     // Reading dave up to its newest line clears its contribution.
     setReadState(u, net, 'dave', d3);
     expect(computeTotalHighlights(u)).toBe(base + 2);
+  });
+});
+
+// #454: the connect snapshot's live loop, buildOfflineBacklogFrames, and the
+// push-badge total (computeTotalHighlights) all walk the same set of buffers via
+// eachUserBufferTarget, so the app-icon badge can't drift from the in-app count.
+// These lock the two invariants that used to diverge: the closed-vs-joined
+// precedence on a live network (finding #3), and per-buffer highlight parity
+// between the frames the client receives and the total the badge shows.
+describe('eachUserBufferTarget / badge-vs-snapshot parity (#454)', () => {
+  // A minimal live-connection stand-in: the enumerator only reads network.id and
+  // the lowercased-keyed channels map (has() for join-precedence, values().name to
+  // surface joined-but-history-less channels). Injected straight into the shared
+  // ircManager singleton — remember to clear it so sibling "offline" tests aren't
+  // poisoned by a lingering live connection.
+  type LiveConn = ReturnType<typeof ircManager.listConnections>[number];
+  function stubLiveConn(netId: number, joinedChannels: string[]): LiveConn {
+    const channels = new Map(joinedChannels.map((c) => [c.toLowerCase(), { name: c }]));
+    return { network: { id: netId }, channels } as unknown as LiveConn;
+  }
+  function setLiveConn(uid: number, conn: LiveConn) {
+    // connectionsForUser creates the inner map if absent — same seam the bouncer
+    // test harness uses to inject upstream connections.
+    ircManager.connectionsForUser(uid).set(conn.network.id, conn);
+  }
+  function clearLiveConns(uid: number) {
+    ircManager.connectionsForUser(uid).clear();
+  }
+
+  const netFor = (uid: number, name: string) =>
+    createNetwork(uid, { name, host: 'h', port: 6697, tls: true, nick: 'x' })!.id;
+  const ins = (net: number, target: string, text: string, matchedRuleId: number | null = null) =>
+    Number(
+      insertMessage({
+        networkId: net,
+        target,
+        time: new Date().toISOString(),
+        type: 'message',
+        nick: 'bob',
+        text,
+        self: false,
+        matchedRuleId,
+      }).id,
+    );
+
+  it('counts a closed-but-currently-joined channel — a live join beats a stale closed flag (finding #3)', () => {
+    const u = createUser('racer').id;
+    const net = netFor(u, 'race');
+    const base = computeTotalHighlights(u);
+
+    // Two real channel highlights (matched_rule_id set → countHighlightsNewer).
+    ins(net, '#joined', 'ping alice', 1);
+    ins(net, '#joined', 'alice again', 1);
+    // Open + offline: enumerated with history → both highlights count.
+    expect(computeTotalHighlights(u)).toBe(base + 2);
+
+    // Closing it while offline hides it from the store, so the badge drops it too.
+    closeBuffer(u, net, '#joined');
+    expect(computeTotalHighlights(u)).toBe(base);
+
+    // The autorejoin/reconnect race: the buffer still carries a stale closed flag
+    // but the live connection reports it currently joined. The snapshot ships it
+    // (isHiddenClosedBuffer join-precedence), so the badge total must count it too
+    // — the exact undercount that used to make the app-icon badge read low.
+    setLiveConn(u, stubLiveConn(net, ['#joined']));
+    try {
+      expect(computeTotalHighlights(u)).toBe(base + 2);
+    } finally {
+      clearLiveConns(u);
+    }
+    // ...and once the connection drops, the closed flag wins again.
+    expect(computeTotalHighlights(u)).toBe(base);
+  });
+
+  it('eachUserBufferTarget honors closed offline but yields a closed channel that is live-joined', () => {
+    const u = createUser('enum').id;
+    const net = netFor(u, 'enumnet');
+    ins(net, '#c', 'hi');
+    closeBuffer(u, net, '#c');
+
+    const targetsFor = () =>
+      [...eachUserBufferTarget(u)].filter((t) => t.networkId === net).map((t) => t.target);
+
+    // Offline: nothing is joined, so the closed flag hides #c.
+    expect(targetsFor()).not.toContain('#c');
+    // The :server: pseudo-buffer is always present and never filtered.
+    expect(targetsFor()).toContain(`:server:${net}`);
+
+    setLiveConn(u, stubLiveConn(net, ['#c']));
+    try {
+      const live = [...eachUserBufferTarget(u)].filter((t) => t.networkId === net);
+      expect(live.map((t) => t.target)).toContain('#c');
+      // A live yield carries the connection so callers can pick shell-vs-backlog.
+      expect(live.find((t) => t.target === '#c')?.conn).not.toBeNull();
+    } finally {
+      clearLiveConns(u);
+    }
+  });
+
+  it('badge total equals the summed highlights of the frames the client actually receives', () => {
+    // The client's totalHighlights getter sums buf.highlighted, and each buffer's
+    // highlighted is set from its snapshot frame's `highlights`. For an all-offline
+    // user the client's frames are the system-buffer frame + buildOfflineBacklogFrames,
+    // so their highlight sum must equal computeTotalHighlights for the same DB state —
+    // the cross-check that fails if the frame path and the badge path ever drift.
+    const u = createUser('parity').id;
+    const net = netFor(u, 'paritynet');
+
+    // Never-opened DM: every unread line is a highlight (DMs are inherently mentions).
+    ins(net, 'zed', 'yo');
+    ins(net, 'zed', 'you there?');
+    // Channel with one genuine mention among plain chatter → contributes 1.
+    ins(net, '#chan', 'idle talk');
+    ins(net, '#chan', 'hey alice', 1);
+    // Plain channel, no mention → contributes 0 (still enumerated).
+    ins(net, '#quiet', 'nothing to see');
+    // Closed buffer with a mention → excluded from both paths.
+    ins(net, '#gone', 'alice?', 1);
+    closeBuffer(u, net, '#gone');
+    // Server pseudo-buffer notice → not a DM, no mention rule → 0 highlights.
+    ins(net, `:server:${net}`, 'connection notice');
+
+    const systemFrame = buildSystemBacklog(u) as { highlights?: number };
+    const offlineHighlights = buildOfflineBacklogFrames(u).reduce(
+      (sum, f) => sum + (Number((f as { highlights?: number }).highlights) || 0),
+      0,
+    );
+    const clientTotal = (Number(systemFrame.highlights) || 0) + offlineHighlights;
+
+    expect(clientTotal).toBe(computeTotalHighlights(u));
+    // Sanity: the mix actually exercised highlights (DM 2 + channel mention 1),
+    // so this isn't a vacuous 0 === 0.
+    expect(computeTotalHighlights(u)).toBe(3 + (Number(systemFrame.highlights) || 0));
+  });
+
+  it('buildOfflineBacklogFrames reuses a pre-walked enumeration identically to walking itself', () => {
+    // The connect snapshot materializes eachUserBufferTarget once and hands it to
+    // buildOfflineBacklogFrames so the per-network listBufferTargets/listNetworksForUser
+    // DB reads run 1× per snapshot, not once here and once in the live loop. This
+    // locks that the reuse path yields the exact same frames as the standalone walk.
+    const u = createUser('reuse').id;
+    const net = netFor(u, 'reusenet');
+    ins(net, '#a', 'one');
+    ins(net, 'dee', 'dm');
+    ins(net, '#closed', 'gone');
+    closeBuffer(u, net, '#closed');
+    ins(net, `:server:${net}`, 'notice');
+
+    const shape = (frames: ReturnType<typeof buildOfflineBacklogFrames>) =>
+      frames
+        .filter((f) => f.networkId === net)
+        .map((f) => `${f.target}|${f.kind}|${(f as { unread?: number }).unread ?? ''}`)
+        .sort();
+
+    const standalone = shape(buildOfflineBacklogFrames(u));
+    const reused = shape(buildOfflineBacklogFrames(u, [...eachUserBufferTarget(u)]));
+    expect(reused).toEqual(standalone);
+    // The closed buffer is absent and the server pseudo-buffer is present in both.
+    expect(standalone.some((s) => s.startsWith('#closed|'))).toBe(false);
+    expect(standalone.some((s) => s.startsWith(`:server:${net}|`))).toBe(true);
   });
 });

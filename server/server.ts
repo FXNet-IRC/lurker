@@ -12,8 +12,7 @@ import { getNodeSecret } from './middleware/nodeAuth.js';
 import { nodeUploadConfigured } from './services/uploadProviders/nodeUpload.js';
 import * as systemLog from './services/systemLog.js';
 import { purgeExpiredSessions } from './db/sessions.js';
-import { backfillEncryptNetworkSecrets } from './db/networks.js';
-import { backfillEncryptE2eSecrets } from './db/e2e.js';
+import { backfillEncryptColumns } from './db/secretBackfill.js';
 import { resolveSessionSecret } from './utils/sessionSecret.js';
 import { getEdition, isNodeMode } from './utils/edition.js';
 import { startOrchestratorClient, stopOrchestratorClient } from './services/orchestratorClient.js';
@@ -25,6 +24,13 @@ import {
   identdPort,
   identdBindHost,
 } from './services/identd.js';
+import {
+  startBouncer,
+  stopBouncer,
+  isBouncerEnabled,
+  bouncerPort,
+  bouncerBindHost,
+} from './services/bouncer.js';
 import {
   recoverInterruptedExports,
   startExportSweeper,
@@ -83,25 +89,29 @@ if (isIdentdEnabled()) {
   startIdentd(identdPort(), identdBindHost());
 }
 
-// Wrap any plaintext network secrets at rest now that the DB schema is ready
-// and before IRC connects. No-op unless LURKER_SECRET_KEY is configured (hosted
-// cells); self-host instances keep secrets in plaintext.
-const wrapped = backfillEncryptNetworkSecrets();
+// Wrap any plaintext secret columns at rest now that the DB schema is ready and
+// before IRC connects — network secrets, +k channel keys, and the RPE2E keyring
+// (identity privkey + session keys), all driven by the encryptedColumns
+// declarations in db/exportSchema.ts. No-op unless LURKER_SECRET_KEY is
+// configured (hosted cells); self-host instances keep secrets in plaintext.
+const wrapped = backfillEncryptColumns();
 if (wrapped.encrypted > 0) {
-  console.log(`[lurker] encrypted ${wrapped.encrypted} network-secret row(s) at rest`);
-  systemLog.log({ scope: 'server', text: `Encrypted ${wrapped.encrypted} network-secret row(s)` });
-}
-
-// Same re-seal for the RPE2E keyring's secret columns (identity privkey +
-// session keys), so a keyless-written cell that later gains a key never leaves
-// the identity private key as cleartext in the R2 backup (#382).
-const wrappedE2e = backfillEncryptE2eSecrets();
-if (wrappedE2e.encrypted > 0) {
-  console.log(`[lurker] encrypted ${wrappedE2e.encrypted} e2e key row(s) at rest`);
-  systemLog.log({ scope: 'server', text: `Encrypted ${wrappedE2e.encrypted} e2e key row(s)` });
+  console.log(`[lurker] encrypted ${wrapped.encrypted} secret column value(s) at rest`);
+  systemLog.log({ scope: 'server', text: `Encrypted ${wrapped.encrypted} secret column value(s)` });
 }
 
 ircManager.initAll();
+
+// Built-in IRC bouncer (opt-in via LURKER_BOUNCER_ENABLED): lets ordinary IRC
+// clients attach to the always-on connections ircManager just established,
+// ZNC-style. Started after initAll so an attaching client finds its network.
+if (isBouncerEnabled()) {
+  // Async because first-boot self-signed TLS generation is; not on the web
+  // server's critical path, so start it in the background.
+  startBouncer(bouncerPort(), bouncerBindHost()).catch((err) => {
+    console.error(`[bouncer] failed to start: ${(err as Error).message}`);
+  });
+}
 
 // Fail any export job a prior crash/restart left mid-flight, drop partial
 // artifacts + expired ones, then sweep finished exports on an interval.
@@ -136,6 +146,7 @@ function shutdown(signal: string): void {
   stopOrchestratorClient();
   stopModerationReporter();
   stopIdentd();
+  stopBouncer();
   shutdownExportJobs();
   stopIgnoreSweeper();
   stopGuestReaper();

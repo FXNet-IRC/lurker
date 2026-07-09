@@ -23,7 +23,7 @@
           <i class="fa-regular fa-bookmark"></i>
         </button>
         <button class="icon" title="Recent uploads" @click="showUploads = true">
-          <i class="fa-solid fa-paperclip"></i>
+          <i class="fa-solid fa-arrow-up-from-bracket"></i>
         </button>
         <!-- Self-revealing DCC transfers button — see DesktopChat for rationale.
              Warn-colored while an offer awaits a decision. -->
@@ -34,7 +34,7 @@
           :title="dccTitle"
           @click="dcc.open()"
         >
-          <i class="fa-solid fa-circle-down"></i>
+          <i class="fa-solid fa-download"></i>
         </button>
         <button
           v-if="!config.isNetworkLocked"
@@ -44,6 +44,15 @@
         >
           <i class="fa-solid fa-plus"></i>
         </button>
+        <RouterLink
+          v-if="showAdminEntry"
+          class="icon"
+          to="/admin"
+          title="Admin panel"
+          aria-label="Admin panel"
+        >
+          <i class="fa-solid fa-shield-halved"></i>
+        </RouterLink>
         <RouterLink class="icon" to="/settings" title="Settings">
           <i class="fa-solid fa-gear"></i>
         </RouterLink>
@@ -86,17 +95,41 @@
             <i class="fa-solid fa-users"></i> {{ friendCount }}
           </span>
         </template>
-        <button v-if="!isVirtual" class="icon" title="Search this buffer" @click="openSearch(true)">
+        <button
+          v-if="!isVirtual && !isServerBuffer"
+          class="icon"
+          title="Search this buffer"
+          @click="openSearch(true)"
+        >
           <i class="fa-solid fa-magnifying-glass"></i>
         </button>
         <button
-          v-if="!isVirtual"
+          v-if="!isVirtual && !isServerBuffer"
           class="icon"
           title="Highlights in this buffer"
           @click="openHighlights(true)"
         >
           <i class="fa-regular fa-bell"></i>
         </button>
+        <template v-if="isServerBuffer">
+          <button
+            class="icon"
+            title="Join channel"
+            aria-label="Join channel"
+            :disabled="serverConnectionState !== 'connected'"
+            @click="active && joinChannelModal.open(active.networkId)"
+          >
+            <i class="fa-solid fa-plus"></i>
+          </button>
+          <button
+            class="icon"
+            title="Channel list"
+            aria-label="Channel list"
+            @click="active && channelListModal.open(active.networkId)"
+          >
+            <i class="fa-solid fa-hashtag"></i>
+          </button>
+        </template>
         <button
           v-if="isChannel"
           class="icon"
@@ -163,6 +196,11 @@
       :network-id="channelListModal.networkId!"
       @close="channelListModal.close()"
     />
+    <JoinChannelModal
+      v-if="joinChannelModal.isOpen && joinChannelModal.networkId !== null"
+      :network-id="joinChannelModal.networkId!"
+      @close="joinChannelModal.close()"
+    />
     <RecentUploadsModal v-if="showUploads" @close="showUploads = false" />
     <TransfersModal v-if="dcc.panelOpen" @close="dcc.close()" />
     <SearchModal
@@ -202,6 +240,7 @@ import { useConfigStore } from '../stores/config.js';
 import { useSocket } from '../composables/useSocket.js';
 import { useChatBootstrap } from '../composables/useChatBootstrap.js';
 import { useActiveBuffer } from '../composables/useActiveBuffer.js';
+import { useBufferSearchScope } from '../composables/useBufferSearchScope.js';
 import { useBufferActions } from '../composables/useBufferActions.js';
 import { useContextMenu } from '../composables/useContextMenu.js';
 import type { ContextMenuItem } from '../composables/useContextMenu.js';
@@ -216,6 +255,7 @@ import HighlightsModal from '../components/HighlightsModal.vue';
 import BookmarksModal from '../components/BookmarksModal.vue';
 import TopicModal from '../components/TopicModal.vue';
 import ChannelListModal from '../components/ChannelListModal.vue';
+import JoinChannelModal from '../components/JoinChannelModal.vue';
 import RecentUploadsModal from '../components/RecentUploadsModal.vue';
 import TransfersModal from '../components/TransfersModal.vue';
 import SearchModal from '../components/SearchModal.vue';
@@ -226,19 +266,25 @@ import ImageViewerModal from '../components/ImageViewerModal.vue';
 import { useNickNotesStore } from '../stores/nickNotes.js';
 import { useFriendsStore } from '../stores/friends.js';
 import { useDccStore } from '../stores/dcc.js';
-import { useSearchStore } from '../stores/search.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useChannelListModal } from '../composables/useChannelListModal.js';
+import { useJoinChannelModal } from '../composables/useJoinChannelModal.js';
 import { useImageModal } from '../composables/useImageModal.js';
 import { useNetworkEditor } from '../composables/useNetworkEditor.js';
 import { useJumpToMessage } from '../composables/useJumpToMessage.js';
 import { useVisualViewport } from '../composables/useVisualViewport.js';
 import { useBuffersStore } from '../stores/buffers.js';
+import { useAuthStore } from '../stores/auth.js';
 import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
 
 const networks = useNetworksStore();
 const config = useConfigStore();
 const buffers = useBuffersStore();
+const auth = useAuthStore();
+
+// Admin panel entry in the mobile top bar — admin-only, and only when the
+// instance enabled LURKER_NEW_ADMIN_PANEL. With the flag off it never renders.
+const showAdminEntry = computed(() => config.newAdminPanel && auth.isAdmin);
 const { connected } = useSocket();
 const { keyboardOpen } = useVisualViewport();
 const {
@@ -282,53 +328,28 @@ function openSystemConsole() {
 // flow is short and stateful, and a URL would expose us to bookmarks that
 // land on the buffer screen with no active buffer.
 const channelListModal = reactive(useChannelListModal());
+const joinChannelModal = reactive(useJoinChannelModal());
 const imageModal = reactive(useImageModal());
 const networkEditor = reactive(useNetworkEditor());
 const screen = ref('list');
-const showHighlights = ref(false);
 const showBookmarks = ref(false);
 const showTopic = ref(false);
 const showUploads = ref(false);
-const showSearch = ref(false);
-const searchScope = ref<string | null>(null);
-const highlightScope = ref<string | null>(null);
 const pendingScrollId = ref<number | null>(null);
 const messageInputRef = ref<{ focus: () => void } | null>(null);
 const bufferCogBtn = ref<HTMLElement | null>(null);
 
-// in:/on: filter that scopes search & highlights to the current buffer when
-// they're opened from the topic bar. Null for the server buffer / system
-// console (no per-buffer scope there). The network name is omitted when it
-// contains whitespace — the filter parser splits tokens on spaces, so
-// `on:<name>` couldn't round-trip; `in:<target>` alone still scopes by
-// channel/nick in that case.
-const bufferScope = computed<string | null>(() => {
-  const a = active.value;
-  if (!a || isServerBuffer.value || isSystemBuffer.value || !a.target) return null;
-  const netName = (a.network as { name?: string } | null)?.name;
-  const onTok = netName && !/\s/.test(netName) ? ` on:${netName}` : '';
-  return `in:${a.target}${onTok}`;
-});
-
-// Topic-bar buttons pass scoped=true so the modal opens pre-filtered to this
-// buffer; the buffer-list top bar passes false for the global view. Both share
-// one modal instance — the scope ref is what differentiates the two entries.
-function openSearch(scoped: boolean) {
-  searchScope.value = scoped ? bufferScope.value : null;
-  showSearch.value = true;
-}
-
-// "View activity" from the Friends overview: open Search with the scoped query
-// (from:<nick> on:<network>) and run it immediately.
-function onViewActivity(query: string) {
-  useSearchStore().runQuery(query);
-  searchScope.value = null;
-  showSearch.value = true;
-}
-function openHighlights(scoped: boolean) {
-  highlightScope.value = scoped ? bufferScope.value : null;
-  showHighlights.value = true;
-}
+// Search & Highlights modal state + per-buffer `in:/on:` scoping, shared with
+// DesktopChat (#496).
+const {
+  showSearch,
+  showHighlights,
+  searchScope,
+  highlightScope,
+  openSearch,
+  openHighlights,
+  onViewActivity,
+} = useBufferSearchScope();
 
 // Mobile folds the remaining buffer/topic/server actions behind one kebab menu
 // to keep the header uncluttered (Members is an inline header button — see
@@ -352,12 +373,9 @@ function openBufferActions() {
     });
   }
   if (isServerBuffer.value) {
+    // Join channel / Channel list now live as top-bar buttons for server buffers,
+    // so the kebab keeps just the less-frequent connect/edit actions.
     items.push(
-      {
-        label: 'Channel list',
-        icon: 'fa-solid fa-hashtag',
-        onClick: () => channelListModal.open(a.networkId),
-      },
       {
         label: serverConnectActionLabel.value,
         icon: serverConnectActionIcon.value,
@@ -548,6 +566,15 @@ useChatBootstrap({ onJump: onJumpToMessage });
 }
 .icon:hover {
   color: var(--fg);
+}
+/* Disabled top-bar icon (e.g. Join channel while the network is disconnected):
+   dimmed and non-interactive, and it must not brighten on hover. */
+.icon:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.icon:disabled:hover {
+  color: var(--accent);
 }
 /* Transfers button turns warn-colored while an offer awaits a decision
    (color-as-signal, no count badge — matches DesktopChat). */

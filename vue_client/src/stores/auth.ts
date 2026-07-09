@@ -47,6 +47,10 @@ export const useAuthStore = defineStore('auth', {
     // "create an account to keep your settings" prompt and hide account-only
     // affordances (passkey/password management lives in the claim flow instead).
     isGuest: (s): boolean => s.user?.is_guest === true,
+    // Instance-admin gate. Every admin-only surface (Settings "Users" category,
+    // the admin panel + its entry buttons, the /admin route guard) keys off this
+    // rather than re-deriving `user?.role === 'admin'` at each call site.
+    isAdmin: (s): boolean => s.user?.role === 'admin',
   },
   actions: {
     // Live flip from the server's 'account-state' WS event, so an open tab

@@ -29,6 +29,8 @@ export function getDefault(key: string): SettingValue | undefined {
 export interface VisibilityContext {
   isAdmin: boolean;
   isNode: boolean;
+  /** Whether the dedicated admin panel (LURKER_NEW_ADMIN_PANEL) is enabled. */
+  newAdminPanel: boolean;
   // FXNet: LURKER_PUBLIC_MODE. Optional so existing callers/tests that predate
   // public mode keep compiling; undefined is treated as "not public".
   isPublicMode?: boolean;
@@ -36,11 +38,14 @@ export interface VisibilityContext {
 
 /**
  * Whether a settings category shows in the sidebar. `adminOnly` categories are
- * hidden from non-admins; `selfHostedOnly` ones are hidden in the hosted (node)
- * edition where the operator, not the tenant, owns them; `hideInPublicMode` ones
- * (the AI-agent API-tokens surface) are hidden on a public FXNet instance.
+ * hidden from non-admins; when the dedicated admin panel is enabled they leave
+ * Settings entirely (they live at /admin instead). `selfHostedOnly` ones are
+ * hidden in the hosted (node) edition where the operator, not the tenant, owns
+ * them; `hideInPublicMode` ones (the AI-agent API-tokens surface) are hidden on
+ * a public FXNet instance.
  */
 export function categoryVisible(cat: SettingCategory, ctx: VisibilityContext): boolean {
+  if (cat.adminOnly && ctx.newAdminPanel) return false;
   if (cat.adminOnly && !ctx.isAdmin) return false;
   if (cat.selfHostedOnly && ctx.isNode) return false;
   if (cat.hideInPublicMode && ctx.isPublicMode) return false;

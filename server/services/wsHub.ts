@@ -11,6 +11,7 @@ import { WebSocketServer } from 'ws';
 import cookie from 'cookie';
 import cookieParser from 'cookie-parser';
 import ircManager from './ircManager.js';
+import type { IrcConnection } from './ircConnection.js';
 import { e2eManager } from './e2e/manager.js';
 import { MAX_IMPORT_BYTES } from './e2e/portable.js';
 import settingsService from './settingsService.js';
@@ -34,11 +35,12 @@ import {
   listBufferTargets,
   listSpeakers,
   countNewer,
+  countServerBufferUnread,
   countHighlightsNewer,
   maxIdByBuffer,
   maxIdForBuffer,
   maxMessageId,
-  COUNTABLE_TYPES,
+  typeCountsForUnread,
 } from '../db/messages.js';
 import {
   listReadStateForUser,
@@ -328,7 +330,12 @@ function computeUnreadFor(
     return { lastReadId: lastReadId || 0, unread, highlights: unread, highlightsCapped: false };
   }
   const nid = networkId as number;
-  const unread = countNewer(nid, target, lastReadId);
+  // The server pseudo-buffer applies a notability filter (#470): routine
+  // Lurker-generated connection-status notices don't mark it unread, but errors,
+  // inbound notices, and closed-buffer mirrors do. Channels/DMs count normally.
+  const unread = target.startsWith(':server:')
+    ? countServerBufferUnread(nid, target, lastReadId)
+    : countNewer(nid, target, lastReadId);
   // A DM is inherently a mention of you, so — like the system buffer — every
   // unread line counts as a highlight. This lights the buffer-list row up in
   // the highlight color and shows the ● badge, surfacing unread DMs above
@@ -347,43 +354,87 @@ function computeUnreadFor(
   };
 }
 
-// App-wide unread-highlight total for a user — the number the PWA app-icon
-// badge shows while no client is open (#451). Must equal the client's
-// `totalHighlights` getter (sum of every store buffer's `highlighted`), so it
-// enumerates the SAME buffer set the snapshot ships: every network the user
-// owns and every target with history under it, plus the app-scoped system
-// buffer. Crucially it keys off buffer history, NOT buffer_reads rows — a
-// buffer the user has never opened has no read pointer, but the client still
-// counts it (the snapshot computes its highlights from lastReadId 0), so this
-// uses getReadState (which defaults to 0) the same way. Closed buffers are
-// excluded to mirror the client dropping them from its store. :server: pseudo-
-// buffers ARE enumerated by listBufferTargets (it doesn't filter them), but
-// isDmTarget excludes them, so they get no DM=unread shortcut — their only
-// highlights are genuine mention-rule matches against server-notice text
-// (normally none), which the client's snapshot counts identically, so the
-// totals still agree. Only called on push delivery (no visible client), so the
-// per-buffer indexed counts are cheap; computeUnreadFor skips the highlight
-// query entirely when a buffer has no unread.
-export function computeTotalHighlights(userId: number): number {
-  const closed = closedKeySetForUser(userId);
+// A joined-set stand-in for buffers with no join concept (offline networks, the
+// system buffer): nothing is ever "currently joined", so isHiddenClosedBuffer
+// falls back to a plain closed-flag check. Shared so we don't allocate one per
+// network in the enumerator.
+const NONE_JOINED: { has(name: string): boolean } = { has: () => false };
+
+// One yield per buffer.
+export interface UserBufferTarget {
+  networkId: number | null; // null == the app-scoped system buffer
+  target: string;
+  conn: IrcConnection | null; // the live connection, or null (offline / system)
+}
+
+// THE single source of "which buffers belong in this user's client store". Every
+// site that has to walk a user's whole buffer set — the connect snapshot's live
+// loop, buildOfflineBacklogFrames, and the push-badge total — used to hand-roll
+// this walk and re-derive the system / :server: / closed-vs-joined carve-outs
+// slightly differently, which let the PWA app-icon badge total drift from the
+// in-app count (#454). Now they all iterate this generator, so the set can't
+// diverge. The app-scoped system buffer (networkId null, uncloseable) is yielded
+// first; then, for every network the user owns (live OR offline), the buffers
+// under it — in no particular order — its :server: pseudo-buffer (uncloseable),
+// every target with persisted history (listBufferTargets), and, for a live
+// connection, its currently-joined channels even before they have history
+// (matching what the snapshot ships). Consumers key frames by network+target and
+// sum per buffer, so intra-network yield order doesn't matter.
+// Closed buffers are dropped with the SAME join-precedence the snapshot uses
+// (isHiddenClosedBuffer): a closed flag hides a buffer only when it isn't
+// currently joined, so an autorejoin/reconnect race where a channel is both
+// closed and joined can't make the badge total omit highlights the snapshot
+// actually shipped (finding #3). `conn` is the live connection or null so callers
+// can choose shell-vs-backlog and thread per-connection state without re-deriving
+// liveness. Keys off buffer history, not buffer_reads rows, so a never-opened
+// buffer (no read pointer) is still enumerated — the client counts it from
+// lastReadId 0, and callers use getReadState (defaults to 0) the same way.
+export function* eachUserBufferTarget(
+  userId: number,
+  closed: Set<string> = closedKeySetForUser(userId),
+): Generator<UserBufferTarget> {
   // System buffer first — app-scoped (networkId null), uncloseable.
-  let total = computeUnreadFor(
-    userId,
-    null,
-    SYSTEM_TARGET,
-    getReadState(userId, null, SYSTEM_TARGET),
-  ).highlights;
+  yield { networkId: null, target: SYSTEM_TARGET, conn: null };
+  const liveById = new Map<number, IrcConnection>(
+    ircManager.listConnections(userId).map((c) => [c.network.id, c]),
+  );
   for (const net of listNetworksForUser(userId)) {
-    for (const target of listBufferTargets(net.id)) {
-      // closedKeySetForUser keys are `${networkId}::${lowercased target}`.
-      if (closed.has(`${net.id}::${target.toLowerCase()}`)) continue;
-      total += computeUnreadFor(
-        userId,
-        net.id,
-        target,
-        getReadState(userId, net.id, target),
-      ).highlights;
+    const conn = liveById.get(net.id) ?? null;
+    const targets = new Set(listBufferTargets(net.id));
+    targets.add(`:server:${net.id}`);
+    // Live: currently-joined channels are shown even before they have history,
+    // and take precedence over a stale closed flag.
+    if (conn) for (const ch of conn.channels.values()) targets.add(ch.name);
+    const joined = conn?.channels ?? NONE_JOINED;
+    for (const target of targets) {
+      // :server: is uncloseable; every other target honors the closed flag, but
+      // a currently-joined channel beats a stale closed flag (join-precedence).
+      if (!target.startsWith(':server:') && isHiddenClosedBuffer(closed, joined, net.id, target))
+        continue;
+      yield { networkId: net.id, target, conn };
     }
+  }
+}
+
+// App-wide unread-highlight total for a user — the number the PWA app-icon badge
+// shows while no client is open (#451). Must equal the client's `totalHighlights`
+// getter (sum of every store buffer's `highlighted`), so it counts highlights
+// over exactly the buffer set eachUserBufferTarget enumerates — the same set the
+// snapshot ships. :server: pseudo-buffers are enumerated but isDmTarget excludes
+// them, so they get no DM=unread shortcut — their only highlights are genuine
+// mention-rule matches against server-notice text (normally none), which the
+// client's snapshot counts identically, so the totals still agree. Only called on
+// push delivery (no visible client), so the per-buffer indexed counts are cheap;
+// computeUnreadFor skips the highlight query entirely when a buffer has no unread.
+export function computeTotalHighlights(userId: number): number {
+  let total = 0;
+  for (const { networkId, target } of eachUserBufferTarget(userId)) {
+    total += computeUnreadFor(
+      userId,
+      networkId,
+      target,
+      getReadState(userId, networkId, target),
+    ).highlights;
   }
   return total;
 }
@@ -753,38 +804,36 @@ export function buildSystemHistoryReply(userId: number, msg: WsPayload): WsPaylo
 // connection exists — which a paused user can never establish. Reuses
 // buildBufferBacklog, which reads purely from the DB and reports joined:false
 // when no connection is tracking the channel.
-// `closed` defaults to a fresh query so standalone callers (tests) stay simple;
-// sendSnapshot passes the Set it already computed for the live loop to avoid a
-// redundant DB read per snapshot.
+// The frame for one offline buffer. The server pseudo-buffer ships its real
+// recent slice (one cheap read per network, and it's where the disconnect reason
+// the user wants lives); channel/DM buffers ship as lazy-load shells — that's
+// where the read cost and buffer count actually pile up on a long-lived account.
+// No live conn, so channelJoined folds #channels to parted and DMs to joined
+// (they never dim). Shared by buildOfflineBacklogFrames and the snapshot's single
+// enumeration pass so the offline carve-out lives in exactly one place.
+function buildOfflineFrame(userId: number, networkId: number, target: string): WsPayload {
+  return target.startsWith(':server:')
+    ? buildBufferBacklog(userId, networkId, target)
+    : buildBufferShell(userId, networkId, target, channelJoined(target));
+}
+
+// `targets` lets the snapshot hand in the enumeration it already materialized for
+// the live loop, so a connect snapshot walks eachUserBufferTarget — and its
+// per-network listBufferTargets/listNetworksForUser DB reads — exactly ONCE
+// instead of once here and once in the live loop. Standalone callers (tests) omit
+// it and get a fresh walk (which computes its own closed set).
 export function buildOfflineBacklogFrames(
   userId: number,
-  closed: Set<string> = closedKeySetForUser(userId),
+  targets: Iterable<UserBufferTarget> = eachUserBufferTarget(userId),
 ): WsPayload[] {
-  const liveIds = new Set(ircManager.listConnections(userId).map((c) => c.network.id));
   const frames: WsPayload[] = [];
-  for (const net of listNetworksForUser(userId)) {
-    if (liveIds.has(net.id)) continue;
-    const targets = new Set(listBufferTargets(net.id));
-    targets.add(`:server:${net.id}`);
-    for (const target of targets) {
-      // Server pseudo-buffer is uncloseable; otherwise honor a closed flag.
-      // Nothing is joined on an offline network, so there's no autorejoin race
-      // to defend against here (unlike the live loop in sendSnapshot). The
-      // closed set is case-folded, so fold the target on lookup too.
-      if (!target.startsWith(':server:') && closed.has(`${net.id}::${target.toLowerCase()}`))
-        continue;
-      // The server pseudo-buffer ships its real recent slice (one cheap read per
-      // network, and it's where the disconnect reason the user wants lives).
-      // Channel/DM buffers ship as lazy-load shells — that's where the read cost
-      // and buffer count actually pile up on a long-lived account.
-      frames.push(
-        target.startsWith(':server:')
-          ? buildBufferBacklog(userId, net.id, target)
-          : // Offline: no live conn, so channelJoined folds #channels to parted
-            // and DMs to joined (they never dim).
-            buildBufferShell(userId, net.id, target, channelJoined(target)),
-      );
-    }
+  for (const { networkId, target, conn } of targets) {
+    // Offline backlog only: the app-scoped system buffer ships via its own frame,
+    // and live networks are handled by the snapshot's live loop. eachUserBufferTarget
+    // has already applied the closed-flag carve-out (nothing is joined offline, so
+    // there's no autorejoin race to defend against here — unlike the live loop).
+    if (networkId == null || conn) continue;
+    frames.push(buildOfflineFrame(userId, networkId, target));
   }
   return frames;
 }
@@ -1332,8 +1381,15 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // Countable persisted events change the buffer's unread/highlight counts
     // for this user. Broadcast the recomputed read-state so every tab —
     // including inactive ones — reflects the new badge without the client
-    // having to mirror the server's counting logic.
-    if (decorated.id != null && decorated.target && COUNTABLE_TYPES.has(decorated.type)) {
+    // having to mirror the server's counting logic. The `:server:` buffer also
+    // counts 'error' lines (a disconnect/quit echo, a kill/ban); without matching
+    // that here the badge wouldn't refresh until the NEXT countable event landed
+    // (e.g. a reconnect's "Connecting…" notice) — the delayed-badge bug (#470).
+    if (
+      decorated.id != null &&
+      decorated.target &&
+      typeCountsForUnread(decorated.target, decorated.type)
+    ) {
       const lastReadId = getReadState(eventUserId, decorated.networkId, decorated.target);
       broadcastReadState(eventUserId, decorated.networkId, decorated.target, lastReadId);
     }
@@ -1638,112 +1694,115 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     const readState = listReadStateForUser(userId);
     const clearedState = listClearedStateForUser(userId);
     const closed = closedKeySetForUser(userId);
+    // Walk the shared enumerator ONCE per snapshot and reuse it for both the live
+    // loop and the offline backlog. Each walk runs a listBufferTargets DB query
+    // (recursive CTE) per network plus listNetworksForUser (SELECT * + decryptRow),
+    // so materializing here — rather than iterating the generator separately in the
+    // live loop and again in buildOfflineBacklogFrames — keeps those per-network
+    // reads at 1× on this ping-timeout-sensitive path (#454/#460). The array holds
+    // buffer references (incl. live conns), which stay valid for the rest of this
+    // synchronous snapshot. The system buffer / :server: / closed-joined precedence
+    // and joined-channel-even-without-history rules all live in the enumerator.
+    // Counted in seedsMs (it's a bulk pre-loop read like readState/clearedState),
+    // so onlineMs/offlineMs stay pure per-buffer frame-build time.
+    const allTargets = [...eachUserBufferTarget(userId, closed)];
     const seedsMs = Date.now() - tSeeds;
     const tOnline = Date.now();
     let maxSentId = ws.sinceId || 0;
     let bufferCount = 0;
     let unreadMs = 0;
     let sliceMs = 0;
-    for (const conn of ircManager.listConnections(userId)) {
-      const targets = new Set(listBufferTargets(conn.network.id));
-      targets.add(`:server:${conn.network.id}`);
-      // Currently-joined channels are always shown — they take precedence over
-      // a stale closed flag (shouldn't normally exist since joining clears it,
-      // but defensive against autorejoin/state races).
-      for (const ch of conn.channels.values()) targets.add(ch.name);
+    // Live loop: the enumerator yields the system buffer and offline networks too —
+    // skip both here. The system buffer ships via its own frame above, and offline
+    // networks are handled by buildOfflineBacklogFrames below (same materialized set).
+    for (const { networkId: nid, target, conn } of allTargets) {
+      if (nid == null || !conn) continue;
       // Fresh-network branch: this connection just came online, so the client
       // has never received a backlog frame for any of its buffers this
       // session. ws.sinceId has been advanced by live events on other
       // networks, so a cursor read would return nothing — ship the full
       // recent slice instead.
       const isFreshNetwork = freshNetworkId != null && conn.network.id === freshNetworkId;
-      for (const target of targets) {
-        if (target.startsWith(':server:')) {
-          // Server pseudo-buffer is uncloseable — never filter.
-        } else if (isHiddenClosedBuffer(closed, conn.channels, conn.network.id, target)) {
-          continue;
-        }
-        // Fresh connect (empty client, nothing focused) or a just-connected
-        // network: ship a lazy SHELL for channel/DM buffers instead of reading
-        // their backlog. Lurker auto-focuses nothing on load, so no messages are
-        // needed up front — the client hydrates whatever the user actually opens
-        // (activate() → reattachToLive). The :server: pseudo-buffer stays real
-        // (one cheap read per network; it holds connection notices worth seeing
-        // without a click). isFreshNetwork routes here too: its buffers' history
-        // all predates the advanced cursor, so a gap read would be empty — a
-        // shell is both correct and cheaper than the old forced-latest slice.
-        // Read/cleared state comes from the bulk maps this loop already built
-        // (listReadStateForUser/listClearedStateForUser) — thread them through so
-        // neither the shell nor the resume frame re-issues a per-buffer point
-        // query (the O(buffers) synchronous work the shell optimization exists to
-        // cut).
-        const key = `${conn.network.id}::${target}`;
-        const precomputed = {
-          lastReadId: readState[key] || 0,
-          cleared: clearedState[key] ?? { clearedBeforeId: 0, clearedAt: null },
-        };
-        if ((isFreshConnect || isFreshNetwork) && !target.startsWith(':server:')) {
-          // Shell path: the only per-buffer work is buildBufferShell's unread
-          // count (bufferStateFields → computeUnreadFor), so it goes to unreadMs.
-          const tShell = Date.now();
-          const shell = buildBufferShell(
-            userId,
-            conn.network.id,
-            target,
-            channelJoined(target, conn),
-            precomputed,
-          );
-          unreadMs += Date.now() - tShell;
-          send(ws, shell);
-          bufferCount += 1;
-          continue;
-        }
-        // Resume cursor: ship the gap the client missed (id > sinceId), or a
-        // fresh latest slice + reset flag when that gap exceeds the cap (see
-        // buildResumeSlice for the gap/reset rationale).
-        const tSlice = Date.now();
-        const slice = buildResumeSlice(userId, conn.network.id, target, ws.sinceId || 0);
-        sliceMs += Date.now() - tSlice;
-        const events = slice.events;
-        for (const e of events) {
-          if (e.id != null && e.id > maxSentId) maxSentId = e.id;
-        }
-        // Per-buffer input history for up-arrow recall — a recent slice
-        // (INPUT_HISTORY_SLICE); older entries stay in the DB (no pagination
-        // request exists, so this slice is the recall depth). The 'history' latest
-        // reply re-seeds it when a shell is opened.
-        const inputHistory = listRecentInputHistory(
+      // Fresh connect (empty client, nothing focused) or a just-connected
+      // network: ship a lazy SHELL for channel/DM buffers instead of reading
+      // their backlog. Lurker auto-focuses nothing on load, so no messages are
+      // needed up front — the client hydrates whatever the user actually opens
+      // (activate() → reattachToLive). The :server: pseudo-buffer stays real
+      // (one cheap read per network; it holds connection notices worth seeing
+      // without a click). isFreshNetwork routes here too: its buffers' history
+      // all predates the advanced cursor, so a gap read would be empty — a
+      // shell is both correct and cheaper than the old forced-latest slice.
+      // Read/cleared state comes from the bulk maps this loop already built
+      // (listReadStateForUser/listClearedStateForUser) — thread them through so
+      // neither the shell nor the resume frame re-issues a per-buffer point
+      // query (the O(buffers) synchronous work the shell optimization exists to
+      // cut).
+      const key = `${conn.network.id}::${target}`;
+      const precomputed = {
+        lastReadId: readState[key] || 0,
+        cleared: clearedState[key] ?? { clearedBeforeId: 0, clearedAt: null },
+      };
+      if ((isFreshConnect || isFreshNetwork) && !target.startsWith(':server:')) {
+        // Shell path: the only per-buffer work is buildBufferShell's unread
+        // count (bufferStateFields → computeUnreadFor), so it goes to unreadMs.
+        const tShell = Date.now();
+        const shell = buildBufferShell(
           userId,
           conn.network.id,
           target,
-          INPUT_HISTORY_SLICE,
+          channelJoined(target, conn),
+          precomputed,
         );
-        // Speakers are deliberately NOT shipped on connect. The sidebar doesn't
-        // use them, and computing them per buffer here (listSpeakers scanning
-        // history × every buffer) was the snapshot's dominant cost once the other
-        // scans were fixed. Nick autocomplete seeds them when you actually OPEN a
-        // buffer (the 'history' latest reply carries them — see applyLatestReplace)
-        // and live via recordSpeaker; omitting the key here leaves the client's
-        // existing map untouched.
-        const tUnread = Date.now();
-        const stateFields = bufferStateFields(userId, conn.network.id, target, precomputed);
-        unreadMs += Date.now() - tUnread;
-        send(ws, {
-          kind: 'backlog',
-          networkId: conn.network.id,
-          target,
-          events,
-          // reset=true means the resume gap overflowed the cap and `events` is
-          // a fresh latest slice — the client must replace its buffer, not
-          // append, or it splices a permanent hole (issue #205).
-          reset: slice.reset,
-          hasMoreOlder: slice.hasMoreOlder,
-          joined: channelJoined(target, conn),
-          ...stateFields,
-          inputHistory,
-        });
+        unreadMs += Date.now() - tShell;
+        send(ws, shell);
         bufferCount += 1;
+        continue;
       }
+      // Resume cursor: ship the gap the client missed (id > sinceId), or a
+      // fresh latest slice + reset flag when that gap exceeds the cap (see
+      // buildResumeSlice for the gap/reset rationale).
+      const tSlice = Date.now();
+      const slice = buildResumeSlice(userId, conn.network.id, target, ws.sinceId || 0);
+      sliceMs += Date.now() - tSlice;
+      const events = slice.events;
+      for (const e of events) {
+        if (e.id != null && e.id > maxSentId) maxSentId = e.id;
+      }
+      // Per-buffer input history for up-arrow recall — a recent slice
+      // (INPUT_HISTORY_SLICE); older entries stay in the DB (no pagination
+      // request exists, so this slice is the recall depth). The 'history' latest
+      // reply re-seeds it when a shell is opened.
+      const inputHistory = listRecentInputHistory(
+        userId,
+        conn.network.id,
+        target,
+        INPUT_HISTORY_SLICE,
+      );
+      // Speakers are deliberately NOT shipped on connect. The sidebar doesn't
+      // use them, and computing them per buffer here (listSpeakers scanning
+      // history × every buffer) was the snapshot's dominant cost once the other
+      // scans were fixed. Nick autocomplete seeds them when you actually OPEN a
+      // buffer (the 'history' latest reply carries them — see applyLatestReplace)
+      // and live via recordSpeaker; omitting the key here leaves the client's
+      // existing map untouched.
+      const tUnread = Date.now();
+      const stateFields = bufferStateFields(userId, conn.network.id, target, precomputed);
+      unreadMs += Date.now() - tUnread;
+      send(ws, {
+        kind: 'backlog',
+        networkId: conn.network.id,
+        target,
+        events,
+        // reset=true means the resume gap overflowed the cap and `events` is
+        // a fresh latest slice — the client must replace its buffer, not
+        // append, or it splices a permanent hole (issue #205).
+        reset: slice.reset,
+        hasMoreOlder: slice.hasMoreOlder,
+        joined: channelJoined(target, conn),
+        ...stateFields,
+        inputHistory,
+      });
+      bufferCount += 1;
     }
     const onlineMs = Date.now() - tOnline;
     const tOffline = Date.now();
@@ -1753,8 +1812,9 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // reattachToLive (buffers.ts activate() → 'history' mode:'latest'), the same
     // lazy path brand-new buffers already use. This keeps the connect snapshot
     // from reading recent backlog for every historical/offline buffer — the bulk
-    // of the synchronous read burst on a long-lived account.
-    for (const frame of buildOfflineBacklogFrames(userId, closed)) {
+    // of the synchronous read burst on a long-lived account. Reuses the enumeration
+    // materialized above so this doesn't re-run the per-network DB reads.
+    for (const frame of buildOfflineBacklogFrames(userId, allTargets)) {
       for (const e of frame.events as Array<{ id?: number | null }>) {
         if (e.id != null && e.id > maxSentId) maxSentId = e.id;
       }
@@ -2000,7 +2060,12 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         break;
       }
       case 'join':
-        ircManager.joinChannel(userId, msg.networkId as number, msg.channel as string);
+        ircManager.joinChannel(
+          userId,
+          msg.networkId as number,
+          msg.channel as string,
+          msg.key as string | undefined,
+        );
         break;
       case 'open-buffer':
         // A clicked channel name — handleOpenBuffer resolves reopen-vs-join.

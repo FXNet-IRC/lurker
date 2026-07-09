@@ -16,28 +16,38 @@ let listMessages: typeof import('./messages.js').listMessages;
 let listMessagesAround: typeof import('./messages.js').listMessagesAround;
 let searchMessages: typeof import('./messages.js').searchMessages;
 let countNewer: typeof import('./messages.js').countNewer;
+let countServerBufferUnread: typeof import('./messages.js').countServerBufferUnread;
+let typeCountsForUnread: typeof import('./messages.js').typeCountsForUnread;
 let countHighlightsNewer: typeof import('./messages.js').countHighlightsNewer;
 let listUserHighlights: typeof import('./messages.js').listUserHighlights;
 let maxIdForBuffer: typeof import('./messages.js').maxIdForBuffer;
 let hasConversationForTarget: typeof import('./messages.js').hasConversationForTarget;
 let listSpeakers: typeof import('./messages.js').listSpeakers;
 let listBufferTargets: typeof import('./messages.js').listBufferTargets;
+let loadHistoryWindow: typeof import('./messages.js').loadHistoryWindow;
+let listActiveTargetsInWindow: typeof import('./messages.js').listActiveTargetsInWindow;
+let demoteLegacyServerStatusNotices: typeof import('./index.js').demoteLegacyServerStatusNotices;
 
 beforeAll(async () => {
   ({ createUser } = await import('./users.js'));
   ({ createNetwork } = await import('./networks.js'));
+  ({ demoteLegacyServerStatusNotices } = await import('./index.js'));
   ({
     insertMessage,
     listMessages,
     listMessagesAround,
     searchMessages,
     countNewer,
+    countServerBufferUnread,
+    typeCountsForUnread,
     countHighlightsNewer,
     listUserHighlights,
     maxIdForBuffer,
     hasConversationForTarget,
     listSpeakers,
     listBufferTargets,
+    loadHistoryWindow,
+    listActiveTargetsInWindow,
   } = await import('./messages.js'));
 });
 
@@ -73,6 +83,104 @@ function event(networkId: number, target: string, type: string, nick: string | n
 function altsFor(networkId: number, target: string) {
   return listMessages(networkId, target, { limit: 1000 }).map((m) => m.alt);
 }
+
+describe('countServerBufferUnread (#470)', () => {
+  let seq = 0;
+  const net = () => {
+    const user = createUser(`sbu-${++seq}`);
+    return createNetwork(user.id, { name: 'n', host: 'h', port: 6697, tls: true, nick: 'me' })!.id;
+  };
+  const put = (
+    networkId: number,
+    target: string,
+    type: string,
+    opts: { nick?: string; notable?: boolean; fromIgnored?: boolean; mirrored?: boolean } = {},
+  ) =>
+    Number(
+      insertMessage({
+        networkId,
+        target,
+        time: new Date().toISOString(),
+        type,
+        nick: opts.nick ?? 'someone',
+        text: 'x',
+        self: false,
+        notable: opts.notable,
+        fromIgnored: opts.fromIgnored,
+        mirrored: opts.mirrored,
+      }).id,
+    );
+
+  it('counts errors, inbound notices/messages, and mirrors; skips Lurker status notices', () => {
+    const n = net();
+    const target = `:server:${n}`;
+    put(n, target, 'error'); // killed/banned/etc. — countNewer would NOT count this
+    put(n, target, 'notice', { nick: 'NickServ' }); // inbound notice
+    put(n, target, 'message', { nick: 'irc.server' }); // server message
+    put(n, target, 'notice', { nick: 'ChanServ', mirrored: true }); // closed-buffer mirror → still counts
+    put(n, target, 'notice', { nick: 'lurker', notable: false }); // "Connecting…" — must NOT count
+    put(n, target, 'notice', { nick: 'lurker', notable: false }); // "Reconnecting…" — must NOT count
+
+    expect(countServerBufferUnread(n, target, 0)).toBe(4);
+    // The generic channel count disagrees on BOTH axes: it drops the 'error' but
+    // counts the two notable=0 Lurker status notices (it ignores the flag) — so it
+    // sees the 5 notice/message rows and misses the error. Exactly why :server:
+    // needs its own count.
+    expect(countNewer(n, target, 0)).toBe(5);
+  });
+
+  it('honors the read pointer and excludes ignored senders', () => {
+    const n = net();
+    const target = `:server:${n}`;
+    const a = put(n, target, 'notice', { nick: 'a' });
+    put(n, target, 'notice', { nick: 'b' });
+    put(n, target, 'notice', { nick: 'spammer', fromIgnored: true }); // ignored → not counted
+    expect(countServerBufferUnread(n, target, 0)).toBe(2);
+    expect(countServerBufferUnread(n, target, a)).toBe(1); // only lines after `a`
+  });
+
+  it('returns 0 when every server line is a non-notable Lurker status notice', () => {
+    const n = net();
+    const target = `:server:${n}`;
+    put(n, target, 'notice', { nick: 'lurker', notable: false });
+    put(n, target, 'notice', { nick: 'lurker', notable: false });
+    expect(countServerBufferUnread(n, target, 0)).toBe(0);
+  });
+
+  it('typeCountsForUnread: :server: counts errors, other buffers do not — matches the count queries', () => {
+    // This is the rule the live read-state-broadcast trigger uses (wsHub). A
+    // :server: 'error' (a disconnect/quit echo, a kill/ban) must count here, or
+    // its badge wouldn't refresh until the next ordinary countable event — the
+    // delayed-badge bug. Everything countNewer counts still counts everywhere.
+    expect(typeCountsForUnread(':server:1', 'error')).toBe(true);
+    expect(typeCountsForUnread(':server:1', 'notice')).toBe(true);
+    expect(typeCountsForUnread(':server:1', 'message')).toBe(true);
+    expect(typeCountsForUnread(':server:1', 'motd')).toBe(false); // motd never counts
+    // Channels/DMs keep the narrower set: an error there doesn't badge.
+    expect(typeCountsForUnread('#chan', 'error')).toBe(false);
+    expect(typeCountsForUnread('#chan', 'message')).toBe(true);
+    expect(typeCountsForUnread('bob', 'notice')).toBe(true);
+  });
+
+  it('backfill demotes historical Lurker :server: status notices, sparing inbound and channel rows', () => {
+    const n = net();
+    const server = `:server:${n}`;
+    // Simulate PRE-migration rows: all notable=1 (the column default), including
+    // Lurker's own status notices, which were only tagged notable=false going
+    // forward. A real inbound :server: notice and a #channel notice from a
+    // (coincidentally) 'lurker'-nicked sender must survive the backfill.
+    put(n, server, 'notice', { nick: 'lurker' }); // status notice → should be demoted
+    put(n, server, 'notice', { nick: 'NickServ' }); // inbound → keep
+    put(n, '#room', 'notice', { nick: 'lurker' }); // wrong buffer → keep (LIKE ':server:%' scope)
+    expect(countServerBufferUnread(n, server, 0)).toBe(2);
+    expect(countServerBufferUnread(n, '#room', 0)).toBe(1);
+
+    demoteLegacyServerStatusNotices();
+
+    expect(countServerBufferUnread(n, server, 0)).toBe(1); // only the status notice dropped
+    expect(countServerBufferUnread(n, '#room', 0)).toBe(1); // channel row untouched
+  });
+});
 
 describe('hasConversationForTarget (#439)', () => {
   it('is true only when a non-notice message exists for the target', () => {
@@ -876,5 +984,107 @@ describe('maxIdForBuffer', () => {
     chat(net1.id, '#b', 'bob', 'b1');
     chat(net2.id, '#a', 'eve', 'e1');
     expect(maxIdForBuffer(net1.id, '#a')).toBe(a2.id);
+  });
+});
+
+describe('chathistory window queries', () => {
+  // Insert a message at a controlled ISO time so the timestamp resolvers are
+  // deterministic; ids stay monotonic in insertion order.
+  function at(networkId: number, target: string, iso: string, text: string) {
+    return Number(
+      insertMessage({ networkId, target, time: iso, type: 'message', nick: 'n', text, self: false })
+        .id,
+    );
+  }
+
+  function evt(networkId: number, target: string, iso: string, type: string) {
+    return Number(insertMessage({ networkId, target, time: iso, type, nick: 'x', self: false }).id);
+  }
+
+  it('loadHistoryWindow applies exclusive time bounds and returns oldest-first', () => {
+    const user = createUser(`cw_${Math.random().toString(36).slice(2)}`);
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'me',
+    })!;
+    const ids = [1, 2, 3, 4, 5].map((n) =>
+      at(net.id, '#w', `2023-05-23T06:00:0${n}.000Z`, `m${n}`),
+    );
+    // upper bound (BEFORE): strictly earlier than :03, newest-first cap → oldest-first out.
+    const before = loadHistoryWindow(net.id, '#w', null, '2023-05-23T06:00:03.000Z', 100, {
+      newestFirst: true,
+    });
+    expect(before.map((m) => m.id)).toEqual([ids[0], ids[1]]);
+    // lower bound (AFTER): strictly later than :02, earliest-first.
+    const after = loadHistoryWindow(net.id, '#w', '2023-05-23T06:00:02.000Z', null, 100);
+    expect(after.map((m) => m.id)).toEqual([ids[2], ids[3], ids[4]]);
+    // newestFirst caps from the recent end but still returns oldest-first.
+    const latest2 = loadHistoryWindow(net.id, '#w', null, null, 2, { newestFirst: true });
+    expect(latest2.map((m) => m.id)).toEqual([ids[3], ids[4]]);
+  });
+
+  it('loadHistoryWindow orders/selects by time even when id order diverges', () => {
+    const user = createUser(`cw_${Math.random().toString(36).slice(2)}`);
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'me',
+    })!;
+    // Insert out of chronological order (a chained/ZNC upstream replaying old
+    // buffered messages as live lines): the OLD-time row gets the highest id.
+    at(net.id, '#o', '2023-05-23T06:00:02.000Z', 'newer');
+    const oldId = at(net.id, '#o', '2023-05-23T06:00:01.000Z', 'older'); // higher id, older time
+    // LATEST must return them oldest-first BY TIME, not by id.
+    const latest = loadHistoryWindow(net.id, '#o', null, null, 10, { newestFirst: true });
+    expect(latest.map((m) => m.text)).toEqual(['older', 'newer']);
+    // BEFORE :02 selects the older-time row (id-ordering would have missed it).
+    const before = loadHistoryWindow(net.id, '#o', null, '2023-05-23T06:00:02.000Z', 10, {
+      newestFirst: true,
+    });
+    expect(before.map((m) => m.id)).toEqual([oldId]);
+  });
+
+  it('loadHistoryWindow excludes non-message rows so limit counts real messages', () => {
+    const user = createUser(`cw_${Math.random().toString(36).slice(2)}`);
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'me',
+    })!;
+    const m1 = at(net.id, '#n', '2023-05-23T06:00:01.000Z', 'hello');
+    // A flood of joins/quits after the message must not fill the window.
+    for (let i = 2; i <= 9; i++) evt(net.id, '#n', `2023-05-23T06:00:0${i}.000Z`, 'join');
+    const rows = loadHistoryWindow(net.id, '#n', null, null, 3, { newestFirst: true });
+    expect(rows.map((r) => r.id)).toEqual([m1]); // the joins are skipped, not counted
+  });
+
+  it('listActiveTargetsInWindow returns buffers active in the window, newest first', () => {
+    const user = createUser(`cw_${Math.random().toString(36).slice(2)}`);
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'me',
+    })!;
+    at(net.id, '#old', '2023-05-20T00:00:00.000Z', 'old');
+    at(net.id, '#a', '2023-05-23T06:00:00.000Z', 'a');
+    at(net.id, '#b', '2023-05-23T07:00:00.000Z', 'b');
+    at(net.id, ':server:x', '2023-05-23T06:30:00.000Z', 'srv'); // excluded (pseudo-buffer)
+    evt(net.id, '#joinonly', '2023-05-23T06:45:00.000Z', 'join'); // excluded (no real message)
+    const targets = listActiveTargetsInWindow(
+      net.id,
+      '2023-05-23T00:00:00.000Z',
+      '2023-05-24T00:00:00.000Z',
+      100,
+    );
+    expect(targets.map((t) => t.target)).toEqual(['#b', '#a']); // #old outside window; :server:/#joinonly excluded
   });
 });
