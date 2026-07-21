@@ -3,6 +3,7 @@
 
 import { defineStore } from 'pinia';
 import { api } from '../api.js';
+import type { AdminUploader, UploaderDriver } from '../utils/uploaders.js';
 
 export interface AdminUser {
   id: number;
@@ -23,12 +24,41 @@ export interface AdminInvite {
   usedByUsername?: string | null;
 }
 
+/** An admin-defined network preset (#298), as the admin API returns it. */
+export interface AdminNetworkPreset {
+  id: number;
+  name: string;
+  host: string;
+  port: number;
+  tls: boolean;
+  saslLikelyRequired: boolean;
+  /** Recommended channels, pre-checked for users in the first-run flow. */
+  channels: string[];
+  enabled: boolean;
+  position: number;
+}
+
+export type AdminNetworkPresetInput = Omit<AdminNetworkPreset, 'id' | 'position'>;
+
 export const useAdminStore = defineStore('admin', {
   state: () => ({
     users: [] as AdminUser[],
     invites: [] as AdminInvite[],
+    uploaders: [] as AdminUploader[],
+    uploaderDrivers: [] as UploaderDriver[],
+    allowUserDefined: true,
+    // Hosted: the uploader is env-managed by the control plane, so the whole
+    // management surface is read-only (the routes 409 anyway).
+    uploadersManaged: false,
+    // Instance network presets + the network lockdown (#298). Named distinctly
+    // from the uploader policy above — the two switches are independent, and
+    // conflating them would let a change to one silently move the other.
+    networkPresets: [] as AdminNetworkPreset[],
+    allowUserDefinedNetworks: true,
+    networksLoaded: false,
     usersLoaded: false,
     invitesLoaded: false,
+    uploadersLoaded: false,
     loading: false,
     error: '',
   }),
@@ -80,6 +110,92 @@ export const useAdminStore = defineStore('admin', {
     async deleteInvite(token: string) {
       await api(`/api/admin/invites/${encodeURIComponent(token)}`, { method: 'DELETE' });
       this.invites = this.invites.filter((i) => i.token !== token);
+    },
+
+    // ─── instance uploaders (#514) ───────────────────────────────────────────
+    // Every mutation refetches rather than patching locally: the policy flags are
+    // interdependent server-side (setting one default clears the incumbent), so a
+    // local patch would drift from the truth on the very first default swap.
+    async fetchUploaders() {
+      this.error = '';
+      try {
+        const data = await api('/api/admin/uploaders');
+        this.uploaders = data.uploaders || [];
+        this.uploaderDrivers = data.drivers || [];
+        this.allowUserDefined = data.allowUserDefined !== false;
+        this.uploadersManaged = !!data.managed;
+        this.uploadersLoaded = true;
+      } catch (e: any) {
+        this.error = e.message || 'failed to load uploaders';
+        throw e;
+      }
+    },
+    async createUploader(body: { driver: string; label: string; values: Record<string, string> }) {
+      await api('/api/admin/uploaders', { method: 'POST', body });
+      await this.fetchUploaders();
+    },
+    async updateUploader(
+      id: number,
+      body: {
+        label?: string;
+        values?: Record<string, string>;
+        enabled?: boolean;
+        offeredToUsers?: boolean;
+      },
+    ) {
+      await api(`/api/admin/uploaders/${id}`, { method: 'PATCH', body });
+      await this.fetchUploaders();
+    },
+    async setDefaultUploader(id: number) {
+      await api(`/api/admin/uploaders/${id}/default`, { method: 'PUT' });
+      await this.fetchUploaders();
+    },
+    async deleteUploader(id: number) {
+      await api(`/api/admin/uploaders/${id}`, { method: 'DELETE' });
+      await this.fetchUploaders();
+    },
+    async setAllowUserDefined(allowUserDefined: boolean) {
+      await api('/api/admin/uploaders/policy', {
+        method: 'PUT',
+        body: { allowUserDefined },
+      });
+      this.allowUserDefined = allowUserDefined;
+    },
+
+    // ─── instance network presets (#298) ─────────────────────────────────────
+    // Same refetch-on-mutate discipline as the uploaders above: the server
+    // refuses some combinations (you can't lock down with no presets, or delete
+    // the last one while locked down), so a local patch would drift from truth
+    // the first time a write is rejected.
+    async fetchNetworkPresets() {
+      this.error = '';
+      try {
+        const data = await api('/api/admin/networks');
+        this.networkPresets = data.presets || [];
+        this.allowUserDefinedNetworks = data.allowUserDefined !== false;
+        this.networksLoaded = true;
+      } catch (e: any) {
+        this.error = e.message || 'failed to load networks';
+        throw e;
+      }
+    },
+    async createNetworkPreset(body: AdminNetworkPresetInput) {
+      await api('/api/admin/networks', { method: 'POST', body });
+      await this.fetchNetworkPresets();
+    },
+    async updateNetworkPreset(id: number, body: Partial<AdminNetworkPresetInput>) {
+      await api(`/api/admin/networks/${id}`, { method: 'PATCH', body });
+      await this.fetchNetworkPresets();
+    },
+    async deleteNetworkPreset(id: number) {
+      await api(`/api/admin/networks/${id}`, { method: 'DELETE' });
+      await this.fetchNetworkPresets();
+    },
+    async setAllowUserDefinedNetworks(allowUserDefined: boolean) {
+      await api('/api/admin/networks/policy', { method: 'PUT', body: { allowUserDefined } });
+      // Refetch rather than assign: the server 409s this when no presets exist,
+      // and the throw must leave the checkbox showing the truth, not the attempt.
+      await this.fetchNetworkPresets();
     },
   },
 });

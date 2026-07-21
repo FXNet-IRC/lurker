@@ -8,7 +8,6 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 // setting it here before importing the router scopes it to this file and lets us
 // assert the endpoint reflects the hosted-node edition.
 process.env.LURKER_EDITION = 'node';
-process.env.LURKER_NEW_ADMIN_PANEL = '1';
 
 import type { Express } from 'express';
 import { createTestApp, createAnonAgent } from '../test-utils/testApp.js';
@@ -22,14 +21,22 @@ beforeAll(async () => {
 
 afterAll(() => {
   delete process.env.LURKER_EDITION;
-  delete process.env.LURKER_NEW_ADMIN_PANEL;
 });
 
 describe('GET /api/config', () => {
-  it('is public (no auth) and reports the edition + feature flags', async () => {
+  it('is public (no auth) and reports the edition', async () => {
     const res = await createAnonAgent(app).get('/api/config');
     expect(res.status).toBe(200);
     expect(res.body.edition).toBe('node');
-    expect(res.body.newAdminPanel).toBe(true);
+  });
+
+  // #569: a native client reads these to check compatibility before opening the
+  // WebSocket, so they must be present and unauthenticated.
+  it('advertises the protocol version and minimum supported version', async () => {
+    const { PROTOCOL_VERSION, MIN_PROTOCOL_VERSION } = await import('../protocol.js');
+    const res = await createAnonAgent(app).get('/api/config');
+    expect(res.status).toBe(200);
+    expect(res.body.protocolVersion).toBe(PROTOCOL_VERSION);
+    expect(res.body.minProtocolVersion).toBe(MIN_PROTOCOL_VERSION);
   });
 });

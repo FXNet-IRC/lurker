@@ -4,9 +4,8 @@
 // Deployment config the client reads once at boot from the public /api/config
 // endpoint. It carries the edition (self-hosted standalone vs a hosted
 // lurker.chat cell), which the Settings UI uses to gate operator-only surfaces
-// (A3), plus instance-level feature flags like the dedicated admin panel. Both
-// default to their safe/off value so a fetch failure degrades to the
-// fully-featured self-hosted experience rather than hiding or misplacing things.
+// (A3). It defaults to the safe value so a fetch failure degrades to the
+// fully-featured self-hosted experience rather than hiding things.
 
 import { defineStore } from 'pinia';
 import { api } from '../api.js';
@@ -29,9 +28,6 @@ export const useConfigStore = defineStore('config', {
     // router sends unauthenticated visitors to the join-as-guest landing rather
     // than the login page.
     publicMode: false,
-    // When true, instance administration lives in the dedicated /admin panel
-    // rather than the "Users" category inside Settings (Milestone 4).
-    newAdminPanel: false,
     checked: false,
   }),
   getters: {
@@ -52,21 +48,21 @@ export const useConfigStore = defineStore('config', {
             edition?: string;
             networkLock?: boolean;
             publicMode?: boolean;
-            newAdminPanel?: boolean;
           }>('/api/config');
           this.edition = data.edition === 'node' ? 'node' : 'standalone';
           this.networkLock = data.networkLock === true;
           this.publicMode = data.publicMode === true;
-          this.newAdminPanel = data.newAdminPanel === true;
           // Latch `checked` ONLY on success. A transient failure must not wedge
           // the session on the safe defaults — leaving it false lets the next
-          // caller (a later /admin navigation, or App.vue) retry and self-heal.
+          // caller retry and self-heal. That second caller is the router guard,
+          // which re-attempts on every navigation while `checked` is false;
+          // App.vue's boot fetch fires only once, so on its own it would be a
+          // single point of failure.
           this.checked = true;
         } catch (_err) {
           this.edition = 'standalone';
           this.networkLock = false;
           this.publicMode = false;
-          this.newAdminPanel = false;
         } finally {
           inflight = null;
         }

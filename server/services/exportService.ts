@@ -22,6 +22,7 @@ import { Readable } from 'stream';
 import type { Database } from 'better-sqlite3';
 import { ZipArchive } from 'archiver';
 import { EXPORT_TABLES, EXPORT_FORMAT_VERSION } from '../db/exportSchema.js';
+import { thumbnailFormat } from './thumbnailFormat.js';
 import { decryptSecret } from '../utils/secretCrypto.js';
 
 interface ExportTableDefWithScope {
@@ -57,6 +58,13 @@ function scopeFilter(scope: string, userId: number): { where: string; params: nu
         where: 'WHERE rule_id IN (SELECT id FROM highlight_rules WHERE user_id = ?)',
         params: [userId],
       };
+    // uploader_config (#514): a user's OWN uploaders only. The scope='user' half
+    // is load-bearing, not decoration — without it an export would rake in the
+    // instance's x0/catbox/local rows (owner_user_id IS NULL, so they'd slip a
+    // `WHERE owner_user_id = ?` only by luck) and hand the operator's
+    // configuration to whoever asked for their data.
+    case 'owned_uploaders':
+      return { where: "WHERE scope = 'user' AND owner_user_id = ?", params: [userId] };
     default:
       throw new Error(`exportService: unknown scope "${scope}"`);
   }
@@ -242,11 +250,16 @@ export async function buildExportZip(
     data[table] = rows.map((row) => projectRow(row, d));
     counts[table] = rows.length;
 
-    // Thumbnails — emit each blob as a separate zip entry.
+    // Thumbnails — emit each blob as a separate zip entry. The extension is
+    // sniffed from the bytes, not assumed: thumbnails are WebP since #560 but a
+    // long-lived account still has JPEG ones from before, so a single archive can
+    // legitimately hold both.
     if (d.blobColumns?.includes('thumbnail')) {
       for (const row of rows) {
         if (row.thumbnail != null) {
-          archive.append(row.thumbnail as Buffer, { name: `thumbnails/${row.id as number}.jpg` });
+          const blob = row.thumbnail as Buffer;
+          const { ext } = thumbnailFormat(blob);
+          archive.append(blob, { name: `thumbnails/${row.id as number}.${ext}` });
         }
       }
     }

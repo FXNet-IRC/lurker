@@ -4,6 +4,8 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router';
 import { useAuthStore } from './stores/auth.js';
 import { useConfigStore } from './stores/config.js';
+import { useToastsStore } from './stores/toasts.js';
+import { isChunkLoadError, safeSessionStorage, shouldReloadFor } from './lib/chunkReload.js';
 
 const routes: RouteRecordRaw[] = [
   { path: '/login', name: 'login', component: () => import('./views/Login.vue') },
@@ -22,9 +24,9 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
   },
   {
-    // Dedicated admin panel (Milestone 4). Gated by both LURKER_NEW_ADMIN_PANEL
-    // and the admin role via the guard below; the flag defaults off, so this
-    // route is a no-op for existing self-hosted installs.
+    // Dedicated admin panel (Milestone 4), gated on the admin role by the guard
+    // below. It is where all instance administration lives; there is no longer a
+    // Users category inside Settings.
     path: '/admin/:tab?',
     name: 'admin',
     component: () => import('./views/Admin.vue'),
@@ -52,11 +54,33 @@ router.beforeEach(async (to) => {
   }
   // Authenticated users have no business on the entry screens.
   if ((to.name === 'login' || to.name === 'welcome') && auth.user) return { name: 'chat' };
-  if (to.meta.requiresAdmin) {
-    // The admin panel needs the instance flag on AND an admin account. Either
-    // missing → bounce to Settings rather than render an empty/forbidden shell.
-    if (!config.newAdminPanel || !auth.isAdmin) return { name: 'settings' };
+  // Non-admins bounce to Settings rather than render a forbidden shell. Every
+  // admin API is requireAdmin-gated regardless — this only decides what renders.
+  if (to.meta.requiresAdmin && !auth.isAdmin) return { name: 'settings' };
+});
+
+// A lazy-route chunk that fails to load leaves the route permanently dead for
+// this document (see lib/chunkReload.ts). Recover by reloading into the target
+// so the user gets the page they asked for rather than a button that silently
+// does nothing forever (#571).
+router.onError((err, to) => {
+  if (!isChunkLoadError(err)) return;
+  const path = to?.fullPath;
+  if (!path) return;
+  if (shouldReloadFor(path, Date.now(), safeSessionStorage())) {
+    window.location.assign(path);
+    return;
   }
+  // Already tried reloading for this path — the chunk is genuinely unavailable,
+  // so reloading again would boot-loop. Tell the user instead: Lurker runs as a
+  // PWA where there is no console to check, so a silent failure here is
+  // indistinguishable from the bug we're fixing.
+  useToastsStore().push({
+    title: "Couldn't open that page",
+    body: 'Part of the app failed to load. Reopening Lurker should fix it.',
+    kind: 'error',
+    ttlMs: 8000,
+  });
 });
 
 export default router;

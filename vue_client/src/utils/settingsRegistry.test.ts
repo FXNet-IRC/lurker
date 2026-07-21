@@ -8,34 +8,30 @@ const cat = (id: string) => CATEGORIES.find((c) => c.id === id)!;
 const opt = (key: string) => REGISTRY.find((o) => o.key === key)!;
 
 describe('categoryVisible', () => {
-  const standalone = { isAdmin: false, isNode: false, newAdminPanel: false };
-  const node = { isAdmin: false, isNode: true, newAdminPanel: false };
+  const standalone = { isNode: false };
+  const node = { isNode: true };
 
-  it('hides adminOnly categories from non-admins, shows them to admins', () => {
-    expect(
-      categoryVisible(cat('users'), { isAdmin: false, isNode: false, newAdminPanel: false }),
-    ).toBe(false);
-    expect(
-      categoryVisible(cat('users'), { isAdmin: true, isNode: false, newAdminPanel: false }),
-    ).toBe(true);
+  // Instance administration now lives entirely in the /admin panel, so Settings
+  // holds nothing an admin sees and a regular user doesn't — the whole adminOnly
+  // dimension (and the "users" category that was its only user) is gone.
+  it('no longer carries an admin-only category', () => {
+    expect(CATEGORIES.some((c) => c.id === 'users')).toBe(false);
   });
 
-  it('removes adminOnly categories from Settings when the admin panel is enabled', () => {
-    // They relocate to the dedicated /admin panel, so even an admin no longer
-    // sees them in the Settings sidebar.
-    expect(
-      categoryVisible(cat('users'), { isAdmin: true, isNode: false, newAdminPanel: true }),
-    ).toBe(false);
+  // The behavioural half of the above: role is no longer an input at all, so on a
+  // standalone box every category is visible to everyone. Asserted through the
+  // function (not just the data) so re-introducing a role gate inside
+  // categoryVisible would fail here rather than pass quietly.
+  it('shows every non-node-restricted category regardless of role', () => {
+    const hidden = CATEGORIES.filter(
+      (c) => !c.selfHostedOnly && !categoryVisible(c, standalone),
+    ).map((c) => c.id);
+    expect(hidden).toStrictEqual([]);
   });
 
   it('hides selfHostedOnly categories in node edition only', () => {
     expect(categoryVisible(cat('api-tokens'), standalone)).toBe(true);
     expect(categoryVisible(cat('api-tokens'), node)).toBe(false);
-    // selfHostedOnly is independent of role — a node-edition admin still can't
-    // see it (the route isn't mounted there anyway).
-    expect(
-      categoryVisible(cat('api-tokens'), { isAdmin: true, isNode: true, newAdminPanel: false }),
-    ).toBe(false);
   });
 
   it('shows ordinary categories in both editions', () => {
@@ -45,34 +41,18 @@ describe('categoryVisible', () => {
 
   it('hides hideInPublicMode categories when public mode is on', () => {
     // API tokens are the AI-agent surface — hidden on a public FXNet instance.
-    expect(
-      categoryVisible(cat('api-tokens'), { isAdmin: true, isNode: false, newAdminPanel: false }),
-    ).toBe(true);
-    expect(
-      categoryVisible(cat('api-tokens'), {
-        isAdmin: true,
-        isNode: false,
-        newAdminPanel: false,
-        isPublicMode: true,
-      }),
-    ).toBe(false);
+    expect(categoryVisible(cat('api-tokens'), { isNode: false })).toBe(true);
+    expect(categoryVisible(cat('api-tokens'), { isNode: false, isPublicMode: true })).toBe(false);
     // Ordinary categories are unaffected by public mode.
-    expect(
-      categoryVisible(cat('appearance'), {
-        isAdmin: false,
-        isNode: false,
-        newAdminPanel: false,
-        isPublicMode: true,
-      }),
-    ).toBe(true);
+    expect(categoryVisible(cat('appearance'), { isNode: false, isPublicMode: true })).toBe(true);
   });
 });
 
 describe('optionVisible', () => {
   it('hides selfHostedOnly settings in node edition, shows them standalone', () => {
-    expect(optionVisible(opt('uploads.provider'), { isNode: false })).toBe(true);
-    expect(optionVisible(opt('uploads.provider'), { isNode: true })).toBe(false);
-    expect(optionVisible(opt('uploads.hoarder.api_key'), { isNode: true })).toBe(false);
+    expect(optionVisible(opt('uploads.image.max_upload_mb'), { isNode: false })).toBe(true);
+    expect(optionVisible(opt('uploads.image.max_upload_mb'), { isNode: true })).toBe(false);
+    expect(optionVisible(opt('uploads.image.quality'), { isNode: true })).toBe(false);
   });
 
   it('hides the cost/abuse pipeline knobs in node edition (operator-controlled)', () => {

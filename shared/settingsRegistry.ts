@@ -86,7 +86,6 @@ export interface SettingCategory {
   id: string;
   label: string;
   kind: 'registry' | 'bespoke';
-  adminOnly?: boolean;
   // As on BaseOption: hide the whole category in the hosted (node) edition.
   selfHostedOnly?: boolean;
   // FXNet: hide the category when LURKER_PUBLIC_MODE is on. Used for the
@@ -706,13 +705,13 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
   // ─── Join/part consolidation (IRCCloud-style summary line) ────────────
   {
     key: 'chat.consolidate_joins',
-    label: 'Consolidate join/part/quit/nick events',
+    label: 'Consolidate join/part/quit/nick/host-change events',
     category: 'chat',
     group: 'consolidate',
     type: 'bool',
     default: true,
     description:
-      'Merge consecutive join/part/quit/nick events into a single summary line ' +
+      'Merge consecutive join/part/quit/nick/host-change events into a single summary line ' +
       'per nick (e.g. "Alice and Bob joined; Dave left; Eve → Eve_afk"). ' +
       'Off shows every event individually. Composes with smart filter — events ' +
       'the smart filter hides are excluded from the summary.',
@@ -727,7 +726,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     max: 50,
     default: 5,
     description:
-      'In each category (joined / left / reconnected / renamed) of a summary ' +
+      'In each category (joined / left / reconnected / renamed / changed host) of a summary ' +
       'line, show at most this many nicks before collapsing the rest into ' +
       '"and N others". Recent speakers (those tracked for nick completion) ' +
       'are preferred when picking which names to show.',
@@ -746,6 +745,21 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'individual lines only; events that collapse into the consolidation ' +
       'summary above stay host-less. Regular chat messages are unaffected.',
   },
+  {
+    key: 'chat.show_join_account',
+    label: 'Show services account on join lines',
+    category: 'chat',
+    group: 'consolidate',
+    type: 'bool',
+    default: false,
+    description:
+      'Show the joining user’s services (NickServ) account next to their nick ' +
+      'on JOIN lines (e.g. "alice [aliceacct] joined") — useful for channel ops ' +
+      'confirming who is identified. Requires the network to support the ' +
+      'extended-join extension; nothing is shown for users who are not logged ' +
+      'in, or on networks without it. Applies to individual lines only; events ' +
+      'that collapse into the consolidation summary above stay account-less.',
+  },
 
   // ─── Composing (outgoing message guardrails) ─────────────────────────
   // irc-framework splits anything past ~350 bytes into multiple PRIVMSGs on
@@ -763,9 +777,9 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'Allow long messages to send as multiple consecutive IRC lines without ' +
       'confirmation. When off (the default), trying to send a message that ' +
       "would split shows a SPLIT warning in the status bar and won't submit " +
-      'until you press Send a second time. Messages that would split into ' +
-      'three or more lines always require confirmation regardless of this ' +
-      'setting. /me actions never split — they are blocked outright.',
+      'until you press Send a second time; one that would split into three or ' +
+      'more offers to upload the text as a file instead. /me actions never ' +
+      'split — they are blocked outright regardless of this setting.',
   },
   {
     key: 'chat.send_typing_notifications',
@@ -849,17 +863,23 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'the JOIN line is revealed. 0 disables unmasking.',
   },
 
-  // ─── Inline image viewer ──────────────────────────────────────────────
+  // ─── Inline media viewer ──────────────────────────────────────────────
   {
+    // ⚠ The key still says `image_modal` even though the viewer now plays video and
+    // audio and reads text (#563). Renaming it is a MIGRATION, not a rename: the stored
+    // row lives under the old key, so a new key would orphan it — silently switching
+    // the viewer back on for exactly the people who went out of their way to turn it
+    // off. The label is what users read; the key is an id, and ids age.
     key: 'chat.image_modal.enabled',
-    label: 'Image viewer',
+    label: 'Media viewer',
     category: 'chat',
     group: 'viewing',
     type: 'bool',
     default: true,
     description:
-      'When enabled, clicking a URL to an image opens it in an in-app viewer instead ' +
-      'of a new browser tab. Cmd/Ctrl-click always opens in a new tab.',
+      'When enabled, clicking a link to an image, video, audio file, or .txt opens it ' +
+      'in an in-app viewer instead of a new browser tab. Cmd/Ctrl-click always opens ' +
+      'in a new tab.',
   },
 
   // ─── Connection ───────────────────────────────────────────────────────
@@ -1002,23 +1022,33 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       '"afk since 2026-05-09 15:30:00-0500".',
   },
 
-  // ─── Image uploads ────────────────────────────────────────────────────
+  // ─── Uploads ────────────────────────────────────────────────────
+  //
+  // WHERE a file goes is no longer a setting. The destination is a configured
+  // uploader (a `uploader_config` row: driver + its own credentials), managed in
+  // the bespoke half of the Uploads pane and selected via /api/uploaders. The old
+  // `uploads.provider` enum + the flat `uploads.catbox.*`/`uploads.hoarder.*`
+  // credential keys were removed in #514 and folded into rows by
+  // db/uploaderConfigSeed.ts#reconcileLegacyUploadSettings. What remains here is
+  // the part that genuinely is a per-user preference: the processing pipeline.
   {
-    key: 'uploads.provider',
-    label: 'Upload provider',
+    key: 'uploads.image.format',
+    label: 'Static image format',
     category: 'uploads',
-    group: 'provider',
+    group: 'pipeline',
     type: 'enum',
-    choices: ['x0', 'catbox', 'hoarder'],
-    default: 'x0',
-    // Node edition forces the operator's in-house uploader (A8); a tenant never
-    // picks a host, so this and the provider-credential settings below are
-    // hidden in the hosted edition.
-    selfHostedOnly: true,
+    choices: ['webp', 'jpeg'],
+    default: 'webp',
+    // Deliberately NOT selfHostedOnly, unlike every other key in this group.
+    // Those are cost/abuse levers the operator owns in hosted edition; this is a
+    // compatibility preference the user owns, and the hosted dropper accepts
+    // both formats, so there is nothing for the operator to protect.
     description:
-      'Where pasted/picked images are uploaded. x0.at and catbox.moe are ' +
-      'anonymous public hosts. hoarder uploads to your own self-hosted ' +
-      'Hoarder instance using the URL + API key configured below.',
+      'Format static images are re-encoded to. "webp" (default) is smaller and — ' +
+      'unlike JPEG — has an alpha channel, so transparent PNGs survive the ' +
+      're-encode instead of being flattened onto black. "jpeg" is the escape ' +
+      'hatch for a client or upload host that mangles WebP. Animated GIF/WebP/' +
+      'APNG bypass this entirely and are uploaded verbatim.',
   },
   {
     key: 'uploads.image.max_dimension',
@@ -1033,12 +1063,12 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     // server-side in A8), not a tenant knob.
     selfHostedOnly: true,
     description:
-      'Longest-edge limit for static images before they are re-encoded as JPEG. ' +
+      'Longest-edge limit for static images before they are re-encoded. ' +
       'Animated GIF/WebP/APNG bypass this and are uploaded verbatim.',
   },
   {
     key: 'uploads.image.quality',
-    label: 'JPEG re-encode quality',
+    label: 'Image re-encode quality',
     category: 'uploads',
     group: 'pipeline',
     type: 'int',
@@ -1046,7 +1076,11 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     max: 100,
     default: 85,
     selfHostedOnly: true,
-    description: 'JPEG quality for the re-encode pass on static images (30–100).',
+    description:
+      'Quality (30–100) for the re-encode pass on static images, handed to ' +
+      'whichever encoder uploads.image.format selects. Higher is better-looking ' +
+      'and bigger in both, but the scales are not identical — WebP at 85 is not ' +
+      'the same picture as JPEG at 85.',
   },
   {
     key: 'uploads.image.max_upload_mb',
@@ -1056,7 +1090,9 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     type: 'int',
     min: 1,
     max: 200,
-    default: 25,
+    // 100, not 25: a 30-second phone video clears 25 MB instantly, and media
+    // uploads (#515) make that the common case rather than the exotic one.
+    default: 100,
     selfHostedOnly: true,
     description:
       'Hard cap on the raw upload size in megabytes. Anything larger is ' +
@@ -1064,7 +1100,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
   },
   {
     key: 'uploads.paste.enabled',
-    label: 'Upload pasted images',
+    label: 'Upload pasted files',
     category: 'uploads',
     group: 'pipeline',
     type: 'bool',
@@ -1072,43 +1108,6 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     description:
       'When enabled, pasting an image into the input area uploads it and ' +
       'inserts the resulting URL. Disable to fall back to plain text paste.',
-  },
-  {
-    key: 'uploads.catbox.userhash',
-    label: 'Catbox userhash',
-    category: 'uploads',
-    group: 'catbox',
-    type: 'secret',
-    default: '',
-    selfHostedOnly: true,
-    description:
-      'Optional catbox.moe account hash. Uploads made with a userhash can ' +
-      'be managed from your catbox account; without one they are anonymous.',
-  },
-  {
-    key: 'uploads.hoarder.url',
-    label: 'Hoarder URL',
-    category: 'uploads',
-    group: 'hoarder',
-    type: 'string',
-    default: '',
-    selfHostedOnly: true,
-    description:
-      'Base URL of your Hoarder instance (e.g. https://upload.example.com). ' +
-      'Only used when the upload provider is set to hoarder.',
-  },
-  {
-    key: 'uploads.hoarder.api_key',
-    label: 'Hoarder API key',
-    category: 'uploads',
-    group: 'hoarder',
-    type: 'secret',
-    default: '',
-    selfHostedOnly: true,
-    description:
-      'API key for your Hoarder instance. Generate one on the Hoarder server ' +
-      'with `node scripts/gen-api-key.js` and add it to ' +
-      'web.auth.api_keys in its config.json.',
   },
 
   // ─── Notifications (unified intent, per signal type) ──────────────────
@@ -1449,6 +1448,19 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'travelling updates it on next connect. Leave blank to fall back to the ' +
       "server's local time.",
   },
+  {
+    key: 'onboarding.completed',
+    label: 'Onboarding completed',
+    category: 'system',
+    group: 'onboarding',
+    type: 'bool',
+    default: false,
+    description:
+      'Set once the first-run flow has been finished or skipped, so it never shows ' +
+      'again. Lives here rather than in localStorage so it follows the user across ' +
+      'devices. Must default to false: settingsService drops any row whose value ' +
+      'equals the registry default, so a true default would be unstorable.',
+  },
 ]);
 
 const BY_KEY = new Map(REGISTRY.map((opt) => [opt.key, opt] as const));
@@ -1481,12 +1493,14 @@ export const CATEGORIES: readonly SettingCategory[] = Object.freeze([
   { id: 'appearance', label: 'Appearance', kind: 'registry' },
   { id: 'chat', label: 'Chat', kind: 'registry' },
   { id: 'input', label: 'Input bar', kind: 'registry' },
-  { id: 'uploads', label: 'Uploads', kind: 'registry' },
+  // Bespoke: the pane leads with the configured-uploader list + picker (which is
+  // table-backed, not registry-backed) and renders the surviving registry rows
+  // for the image pipeline underneath it.
+  { id: 'uploads', label: 'Uploads', kind: 'bespoke' },
   { id: 'notifications', label: 'Notifications', kind: 'bespoke' },
   { id: 'highlights', label: 'Highlights', kind: 'bespoke' },
   { id: 'ignores', label: 'Ignores', kind: 'bespoke' },
   { id: 'away', label: 'Away', kind: 'registry' },
-  { id: 'users', label: 'Users', kind: 'bespoke', adminOnly: true },
   { id: 'networks', label: 'Networks', kind: 'bespoke' },
   { id: 'account', label: 'Account', kind: 'bespoke' },
   // Disabled in node edition: bearer clients can't be routed through the
@@ -1521,11 +1535,8 @@ export const GROUPS: Readonly<Record<string, string>> = Object.freeze({
   connection: 'Connection',
   ctcp: 'CTCP replies',
   'auto-away': 'Auto-away',
-  provider: 'Provider',
   pipeline: 'Image pipeline',
   viewing: 'Viewing',
-  catbox: 'catbox.moe',
-  hoarder: 'Hoarder',
   alerts: 'Alerts',
   push_filters: 'Push filters',
   system_features: 'System text features',

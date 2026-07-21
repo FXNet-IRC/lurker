@@ -116,7 +116,31 @@ Lurker is a single-user-per-account always-on IRC client — most operators want
 
 ### Alternative: any reverse proxy
 
-If you already run Caddy, Traefik, nginx, or another reverse proxy with an automatic-TLS story, point it at `http://localhost:8015` (or attach Lurker to your proxy network) and you're done. Lurker behaves like any other HTTP service — it doesn't need to know it's behind a proxy. The only thing it cares about for passkeys / push is that the public origin matches `WEBAUTHN_ORIGIN`.
+If you already run Caddy, Traefik, nginx, or another reverse proxy with an automatic-TLS story, point it at `http://localhost:8015` (or attach Lurker to your proxy network). For passkeys / push, the public origin must match `WEBAUTHN_ORIGIN`.
+
+Two things the proxy **must** get right, because Lurker's live connection is a WebSocket:
+
+1. **Forward the WebSocket upgrade.** The `/ws` endpoint needs the `Upgrade` and `Connection` headers passed through. Caddy and Traefik do this automatically. For nginx you have to add it explicitly (see below).
+2. **Forward the browser's host** — either preserve the original `Host` header, or send `X-Forwarded-Host`. Lurker's WebSocket does a same-origin check on the upgrade (a CSRF protection against cross-site socket hijacking), comparing the browser's `Origin` against the host it sees. A proxy that rewrites `Host` to the upstream address (`127.0.0.1:8015`) breaks that match, and the socket is rejected with a `403`. Caddy and Traefik send `X-Forwarded-Host` by default; for nginx, set `Host` (shown below).
+
+A minimal nginx `location` that satisfies both:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8015;
+    proxy_set_header Host $http_host;         # same-origin WS check (see note)
+    proxy_set_header Upgrade $http_upgrade;   # WebSocket upgrade
+    proxy_set_header Connection "upgrade";
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+Use `$http_host`, not `$host`, for the `Host` line: `$host` drops the port, so on a non-standard port the forwarded host (`irc.example.com`) won't match the browser's `Origin` (`irc.example.com:8443`) and the check still fails. `$http_host` forwards the host **and** port verbatim, so it's correct on any port. (On the standard 443 the two are equivalent.)
+
+If you'd rather not (or can't) fix the forwarded host, set `CORS_ORIGIN` to your public origin as an explicit allowlist instead — e.g. `CORS_ORIGIN=https://irc.example.com`. It accepts a comma-separated list, and a trailing slash is tolerated, but the scheme, host, and port must otherwise match the address you load Lurker at exactly.
+
+> **Upgraded to 1.1.1 and the connection stopped working?** This same-origin check is new in 1.1.1. If your reverse proxy rewrites `Host` and you don't set `CORS_ORIGIN`, the WebSocket now `403`s where it used to connect. Add `proxy_set_header Host $http_host;` (or `X-Forwarded-Host`), or set `CORS_ORIGIN`, per above.
 
 ---
 
@@ -156,6 +180,50 @@ Lurker supports background push notifications for highlights and DMs, delivered 
 
 If you change `VAPID_SUBJECT` later, existing subscriptions continue to work — the subject only affects new push JWTs, not the keypair.
 
+### Push and the mobile apps
+
+**Short version: install Lurker as a home-screen PWA and use Web Push above. That is the supported path for a self-hosted server, and it works on iOS 16.4+ and Android with no developer account and no extra configuration.**
+
+The first-party Lurker mobile apps use native push (APNs on iOS, FCM on Android), and a self-hosted server **cannot** deliver to them. This isn't a missing feature — it's how the platforms work:
+
+- An APNs signing key only signs for the bundle id Apple issued it to.
+- An FCM token is scoped to the Firebase project compiled into the APK; a token from a different project is rejected outright (`MismatchSenderId`).
+
+So only the publisher of a build can push to that build. Supplying your own Apple or Google credentials to `LURKER_APNS_*` / `LURKER_FCM_SERVICE_ACCOUNT` will not make your server able to push to the App Store or Play Store app — those variables exist for whoever publishes the app, and for anyone running **their own build** of it signed with their own credentials.
+
+You can check what a given server can actually deliver on: `GET /api/push/config` returns a `transports` list. A self-hosted server reports `["webpush"]`, and the apps use that to tell you push isn't available rather than asking for notification permission and then silently never delivering.
+
+### File uploads on your own disk
+
+By default, images you paste or drop into the message box are uploaded to a third-party host (x0.at). If you'd rather keep them on your own server, pick **local** in **Settings → Uploads**. Lurker then writes the file to disk and serves it back from your own instance, and the link it pastes into IRC points at you — no third party involved.
+
+Files land in `uploads/` next to the SQLite database (so they're on your mounted volume and already covered by the [backup](#backups) advice above). Point them somewhere else with:
+
+```yaml
+environment:
+  - LOCAL_UPLOADS_DIR=/data/uploads
+```
+
+The link Lurker pastes into IRC has to be an **absolute** URL, or nobody else can open it. Lurker works the origin out from the incoming request, which is right for most reverse-proxy setups. If your links come out with the wrong hostname or scheme, pin it explicitly:
+
+```yaml
+environment:
+  - PUBLIC_BASE_URL=https://lurker.example.com
+```
+
+::: warning Cloudflare users: turn off Hotlink Protection
+If you expose Lurker through Cloudflare (including a [Cloudflare Tunnel](#exposing-lurker-to-the-internet-recommended-cloudflare-tunnel)), **Hotlink Protection will break local uploads.** It's a Cloudflare feature that blocks image files whenever they're loaded from a page on another domain — which is exactly what an uploaded image _is_ once you share the link on IRC. Cloudflare returns a `403` at the edge and the request never reaches Lurker, so the image loads for you but is broken for everyone else.
+
+Fix it in the Cloudflare dashboard under **Scrape Shield → Hotlink Protection → Off**. If you want to keep it on for the rest of your site, leave it enabled and add a **Configuration Rule** that turns it off just for your uploads:
+
+- **When incoming requests match:** `URI Path` `starts with` `/uploads/`
+- **Then the settings are:** `Hotlink Protection` → `Off`
+
+If you set this rule up before Lurker 1.0 it will say `/uploads/local/`. Uploads now live directly under `/uploads/`, so widen it — the shorter prefix still matches the old links, which keep working.
+
+See [Uploaded images are broken for other people](#uploaded-images-are-broken-for-other-people-403) if you've already hit this.
+:::
+
 ### Secure cookies
 
 Lurker's session cookies are **not** flagged `Secure` by default. This sounds wrong but is correct for the common self-hosted shapes:
@@ -169,6 +237,19 @@ If you genuinely serve Lurker over end-to-end HTTPS (Express terminating TLS dir
 environment:
   - COOKIE_SECURE=true
 ```
+
+### Auth rate limiting behind a proxy
+
+Lurker throttles repeated failed logins per client IP (a per-IP backoff on the login, token, and password-change endpoints, plus a coarse request cap on the auth surface). By default it uses the connection's socket address, which is correct when Lurker faces the internet directly.
+
+If you run Lurker behind a reverse proxy or tunnel (Caddy, nginx, Cloudflare), the socket address is the _proxy_, so every visitor would share one bucket. Set this **only** when a proxy you control populates `X-Forwarded-For`, so Lurker keys on the real client:
+
+```yaml
+environment:
+  - LURKER_TRUST_PROXY=true
+```
+
+Do **not** set it on a directly-exposed instance — `X-Forwarded-For` is then attacker-spoofable and an attacker can dodge the limit by rotating a fake value.
 
 ### Custom session secret
 
@@ -273,6 +354,39 @@ Now Lurker is reachable on `http://localhost:9999`.
 ### Reverse-proxy / CORS errors
 
 If you're seeing browser console errors about CORS, your browser is hitting a different origin than what Lurker expects. The bundled image serves both the API and the UI from the same port, so the default no-`CORS_ORIGIN` config is correct for almost everyone. Only set `CORS_ORIGIN` if you're running the Vue dev server (`npm run dev`) against a containerized API, or doing something similarly unusual.
+
+A related failure mode is a **WebSocket that `403`s while the page itself loads fine** — the UI appears but never connects, and this typically shows up right after upgrading to 1.1.1. That's the same-origin check on the `/ws` upgrade, not a browser CORS error. It means your reverse proxy isn't forwarding the browser's host to Lurker. Fix it at the proxy (`proxy_set_header Host $http_host;` on nginx, or `X-Forwarded-Host`), or set `CORS_ORIGIN` to your public origin. See [Alternative: any reverse proxy](#alternative-any-reverse-proxy) for the full `location` block. When you do set `CORS_ORIGIN`, it must match the address you load Lurker at exactly on scheme, host, and port — a trailing slash is fine and a comma-separated list is allowed, but `http` vs `https` or a stray port will not match.
+
+### Uploaded images are broken for other people (403)
+
+Symptom: you're using the **local** uploader, and an uploaded image loads fine when you open the link in a new tab, but shows as broken when it's embedded — in someone else's client, or in Lurker's own image viewer on a different domain.
+
+That asymmetry is the tell. Opening a link directly and embedding it on a page are different requests: the embedded one carries a `Referer` header naming the page it's embedded on. **Cloudflare's Hotlink Protection blocks image files whose `Referer` is a different domain**, returning a `403` at the edge before the request ever reaches Lurker.
+
+Confirm it with two `curl`s against the same URL, where the _only_ difference is the `Referer` header:
+
+```bash
+# 1. No referer → 200, and Lurker serves the image
+curl -sS -o /dev/null -D - \
+  https://lurker.example.com/uploads/<key>.<ext> \
+  | grep -iE '^HTTP/|^content-type:'
+#   HTTP/2 200
+#   content-type: image/webp     ← or image/jpeg, depending on the upload
+
+# 2. Cross-domain referer → 403, and your image never gets served
+curl -sS -o /dev/null -D - -H 'Referer: https://example.org/' \
+  https://lurker.example.com/uploads/<key>.<ext> \
+  | grep -iE '^HTTP/|^content-type:|^vary:'
+#   HTTP/2 403
+#   content-type: text/plain; charset=UTF-8
+#   vary: referer
+```
+
+If adding a `Referer` is all it takes to flip a `200` into a `403`, that's Hotlink Protection. The `403` comes back as `text/plain` (Cloudflare's block page) rather than your image, and `vary: referer` is Cloudflare telling you the decision was made on the referer.
+
+> Don't try to tell the two apart by looking for `server: cloudflare` — Cloudflare proxies the _successful_ response too, so that header is on both. The status flip is the signal.
+
+Turn Hotlink Protection off (or scope it around `/uploads/`) — see [File uploads on your own disk](#file-uploads-on-your-own-disk).
 
 ### Container logs
 

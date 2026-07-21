@@ -40,7 +40,13 @@ function nextHistoryToken() {
 // (forNetwork, the sidebar) — skip them. Network buffers keep the
 // `${networkId}::${target}` form. networkId == null is what makes a buffer
 // app-scoped; there is no magic network value.
-function key(networkId: number | string | null, target: string) {
+// Exported because it is also the format networks.activeKey holds, and so the
+// format the navHistory/recentBuffers stores key their trails by: anything
+// ranking a buffer against those trails has to derive the same string from a
+// (networkId, target) pair. activate() canonicalizes casing before setActive(),
+// so a key built from a stored buffer's `target` always matches the activeKey
+// recorded for it.
+export function bufferKey(networkId: number | string | null, target: string) {
   return networkId == null ? target : `${networkId}::${target}`;
 }
 
@@ -56,7 +62,7 @@ function resolveExistingKey(
   networkId: number | string | null,
   target: string,
 ): string | null {
-  const exact = key(networkId, target);
+  const exact = bufferKey(networkId, target);
   if (buffers[exact]) return exact;
   if (target.startsWith(':')) return null;
   const nid = Number(networkId);
@@ -88,6 +94,11 @@ export interface BufferMember {
   // because pre-upgrade backlog and bare JOIN-derived members may lack them.
   user?: string | null;
   host?: string | null;
+  // Services account (extended-join / account-notify, #508). A string means
+  // logged in; null means the server told us they're logged out; undefined
+  // means we never learned. Both falsy states render as nothing today — the
+  // distinction is kept so a later WHOX backfill can merge without clobbering.
+  account?: string | null;
 }
 
 export interface TypingEntry {
@@ -253,7 +264,7 @@ function ensureBuffer(
   // then under the target's own casing, so the first writer's case is canonical.
   const existing = resolveExistingKey(state.buffers, networkId, target);
   if (existing) return state.buffers[existing];
-  const k = key(networkId, target);
+  const k = bufferKey(networkId, target);
   state.buffers[k] = makeBuffer(networkId, target);
   return state.buffers[k];
 }
@@ -290,6 +301,30 @@ export const useBuffersStore = defineStore('buffers', {
       resolveExistingKey(state.buffers, networkId, target) !== null,
     forNetwork: (state) => (networkId: number | string) =>
       Object.values(state.buffers).filter((b) => b.networkId === networkId),
+    // The services account we've learned for a nick anywhere on this network,
+    // from extended-join / account-notify (#508). Account is per-network, not
+    // per-channel, so any channel we share is an equally good source — take the
+    // first that actually knows. Returns undefined when no shared channel has
+    // data (we joined after them, or the network lacks the caps), which is
+    // distinct from null ("server told us they're logged out").
+    accountFor:
+      (state) =>
+      (networkId: number | string, nick: string): string | null | undefined => {
+        if (!nick) return undefined;
+        const lc = nick.toLowerCase();
+        // Coerce before comparing: buffers store networkId as a number, but the
+        // signature accepts a string, and `'3' !== 3` would silently match
+        // nothing rather than fail loudly. Same guard resolveExistingKey uses.
+        const nid = Number(networkId);
+        for (const b of Object.values(state.buffers)) {
+          if (b.networkId !== nid) continue;
+          const m = b.members?.find(
+            (x) => typeof x === 'object' && (x.nick || '').toLowerCase() === lc,
+          );
+          if (m && m.account !== undefined) return m.account;
+        }
+        return undefined;
+      },
     // The open DM buffer for a (network, nick), matched case-insensitively so we
     // resolve to whatever case is already open rather than forking a second
     // buffer that differs only by nick case. Channels and the flat virtual
@@ -353,7 +388,7 @@ export const useBuffersStore = defineStore('buffers', {
       // Active-divider tracking + live mark-read. Applies to the system buffer
       // too (#355): it's now a normal buffer with a server-owned read pointer
       // (buffer_reads, null networkId), so a live line marks read the same way —
-      // key() folds the null networkId to the bare :system: key, and the
+      // bufferKey() folds the null networkId to the bare :system: key, and the
       // mark-read below rides through with networkId null.
       if (event.id != null) {
         const networks = useNetworksStore();
@@ -362,7 +397,7 @@ export const useBuffersStore = defineStore('buffers', {
         // `bob` while the user sits in the `Bob` buffer reads as inactive and
         // the divider/read-sync below silently skips (#327). Mirrors the same
         // resolve-then-compare applyReadState does.
-        const isActive = networks.activeKey === key(buf.networkId, buf.target);
+        const isActive = networks.activeKey === bufferKey(buf.networkId, buf.target);
         if (isActive) {
           // While the user is sitting in this buffer, keep the divider
           // tracking the bottom UNLESS there's already an unread boundary
@@ -696,7 +731,7 @@ export const useBuffersStore = defineStore('buffers', {
       target: string,
       { wipeMessages = false } = {},
     ) {
-      const buf = this.buffers[key(networkId, target)];
+      const buf = this.buffers[bufferKey(networkId, target)];
       if (!buf || !buf.detached) return;
       buf.detached = false;
       buf.liveDuringDetach = 0;
@@ -740,6 +775,35 @@ export const useBuffersStore = defineStore('buffers', {
       const buf = ensureBuffer(this, networkId, target);
       const existing = buf.members.find((m) => (m.nick || m) === nick);
       if (!existing) buf.members.push({ nick, modes: [], away: false });
+    },
+    // Patch attributes on one member in place, leaving fields the caller didn't
+    // mention alone. Matched case-insensitively: a CHGHOST/ACCOUNT echoes the
+    // nick as the server holds it, which needn't match the case NAMES gave us.
+    updateMember(
+      networkId: number | string,
+      target: string,
+      nick: string | undefined,
+      patch: Partial<BufferMember> | undefined,
+    ) {
+      if (!nick || !patch) return;
+      // Resolve, never create. Unlike addMember/removeMember — which ride a
+      // join/part that legitimately implies the buffer should exist — a pure
+      // attribute patch has no business materializing a buffer, and doing so
+      // would leave an empty one in the sidebar when the target isn't open.
+      const bufKey = resolveExistingKey(this.buffers, networkId, target);
+      if (!bufKey) return;
+      const buf = this.buffers[bufKey];
+      const lc = nick.toLowerCase();
+      const m = buf.members.find(
+        (x) => typeof x === 'object' && (x.nick || '').toLowerCase() === lc,
+      );
+      if (!m) return;
+      // Never let a patch blank out a nick, and skip keys the sender omitted so
+      // a chghost carrying only the changed half can't wipe the other one.
+      for (const [k, v] of Object.entries(patch)) {
+        if (k === 'nick' || v === undefined) continue;
+        (m as unknown as Record<string, unknown>)[k] = v;
+      }
     },
     renameMember(networkId: number | string, target: string, oldNick: string, newNick: string) {
       const buf = ensureBuffer(this, networkId, target);
@@ -932,9 +996,9 @@ export const useBuffersStore = defineStore('buffers', {
       const networks = useNetworksStore();
       // Compare against the resolved buffer's canonical key, not the (possibly
       // differently-cased) broadcast target, so badge suppression tracks the
-      // buffer the user is actually sitting in. key() also yields the bare
+      // buffer the user is actually sitting in. bufferKey() also yields the bare
       // sentinel for the app-scoped system buffer (networkId null).
-      const isActive = networks.activeKey === key(buf.networkId, buf.target);
+      const isActive = networks.activeKey === bufferKey(buf.networkId, buf.target);
       // Suppress the unread badge for the buffer the user is sitting in.
       // A read-state broadcast can briefly carry a non-zero unread for the
       // active buffer when an IRC event lands before the mark-read echo;
@@ -996,9 +1060,9 @@ export const useBuffersStore = defineStore('buffers', {
       // target when none is open yet (first writer's case becomes canonical).
       const existing = this.findByTarget(networkId, target);
       const canonTarget = existing ? existing.target : target;
-      // key() yields the bare sentinel for the app-scoped system buffer
+      // bufferKey() yields the bare sentinel for the app-scoped system buffer
       // (networkId null) and the usual `${networkId}::${target}` otherwise.
-      const newKey = key(networkId, canonTarget);
+      const newKey = bufferKey(networkId, canonTarget);
       const prevKey = networks.activeKey;
       if (prevKey && prevKey !== newKey) {
         const prev = this.buffers[prevKey];
@@ -1147,7 +1211,7 @@ export const useBuffersStore = defineStore('buffers', {
       buf.typing[canon] = { nick, state, expiresAt: Date.now() + duration, userhost };
 
       const timer = setTimeout(() => {
-        const b = this.buffers[key(networkId, tkTarget)];
+        const b = this.buffers[bufferKey(networkId, tkTarget)];
         if (b && b.typing[canon]) {
           delete b.typing[canon];
         }

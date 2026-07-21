@@ -15,6 +15,7 @@ import path from 'path';
 
 import authRouter from './routes/auth.js';
 import networksRouter from './routes/networks.js';
+import networkPresetsRouter from './routes/networkPresets.js';
 import settingsRouter from './routes/settings.js';
 import highlightRulesRouter from './routes/highlightRules.js';
 import highlightsRouter from './routes/highlights.js';
@@ -22,6 +23,8 @@ import bookmarksRouter from './routes/bookmarks.js';
 import pushRouter from './routes/push.js';
 import adminRouter from './routes/admin.js';
 import uploadsRouter from './routes/uploads.js';
+import uploadersRouter from './routes/uploaders.js';
+import localUploadsRouter from './routes/localUploads.js';
 import dccRouter from './routes/dcc.js';
 import draftsRouter from './routes/drafts.js';
 import { exportsRouter, importRouter } from './routes/exports.js';
@@ -35,6 +38,7 @@ import { requireApiAuth } from './middleware/apiAuth.js';
 import { isNodeMode } from './utils/edition.js';
 import { isPublicModeEnabled } from './utils/publicMode.js';
 import { trustProxyConfig } from './utils/clientIp.js';
+import { allowedBrowserOrigins } from './utils/corsOrigins.js';
 
 const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
   console.error('[lurker] error:', err);
@@ -58,13 +62,25 @@ export function buildApp(sessionSecret: string): Express {
   // nginx and sets LURKER_TRUST_PROXY=loopback. See utils/clientIp.ts.
   app.set('trust proxy', trustProxyConfig());
 
-  const corsOrigin = process.env.CORS_ORIGIN || 'https://irc.local.bradroot.me:5173';
-  app.use(cors({ origin: corsOrigin, credentials: true }));
+  // CORS_ORIGIN is a comma-separated allowlist, normalized to URL origins (see
+  // utils/corsOrigins). The WS upgrade origin check reads the same source, so the
+  // HTTP and WebSocket layers agree exactly on what's allowed.
+  const corsOrigins = allowedBrowserOrigins();
+  // A set-but-unparseable CORS_ORIGIN (e.g. a bare host with no scheme) normalizes
+  // to nothing, silently rejecting every cross-origin request. Surface it once at
+  // startup rather than leaving the operator to debug a mystery 403/CORS failure.
+  if (process.env.CORS_ORIGIN && corsOrigins.length === 0) {
+    console.warn(
+      `[lurker] CORS_ORIGIN is set ("${process.env.CORS_ORIGIN}") but no valid origin parsed from it — cross-origin requests will be rejected. Each entry needs a scheme, e.g. https://irc.example.com`,
+    );
+  }
+  app.use(cors({ origin: corsOrigins, credentials: true }));
   app.use(express.json({ limit: '1mb' }));
   app.use(cookieParser(sessionSecret));
 
   app.use('/api/auth', authRouter);
   app.use('/api/networks', networksRouter);
+  app.use('/api/network-presets', networkPresetsRouter);
   app.use('/api/settings', settingsRouter);
   app.use('/api/highlight-rules', highlightRulesRouter);
   app.use('/api/highlights', highlightsRouter);
@@ -72,6 +88,22 @@ export function buildApp(sessionSecret: string): Express {
   app.use('/api/push', pushRouter);
   app.use('/api/admin', adminRouter);
   app.use('/api/uploads', uploadsRouter);
+  app.use('/api/uploaders', uploadersRouter);
+  // Public (no-auth) serving of local-driver files. Off /api by design: the URL
+  // is opened by anyone the uploader shares it with, protected only by its
+  // non-guessable key. Mounted before the SPA fallback so it wins the route.
+  // Self-host only — the `local` driver isn't offered on the (ephemeral) hosted
+  // fleet, so the route would only ever 404 there; don't expose it at all.
+  if (!isNodeMode()) {
+    // /uploads/local was the original mount (#582 dropped the redundant segment).
+    // It stays mounted forever as an alias: upload_history.url stores the fully
+    // absolutized link and nothing reparses it, so every link already pasted into
+    // IRC — including ones read by other clients we can't rewrite — still resolves.
+    // The two-segment path can't match the new mount's single-segment '/:key', so
+    // order between them doesn't matter.
+    app.use('/uploads/local', localUploadsRouter);
+    app.use('/uploads', localUploadsRouter);
+  }
   app.use('/api/dcc', dccRouter);
   app.use('/api/drafts', draftsRouter);
   app.use('/api/exports', exportsRouter);
@@ -119,9 +151,16 @@ export function buildApp(sessionSecret: string): Express {
   // so that in node edition — where /mcp isn't mounted — a stray GET /mcp 404s
   // instead of being served index.html; it's a disabled endpoint, not a page.
   // (In standalone the mounted /mcp middleware handles it before this anyway.)
+  //
+  // `assets` is excluded for a different reason: everything under it is a real
+  // hashed build artifact served by express.static above, never a client route.
+  // Without the exclusion a missing chunk falls through to here and gets
+  // index.html back with a 200 and Content-Type: text/html, so the browser
+  // reports a confusing module-type refusal instead of a plain 404 — and the
+  // client can't cleanly tell "chunk is gone" from "page is fine" (#571).
   const clientDist = path.join(import.meta.dirname, '../vue_client/dist');
   app.use(express.static(clientDist));
-  app.get(/^\/(?!api|ws|mcp).*/, (_req, res, next) => {
+  app.get(/^\/(?!api|ws|mcp|assets).*/, (_req, res, next) => {
     res.sendFile(path.join(clientDist, 'index.html'), (err) => {
       if (err) next();
     });

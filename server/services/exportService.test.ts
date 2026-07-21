@@ -6,6 +6,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { PassThrough } from 'stream';
+import sharp from 'sharp';
 import yauzl from 'yauzl';
 import type { User } from '../db/users.js';
 import type { Network } from '../db/networks.js';
@@ -16,7 +17,7 @@ process.env.DATABASE_PATH = path.join(tmpDir, 'test.db');
 let db: typeof import('../db/index.js').default;
 let createUser: typeof import('../db/users.js').createUser;
 let createNetwork: typeof import('../db/networks.js').createNetwork;
-let upsertChannel: typeof import('../db/networks.js').upsertChannel;
+let buffers: typeof import('../db/buffers.js');
 let insertMessage: typeof import('../db/messages.js').insertMessage;
 let setUserSetting: typeof import('../db/settings.js').setUserSetting;
 let createRule: typeof import('../db/highlightRules.js').createRule;
@@ -49,7 +50,8 @@ let EXPORT_FORMAT_VERSION: typeof import('../db/exportSchema.js').EXPORT_FORMAT_
 beforeAll(async () => {
   db = (await import('../db/index.js')).default;
   ({ createUser } = await import('../db/users.js'));
-  ({ createNetwork, upsertChannel } = await import('../db/networks.js'));
+  ({ createNetwork } = await import('../db/networks.js'));
+  buffers = await import('../db/buffers.js');
   ({ insertMessage } = await import('../db/messages.js'));
   ({ insertUpload } = await import('../db/uploadHistory.js'));
   ({ setUserSetting } = await import('../db/settings.js'));
@@ -117,7 +119,7 @@ describe('buildExportZip', () => {
       tls: true,
       nick: 'alice',
     }) as Network;
-    upsertChannel(aliceNetA.id, '#general', true);
+    buffers.ensureOpen(alice.id, aliceNetA.id, '#general', { kind: 'channel', autojoin: true });
 
     aliceMsg1 = insertMessage({
       networkId: aliceNetA.id,
@@ -204,18 +206,18 @@ describe('buildExportZip', () => {
     expect(manifest.counts.messages).toBe(2);
   });
 
-  it('writes data.json with networks, channels, and other per-user rows', async () => {
+  it('writes data.json with networks, buffers, and other per-user rows', async () => {
     const buf = await runExport(alice.id, { includeMessages: false });
     const entries = await readZipToMap(buf);
     const data = JSON.parse(entries.get('data.json')!.toString('utf8')) as {
       networks: Array<{ name: string }>;
-      channels: Array<{ name: string }>;
+      buffers: Array<{ target: string }>;
       users: Array<{ username: string }>;
     };
     expect(data.networks.length).toBe(1);
     expect(data.networks[0].name).toBe('libera');
-    expect(data.channels.length).toBe(1);
-    expect(data.channels[0].name).toBe('#general');
+    expect(data.buffers.length).toBe(1);
+    expect(data.buffers[0].target).toBe('#general');
     expect(data.users.length).toBe(1);
     expect(data.users[0].username).toBe('alice');
   });
@@ -232,6 +234,31 @@ describe('buildExportZip', () => {
     expect(upload.hasThumbnail).toBe(true);
     expect(entries.has(`thumbnails/${upload.id}.jpg`)).toBe(true);
     expect(entries.get(`thumbnails/${upload.id}.jpg`)!.length).toBeGreaterThan(0);
+  });
+
+  // Thumbnails are WebP since #560, but rows predating it are JPEG and both can
+  // sit in one account — so the entry name is sniffed per blob, not assumed.
+  it('names a WebP thumbnail .webp while a legacy JPEG one stays .jpg', async () => {
+    const webpThumb = await sharp({
+      create: { width: 8, height: 8, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    })
+      .webp()
+      .toBuffer();
+    const webpUpload = insertUpload(alice.id, {
+      provider: 'hoarder',
+      url: 'https://example.com/new.webp',
+      filename: 'new.webp',
+      mime: 'image/webp',
+      byte_size: 99,
+      width: 8,
+      height: 8,
+      thumbnail: webpThumb,
+    });
+
+    const entries = await readZipToMap(await runExport(alice.id, { includeMessages: false }));
+    expect(entries.has(`thumbnails/${webpUpload}.webp`)).toBe(true);
+    // The JPEG row seeded in beforeAll is untouched by the new default.
+    expect([...entries.keys()].some((k) => k.endsWith('.jpg'))).toBe(true);
   });
 
   it('scopes data per-user (bob does not see alice)', async () => {

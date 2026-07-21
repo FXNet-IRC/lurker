@@ -23,6 +23,8 @@ import { useWhoisStore } from '../stores/whois.js';
 import { useBookmarksStore } from '../stores/bookmarks.js';
 import { useDataExportStore } from '../stores/dataExport.js';
 import { useDccStore } from '../stores/dcc.js';
+import { useUploadsStore } from '../stores/uploads.js';
+import { makeClientId } from '../utils/clientId.js';
 import { useToastsStore } from '../stores/toasts.js';
 import { downloadTextFile } from '../utils/download.js';
 import { notifyForEvent, playSound } from './useHighlightNotifier.js';
@@ -168,8 +170,19 @@ function applyEvent(event: any): void {
     case 'away-state':
       networks.applyAwayState(event);
       break;
+    // Render only. The nicklist patch rides the `member-update` the server
+    // sends alongside this — patching here too would double the work and, since
+    // the raw event carries '' for a half the server chose to keep unchanged,
+    // would briefly write the wrong value before member-update corrected it.
+    case 'chghost':
+      buffers.pushMessage(event);
+      break;
     case 'names':
       buffers.setMembers(event.networkId, event.target, event.members);
+      break;
+    // Incremental nicklist patch — not persisted, so no pushMessage/dedupe.
+    case 'member-update':
+      buffers.updateMember(event.networkId, event.target, event.member?.nick, event.member);
       break;
     case 'channel-joined':
       buffers.ensure(event.networkId, event.target);
@@ -220,8 +233,20 @@ function applyEvent(event: any): void {
       // Keep the buffer around so the user can still scroll history; just
       // mark it un-joined so it renders dimmed in the buffer list. /close
       // (or the server's buffer-closed broadcast) is what actually drops it.
-      buffers.setJoined(event.networkId, event.target, false);
-      buffers.setMembers(event.networkId, event.target, []);
+      //
+      // Resolve, never materialize: a 470-forward evicts a channel we never
+      // had open (evictChannel announces the part for the forwarded-from
+      // name), and setMembers' ensureBuffer would otherwise conjure a dead,
+      // empty buffer for a channel we were never in.
+      if (buffers.findByTarget(event.networkId, event.target)) {
+        buffers.setJoined(event.networkId, event.target, false);
+        buffers.setMembers(event.networkId, event.target, []);
+      }
+      // Whether or not a buffer exists, this part is definitive: no join is
+      // landing under this name (the forward case) — stop the pending-join
+      // timer so its "no response" toast can't fire for a join that WAS
+      // answered, just under a different name.
+      buffers.cancelPendingJoin(event.networkId, event.target);
       break;
     case 'typing':
       buffers.setTyping(
@@ -701,6 +726,14 @@ function handleMessage(raw: string): void {
     useDataExportStore().apply(payload.job);
     return;
   }
+  if (payload.kind === 'upload-progress') {
+    // The server narrating the half of an upload the browser can't see: the
+    // pipeline, then the server→provider send (#545). The store drops frames whose
+    // token isn't the upload THIS tab is running — these fan out to every socket the
+    // user has open, so a second tab's upload must not drive this one's bar.
+    useUploadsStore().applyProgress(payload);
+    return;
+  }
 }
 
 function open() {
@@ -782,16 +815,6 @@ function failAllPendingAcks(error: string): void {
   const entries = Array.from(pendingAcks.values());
   pendingAcks.clear();
   for (const resolver of entries) resolver({ ok: false, error });
-}
-
-// Generate a clientId for an ACK-tracked send. Uses crypto.randomUUID where
-// available and falls back to a random-base36 string otherwise (older Safari
-// in non-secure contexts won't expose randomUUID).
-function makeClientId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `c-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 // Send a payload that expects a `send-result` ACK from the server. Returns

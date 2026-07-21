@@ -7,8 +7,9 @@
 // No-op when the lock is off — an unlocked instance has no forced network to
 // seed, so the account simply starts with none.
 
-import { createNetwork, upsertChannel } from '../db/networks.js';
+import { createNetwork } from '../db/networks.js';
 import type { Network } from '../db/networks.js';
+import { seedAutojoinChannel } from '../db/buffers.js';
 import { getForcedNetworkConfig } from '../utils/forcedNetwork.js';
 
 /**
@@ -31,6 +32,6 @@ export function seedForcedNetwork(userId: number, nick: string): Network | undef
     autoconnect: true,
   });
   if (!network) return undefined;
-  for (const channel of cfg.channels) upsertChannel(network.id, channel, true);
+  for (const channel of cfg.channels) seedAutojoinChannel(userId, network.id, channel);
   return network;
 }

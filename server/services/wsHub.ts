@@ -32,7 +32,7 @@ import {
   listMessagesAround,
   hasOlderRow,
   hasNewerRow,
-  listBufferTargets,
+  hasMessageForTarget,
   listSpeakers,
   countNewer,
   countServerBufferUnread,
@@ -61,7 +61,18 @@ import {
   addEntry as addInputHistory,
   listRecent as listRecentInputHistory,
 } from '../db/inputHistory.js';
-import { closeBuffer, reopenBuffer, isClosed, closedKeySetForUser } from '../db/closedBuffers.js';
+import {
+  getBuffer,
+  getState as getBufferState,
+  ensureExists as ensureBufferExists,
+  ensureOpen as ensureBufferOpen,
+  reopen as reopenBufferRow,
+  close as closeBufferRow,
+  setAutojoin as setBufferAutojoin,
+  listStatesForUser as listBufferStatesForUser,
+  kindForTarget,
+} from '../db/buffers.js';
+import type { BufferStateRow } from '../db/buffers.js';
 import {
   pinBuffer,
   unpinBuffer,
@@ -78,11 +89,13 @@ import {
 } from '../db/channelNotify.js';
 import { getUserAwayState } from '../db/userAwayState.js';
 import { findNotifyContactForTarget } from '../db/contacts.js';
-import { upsertChannel, ownsNetwork, listNetworksForUser } from '../db/networks.js';
+import { ownsNetwork, listNetworksForUser } from '../db/networks.js';
 import * as chanlistDb from '../db/chanlist.js';
 import { getUserSettings } from '../db/settings.js';
 import { defaultsAsObject } from './settingsRegistry.js';
-import { SESSION_COOKIE } from '../middleware/auth.js';
+import { SESSION_COOKIE, loadBearerSession } from '../middleware/auth.js';
+import { PROTOCOL_VERSION, MIN_PROTOCOL_VERSION } from '../protocol.js';
+import { isAllowedBrowserOrigin } from '../utils/corsOrigins.js';
 import { callVerb } from './verbRegistry.js';
 
 // WebSocket extended with per-socket bookkeeping fields.
@@ -104,6 +117,130 @@ interface LurkerWebSocket extends WebSocket {
   // needs a per-message DB read. (Named accountPaused, not isPaused, to avoid
   // colliding with the ws library's own WebSocket.isPaused.)
   accountPaused?: boolean;
+  // Protocol version the client announced via `?v=` on the upgrade (#569), or
+  // PROTOCOL_VERSION when it announced none (web client / legacy native build).
+  protocolVersion?: number;
+  // Per-socket inbound flood-control token bucket (#574). Lazily initialized on
+  // the first message; see allowInboundMessage.
+  floodTokens?: number;
+  floodRefilledAt?: number;
+}
+
+// #574: cap a single inbound WS frame. The library default is 100 MB; client→
+// server frames are IRC-shaped (a line of text plus a little JSON), so a low cap
+// is safe and stops one frame from allocating a huge buffer. Uploads and imports
+// go over REST, never the socket.
+const MAX_WS_MESSAGE_BYTES = 256 * 1024;
+
+// #574: per-socket inbound message-rate limiter. A token bucket sized well above
+// any legitimate client — a human, plus the burst of open-buffer verbs a client
+// fires right after connect, never approaches this — that caps an authenticated
+// client trying to flood verbs. Checked BEFORE JSON.parse so a flood can't even
+// pay parse cost.
+const WS_MSG_BUCKET_CAPACITY = 120;
+const WS_MSG_BUCKET_REFILL_PER_SEC = 40;
+
+// Refill by elapsed time, spend one token. Returns false when the bucket is dry
+// — the caller then closes the socket, since a client hitting this rate is
+// misbehaving, not racing.
+export function allowInboundMessage(ws: LurkerWebSocket): boolean {
+  const now = Date.now();
+  const last = ws.floodRefilledAt ?? now;
+  const refilled = Math.min(
+    WS_MSG_BUCKET_CAPACITY,
+    (ws.floodTokens ?? WS_MSG_BUCKET_CAPACITY) +
+      ((now - last) / 1000) * WS_MSG_BUCKET_REFILL_PER_SEC,
+  );
+  ws.floodRefilledAt = now;
+  if (refilled < 1) {
+    ws.floodTokens = refilled;
+    return false;
+  }
+  ws.floodTokens = refilled - 1;
+  return true;
+}
+
+// X-Forwarded-Host may carry a comma list when the request passed through a proxy
+// chain; the first value is the original client-facing host. Node joins repeated
+// headers into one comma-separated string (and hands back an array only in edge
+// cases), so handle both.
+function firstForwardedHost(raw: string | string[] | undefined): string | undefined {
+  if (!raw) return undefined;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  const first = value?.split(',')[0]?.trim();
+  return first || undefined;
+}
+
+// Same-origin when the Origin and the request's public host resolve to the same
+// URL origin. Both sides are run through the URL parser under the Origin's own
+// scheme, so the comparison is case-insensitive on the host and treats a default
+// port that one side spells out and the other omits as equal — a browser omits
+// `:443`/`:80` in Origin, but a proxy (e.g. the `$host:$server_port` idiom) may
+// append it to Host. A raw string compare would let those cosmetic differences
+// spuriously fall through to the allowlist and reintroduce a 403.
+function isSameOriginHost(originUrl: URL, effectiveHost: string): boolean {
+  try {
+    return new URL(`${originUrl.protocol}//${effectiveHost}`).origin === originUrl.origin;
+  } catch {
+    return false;
+  }
+}
+
+// #574: same-origin / allowed-origin check for the WS upgrade. Browsers always
+// send Origin on a WS handshake; native clients send none. We reject only a
+// *browser* upgrade whose Origin is neither same-origin as the request's public
+// host nor an explicitly allowlisted origin (CORS_ORIGIN) — i.e. a cross-site
+// attempt. Absent Origin (native) and same-origin always pass, so this can't
+// wedge a working deployment.
+//
+// "Public host" is the subtle part behind a reverse proxy. The socket's own Host
+// header is whatever the proxy forwarded, and a great many proxies rewrite it to
+// the upstream address (e.g. `127.0.0.1:8015`) unless explicitly told to preserve
+// it. That would never equal the browser's Origin host, pushing every legitimate
+// request onto the CORS_ORIGIN allowlist path — exactly the regression 1.1.1 hit.
+// So we accept a same-origin match on EITHER the proxy-advertised public host
+// (X-Forwarded-Host) OR the socket's own Host — a match on either is proof of
+// same-origin, and requiring one specific header would 403 a legitimate upgrade
+// whenever a proxy forwards an unexpected value in the other (e.g. an outer hop
+// sets X-Forwarded-Host to an internal name while Host is still the public host).
+// This is safe against the cross-site WS hijack this check defends against: a
+// browser cannot set X-Forwarded-Host on a WebSocket handshake (the WS API forbids
+// custom request headers) and cannot forge Host either, so neither candidate is
+// attacker-controlled in a browser; and a non-browser client sends no Origin and
+// is already allowed, so it gains nothing by forging one.
+export function isAllowedUpgradeOrigin(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  let originUrl: URL;
+  try {
+    originUrl = new URL(origin);
+  } catch {
+    return false;
+  }
+  const candidateHosts = [firstForwardedHost(req.headers['x-forwarded-host']), req.headers.host];
+  if (candidateHosts.some((host) => host && isSameOriginHost(originUrl, host))) return true;
+  return isAllowedBrowserOrigin(origin);
+}
+
+// The protocol version a client announces via `?v=<n>` on the /ws upgrade (#569).
+// Returns null when the param is absent OR present-but-unparseable, and the
+// caller treats null as "current" (no version gate). Conflating the two is
+// deliberate and consistent: a client that omits `?v` and one that sends garbage
+// have both failed to announce a valid version, so both are treated identically.
+// This is not a security bypass of MIN_PROTOCOL_VERSION — omitting `?v` is itself
+// the sanctioned "treat me as current" path, so there is nothing a malformed
+// value could bypass that an absent one couldn't. The gate is a compatibility
+// courtesy (tell a well-behaved old client to update), not an auth control.
+// Mirrors parseSinceParam.
+export function parseProtocolParam(rawUrl: string): number | null {
+  try {
+    const raw = new URL(rawUrl, 'http://localhost').searchParams.get('v');
+    if (!raw) return null;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 // Generic payload for outgoing WS messages.
@@ -251,6 +388,23 @@ function isInQuietWindow(currentMin: number, startMin: number, endMin: number): 
 // instead) and a service notice (NickServ/ChanServ) must not fire a DM notification.
 export const DM_ELIGIBLE_TYPES = new Set(['message', 'action']);
 
+// Does this event outrank the user's closed flag and reopen the buffer?
+//
+// Two things qualify. A persisted message with a real id (DM, action) is a
+// strong signal the buffer is wanted again. And a self-join is definitive — we
+// ARE in that channel now — which is the same join-precedence the snapshot walk
+// applies (eachUserBufferTarget). The two paths used to disagree on the second
+// case: channel-joined carries no id, so the live event was dropped here while
+// the snapshot showed the channel anyway. Rejoining a closed channel therefore
+// did nothing visible until the user reloaded the client.
+//
+// Everything else — typing, away markers, names — stays out: ephemeral traffic
+// must not resurrect a buffer the user closed.
+export function reopensClosedBuffer(type: string, id: unknown): boolean {
+  if (type === 'channel-joined') return true;
+  return id != null && DM_ELIGIBLE_TYPES.has(type);
+}
+
 // Structural DM detection from a target string: ircConnection routes any direct
 // message into a buffer keyed by the *other* person's nick, so a target that's
 // not a channel (`#…`) and not a server pseudo-buffer (`:server:…`) is a direct
@@ -354,12 +508,6 @@ function computeUnreadFor(
   };
 }
 
-// A joined-set stand-in for buffers with no join concept (offline networks, the
-// system buffer): nothing is ever "currently joined", so isHiddenClosedBuffer
-// falls back to a plain closed-flag check. Shared so we don't allocate one per
-// network in the enumerator.
-const NONE_JOINED: { has(name: string): boolean } = { has: () => false };
-
 // One yield per buffer.
 export interface UserBufferTarget {
   networkId: number | null; // null == the app-scoped system buffer
@@ -373,45 +521,46 @@ export interface UserBufferTarget {
 // this walk and re-derive the system / :server: / closed-vs-joined carve-outs
 // slightly differently, which let the PWA app-icon badge total drift from the
 // in-app count (#454). Now they all iterate this generator, so the set can't
-// diverge. The app-scoped system buffer (networkId null, uncloseable) is yielded
-// first; then, for every network the user owns (live OR offline), the buffers
-// under it — in no particular order — its :server: pseudo-buffer (uncloseable),
-// every target with persisted history (listBufferTargets), and, for a live
-// connection, its currently-joined channels even before they have history
-// (matching what the snapshot ships). Consumers key frames by network+target and
-// sum per buffer, so intra-network yield order doesn't matter.
-// Closed buffers are dropped with the SAME join-precedence the snapshot uses
-// (isHiddenClosedBuffer): a closed flag hides a buffer only when it isn't
-// currently joined, so an autorejoin/reconnect race where a channel is both
-// closed and joined can't make the badge total omit highlights the snapshot
-// actually shipped (finding #3). `conn` is the live connection or null so callers
-// can choose shell-vs-backlog and thread per-connection state without re-deriving
-// liveness. Keys off buffer history, not buffer_reads rows, so a never-opened
-// buffer (no read pointer) is still enumerated — the client counts it from
+// diverge.
+//
+// The set is the buffers registry: the app-scoped system buffer (networkId
+// null, uncloseable) first, then per network its :server: pseudo-buffer
+// (uncloseable, synthesized — no row) followed by that network's open buffer
+// rows. A closed row hides its buffer unless the channel is currently joined
+// (join-precedence, matching the live filter's channel-joined reopen: in the
+// close→PART-echo window the buffer is still materially there). A live-joined
+// channel with no row at all (its row was forgotten mid-session) is yielded
+// defensively so the sidebar can never lose a channel the user is actually in.
+// `conn` is the live connection or null so callers can choose shell-vs-backlog
+// without re-deriving liveness. Rows exist independently of history, so a
+// never-spoken empty buffer is still enumerated — the client counts it from
 // lastReadId 0, and callers use getReadState (defaults to 0) the same way.
-export function* eachUserBufferTarget(
-  userId: number,
-  closed: Set<string> = closedKeySetForUser(userId),
-): Generator<UserBufferTarget> {
+export function* eachUserBufferTarget(userId: number): Generator<UserBufferTarget> {
   // System buffer first — app-scoped (networkId null), uncloseable.
   yield { networkId: null, target: SYSTEM_TARGET, conn: null };
   const liveById = new Map<number, IrcConnection>(
     ircManager.listConnections(userId).map((c) => [c.network.id, c]),
   );
+  const rowsByNetwork = new Map<number, BufferStateRow[]>();
+  for (const row of listBufferStatesForUser(userId)) {
+    if (row.networkId == null) continue; // app-scoped rows are synthesized above
+    let list = rowsByNetwork.get(row.networkId);
+    if (!list) rowsByNetwork.set(row.networkId, (list = []));
+    list.push(row);
+  }
   for (const net of listNetworksForUser(userId)) {
     const conn = liveById.get(net.id) ?? null;
-    const targets = new Set(listBufferTargets(net.id));
-    targets.add(`:server:${net.id}`);
-    // Live: currently-joined channels are shown even before they have history,
-    // and take precedence over a stale closed flag.
-    if (conn) for (const ch of conn.channels.values()) targets.add(ch.name);
-    const joined = conn?.channels ?? NONE_JOINED;
-    for (const target of targets) {
-      // :server: is uncloseable; every other target honors the closed flag, but
-      // a currently-joined channel beats a stale closed flag (join-precedence).
-      if (!target.startsWith(':server:') && isHiddenClosedBuffer(closed, joined, net.id, target))
-        continue;
-      yield { networkId: net.id, target, conn };
+    yield { networkId: net.id, target: `:server:${net.id}`, conn };
+    const seen = new Set<string>();
+    for (const row of rowsByNetwork.get(net.id) ?? []) {
+      seen.add(row.targetFolded);
+      if (row.state === 'closed' && !conn?.channels.has(row.targetFolded)) continue;
+      yield { networkId: net.id, target: row.target, conn };
+    }
+    if (conn) {
+      for (const ch of conn.channels.values()) {
+        if (!seen.has(ch.name.toLowerCase())) yield { networkId: net.id, target: ch.name, conn };
+      }
     }
   }
 }
@@ -597,6 +746,12 @@ interface SnapshotBreakdown {
   // lookups are NOT included (the loop passes precomputed values).
   unreadMs: number; // shell: buildBufferShell; resume: bufferStateFields
   sliceMs: number; // buildResumeSlice — message reads + decorate (resume path only)
+  // Offline split: :server: buffers ship a REAL backlog read (server), all
+  // other offline buffers ship shells whose cost is dominated by
+  // computeUnreadFor — a large shells number usually means unread COUNT scans
+  // (e.g. detached read pointers counting whole histories from lastReadId 0).
+  offlineServerMs: number;
+  offlineShellMs: number;
 }
 
 // Decide the slice a resume snapshot ships for ONE buffer.
@@ -819,12 +974,13 @@ function buildOfflineFrame(userId: number, networkId: number, target: string): W
 
 // `targets` lets the snapshot hand in the enumeration it already materialized for
 // the live loop, so a connect snapshot walks eachUserBufferTarget — and its
-// per-network listBufferTargets/listNetworksForUser DB reads — exactly ONCE
-// instead of once here and once in the live loop. Standalone callers (tests) omit
-// it and get a fresh walk (which computes its own closed set).
+// listBufferStatesForUser/listNetworksForUser DB reads — exactly ONCE instead
+// of once here and once in the live loop. Standalone callers (tests) omit it
+// and get a fresh walk.
 export function buildOfflineBacklogFrames(
   userId: number,
   targets: Iterable<UserBufferTarget> = eachUserBufferTarget(userId),
+  timings?: { serverMs: number; shellMs: number },
 ): WsPayload[] {
   const frames: WsPayload[] = [];
   for (const { networkId, target, conn } of targets) {
@@ -833,18 +989,23 @@ export function buildOfflineBacklogFrames(
     // has already applied the closed-flag carve-out (nothing is joined offline, so
     // there's no autorejoin race to defend against here — unlike the live loop).
     if (networkId == null || conn) continue;
+    const t0 = timings ? Date.now() : 0;
     frames.push(buildOfflineFrame(userId, networkId, target));
+    if (timings) {
+      const dt = Date.now() - t0;
+      if (target.startsWith(':server:')) timings.serverMs += dt;
+      else timings.shellMs += dt;
+    }
   }
   return frames;
 }
 
 // A buffer the user closed and isn't currently joined to is hidden from the
-// sidebar; broadcasting or seeding a frame for it would resurrect it (#319).
-// Centralizes the live-loop carve-out shared by the snapshot and mark-all-read
-// so the two sites can't drift. The closed set is case-folded
-// (closedKeySetForUser), so fold the target here too — servers hand us
-// inconsistently-cased names (#289). A currently-joined channel always beats a
-// stale closed flag (defensive against autorejoin/state races).
+// sidebar; broadcasting a read-state frame for it would resurrect it (#319).
+// The closed set is folded `${networkId}::${folded}` keys built from the
+// buffers registry (closedBufferKeySet); fold the target here too — servers
+// hand us inconsistently-cased names (#289). A currently-joined channel always
+// beats a stale closed flag (defensive against autorejoin/state races).
 function isHiddenClosedBuffer(
   closed: Set<string>,
   joined: { has(name: string): boolean },
@@ -855,14 +1016,28 @@ function isHiddenClosedBuffer(
   return closed.has(`${networkId}::${lower}`) && !joined.has(lower);
 }
 
+// The folded closed-buffer key set for isHiddenClosedBuffer, from the registry.
+function closedBufferKeySet(userId: number): Set<string> {
+  const set = new Set<string>();
+  for (const row of listBufferStatesForUser(userId)) {
+    if (row.state === 'closed' && row.networkId != null) {
+      set.add(`${row.networkId}::${row.targetFolded}`);
+    }
+  }
+  return set;
+}
+
 // Handles a client `open-buffer` request (a clicked channel name). Resolves
-// the requested target against buffers that already have persisted history —
-// case-insensitively, since IRC channel names are case-insensitive but
-// message rows store one canonical casing. A match (even a since-/closed
-// buffer) is reopened and re-seeded without a re-JOIN; a channel with no
-// history anywhere is one we've never visited, so it gets joined. Either way
-// the requesting socket is told the canonical target to focus, so it never
-// has to guess the casing.
+// the requested target against the buffers registry — folded, since IRC names
+// are case-insensitive but rows store one canonical casing. A row with
+// persisted history (even a closed one) is reopened and re-seeded without a
+// re-JOIN; a channel with no history is one we've never sat in — a bare
+// registry row can exist for it (a config-seeded autojoin entry), but there is
+// nothing to show, so it gets joined and surfaces on the echo. A bare nick
+// becomes a real (possibly empty) DM row — under the registry an empty DM can
+// exist and survive a reload, which the derived model couldn't express.
+// Either way the requesting socket is told the canonical target to focus, so
+// it never has to guess the casing.
 export function handleOpenBuffer(
   ws: LurkerWebSocket,
   userId: number,
@@ -870,16 +1045,23 @@ export function handleOpenBuffer(
   requested: string,
 ): void {
   if (!networkId || !requested || requested.startsWith(':server:')) return;
-  const canonical = listBufferTargets(networkId).find(
-    (t) => t.toLowerCase() === requested.toLowerCase(),
-  );
-  if (canonical) {
-    reopenBuffer(userId, networkId, canonical);
-    send(ws, buildBufferBacklog(userId, networkId, canonical));
-    send(ws, { kind: 'buffer-opened', networkId, target: canonical });
+  const row = getBuffer(userId, networkId, requested);
+  if (row && hasMessageForTarget(networkId, row.target)) {
+    reopenBufferRow(userId, networkId, row.target);
+    send(ws, buildBufferBacklog(userId, networkId, row.target));
+    send(ws, { kind: 'buffer-opened', networkId, target: row.target });
   } else if (requested.startsWith('#')) {
     ircManager.joinChannel(userId, networkId, requested);
     send(ws, { kind: 'buffer-opened', networkId, target: requested });
+  } else if (kindForTarget(requested) === 'dm') {
+    // A bare nick becomes a real (possibly empty) DM row that survives a
+    // reload. Gated on the DM classification, NOT "not '#'": a history-less
+    // '&'/'+'/'!' channel must not be minted as a permanently-dead channel
+    // buffer that never JOINs — those fall through as a no-op, exactly as the
+    // pre-registry code behaved.
+    const { record } = ensureBufferOpen(userId, networkId, requested);
+    send(ws, buildBufferBacklog(userId, networkId, record.target));
+    send(ws, { kind: 'buffer-opened', networkId, target: record.target });
   }
 }
 
@@ -1079,8 +1261,40 @@ export function startChanlistRefresh(networkId: number): void {
   chanlistDb.setMeta(networkId, { inProgress: true, totalCount: 0, fetchedAt: null });
 }
 
+// Authenticate a `/ws` upgrade. Two accepted credentials, in order:
+//
+//   1. the signed `lurker_session` cookie — every browser client, unchanged;
+//   2. `Authorization: Bearer <session token>` — native clients, which unlike
+//      browsers can set arbitrary headers on the upgrade request.
+//
+// Both resolve to the same `sessions` row, so everything downstream of the
+// upgrade (and every WS verb) is identical regardless of how the client
+// authenticated. Lives at module scope rather than inside attachWsHub so it is
+// reachable from tests without standing up a real WebSocket server.
+export function authenticateUpgrade(req: IncomingMessage, sessionSecret: string): User | null {
+  const header = req.headers.cookie;
+  if (header) {
+    const cookies = cookie.parse(header);
+    const raw = cookies[SESSION_COOKIE];
+    if (raw) {
+      const token = raw.startsWith('s:') ? cookieParser.signedCookie(raw, sessionSecret) : false;
+      if (token) {
+        const session = findSession(token);
+        // A present-but-dead cookie falls through to the bearer check rather
+        // than short-circuiting to 401 — a native client sends no cookie at
+        // all, so in practice only one credential is ever on the request.
+        if (session) {
+          const user = findUserById(session.user_id);
+          if (user) return user;
+        }
+      }
+    }
+  }
+  return loadBearerSession(req.headers.authorization)?.user ?? null;
+}
+
 export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_MESSAGE_BYTES });
   // Per-user pending auto-away timers. Set when a user goes from 1→0 sockets;
   // cleared on 0→1 or when the timer fires.
   const autoAwayTimers = new Map();
@@ -1347,28 +1561,35 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     }
     const decorated = decorateMessage(eventUserId, event);
     const target = decorated.target;
-    if (
-      target &&
-      !target.startsWith(':server:') &&
-      isClosed(eventUserId, decorated.networkId, target)
-    ) {
-      // A persisted message with a real id (DM, message, action, notice, etc.)
-      // is a strong signal the buffer is wanted again — reopen it. Ephemeral
-      // events (typing, away markers fanned to this target, names) shouldn't
-      // resurrect a closed buffer, so we drop them on the floor.
-      const reopens = decorated.id != null && DM_ELIGIBLE_TYPES.has(decorated.type);
-      // Ignored senders cannot resurrect a closed DM either. Otherwise an
-      // ignored user can force the buffer back into the sidebar simply by
-      // sending — a soft harassment vector the client-side render filter
-      // doesn't close, since the reopen happens server-side.
-      const senderIgnored = reopens && senderHidden(eventUserId, decorated);
-      if (!reopens || senderIgnored) return;
-      reopenBuffer(eventUserId, decorated.networkId, target);
-      fanOut(eventUserId, {
-        kind: 'buffer-reopened',
-        networkId: decorated.networkId,
-        target,
-      });
+    if (target && decorated.networkId != null && !target.startsWith(':server:')) {
+      const state = getBufferState(eventUserId, decorated.networkId, target);
+      if (state === 'closed') {
+        // See reopensClosedBuffer for which events outrank a closed flag; anything
+        // else is dropped on the floor rather than resurrecting the buffer.
+        const selfJoin = decorated.type === 'channel-joined';
+        const reopens = reopensClosedBuffer(decorated.type, decorated.id);
+        // Ignored senders cannot resurrect a closed DM either. Otherwise an
+        // ignored user can force the buffer back into the sidebar simply by
+        // sending — a soft harassment vector the client-side render filter
+        // doesn't close, since the reopen happens server-side. A self-join has no
+        // sender to ignore — it's our own action — so it skips this gate.
+        const senderIgnored = reopens && !selfJoin && senderHidden(eventUserId, decorated);
+        if (!reopens || senderIgnored) return;
+        reopenBufferRow(eventUserId, decorated.networkId, target);
+        fanOut(eventUserId, {
+          kind: 'buffer-reopened',
+          networkId: decorated.networkId,
+          target,
+        });
+      } else if (state === undefined && decorated.id != null) {
+        // A persisted event for a target with no registry row mints one — this
+        // replaces the old derived-existence-from-messages. Covers first-contact
+        // DMs (message OR notice: a NOTICE may create a buffer, #439, it just
+        // can't reopen a closed one — that's the branch above) and any stray
+        // persisted channel traffic. The event itself flows on unchanged; the
+        // client materializes the buffer from it exactly as it always has.
+        ensureBufferExists(eventUserId, decorated.networkId, target);
+      }
     }
     fanOut(eventUserId, { ...decorated, kind: 'irc' });
     maybePush(eventUserId, decorated);
@@ -1527,22 +1748,26 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     fanOut(userId, { kind: 'account-state', paused: false });
   });
 
-  function authenticateRequest(req: IncomingMessage): User | null | undefined {
-    const header = req.headers.cookie;
-    if (!header) return null;
-    const cookies = cookie.parse(header);
-    const raw = cookies[SESSION_COOKIE];
-    if (!raw) return null;
-    const token = raw.startsWith('s:') ? cookieParser.signedCookie(raw, sessionSecret) : false;
-    if (!token) return null;
-    const session = findSession(token);
-    if (!session) return null;
-    return findUserById(session.user_id);
-  }
-
   httpServer.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
     if (!req.url || !req.url.startsWith('/ws')) return;
-    const user = authenticateRequest(req);
+    // #574: reject a cross-site browser upgrade before we touch auth or the DB.
+    // Native clients send no Origin and pass; same-origin/allowlisted pass.
+    if (!isAllowedUpgradeOrigin(req)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    // #569: a client too old for this server is told to update (426) rather than
+    // handed a snapshot it would mis-render. A client that announces no version
+    // (?v absent) is treated as current — the web client ships in lockstep and
+    // any native build predating the handshake speaks today's protocol.
+    const clientVersion = parseProtocolParam(req.url);
+    if (clientVersion !== null && clientVersion < MIN_PROTOCOL_VERSION) {
+      socket.write('HTTP/1.1 426 Upgrade Required\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const user = authenticateUpgrade(req, sessionSecret);
     if (!user) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
@@ -1564,6 +1789,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
       const lurkerWs = ws as LurkerWebSocket;
       lurkerWs.userId = user.id;
       lurkerWs.sinceId = initialSinceId;
+      lurkerWs.protocolVersion = clientVersion ?? PROTOCOL_VERSION;
       lurkerWs.presence = { visible: false };
       lurkerWs.isAlive = true;
       lurkerWs.accountPaused = user.is_paused === 1;
@@ -1576,6 +1802,20 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     sendSnapshot(ws, user.id);
 
     ws.on('message', (raw) => {
+      // #574: per-socket flood control, checked before JSON.parse so a flood
+      // pays no parse cost. Exhausting the bucket closes the socket (1008 policy
+      // violation) rather than dropping silently — a client at this rate is
+      // misbehaving, and closing makes it stop.
+      if (!allowInboundMessage(ws)) {
+        console.warn(`[wsHub] user ${user.id} exceeded WS message rate; closing socket`);
+        try {
+          send(ws, { kind: 'error', text: 'message rate exceeded' });
+        } catch (_err) {
+          /* socket may already be unwritable */
+        }
+        ws.close(1008, 'message rate exceeded');
+        return;
+      }
       let msg: WsPayload;
       try {
         msg = JSON.parse(raw.toString()) as WsPayload;
@@ -1615,6 +1855,8 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
       offlineMs: 0,
       unreadMs: 0,
       sliceMs: 0,
+      offlineServerMs: 0,
+      offlineShellMs: 0,
     };
     let ok = false;
     try {
@@ -1635,7 +1877,8 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         `[wsHub] snapshot for user ${userId} took ${ms}ms across ${b.bufferCount} buffers ` +
           `(${b.fresh ? 'fresh/shells' : 'resume'}) — networks=${b.networksMs}ms seeds=${b.seedsMs}ms ` +
           `online=${b.onlineMs}ms offline=${b.offlineMs}ms [online split: unread=${b.unreadMs}ms ` +
-          `slice=${b.sliceMs}ms rest=${Math.max(0, b.onlineMs - b.unreadMs - b.sliceMs)}ms]. ` +
+          `slice=${b.sliceMs}ms rest=${Math.max(0, b.onlineMs - b.unreadMs - b.sliceMs)}ms] ` +
+          `[offline split: server=${b.offlineServerMs}ms shells=${b.offlineShellMs}ms]. ` +
           `Runs synchronously on the event loop; on slow storage or a large account this can starve ` +
           `IRC socket I/O and trip ping timeouts (see [event-loop] logs). networks=member-list blob; ` +
           `unread≈computeUnreadFor(+frame assembly), slice=buildResumeSlice reads, ` +
@@ -1666,6 +1909,10 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // so they ride alongside the per-network snapshot as their own field (#350).
     send(ws, {
       kind: 'snapshot',
+      // #569: the server's protocol version rides the snapshot so a client that
+      // connected without pre-checking GET /api/config still learns what the
+      // server speaks and can degrade knowingly.
+      protocolVersion: PROTOCOL_VERSION,
       networks,
       globalIgnores: ircManager.listGlobalIgnoresFor(userId),
       ...(isFreshConnect ? { cursor } : {}),
@@ -1693,19 +1940,18 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     send(ws, { kind: 'contacts-snapshot', contacts: ircManager.listContacts(userId) });
     const readState = listReadStateForUser(userId);
     const clearedState = listClearedStateForUser(userId);
-    const closed = closedKeySetForUser(userId);
     // Walk the shared enumerator ONCE per snapshot and reuse it for both the live
-    // loop and the offline backlog. Each walk runs a listBufferTargets DB query
-    // (recursive CTE) per network plus listNetworksForUser (SELECT * + decryptRow),
-    // so materializing here — rather than iterating the generator separately in the
-    // live loop and again in buildOfflineBacklogFrames — keeps those per-network
-    // reads at 1× on this ping-timeout-sensitive path (#454/#460). The array holds
-    // buffer references (incl. live conns), which stay valid for the rest of this
-    // synchronous snapshot. The system buffer / :server: / closed-joined precedence
-    // and joined-channel-even-without-history rules all live in the enumerator.
-    // Counted in seedsMs (it's a bulk pre-loop read like readState/clearedState),
-    // so onlineMs/offlineMs stay pure per-buffer frame-build time.
-    const allTargets = [...eachUserBufferTarget(userId, closed)];
+    // loop and the offline backlog. Each walk runs one listBufferStatesForUser query
+    // plus listNetworksForUser (SELECT * + decryptRow), so materializing here —
+    // rather than iterating the generator separately in the live loop and again
+    // in buildOfflineBacklogFrames — keeps those reads at 1× on this
+    // ping-timeout-sensitive path (#454/#460). The array holds buffer references
+    // (incl. live conns), which stay valid for the rest of this synchronous
+    // snapshot. The system buffer / :server: / closed-joined precedence rules
+    // all live in the enumerator. Counted in seedsMs (it's a bulk pre-loop read
+    // like readState/clearedState), so onlineMs/offlineMs stay pure per-buffer
+    // frame-build time.
+    const allTargets = [...eachUserBufferTarget(userId)];
     const seedsMs = Date.now() - tSeeds;
     const tOnline = Date.now();
     let maxSentId = ws.sinceId || 0;
@@ -1806,6 +2052,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     }
     const onlineMs = Date.now() - tOnline;
     const tOffline = Date.now();
+    const offlineSplit = { serverMs: 0, shellMs: 0 };
     // Offline networks (no live connection) ship their buffers as lightweight
     // SHELLS (buffer row + unread/read state, no message rows) rather than the
     // full recent slice. The client hydrates a shell's history on first open via
@@ -1814,7 +2061,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // from reading recent backlog for every historical/offline buffer — the bulk
     // of the synchronous read burst on a long-lived account. Reuses the enumeration
     // materialized above so this doesn't re-run the per-network DB reads.
-    for (const frame of buildOfflineBacklogFrames(userId, allTargets)) {
+    for (const frame of buildOfflineBacklogFrames(userId, allTargets, offlineSplit)) {
       for (const e of frame.events as Array<{ id?: number | null }>) {
         if (e.id != null && e.id > maxSentId) maxSentId = e.id;
       }
@@ -1838,6 +2085,8 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
       offlineMs,
       unreadMs,
       sliceMs,
+      offlineServerMs: offlineSplit.serverMs,
+      offlineShellMs: offlineSplit.shellMs,
     };
   }
 
@@ -2089,27 +2338,28 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         const target = typeof msg.target === 'string' ? msg.target : '';
         // Server pseudo-buffer can't be closed (it's the per-network log).
         if (!networkId || !target || target.startsWith(':server:')) break;
-        closeBuffer(userId, networkId, target);
+        closeBufferRow(userId, networkId, target);
         // The client renders the pinned section by intersecting pins with open
         // buffers, so a pin on a now-closed buffer is invisible — and leaving
         // the row would diverge the client's pin set from ours (issue #112).
-        // Close implies unpin. Match case-insensitively: the snapshot hides
-        // closed buffers case-folded (closedKeySetForUser lowercases), so a
-        // differently-cased close would otherwise hide the buffer while leaving
-        // the exact-cased pin row stranded — an invisible orphan (issue #405).
+        // Close implies unpin. Match case-insensitively: the registry hides
+        // closed buffers folded, so a differently-cased close would otherwise
+        // hide the buffer while leaving the exact-cased pin row stranded — an
+        // invisible orphan (issue #405).
         const pinned = unpinBufferCaseInsensitive(userId, networkId, target);
         if (pinned) {
           fanOut(userId, { kind: 'pins-changed', networkId, pinned });
         }
         if (target.startsWith('#')) {
-          // Send PART if connected; partChannel also flips channels.joined=0.
-          // If disconnected, partChannel is a no-op, so explicitly mark the
-          // channel as not-joined here to keep it from auto-rejoining the
-          // next time the network connects.
+          // Send PART if connected; partChannel also lowers autojoin. If
+          // disconnected, partChannel is a no-op, so lower autojoin here to
+          // keep the channel from auto-rejoining the next time the network
+          // connects. Update-only — closing a buffer that has no row must not
+          // conjure one (the last of the old upsertChannel conjure sites).
           if (
             !ircManager.partChannel(userId, networkId, target, msg.reason as string | undefined)
           ) {
-            upsertChannel(networkId, target, false);
+            setBufferAutojoin(userId, networkId, target, false);
           }
         } else {
           // Closing a DM means we stop tracking this peer. Drop them from
@@ -2291,7 +2541,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         // read-state for one that's closed-and-not-joined: the client would
         // re-materialize it and pop it back into the sidebar (#319). So clamp
         // first, then skip only the broadcast.
-        const closed = closedKeySetForUser(userId);
+        const closed = closedBufferKeySet(userId);
         for (const conn of ircManager.listConnections(userId)) {
           const networkId = conn.network.id;
           for (const row of maxIdByBuffer(networkId)) {

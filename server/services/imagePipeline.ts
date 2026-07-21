@@ -1,9 +1,23 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
-import sharp, { type Metadata } from 'sharp';
+import fs from 'node:fs';
+import sharp, { type Metadata, type Sharp } from 'sharp';
+import { canScrubInPlace, scrubMetadata } from './metadataScrub.js';
 
-const THUMB_SIZE = 128;
+// 512, not 128. The uploads browser (#547) is a gallery you browse BY thumbnail, and
+// at 128px that doesn't work — you squint. Its tiles are ~180px, which is 360 device
+// pixels on a 2x display, so the source has to be at least that to stay crisp; 512
+// covers it with headroom for 3x and for larger tiles later.
+//
+// Measured on a real photo, as WebP: 128px = 2.3 KB, 256px = 4.5 KB, 512px = 9.3 KB.
+// Seven kilobytes per upload is not a number worth designing a UI around.
+//
+// ⚠ Only NEW uploads get it. Existing rows keep the thumb they were made with and we
+// can't regenerate them — the originals live at the provider, not here — so the
+// gallery is mixed-sharpness until it churns. That's the accepted cost; the
+// alternative was designing every tile around the smallest thumb we ever wrote.
+const THUMB_SIZE = 512;
 
 interface FormatInfo {
   mime: string;
@@ -24,6 +38,11 @@ const FORMAT_INFO: Record<string, FormatInfo> = {
   svg: { mime: 'image/svg+xml', ext: 'svg' },
 };
 
+// The formats the static path will ENCODE to (a subset of the formats it can
+// read). webp is the default; jpeg is the escape hatch for an ancient client or
+// an upload host that mangles webp (`uploads.image.format`, #560).
+export type OutputFormat = 'webp' | 'jpeg';
+
 export interface OptimizeResult {
   buffer: Buffer;
   mime: string;
@@ -39,21 +58,40 @@ export function extensionFor(mime: string, fallback = 'bin'): string {
   return entry?.ext || fallback;
 }
 
-// Optimize a static image (resize longest edge to maxDim, re-encode JPEG).
+// `quality` is a single 0–100 perceptual scale handed to whichever encoder the
+// format selects. The two scales are NOT identical — libwebp's 85 is not
+// mozjpeg's 85 — but both mean "higher = better and bigger", which is what the
+// setting promises, and one slider beats two knobs nobody touches.
+function encode(pipeline: Sharp, format: OutputFormat, quality: number): Sharp {
+  return format === 'jpeg' ? pipeline.jpeg({ quality, mozjpeg: true }) : pipeline.webp({ quality });
+}
+
+// Optimize a static image (resize longest edge to maxDim, re-encode to `format`).
 // Animated images (sharp.metadata.pages > 1) bypass the resize/re-encode and
 // are returned verbatim, which is a hard requirement so reaction GIFs / animated
 // WebP / APNG don't lose animation on the way through Lurker.
+// `input` is a path (an upload's temp file) or a Buffer. sharp accepts either, so
+// the image path never has to read a file into the heap just to hand it over; the
+// scrub/passthrough branches below do read the bytes, but only after sharp has
+// confirmed it's an image, which the size cap already bounds.
 export async function optimize(
-  buffer: Buffer,
+  input: Buffer | string,
   {
     maxDim,
     quality,
+    format = 'webp',
     rasterOnly = false,
-  }: { maxDim: number; quality: number; rasterOnly?: boolean },
+  }: { maxDim: number; quality: number; format?: OutputFormat; rasterOnly?: boolean },
 ): Promise<OptimizeResult> {
+  // Only the passthrough/scrub branches need the bytes in memory; the resize path
+  // hands the path straight to sharp. Read lazily so an ordinary image upload
+  // never materializes its original file in the heap.
+  const readInput = async (): Promise<Buffer> =>
+    typeof input === 'string' ? fs.promises.readFile(input) : input;
+
   let meta: Metadata;
   try {
-    meta = await sharp(buffer).metadata();
+    meta = await sharp(input).metadata();
   } catch (cause) {
     const err = new Error(
       `unable to read image: ${(cause as Error).message || String(cause)}`,
@@ -72,15 +110,44 @@ export async function optimize(
 
   const animated = (meta.pages || 1) > 1;
   if (animated) {
-    return {
-      buffer,
-      mime: fmt.mime,
-      ext: fmt.ext,
-      width: meta.width || null,
-      height: meta.height || null,
-      byteSize: buffer.length,
-      animated: true,
-    };
+    // Passthrough keeps frames intact but must still honor "strip metadata":
+    // animated WebP/APNG can carry GPS EXIF. Scrub in-container (no re-encode)
+    // for the formats we can do surgically.
+    if (canScrubInPlace(meta.format)) {
+      const scrubbed = scrubMetadata(await readInput(), meta.format);
+      return {
+        buffer: scrubbed,
+        mime: fmt.mime,
+        ext: fmt.ext,
+        width: meta.width || null,
+        height: meta.height || null,
+        byteSize: scrubbed.length,
+        animated: true,
+      };
+    }
+
+    // No surgical scrubber for this container (multi-page TIFF, animated
+    // AVIF/HEIF). Re-encode to strip metadata rather than leak it — prefer
+    // keeping the animation, and only if the codec can't round-trip do we fall
+    // through to the static single-frame encode below. Either way the metadata
+    // is gone; we never pass an un-scrubbed image through.
+    try {
+      const out = await sharp(input, { animated: true })
+        .toFormat(meta.format)
+        .toBuffer({ resolveWithObject: true });
+      return {
+        buffer: out.data,
+        mime: fmt.mime,
+        ext: fmt.ext,
+        width: meta.width || null,
+        height: meta.height || null,
+        byteSize: out.data.length,
+        animated: true,
+      };
+    } catch {
+      // Codec can't re-encode animated — fall through to the static path, which
+      // flattens to a metadata-free first frame. Degraded but never leaks.
+    }
   }
 
   // SVG is a static vector — we pass it through unchanged. sharp can rasterize
@@ -95,32 +162,38 @@ export async function optimize(
       err.code = 'UNSUPPORTED_FORMAT';
       throw err;
     }
+    // Strip <metadata>/comments from the vector without rasterizing it.
+    const scrubbed = scrubMetadata(await readInput(), meta.format);
     return {
-      buffer,
+      buffer: scrubbed,
       mime: fmt.mime,
       ext: fmt.ext,
       width: meta.width || null,
       height: meta.height || null,
-      byteSize: buffer.length,
+      byteSize: scrubbed.length,
       animated: false,
     };
   }
 
-  const out = await sharp(buffer)
-    .rotate()
-    .resize({
+  // ⚠ The output format, mime and ext MUST agree — they used to be three
+  // hardcoded jpeg constants that could drift. Pick the format once and derive
+  // the other two from FORMAT_INFO.
+  const outFmt = FORMAT_INFO[format];
+  const out = await encode(
+    sharp(input).rotate().resize({
       width: maxDim,
       height: maxDim,
       fit: 'inside',
       withoutEnlargement: true,
-    })
-    .jpeg({ quality, mozjpeg: true })
-    .toBuffer({ resolveWithObject: true });
+    }),
+    format,
+    quality,
+  ).toBuffer({ resolveWithObject: true });
 
   return {
     buffer: out.data,
-    mime: 'image/jpeg',
-    ext: 'jpg',
+    mime: outFmt.mime,
+    ext: outFmt.ext,
     width: out.info.width,
     height: out.info.height,
     byteSize: out.data.length,
@@ -128,11 +201,18 @@ export async function optimize(
   };
 }
 
-export async function thumbnail(buffer: Buffer): Promise<Buffer> {
-  // Force first frame for animated inputs; cover-crop to a square JPEG.
-  return sharp(buffer, { animated: false })
-    .rotate()
-    .resize(THUMB_SIZE, THUMB_SIZE, { fit: 'cover', position: 'centre' })
-    .jpeg({ quality: 80 })
-    .toBuffer();
+export async function thumbnail(
+  input: Buffer | string,
+  { format = 'webp', quality = 80 }: { format?: OutputFormat; quality?: number } = {},
+): Promise<Buffer> {
+  // Force first frame for animated inputs; cover-crop to a square. Follows the
+  // same format as the full image: a jpeg thumbnail of a transparent PNG is
+  // black-backgrounded, which is the most visible face of the alpha bug.
+  return encode(
+    sharp(input, { animated: false })
+      .rotate()
+      .resize(THUMB_SIZE, THUMB_SIZE, { fit: 'cover', position: 'centre' }),
+    format,
+    quality,
+  ).toBuffer();
 }

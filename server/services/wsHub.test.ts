@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import { setupTestDb } from '../test-utils/testApp.js';
+import { setupTestDb, TEST_SESSION_SECRET } from '../test-utils/testApp.js';
+import { sign as signCookie } from 'cookie-signature';
+import type { IncomingMessage } from 'http';
 
 // setupTestDb sets DATABASE_PATH before any dynamic import touches db/index.js,
 // so it must run at module top level.
@@ -10,10 +12,9 @@ const testDb = setupTestDb('wshub');
 
 let createUser: typeof import('../db/users.js').createUser;
 let createNetwork: typeof import('../db/networks.js').createNetwork;
+let dbHandle: typeof import('../db/index.js').default;
 let insertMessage: typeof import('../db/messages.js').insertMessage;
-let closeBuffer: typeof import('../db/closedBuffers.js').closeBuffer;
-let reopenBuffer: typeof import('../db/closedBuffers.js').reopenBuffer;
-let isClosed: typeof import('../db/closedBuffers.js').isClosed;
+let buffers: typeof import('../db/buffers.js');
 let setClearedState: typeof import('../db/bufferReads.js').setClearedState;
 let setReadState: typeof import('../db/bufferReads.js').setReadState;
 let computeTotalHighlights: typeof import('./wsHub.js').computeTotalHighlights;
@@ -31,6 +32,7 @@ let systemLineToEvent: typeof import('./wsHub.js').systemLineToEvent;
 let buildSystemHistoryReply: typeof import('./wsHub.js').buildSystemHistoryReply;
 let startChanlistRefresh: typeof import('./wsHub.js').startChanlistRefresh;
 let DM_ELIGIBLE_TYPES: typeof import('./wsHub.js').DM_ELIGIBLE_TYPES;
+let reopensClosedBuffer: typeof import('./wsHub.js').reopensClosedBuffer;
 let chanlist: typeof import('../db/chanlist.js');
 let systemMessages: typeof import('../db/systemMessages.js').default;
 
@@ -40,8 +42,9 @@ let networkId: number;
 beforeAll(async () => {
   ({ createUser } = await import('../db/users.js'));
   ({ createNetwork } = await import('../db/networks.js'));
+  dbHandle = (await import('../db/index.js')).default;
   ({ insertMessage, maxMessageId } = await import('../db/messages.js'));
-  ({ closeBuffer, reopenBuffer, isClosed } = await import('../db/closedBuffers.js'));
+  buffers = await import('../db/buffers.js');
   ({ setClearedState, setReadState } = await import('../db/bufferReads.js'));
   ircManager = (await import('./ircManager.js')).default;
   ({
@@ -58,6 +61,7 @@ beforeAll(async () => {
     buildSystemHistoryReply,
     startChanlistRefresh,
     DM_ELIGIBLE_TYPES,
+    reopensClosedBuffer,
   } = await import('./wsHub.js'));
   chanlist = await import('../db/chanlist.js');
   systemMessages = (await import('../db/systemMessages.js')).default;
@@ -76,6 +80,9 @@ beforeAll(async () => {
 afterAll(() => testDb.cleanup());
 
 function seed(target: string, text: string): number {
+  // In production a persisted event mints the registry row (the live filter's
+  // ensureExists); tests write history directly, so mirror that here.
+  buffers.ensureExists(userId, networkId, target);
   return Number(
     insertMessage({
       networkId,
@@ -89,6 +96,19 @@ function seed(target: string, text: string): number {
   );
 }
 
+// Registry shims mirroring production: a buffer you can close necessarily has
+// a row (the live filter minted it), and close/reopen are update-only flips.
+function closeBuffer(uid: number, nid: number, target: string): void {
+  buffers.ensureOpen(uid, nid, target);
+  buffers.close(uid, nid, target);
+}
+function isClosed(uid: number, nid: number, target: string): boolean {
+  return buffers.isClosed(uid, nid, target);
+}
+function reopenBuffer(uid: number, nid: number, target: string): boolean {
+  return buffers.reopen(uid, nid, target);
+}
+
 // A WebSocket stand-in that records the frames send() writes. send() gates on
 // `readyState === OPEN`, so the two must match for a frame to be captured.
 function mockWs() {
@@ -96,6 +116,11 @@ function mockWs() {
   const ws = { OPEN: 1, readyState: 1, send: (s: string) => frames.push(JSON.parse(s)) };
   return { ws: ws as unknown as Parameters<typeof handleOpenBuffer>[0], frames };
 }
+
+// authenticateUpgrade only reads headers, so a bare object stands in for a real
+// upgrade request.
+const upgrade = (headers: Record<string, string>): IncomingMessage =>
+  ({ headers }) as unknown as IncomingMessage;
 
 describe('buildBufferBacklog', () => {
   it('builds a backlog frame from a buffer’s persisted history', () => {
@@ -281,6 +306,8 @@ describe('buildOfflineBacklogFrames', () => {
     });
     const offId = net!.id;
     const seedOff = (target: string, text: string): void => {
+      // Mirror the live filter's row-minting — except :server:, never a row.
+      if (!target.startsWith(':')) buffers.ensureExists(userId, offId, target);
       insertMessage({
         networkId: offId,
         target,
@@ -336,6 +363,7 @@ describe('buildOfflineBacklogFrames', () => {
       nick: 'alice',
     });
     const offId = net!.id;
+    buffers.ensureExists(userId, offId, '#hidden');
     insertMessage({
       networkId: offId,
       target: '#hidden',
@@ -366,7 +394,44 @@ describe('DM_ELIGIBLE_TYPES (#439)', () => {
   });
 });
 
+describe('reopensClosedBuffer join-precedence', () => {
+  // The live event pipe and the snapshot walk (eachUserBufferTarget) must agree
+  // on which signals outrank a closed flag. They didn't: a self-join carries no
+  // id, so the live channel-joined was dropped while the snapshot showed the
+  // channel regardless — rejoining a closed channel looked like a no-op until
+  // the user reloaded and the buffer reappeared on its own.
+  it('reopens on a self-join, which carries no message id', () => {
+    expect(reopensClosedBuffer('channel-joined', null)).toBe(true);
+    expect(reopensClosedBuffer('channel-joined', undefined)).toBe(true);
+  });
+
+  it('reopens on a persisted DM-eligible message', () => {
+    expect(reopensClosedBuffer('message', 42)).toBe(true);
+    expect(reopensClosedBuffer('action', 42)).toBe(true);
+  });
+
+  it('stays closed for an unpersisted message or an ephemeral event', () => {
+    expect(reopensClosedBuffer('message', null)).toBe(false);
+    expect(reopensClosedBuffer('typing', null)).toBe(false);
+    expect(reopensClosedBuffer('names', null)).toBe(false);
+    expect(reopensClosedBuffer('notice', 42)).toBe(false);
+    // A part is not a join — leaving a channel must not resurrect its buffer.
+    expect(reopensClosedBuffer('channel-parted', null)).toBe(false);
+  });
+});
+
 describe('handleOpenBuffer', () => {
+  it("does not mint a dead buffer for a history-less '&'/'+'/'!' channel (no JOIN path)", () => {
+    // Non-'#' channel prefixes have no join wiring here; before the registry
+    // this request was a silent no-op, and it must stay one — minting an open
+    // kind='channel' row would plant a permanently dead channel buffer that
+    // never receives a JOIN.
+    const { ws, frames } = mockWs();
+    handleOpenBuffer(ws, userId, networkId, '&local-unvisited');
+    expect(frames).toHaveLength(0);
+    expect(buffers.getBuffer(userId, networkId, '&local-unvisited')).toBeUndefined();
+  });
+
   it('reopens a since-closed channel without re-JOINing, resolving casing case-insensitively', () => {
     seed('#reopen', 'history line');
     closeBuffer(userId, networkId, '#reopen');
@@ -662,8 +727,9 @@ describe('computeTotalHighlights', () => {
       tls: true,
       nick: 'badger',
     })!.id;
-    const ins = (target: string, text: string) =>
-      Number(
+    const ins = (target: string, text: string) => {
+      buffers.ensureExists(u, net, target); // the live filter's row-minting
+      return Number(
         insertMessage({
           networkId: net,
           target,
@@ -674,6 +740,7 @@ describe('computeTotalHighlights', () => {
           self: false,
         }).id,
       );
+    };
 
     // The system-buffer term is constant for this user across the test (we never
     // add notable system lines), so assert deltas against this baseline rather
@@ -740,8 +807,13 @@ describe('eachUserBufferTarget / badge-vs-snapshot parity (#454)', () => {
 
   const netFor = (uid: number, name: string) =>
     createNetwork(uid, { name, host: 'h', port: 6697, tls: true, nick: 'x' })!.id;
-  const ins = (net: number, target: string, text: string, matchedRuleId: number | null = null) =>
-    Number(
+  const ins = (net: number, target: string, text: string, matchedRuleId: number | null = null) => {
+    // The live filter's row-minting; the network row knows its owner.
+    const owner = dbHandle.prepare('SELECT user_id AS uid FROM networks WHERE id = ?').get(net) as {
+      uid: number;
+    };
+    buffers.ensureExists(owner.uid, net, target);
+    return Number(
       insertMessage({
         networkId: net,
         target,
@@ -753,6 +825,7 @@ describe('eachUserBufferTarget / badge-vs-snapshot parity (#454)', () => {
         matchedRuleId,
       }).id,
     );
+  };
 
   it('counts a closed-but-currently-joined channel — a live join beats a stale closed flag (finding #3)', () => {
     const u = createUser('racer').id;
@@ -869,5 +942,290 @@ describe('eachUserBufferTarget / badge-vs-snapshot parity (#454)', () => {
     // The closed buffer is absent and the server pseudo-buffer is present in both.
     expect(standalone.some((s) => s.startsWith('#closed|'))).toBe(false);
     expect(standalone.some((s) => s.startsWith(`:server:${net}|`))).toBe(true);
+  });
+});
+
+// The /ws upgrade accepts two credentials: the signed session cookie (browsers)
+// and a bearer session token (native clients, which can set headers on the
+// upgrade where browsers cannot). Both must land on the same user.
+describe('authenticateUpgrade', () => {
+  let authenticateUpgrade: typeof import('./wsHub.js').authenticateUpgrade;
+  let createSession: typeof import('../db/sessions.js').createSession;
+
+  beforeAll(async () => {
+    ({ authenticateUpgrade } = await import('./wsHub.js'));
+    ({ createSession } = await import('../db/sessions.js'));
+  });
+
+  it('authenticates a browser via the signed session cookie', () => {
+    const { token } = createSession(userId);
+    const signed = encodeURIComponent('s:' + signCookie(token, TEST_SESSION_SECRET));
+    const user = authenticateUpgrade(
+      upgrade({ cookie: `lurker_session=${signed}` }),
+      TEST_SESSION_SECRET,
+    );
+    expect(user?.id).toBe(userId);
+  });
+
+  it('authenticates a native client via a bearer session token', () => {
+    const { token } = createSession(userId);
+    const user = authenticateUpgrade(
+      upgrade({ authorization: `Bearer ${token}` }),
+      TEST_SESSION_SECRET,
+    );
+    expect(user?.id).toBe(userId);
+  });
+
+  it('rejects an upgrade with no credentials at all', () => {
+    expect(authenticateUpgrade(upgrade({}), TEST_SESSION_SECRET)).toBeNull();
+  });
+
+  it('rejects an unknown bearer token', () => {
+    const user = authenticateUpgrade(
+      upgrade({ authorization: 'Bearer not-a-real-token' }),
+      TEST_SESSION_SECRET,
+    );
+    expect(user).toBeNull();
+  });
+
+  it('rejects a raw (unsigned) session token in the cookie', () => {
+    // The cookie path requires the 's:' signature prefix — a bearer token pasted
+    // into the cookie must not authenticate.
+    const { token } = createSession(userId);
+    const user = authenticateUpgrade(
+      upgrade({ cookie: `lurker_session=${token}` }),
+      TEST_SESSION_SECRET,
+    );
+    expect(user).toBeNull();
+  });
+
+  it('rejects a cookie signed with a different secret', () => {
+    const { token } = createSession(userId);
+    const signed = encodeURIComponent('s:' + signCookie(token, 'some-other-secret'));
+    const user = authenticateUpgrade(
+      upgrade({ cookie: `lurker_session=${signed}` }),
+      TEST_SESSION_SECRET,
+    );
+    expect(user).toBeNull();
+  });
+});
+
+// #574: the /ws upgrade only accepts a same-origin or allowlisted browser
+// upgrade; a native client (no Origin header) always passes.
+describe('isAllowedUpgradeOrigin', () => {
+  let isAllowedUpgradeOrigin: typeof import('./wsHub.js').isAllowedUpgradeOrigin;
+  const savedCors = process.env.CORS_ORIGIN;
+
+  beforeAll(async () => {
+    ({ isAllowedUpgradeOrigin } = await import('./wsHub.js'));
+  });
+  afterAll(() => {
+    if (savedCors === undefined) delete process.env.CORS_ORIGIN;
+    else process.env.CORS_ORIGIN = savedCors;
+  });
+
+  it('allows an upgrade with no Origin header (native client)', () => {
+    expect(isAllowedUpgradeOrigin(upgrade({ host: 'app.lurker.chat' }))).toBe(true);
+  });
+
+  it('allows a same-origin browser upgrade regardless of CORS_ORIGIN', () => {
+    process.env.CORS_ORIGIN = 'https://something-else.example';
+    expect(
+      isAllowedUpgradeOrigin(
+        upgrade({ host: 'app.lurker.chat', origin: 'https://app.lurker.chat' }),
+      ),
+    ).toBe(true);
+  });
+
+  it('allows a cross-origin upgrade that matches the configured CORS_ORIGIN', () => {
+    process.env.CORS_ORIGIN = 'https://client.example';
+    expect(
+      isAllowedUpgradeOrigin(upgrade({ host: 'api.internal', origin: 'https://client.example' })),
+    ).toBe(true);
+  });
+
+  // Regression for the 1.1.1 reverse-proxy break: a proxy that rewrites Host to
+  // the upstream address makes the browser Origin host differ from req Host, so
+  // the same-origin path can only fire off the public host the proxy advertises
+  // in X-Forwarded-Host. Without this, every proxied request fell through to the
+  // (brittle) CORS_ORIGIN string match and 403'd.
+  it('allows a same-origin upgrade via X-Forwarded-Host when the proxy rewrote Host', () => {
+    delete process.env.CORS_ORIGIN;
+    expect(
+      isAllowedUpgradeOrigin(
+        upgrade({
+          host: '127.0.0.1:8015',
+          'x-forwarded-host': 'irc.example.com',
+          origin: 'https://irc.example.com',
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  // A same-origin match on Host must still pass even when X-Forwarded-Host is an
+  // unrelated value (e.g. an outer proxy hop that rewrites XFH to an internal
+  // name). Matching on EITHER candidate avoids 403'ing a legitimate upgrade.
+  it('accepts a same-origin match on Host even when X-Forwarded-Host is unrelated', () => {
+    delete process.env.CORS_ORIGIN;
+    expect(
+      isAllowedUpgradeOrigin(
+        upgrade({
+          host: 'irc.example.com',
+          'x-forwarded-host': 'internal-name.local',
+          origin: 'https://irc.example.com',
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  // A browser omits the default port in Origin, but a proxy may append it to the
+  // forwarded host (e.g. the nginx `$host:$server_port` idiom on 443). Normalizing
+  // both through the URL parser treats these as the same origin instead of falling
+  // through to the allowlist and 403'ing a genuinely same-origin request.
+  it('treats an explicit default port on the forwarded host as same-origin', () => {
+    delete process.env.CORS_ORIGIN;
+    expect(
+      isAllowedUpgradeOrigin(
+        upgrade({ host: 'irc.example.com:443', origin: 'https://irc.example.com' }),
+      ),
+    ).toBe(true);
+    expect(
+      isAllowedUpgradeOrigin(
+        upgrade({ host: 'irc.example.com:80', origin: 'http://irc.example.com' }),
+      ),
+    ).toBe(true);
+  });
+
+  it('matches the forwarded host case-insensitively', () => {
+    delete process.env.CORS_ORIGIN;
+    expect(
+      isAllowedUpgradeOrigin(
+        upgrade({ host: 'IRC.Example.COM', origin: 'https://irc.example.com' }),
+      ),
+    ).toBe(true);
+  });
+
+  // The default-port normalization must not blur a *different* explicit port into
+  // a match — a cross-port Origin is still cross-origin. CORS_ORIGIN is set to an
+  // unrelated value so the allowlist can't rescue it and mask the same-origin path.
+  it('does not treat a non-default explicit port as same-origin', () => {
+    process.env.CORS_ORIGIN = 'https://something-else.example';
+    expect(
+      isAllowedUpgradeOrigin(
+        upgrade({ host: 'irc.example.com', origin: 'https://irc.example.com:8443' }),
+      ),
+    ).toBe(false);
+  });
+
+  it('uses only the first host in an X-Forwarded-Host proxy chain', () => {
+    delete process.env.CORS_ORIGIN;
+    expect(
+      isAllowedUpgradeOrigin(
+        upgrade({
+          host: '127.0.0.1:8015',
+          'x-forwarded-host': 'irc.example.com, inner-proxy.internal',
+          origin: 'https://irc.example.com',
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  // The CORS_ORIGIN allowlist path now normalizes both sides, so the two most
+  // common self-host footguns — a trailing slash, and a comma-separated list read
+  // as one literal string — match instead of silently 403'ing.
+  it('tolerates a trailing slash on the configured CORS_ORIGIN', () => {
+    process.env.CORS_ORIGIN = 'https://client.example/';
+    expect(
+      isAllowedUpgradeOrigin(upgrade({ host: 'api.internal', origin: 'https://client.example' })),
+    ).toBe(true);
+  });
+
+  it('treats CORS_ORIGIN as a comma-separated allowlist', () => {
+    process.env.CORS_ORIGIN = 'https://a.example, https://b.example';
+    expect(
+      isAllowedUpgradeOrigin(upgrade({ host: 'api.internal', origin: 'https://b.example' })),
+    ).toBe(true);
+    expect(
+      isAllowedUpgradeOrigin(upgrade({ host: 'api.internal', origin: 'https://c.example' })),
+    ).toBe(false);
+  });
+
+  it('rejects a cross-site browser upgrade that is neither same-origin nor allowlisted', () => {
+    process.env.CORS_ORIGIN = 'https://app.lurker.chat';
+    expect(
+      isAllowedUpgradeOrigin(upgrade({ host: 'app.lurker.chat', origin: 'https://evil.example' })),
+    ).toBe(false);
+  });
+
+  // A cross-site attacker forging X-Forwarded-Host to match its own Origin still
+  // fails the same-origin path, because the compared host is the *forwarded* one,
+  // not the attacker's Origin. (In a real browser the attacker can't set this
+  // header at all — this just proves the logic doesn't hand them a bypass.)
+  it('rejects a cross-site upgrade even if X-Forwarded-Host is forged to another host', () => {
+    process.env.CORS_ORIGIN = 'https://app.lurker.chat';
+    expect(
+      isAllowedUpgradeOrigin(
+        upgrade({
+          host: 'app.lurker.chat',
+          'x-forwarded-host': 'app.lurker.chat',
+          origin: 'https://evil.example',
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects a malformed Origin header from a browser', () => {
+    expect(isAllowedUpgradeOrigin(upgrade({ host: 'app.lurker.chat', origin: 'not-a-url' }))).toBe(
+      false,
+    );
+  });
+});
+
+// #569: the client announces its protocol version via ?v= on the upgrade URL.
+describe('parseProtocolParam', () => {
+  let parseProtocolParam: typeof import('./wsHub.js').parseProtocolParam;
+  beforeAll(async () => {
+    ({ parseProtocolParam } = await import('./wsHub.js'));
+  });
+
+  it('returns null when ?v is absent', () => {
+    expect(parseProtocolParam('/ws')).toBeNull();
+    expect(parseProtocolParam('/ws?since=5')).toBeNull();
+  });
+
+  it('parses a positive integer version', () => {
+    expect(parseProtocolParam('/ws?v=1')).toBe(1);
+    expect(parseProtocolParam('/ws?v=3&since=5')).toBe(3);
+  });
+
+  it('returns null for a non-positive or non-numeric version', () => {
+    expect(parseProtocolParam('/ws?v=0')).toBeNull();
+    expect(parseProtocolParam('/ws?v=-2')).toBeNull();
+    expect(parseProtocolParam('/ws?v=abc')).toBeNull();
+  });
+});
+
+// #574: per-socket inbound flood control. The bucket starts full, drains one
+// token per message, and refills over time.
+describe('allowInboundMessage', () => {
+  let allowInboundMessage: typeof import('./wsHub.js').allowInboundMessage;
+  beforeAll(async () => {
+    ({ allowInboundMessage } = await import('./wsHub.js'));
+  });
+
+  it('passes a normal message rate and eventually throttles a sustained flood', () => {
+    const ws = {} as Parameters<typeof allowInboundMessage>[0];
+    // A full bucket admits a burst; a tight loop with no time to refill must hit
+    // the floor and start rejecting.
+    let allowed = 0;
+    let rejected = 0;
+    for (let i = 0; i < 10_000; i++) {
+      if (allowInboundMessage(ws)) allowed++;
+      else rejected++;
+    }
+    expect(allowed).toBeGreaterThan(0); // the initial burst got through
+    expect(rejected).toBeGreaterThan(0); // the flood was throttled
+    // Nowhere near all 10k were admitted — the cap held.
+    expect(allowed).toBeLessThan(1_000);
   });
 });

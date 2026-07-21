@@ -8,6 +8,13 @@ import fs from 'fs';
 import { isNodeMode } from '../utils/edition.js';
 import { isPublicModeEnabled } from '../utils/publicMode.js';
 import { foldBufferCase } from './foldBufferCase.js';
+import {
+  seedUploaderConfig,
+  reconcileBuiltInUploaders,
+  reconcileLegacyUploadSettings,
+  renameHoarderDriver,
+  reconcileHostedUploaderFromEnv,
+} from './uploaderConfigSeed.js';
 
 // Guardrail: under vitest, refuse to fall back to the real database. A test
 // that forgets to isolate DATABASE_PATH would otherwise open data/lurker.db and
@@ -80,16 +87,37 @@ function migrate() {
     );
     CREATE INDEX IF NOT EXISTS idx_networks_user ON networks(user_id);
 
-    CREATE TABLE IF NOT EXISTS channels (
+    -- First-class buffer registry: a buffer exists because a row exists, not
+    -- because messages exist (the old derived model). Replaces the retired
+    -- channels table (autojoin/key carrier) and closed_buffers (per-user hide
+    -- list) — see the schemaVersion 16 backfill. target keeps the canonical
+    -- display casing; target_folded (ASCII lower) is the ONLY lookup key,
+    -- enforced by idx_buffers_key (coalesced like idx_buffer_reads_key so a
+    -- NULL-network row dedupes). kind: channel | dm | server | system —
+    -- server/system rows are reserved for now (wsHub's walk synthesizes those
+    -- uncloseable buffers). state: open | closed; a 'closed' row with NULL
+    -- closed_at means "never surfaced" (a config-seeded autojoin channel
+    -- awaiting its first join echo), not "user closed it". autojoin is written
+    -- on the join ECHO, never the request, so a forwarded/failed join can't
+    -- plant a rejoin. key is the channel +k key, encrypted at rest.
+    CREATE TABLE IF NOT EXISTS buffers (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      network_id INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      joined INTEGER NOT NULL DEFAULT 0,
+      user_id INTEGER NOT NULL,
+      network_id INTEGER,
+      target TEXT NOT NULL,
+      target_folded TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'open',
+      autojoin INTEGER NOT NULL DEFAULT 0,
+      key TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE (network_id, name),
+      closed_at TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
     );
-    CREATE INDEX IF NOT EXISTS idx_channels_network ON channels(network_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_buffers_key
+      ON buffers(user_id, IFNULL(network_id, 0), target_folded);
+    CREATE INDEX IF NOT EXISTS idx_buffers_network ON buffers(network_id);
 
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,17 +170,6 @@ function migrate() {
       auto_set INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
-
-    CREATE TABLE IF NOT EXISTS closed_buffers (
-      user_id INTEGER NOT NULL,
-      network_id INTEGER NOT NULL,
-      target TEXT NOT NULL,
-      closed_at TEXT NOT NULL DEFAULT (datetime('now')),
-      PRIMARY KEY (user_id, network_id, target),
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_closed_buffers_user ON closed_buffers(user_id);
 
     CREATE TABLE IF NOT EXISTS user_settings (
       user_id INTEGER NOT NULL,
@@ -285,7 +302,7 @@ function migrate() {
     -- Per-user log of every successful image upload. Thumbnail is a 128² JPEG
     -- generated at upload time and served back via /api/uploads/:id/thumb,
     -- so the recent-uploads modal stays cheap even if the original lives on a
-    -- third-party host. provider is the upload destination ('hoarder', 'catbox',
+    -- third-party host. provider is the upload destination ('dropper', 'catbox',
     -- 'x0') so the modal can label rows and so we know whether to attempt any
     -- provider-side delete (none today; tracked as a follow-up).
     CREATE TABLE IF NOT EXISTS upload_history (
@@ -727,6 +744,71 @@ function migrate() {
     );
     CREATE INDEX IF NOT EXISTS idx_e2e_recipients_handle
       ON e2e_outgoing_recipients(user_id, network_id, handle);
+
+    -- Configured uploaders (issue #510): a named instance of an upload driver
+    -- with its settings filled in. scope 'instance' rows are admin-defined
+    -- (secrets held server-side); 'user' rows are a user's own. config_json holds
+    -- the non-secret fields; secrets_enc is a secretCrypto envelope (lk1.*) of the
+    -- secret fields — plaintext no-op on self-host without LURKER_SECRET_KEY,
+    -- decrypted server-side at upload time and never sent to a client. locked
+    -- expresses the hosted "you get this default, can't touch it" case without a
+    -- separate edition fork; at most one instance row may be is_default. The
+    -- denormalized driver string on upload_history keeps display working even if
+    -- the config row is later deleted.
+    CREATE TABLE IF NOT EXISTS uploader_config (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      scope TEXT NOT NULL CHECK (scope IN ('instance','user')),
+      owner_user_id INTEGER,
+      driver TEXT NOT NULL,
+      label TEXT NOT NULL,
+      config_json TEXT NOT NULL DEFAULT '{}',
+      secrets_enc TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      offered_to_users INTEGER NOT NULL DEFAULT 0,
+      locked INTEGER NOT NULL DEFAULT 0,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_uploader_config_owner
+      ON uploader_config(owner_user_id) WHERE scope = 'user';
+    -- At most one instance default (partial unique index over is_default=1).
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_uploader_config_one_default
+      ON uploader_config(is_default) WHERE scope = 'instance' AND is_default = 1;
+
+    -- Minimal instance-level key/value settings (issue #510). Keys today:
+    -- uploads.allow_user_defined and networks.allow_user_defined ('1'|'0').
+    CREATE TABLE IF NOT EXISTS instance_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
+    -- Admin-defined network presets (#298): the networks THIS instance
+    -- recommends, floated to the top of the picker. Deliberately NOT a scope
+    -- column on the networks table (the uploader_config shape) — an uploader is
+    -- a shared thing you send to, but an IRC connection is inherently per-user
+    -- (own nick, own SASL, own session), so an admin cannot own one, only
+    -- recommend it. A preset is a template a user instantiates into their own
+    -- networks row; that keeps the networks table (and everything in ircManager
+    -- that assumes a user owns the row) completely untouched.
+    --
+    -- channels_json is a JSON string[] of recommended channels, pre-checked in
+    -- the first-run flow. Mirrors the shape of the client's builtinNetworks.json
+    -- so the picker can merge the two lists.
+    CREATE TABLE IF NOT EXISTS instance_network (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      host TEXT NOT NULL,
+      port INTEGER NOT NULL DEFAULT 6697,
+      tls INTEGER NOT NULL DEFAULT 1,
+      sasl_likely_required INTEGER NOT NULL DEFAULT 0,
+      channels_json TEXT NOT NULL DEFAULT '[]',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      position INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 }
 
@@ -750,6 +832,10 @@ function ensureColumn(table: string, column: string, def: string): void {
 function columnExists(table: string, column: string): boolean {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as TableInfoRow[];
   return !!cols.find((c) => c.name === column);
+}
+
+function tableExists(table: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table);
 }
 
 // Recovery for pre-role SELF-HOSTED installs: if no admin exists, promote the
@@ -818,10 +904,6 @@ ensureColumn('messages', 'extra', 'TEXT');
 ensureColumn('messages', 'userhost', 'TEXT');
 ensureColumn('networks', 'sasl_account', 'TEXT');
 ensureColumn('networks', 'sasl_password', 'TEXT');
-// The +k channel key, so a keyed channel can be auto-rejoined with its key
-// after a reconnect/restart (like soju/znc/thelounge). Stored encrypted at rest
-// on hosted cells (see secretCrypto), NULL for keyless channels.
-ensureColumn('channels', 'key', 'TEXT');
 ensureColumn('networks', 'trusted_certificates', 'INTEGER NOT NULL DEFAULT 1');
 // Newline-delimited raw IRC commands fired after RPL_WELCOME, IRCCloud-style.
 // Supports `WAIT <seconds>` lines that pause before the next command.
@@ -951,6 +1033,15 @@ ensureColumn('upload_history', 'synced_to_cp', 'INTEGER NOT NULL DEFAULT 0');
 // image), but the bytes are gone from storage. Standalone never sets it.
 ensureColumn('upload_history', 'removed', 'INTEGER NOT NULL DEFAULT 0');
 
+// Issue #510: which configured uploader (uploader_config.id) produced this
+// upload — for a later delete + display — and `ref`, the driver's opaque delete
+// handle (object key / disk key), NULL for non-deletable drivers (all P0
+// drivers). The denormalized `provider` string above is kept for display even if
+// the uploader_config row is later deleted. Behavior-neutral in P0: no path yet
+// reads these back, they're the seam later phases (delete, s3/local) build on.
+ensureColumn('upload_history', 'uploader_config_id', 'INTEGER');
+ensureColumn('upload_history', 'ref', 'TEXT');
+
 // The offer's address/port, persisted so an unsolicited DCC SEND recorded as
 // pending_approval can be accepted later (the user clicks Accept seconds/minutes
 // after the bot offered). #270 phase 2.
@@ -962,10 +1053,16 @@ ensureColumn('dcc_transfers', 'peer_port', 'INTEGER');
 // so it stops erroring on every notification.
 ensureColumn('push_subscriptions', 'fail_count', 'INTEGER NOT NULL DEFAULT 0');
 
+// #490: native push. A row now says which transport it speaks, because APNs and
+// FCM deliver to an opaque device token rather than a Web Push service URL and
+// carry no ECDH keypair. Every pre-existing row is Web Push by definition, which
+// is also why the default is safe to rely on rather than backfill.
+ensureColumn('push_subscriptions', 'transport', "TEXT NOT NULL DEFAULT 'webpush'");
+
 // Schema versioning lets us retire one-shot recovery blocks once every
 // production DB has run through them. Bump SCHEMA_VERSION when adding a new
 // recovery block, and delete blocks for versions far enough in the past.
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 16;
 const schemaVersionRow = db
   .prepare(`SELECT value FROM app_meta WHERE key = 'schema_version'`)
   .get() as { value: string } | undefined;
@@ -1218,7 +1315,9 @@ if (schemaVersion < 6) {
   seed();
 }
 
-if (schemaVersion < 7) {
+// tableExists gate: fresh installs never create closed_buffers (retired by
+// schemaVersion 16) and have no pinned rows to repair — see the v9 gate below.
+if (schemaVersion < 7 && tableExists('closed_buffers')) {
   // Issue #112 backfill: before this version, close-buffer left the
   // pinned_buffers row intact. The client filters the pinned section by open
   // buffers, so the orphan was invisible — but it made the client's pin set
@@ -1254,7 +1353,12 @@ if (schemaVersion < 7) {
   `);
 }
 
-if (schemaVersion < 9) {
+// Gated on the legacy channels table: fresh installs no longer create the
+// channels/closed_buffers tables the fold repairs (retired by schemaVersion 16),
+// so a fresh DB — which starts at schemaVersion 0 and runs every block — must
+// skip this one. Any DB that actually needs the fold predates v16 and still has
+// the tables.
+if (schemaVersion < 9 && tableExists('channels')) {
   // Issue #268/#289/#327 repair: a server relaying a different case than we
   // joined/opened with (DALnet's registered #Christian vs the #christian we
   // joined; a DM peer presented as `bob` vs the `Bob` we /query'd) forked a
@@ -1448,6 +1552,62 @@ try {
   }
 }
 
+// Issue #490 native push: p256dh/auth must be nullable. They are Web Push ECDH
+// crypto (RFC 8291) and an APNs/FCM device token has no equivalent — a native row
+// has nothing truthful to put there, and '' would be a lie the type system would
+// then have to believe. SQLite can't drop a NOT NULL in place, so rebuild.
+// Shape-gated on p256dh's notnull flag — idempotent, self-heals a half-migrated
+// DB, and won't touch a DB already on the new shape. Placed after the
+// ensureColumn block above so `transport` and `fail_count` exist to copy.
+//
+// `endpoint` keeps its global UNIQUE rather than moving to UNIQUE(transport,
+// endpoint): a device token and a push-service URL cannot collide in practice, so
+// the composite would buy nothing while forcing `transport` through every
+// endpoint-keyed call site (get/delete/heartbeat) and the routes above them.
+{
+  const p256Col = (
+    db.prepare(`PRAGMA table_info(push_subscriptions)`).all() as TableInfoRow[]
+  ).find((c) => c.name === 'p256dh');
+  if (p256Col && p256Col.notnull === 1) {
+    const rebuild = db.transaction(() => {
+      db.exec(`DROP INDEX IF EXISTS idx_push_subs_user`);
+      db.exec(`
+        CREATE TABLE push_subscriptions_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          endpoint TEXT NOT NULL UNIQUE,
+          transport TEXT NOT NULL DEFAULT 'webpush',
+          p256dh TEXT,
+          auth TEXT,
+          user_agent TEXT,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+          fail_count INTEGER NOT NULL DEFAULT 0,
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+      `);
+      db.exec(`
+        INSERT INTO push_subscriptions_new
+          (id, user_id, endpoint, transport, p256dh, auth, user_agent, enabled,
+           created_at, last_seen_at, fail_count)
+        SELECT id, user_id, endpoint, transport, p256dh, auth, user_agent, enabled,
+           created_at, last_seen_at, fail_count
+        FROM push_subscriptions
+      `);
+      db.exec(`DROP TABLE push_subscriptions`);
+      db.exec(`ALTER TABLE push_subscriptions_new RENAME TO push_subscriptions`);
+    });
+    const prevFk = db.pragma('foreign_keys', { simple: true });
+    db.pragma('foreign_keys = OFF');
+    try {
+      rebuild();
+    } finally {
+      db.pragma(`foreign_keys = ${prevFk ? 'ON' : 'OFF'}`);
+    }
+  }
+}
+
 // Issue #349 highlight overhaul: `pattern` must be nullable so a pure -mask
 // rule (highlight everyone matching a nick!user@host) can carry no keyword, and
 // the table gains `mask` + `channels` scope columns. SQLite can't drop a NOT
@@ -1501,7 +1661,208 @@ try {
   }
 }
 
+// Retire the channels + closed_buffers tables in favor of the first-class
+// buffers registry (created in migrate() above). Gated on the legacy table:
+// fresh installs never create channels/closed_buffers, so they skip this; any
+// older DB still has both (they were created together since the beginning).
+//
+// Backfill = the union of the three places buffer state used to live, folded
+// with the same canonicalization foldBufferCase uses (canonical casing = the
+// message-majority variant, ties by target ASC):
+//   A. every distinct messages target        → open buffer (existence-with-history)
+//   B. every channels row                    → autojoin/key carrier; a row with
+//      no history gets state 'closed' + NULL closed_at ("never surfaced"), so
+//      the sidebar after this migration shows exactly what it showed before —
+//      config-seeded channels still appear only on their join echo
+//   C. every closed_buffers row              → state 'closed' (folded; a
+//      history-less tombstone still becomes a row so a NOTICE from that nick
+//      keeps NOT resurrecting the buffer, same as the old tombstone did)
+if (schemaVersion < 16 && tableExists('channels')) {
+  // Very old DBs that jump straight here may predate the channels.key column
+  // (its ensureColumn used to run unconditionally; it's gone now that fresh
+  // installs have no channels table).
+  ensureColumn('channels', 'key', 'TEXT');
+  const cutover = db.transaction(() => {
+    // Capture the closed set (folded, latest closed_at per fork) BEFORE the
+    // fold below runs: foldBufferCase DELETES stray-cased closed_buffers rows
+    // (in its v9 context those marked a junk fork-variant), but ever since the
+    // live paths went folded, a closed row whose casing merely differs from
+    // the message-majority casing is genuine user intent — the folded snapshot
+    // honored it — and must survive into backfill pass C.
+    db.exec(`DROP TABLE IF EXISTS _bf_closed`);
+    db.exec(`
+      CREATE TEMP TABLE _bf_closed AS
+      SELECT user_id, network_id, lower(target) AS lkey,
+             MIN(target) AS any_target, MAX(closed_at) AS closed_at
+      FROM closed_buffers
+      GROUP BY user_id, network_id, lower(target)
+    `);
+    // Re-run the case-fold repair (the v9 one-shot, for forks that appeared
+    // since). The backfill below picks ONE canonical casing per buffer for the
+    // registry row, and every read path keys messages/buffer_reads by exact
+    // target — so any satellite row still sitting on a fork's other casing
+    // would detach: read pointers stop resolving (every snapshot then
+    // COUNT-scans the buffer's whole history as unread) and backlog reads see
+    // only the majority variant's messages. Folding here guarantees messages,
+    // buffer_reads, pins, drafts, and the channels rows all agree with the
+    // casing the backfill is about to canonicalize on. No-op when no forks.
+    // Its internal db.transaction nests as a savepoint under this one.
+    foldBufferCase(db, { scope: 'all', report: false });
+    db.exec(`DROP TABLE IF EXISTS _bf_canon`);
+    db.exec(`
+      CREATE TEMP TABLE _bf_canon AS
+      SELECT network_id, lower(target) AS lkey, target AS canon FROM (
+        SELECT network_id, target,
+               ROW_NUMBER() OVER (
+                 PARTITION BY network_id, lower(target)
+                 ORDER BY COUNT(*) DESC, target ASC
+               ) AS rn
+        FROM messages WHERE target NOT LIKE ':%'
+        GROUP BY network_id, target
+      ) WHERE rn = 1
+    `);
+
+    // A: history-derived buffers, open by default (C flips the closed ones).
+    db.exec(`
+      INSERT INTO buffers (user_id, network_id, target, target_folded, kind, state, autojoin)
+      SELECT n.user_id, c.network_id, c.canon, c.lkey,
+             CASE WHEN substr(c.lkey, 1, 1) IN ('#', '&', '+', '!')
+                  THEN 'channel' ELSE 'dm' END,
+             'open', 0
+      FROM _bf_canon c JOIN networks n ON n.id = c.network_id
+      ON CONFLICT(user_id, IFNULL(network_id, 0), target_folded) DO NOTHING
+    `);
+
+    // B: channels rows. GROUP BY folded name defends against a post-v9 case
+    // fork (joined=MAX, any key wins, earliest created_at). The encrypted key
+    // copies verbatim — buffers.key uses the same secretCrypto scheme.
+    db.exec(`
+      INSERT INTO buffers
+        (user_id, network_id, target, target_folded, kind, state, autojoin, key, created_at)
+      SELECT n.user_id, ch.network_id,
+             COALESCE(c.canon, ch.name),
+             lower(ch.name),
+             'channel',
+             CASE WHEN c.lkey IS NOT NULL THEN 'open' ELSE 'closed' END,
+             MAX(ch.joined),
+             MAX(ch.key),
+             MIN(ch.created_at)
+      FROM channels ch
+      JOIN networks n ON n.id = ch.network_id
+      LEFT JOIN _bf_canon c ON c.network_id = ch.network_id AND c.lkey = lower(ch.name)
+      GROUP BY ch.network_id, lower(ch.name)
+      ON CONFLICT(user_id, IFNULL(network_id, 0), target_folded) DO UPDATE SET
+        autojoin = MAX(buffers.autojoin, excluded.autojoin),
+        key = COALESCE(buffers.key, excluded.key),
+        created_at = MIN(buffers.created_at, excluded.created_at)
+    `);
+
+    // C: closed flags win over A/B state; latest closed_at survives a case
+    // fork. Reads the pre-fold _bf_closed capture, not the closed_buffers
+    // table — the fold above deletes stray-cased rows from the latter.
+    db.exec(`
+      INSERT INTO buffers
+        (user_id, network_id, target, target_folded, kind, state, autojoin, closed_at)
+      SELECT cb.user_id, cb.network_id,
+             COALESCE(c.canon, cb.any_target),
+             cb.lkey,
+             CASE WHEN substr(cb.lkey, 1, 1) IN ('#', '&', '+', '!')
+                  THEN 'channel' ELSE 'dm' END,
+             'closed', 0, cb.closed_at
+      FROM _bf_closed cb
+      LEFT JOIN _bf_canon c ON c.network_id = cb.network_id AND c.lkey = cb.lkey
+      ON CONFLICT(user_id, IFNULL(network_id, 0), target_folded) DO UPDATE SET
+        state = 'closed',
+        closed_at = excluded.closed_at
+    `);
+
+    db.exec(`DROP TABLE _bf_canon`);
+    db.exec(`DROP TABLE _bf_closed`);
+    db.exec(`DROP TABLE IF EXISTS closed_buffers`);
+    db.exec(`DROP TABLE channels`);
+  });
+  // BEGIN IMMEDIATE, not deferred: the transaction opens with a long READ
+  // (the fold's and _bf_canon's full-messages scans) before its first write.
+  // Under a deferred BEGIN that read establishes a snapshot, and on a hosted
+  // cell Litestream's once-a-second sync writes its own bookkeeping in that
+  // window — staling the snapshot so the first write dies with
+  // SQLITE_BUSY_SNAPSHOT (non-retryable) and the cell crash-loops on the one
+  // boot that migrates (2026-07-19 roswell incident). Taking the write lock
+  // up front makes Litestream's checkpoints wait/retry (their normal, harmless
+  // behavior) instead of invalidating us.
+  cutover.immediate();
+}
+
+// Issue #510: seed the uploader data model — instance x0/catbox rows +
+// per-user conversion of existing uploads.* settings (self-host), or a single
+// locked hosted uploader from env + allow_user_defined=0 (hosted). Behavior is
+// byte-identical post-migration. Passed `db` (not importing it) to avoid an
+// import cycle, matching foldMutedIntoIgnoreRules above. See db/uploaderConfigSeed.ts.
+//
+// The gate is the current SCHEMA_VERSION (not a fixed 14) because the seed is
+// fully idempotent: bumping the version re-runs it to introduce a newly-added
+// built-in instance row on already-migrated installs without a bespoke block.
+// v15 (#511) adds the self-host `local` disk uploader this way — a DB seeded at
+// v14 by P0 has no `local` row, so the dropdown would resolve to nothing and
+// fall back to x0 until this re-seed creates it.
+let uploaderSeedOk = true;
 if (schemaVersion < SCHEMA_VERSION) {
+  try {
+    seedUploaderConfig(db);
+  } catch (err) {
+    // Leave schema_version un-bumped (see the version write below) so this
+    // genuinely retries next boot rather than being permanently skipped. The
+    // seed is idempotent, so a retry after a partial/failed run is safe.
+    uploaderSeedOk = false;
+    console.warn('[db] uploader-config seed migration failed (will retry next boot):', err);
+  }
+}
+
+// Ensure the self-host built-in instance uploaders exist on every boot
+// (idempotent). Independent of the version-gated seed above so a newly-added
+// built-in (the #511 local disk driver) reaches an already-migrated DB even
+// though its schema_version won't re-trigger the one-shot seed.
+try {
+  reconcileBuiltInUploaders(db);
+} catch (err) {
+  console.warn('[db] built-in uploader reconcile failed:', err);
+}
+
+// Fold the legacy per-user `uploads.*` credential/selection keys into real
+// uploader_config rows and delete them (#514). MUST run after the built-in
+// reconcile above, which is what guarantees the instance rows this points users
+// at actually exist. Self-terminating: once the keys are gone it's a no-op.
+try {
+  reconcileLegacyUploadSettings(db);
+} catch (err) {
+  console.warn('[db] legacy upload-settings reconcile failed:', err);
+}
+
+// Rewrite the old `hoarder` driver id to `dropper` (#537). Every boot, idempotent,
+// self-terminating. MUST come after the legacy reconcile above (the last thing that
+// can still mint a row from legacy keys) and BEFORE the hosted reconcile below,
+// which finds its row by driver id.
+try {
+  renameHoarderDriver(db);
+} catch (err) {
+  console.warn('[db] hoarder→dropper driver rename failed:', err);
+}
+
+// Re-sync the hosted locked uploader from env on every boot — idempotent no-op on
+// self-host and when the hosted upload env is unset. The config now lives in the
+// DB row, so this is what lets a deploy that rotates LURKER_NODE_UPLOAD_API_KEY or
+// changes the caps still take effect.
+try {
+  reconcileHostedUploaderFromEnv(db);
+} catch (err) {
+  console.warn('[db] hosted uploader env reconcile failed:', err);
+}
+
+// Gate on uploaderSeedOk: if the uploader seed threw, leave schema_version
+// un-bumped so the seed retries on the next boot instead of being silently
+// skipped forever (the other version blocks are shape/data-gated, so re-running
+// them is a no-op).
+if (schemaVersion < SCHEMA_VERSION && uploaderSeedOk) {
   db.prepare(
     `INSERT INTO app_meta (key, value) VALUES ('schema_version', ?)
               ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
@@ -1527,5 +1888,10 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_ignored_masks_user_net
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_buffer_reads_key
          ON buffer_reads(user_id, IFNULL(network_id, 0), target)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_buffer_reads_user ON buffer_reads(user_id)`);
+
+// #490: the push_subscriptions rebuild drops this with the table, and migrate()'s
+// CREATE already ran before it — so recreate here for both fresh and rebuilt
+// paths. hasEnabledForUser hits it on the push hot path.
+db.exec(`CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions(user_id)`);
 
 export default db;

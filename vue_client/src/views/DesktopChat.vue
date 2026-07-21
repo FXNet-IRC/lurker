@@ -279,10 +279,17 @@
       @jump="onJumpToMessage"
     />
     <KeyboardHelpModal v-if="showKbdHelp" @close="showKbdHelp = false" />
-    <ImageViewerModal
-      v-if="imageModal.isOpen && imageModal.url !== null"
-      :url="imageModal.url"
-      @close="imageModal.close()"
+    <MediaViewerModal
+      v-if="viewer.isOpen && viewer.url !== null"
+      :url="viewer.url"
+      :filename="viewer.current?.filename ?? null"
+      :index="viewer.index"
+      :count="viewer.count"
+      :has-prev="viewer.hasPrev"
+      :has-next="viewer.hasNext"
+      @close="viewer.close()"
+      @prev="viewer.prev()"
+      @next="viewer.next()"
     />
     <UserProfileModal
       v-if="whois.viewer.open && whois.viewer.networkId != null"
@@ -336,7 +343,7 @@ import KeyboardHelpModal from '../components/KeyboardHelpModal.vue';
 import NickNoteModal from '../components/NickNoteModal.vue';
 import ConfigureFriendModal from '../components/ConfigureFriendModal.vue';
 import UserProfileModal from '../components/UserProfileModal.vue';
-import ImageViewerModal from '../components/ImageViewerModal.vue';
+import MediaViewerModal from '../components/MediaViewerModal.vue';
 import { useKeyboardShortcuts } from '../composables/useKeyboardShortcuts.js';
 import { useNicklistCollapseStore } from '../stores/nicklistCollapse.js';
 import { useNickNotesStore } from '../stores/nickNotes.js';
@@ -345,7 +352,7 @@ import { useDccStore } from '../stores/dcc.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useChannelListModal } from '../composables/useChannelListModal.js';
 import { useJoinChannelModal } from '../composables/useJoinChannelModal.js';
-import { useImageModal } from '../composables/useImageModal.js';
+import { useMediaViewer } from '../composables/useMediaViewer.js';
 import { useNetworkEditor } from '../composables/useNetworkEditor.js';
 import { useJumpToMessage } from '../composables/useJumpToMessage.js';
 import { useNavHistoryStore } from '../stores/navHistory.js';
@@ -396,7 +403,7 @@ const whois = useWhoisStore();
 
 const channelListModal = reactive(useChannelListModal());
 const joinChannelModal = reactive(useJoinChannelModal());
-const imageModal = reactive(useImageModal());
+const viewer = reactive(useMediaViewer());
 const networkEditor = reactive(useNetworkEditor());
 const navHistory = useNavHistoryStore();
 const showBookmarks = ref(false);
@@ -429,7 +436,7 @@ const anyModalOpen = computed(
     showTopic.value ||
     channelListModal.isOpen ||
     joinChannelModal.isOpen ||
-    imageModal.isOpen ||
+    viewer.isOpen ||
     showUploads.value ||
     dcc.panelOpen ||
     showSwitcher.value ||
@@ -585,15 +592,17 @@ const router = useRouter();
 // Collapsed-only footer affordance: the settings cog normally lives on the
 // LURKER sidebar row, but that whole list is unmounted when the sidebar is
 // collapsed (BufferList v-if), so the rail offers the cog here instead (#355).
+// The .catch matches BufferList's expanded-sidebar twin: router.onError does
+// the actual recovery, this just keeps an aborted navigation from surfacing as
+// an unhandled rejection.
 function openSettings() {
-  router.push('/settings');
+  router.push('/settings').catch((err) => console.error('[DesktopChat] open settings failed', err));
 }
 
-// Admin panel entry (collapsed-rail twin of the BufferList header shield):
-// admin-only, and only when the instance enabled LURKER_NEW_ADMIN_PANEL.
-const showAdminEntry = computed(() => config.newAdminPanel && auth.isAdmin);
+// Admin panel entry (collapsed-rail twin of the BufferList header shield).
+const showAdminEntry = computed(() => auth.isAdmin);
 function openAdmin() {
-  router.push('/admin');
+  router.push('/admin').catch((err) => console.error('[DesktopChat] open admin failed', err));
 }
 
 // Collapsed-rail add-network (the expanded affordance is the LURKER header's +,

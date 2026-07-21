@@ -41,7 +41,7 @@ import {
   deleteById as deleteCredentialById,
 } from '../db/webauthnCredentials.js';
 import { createSession, deleteSession } from '../db/sessions.js';
-import { SESSION_COOKIE, getCookieOptions, requireAuth } from '../middleware/auth.js';
+import { SESSION_COOKIE, getCookieOptions, requireAuth, bearerToken } from '../middleware/auth.js';
 import { rpConfig, saveChallenge, consumeChallenge, userIdToHandle } from '../services/webauthn.js';
 import {
   hashPassword,
@@ -50,6 +50,12 @@ import {
   passwordRequirementsMessage,
 } from '../services/password.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import {
+  guardCredentialAttempt,
+  limitRequests,
+  loginFailureThrottle,
+  authRequestThrottle,
+} from '../middleware/rateLimit.js';
 
 const CHALLENGE_COOKIE = 'lurker_webauthn_challenge';
 
@@ -83,6 +89,12 @@ function publicCredential(c: any): Record<string, unknown> {
 }
 
 const router = Router();
+
+// Coarse per-IP request cap across the entire auth surface (options, invite probing,
+// setup, auth-methods, ...) — a blanket flood/enumeration backstop. The credential
+// endpoints below stack a much tighter failure throttle on top. Both are no-ops on an
+// untrusted client key (fail open); see middleware/rateLimit.ts (#568).
+router.use(limitRequests(authRequestThrottle));
 
 // ---------- setup status ----------
 
@@ -446,6 +458,7 @@ router.post(
 
 router.post(
   '/login/verify',
+  guardCredentialAttempt(loginFailureThrottle),
   asyncHandler(async (req: Request, res: Response) => {
     const token = req.signedCookies?.[CHALLENGE_COOKIE];
     const entry = consumeChallenge(token);
@@ -516,25 +529,71 @@ router.post(
 // fixed zero bytes — no secret value.
 const DUMMY_PASSWORD_HASH = `scrypt$32768$8$1$${Buffer.alloc(16).toString('base64')}$${Buffer.alloc(64).toString('base64')}`;
 
-router.post('/login/password', (req: Request, res: Response) => {
-  const username = (req.body?.username || '').trim();
-  const password: unknown = req.body?.password;
-  if (!isValidUsername(username) || typeof password !== 'string' || password.length === 0) {
-    res.status(400).json({ error: 'username and password required' });
-    return;
-  }
-  const user = findUserByUsername(username);
-  const stored = user ? getPasswordHash(user.id) : null;
-  const ok = verifyPassword(password, stored || DUMMY_PASSWORD_HASH);
-  if (!user || !stored || !ok) {
-    res.status(401).json({ error: 'invalid username or password' });
-    return;
-  }
-  const { token: sessionToken } = createSession(user.id);
-  res.cookie(SESSION_COOKIE, sessionToken, getCookieOptions());
-  setClientIpForAllUserNetworks(user.id, normalizeIp(req.ip));
-  res.json({ user: { id: user.id, username: user.username, role: user.role } });
-});
+router.post(
+  '/login/password',
+  guardCredentialAttempt(loginFailureThrottle),
+  (req: Request, res: Response) => {
+    const username = (req.body?.username || '').trim();
+    const password: unknown = req.body?.password;
+    if (!isValidUsername(username) || typeof password !== 'string' || password.length === 0) {
+      res.status(400).json({ error: 'username and password required' });
+      return;
+    }
+    const user = findUserByUsername(username);
+    const stored = user ? getPasswordHash(user.id) : null;
+    const ok = verifyPassword(password, stored || DUMMY_PASSWORD_HASH);
+    if (!user || !stored || !ok) {
+      res.status(401).json({ error: 'invalid username or password' });
+      return;
+    }
+    const { token: sessionToken } = createSession(user.id);
+    res.cookie(SESSION_COOKIE, sessionToken, getCookieOptions());
+    setClientIpForAllUserNetworks(user.id, normalizeIp(req.ip));
+    res.json({ user: { id: user.id, username: user.username, role: user.role } });
+  },
+);
+
+// Password → session token, for clients that have no browser to hold a cookie.
+// This is the native-app front door (iOS/Android): same credentials and same
+// `sessions` row as POST /login/password above, but the token is returned in the
+// body instead of a Set-Cookie, and the app then presents it as
+// `Authorization: Bearer <token>` on both REST calls and the /ws upgrade.
+//
+// Deliberately NOT a new kind of credential: a native session is an ordinary
+// session row, so expiry, lookup, and revocation all work exactly as they do
+// for the web client.
+//
+// SECURITY: this is a public, unauthenticated, password-in / long-lived-token-out
+// endpoint — the most attractive credential-stuffing target on the cell. It shares
+// /login/password's constant-time miss behavior via DUMMY_PASSWORD_HASH and, as of
+// #568, the same per-IP failure throttle (guardCredentialAttempt above): repeated
+// failures from an IP back off with 429 before scrypt runs.
+router.post(
+  '/login/token',
+  guardCredentialAttempt(loginFailureThrottle),
+  (req: Request, res: Response) => {
+    const username = (req.body?.username || '').trim();
+    const password: unknown = req.body?.password;
+    if (!isValidUsername(username) || typeof password !== 'string' || password.length === 0) {
+      res.status(400).json({ error: 'username and password required' });
+      return;
+    }
+    const user = findUserByUsername(username);
+    const stored = user ? getPasswordHash(user.id) : null;
+    const ok = verifyPassword(password, stored || DUMMY_PASSWORD_HASH);
+    if (!user || !stored || !ok) {
+      res.status(401).json({ error: 'invalid username or password' });
+      return;
+    }
+    const { token, expiresAt } = createSession(user.id);
+    setClientIpForAllUserNetworks(user.id, normalizeIp(req.ip));
+    res.json({
+      token,
+      expiresAt,
+      user: { id: user.id, username: user.username, role: user.role },
+    });
+  },
+);
 
 // Public probe so the login UI can decide which sign-in buttons to surface.
 // Currently just reports whether any passkey exists anywhere — discoverable
@@ -546,7 +605,10 @@ router.get('/auth-methods', (_req: Request, res: Response) => {
 // ---------- session ----------
 
 router.post('/logout', (req: Request, res: Response) => {
-  const token = req.signedCookies?.[SESSION_COOKIE];
+  // Cookie for web, bearer for native — a native client has no cookie to clear,
+  // so without the bearer branch its "log out" would leave a live session row
+  // behind and the token on the device would keep working.
+  const token = req.signedCookies?.[SESSION_COOKIE] ?? bearerToken(req.headers.authorization);
   if (token) deleteSession(token);
   res.clearCookie(SESSION_COOKIE, { ...getCookieOptions(), maxAge: undefined });
   res.json({ ok: true });
@@ -693,25 +755,30 @@ router.get('/password', requireAuth, (req: Request, res: Response) => {
   res.json({ hasPassword: userHasPassword(req.user!.id) });
 });
 
-router.put('/password', requireAuth, (req: Request, res: Response) => {
-  const password: unknown = req.body?.password;
-  const currentPassword: unknown = req.body?.currentPassword;
-  if (!isValidPassword(password)) {
-    res.status(400).json({ error: passwordRequirementsMessage() });
-    return;
-  }
-  // Require the current password when one already exists, so a stolen session
-  // cookie can't lock the real owner out by silently rotating it.
-  if (userHasPassword(req.user!.id)) {
-    const stored = getPasswordHash(req.user!.id);
-    if (typeof currentPassword !== 'string' || !verifyPassword(currentPassword, stored)) {
-      res.status(401).json({ error: 'current password is incorrect' });
+router.put(
+  '/password',
+  requireAuth,
+  guardCredentialAttempt(loginFailureThrottle),
+  (req: Request, res: Response) => {
+    const password: unknown = req.body?.password;
+    const currentPassword: unknown = req.body?.currentPassword;
+    if (!isValidPassword(password)) {
+      res.status(400).json({ error: passwordRequirementsMessage() });
       return;
     }
-  }
-  setPasswordHash(req.user!.id, hashPassword(password as string));
-  res.json({ ok: true, hasPassword: true });
-});
+    // Require the current password when one already exists, so a stolen session
+    // cookie can't lock the real owner out by silently rotating it.
+    if (userHasPassword(req.user!.id)) {
+      const stored = getPasswordHash(req.user!.id);
+      if (typeof currentPassword !== 'string' || !verifyPassword(currentPassword, stored)) {
+        res.status(401).json({ error: 'current password is incorrect' });
+        return;
+      }
+    }
+    setPasswordHash(req.user!.id, hashPassword(password as string));
+    res.json({ ok: true, hasPassword: true });
+  },
+);
 
 router.delete('/password', requireAuth, (req: Request, res: Response) => {
   // Can't drop the last sign-in method.

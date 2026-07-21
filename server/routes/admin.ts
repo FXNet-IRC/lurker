@@ -9,9 +9,18 @@ import { createInvite, listInvites, deleteInvite, getInvite } from '../db/invite
 import ircManager from '../services/ircManager.js';
 import { presenceDiagnostics } from '../services/wsHub.js';
 import { isNodeMode } from '../utils/edition.js';
+import adminUploadersRouter from './adminUploaders.js';
+import adminNetworksRouter from './adminNetworks.js';
 
 const router = Router();
 router.use(requireAuth, requireAdmin);
+
+// Instance uploaders + upload policy (#514). Its own module — it inherits the
+// requireAuth + requireAdmin above.
+router.use('/uploaders', adminUploadersRouter);
+
+// Instance network presets + the network lockdown (#298). Same deal.
+router.use('/networks', adminNetworksRouter);
 
 // invites.ts is still untyped — row shape inferred as any from the JS module
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

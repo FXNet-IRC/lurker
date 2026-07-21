@@ -6,7 +6,7 @@ import type { Request, Response } from 'express';
 import { getEdition } from '../utils/edition.js';
 import { isNetworkLockEnabled } from '../utils/forcedNetwork.js';
 import { isPublicModeEnabled } from '../utils/publicMode.js';
-import { isNewAdminPanelEnabled } from '../utils/adminPanel.js';
+import { PROTOCOL_VERSION, MIN_PROTOCOL_VERSION } from '../protocol.js';
 
 const router = Router();
 
@@ -17,15 +17,19 @@ const router = Router();
 // instance binds every account to a single network, so it hides add/remove and
 // the destination fields. `publicMode` tells the client anonymous guest access is
 // available, so it routes unauthenticated visitors to the join-as-guest landing
-// instead of /login. `newAdminPanel` gates the dedicated admin surface (Milestone
-// 4); it is just a UI toggle, and every admin route stays requireAdmin-gated
-// regardless, so exposing the flag leaks nothing.
+// instead of /login.
+//
+// protocolVersion / minProtocolVersion let a native client check compatibility
+// BEFORE it opens the WebSocket and render a real "update required" error instead
+// of a failed connect (#569). minProtocolVersion is the oldest CLIENT this server
+// serves; protocolVersion is what the server itself speaks.
 router.get('/', (_req: Request, res: Response) => {
   res.json({
     edition: getEdition(),
     networkLock: isNetworkLockEnabled(),
     publicMode: isPublicModeEnabled(),
-    newAdminPanel: isNewAdminPanelEnabled(),
+    protocolVersion: PROTOCOL_VERSION,
+    minProtocolVersion: MIN_PROTOCOL_VERSION,
   });
 });
 

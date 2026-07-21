@@ -124,17 +124,35 @@ export const EXPORT_TABLES = Object.freeze({
     },
   },
 
-  channels: {
+  // The buffer registry (replaced channels + closed_buffers; a legacy archive
+  // carrying those instead is converted by convertLegacyBuffers in
+  // importService). network_id is NULL for app-scoped rows — rekeyRow passes
+  // NULL through untouched, while a non-NULL id that isn't in the archive's
+  // network map correctly drops the row (NOT fkRekeyNullable, which would
+  // morph an orphaned network buffer into an app-scoped one).
+  buffers: {
     mode: 'export',
-    scope: 'via_network',
+    scope: 'user_id',
     section: 'data',
     pk: 'id',
     rekeyOnImport: true,
-    fkRekey: { network_id: 'networks' },
+    fkRekey: { user_id: 'users', network_id: 'networks' },
     // The +k channel key gates entry to the channel — same credential class as
     // the network secrets, so same at-rest treatment.
     encryptedColumns: ['key'],
-    columns: ['id', 'network_id', 'name', 'joined', 'created_at', 'key'],
+    columns: [
+      'id',
+      'user_id',
+      'network_id',
+      'target',
+      'target_folded',
+      'kind',
+      'state',
+      'autojoin',
+      'key',
+      'created_at',
+      'closed_at',
+    ],
   },
 
   // Friends/contacts. contacts is a rekey root (its id is referenced by
@@ -226,14 +244,6 @@ export const EXPORT_TABLES = Object.freeze({
     columns: ['user_id', 'away_datetime', 'back_datetime', 'away_message', 'auto_set'],
   },
 
-  closed_buffers: {
-    mode: 'export',
-    scope: 'user_id',
-    section: 'data',
-    fkRekey: { user_id: 'users', network_id: 'networks' },
-    columns: ['user_id', 'network_id', 'target', 'closed_at'],
-  },
-
   user_settings: {
     mode: 'export',
     scope: 'user_id',
@@ -291,9 +301,21 @@ export const EXPORT_TABLES = Object.freeze({
     section: 'data',
     pk: 'id',
     rekeyOnImport: true,
-    fkRekey: { user_id: 'users' },
-    // thumbnail BLOB is written to thumbnails/<id>.jpg in the zip rather than
-    // base64-inlined; the row carries a hasThumbnail boolean in data.json.
+    // uploader_config_id now rides the uploader_config id map (#514): user
+    // uploaders survive the trip, so the history row can still say which of them
+    // produced a file. It lands NULL when it pointed at an INSTANCE uploader
+    // (those aren't exported and the map has no entry) — correct: on the target
+    // that upload came from a host the importing user doesn't own.
+    fkRekey: { user_id: 'users', uploader_config_id: 'uploader_config' },
+    // MUST be nullable: an unmapped FK otherwise makes the importer DROP the row,
+    // and rows uploaded through an instance uploader (x0/catbox/local — most of
+    // them) have no map entry by design. Nulling the column keeps the upload in
+    // the user's history, just without a link to an uploader that isn't theirs.
+    fkRekeyNullable: ['uploader_config_id'],
+    // thumbnail BLOB is written to thumbnails/<id>.<ext> in the zip rather than
+    // base64-inlined; the row carries a hasThumbnail boolean in data.json. The ext
+    // is sniffed from the bytes (services/thumbnailFormat.ts) — webp since #560,
+    // jpg for everything stored before it, and one archive can hold both.
     // thumbnail_url (node edition) is a plain string column carried as-is.
     blobColumns: ['thumbnail'],
     columns: [
@@ -308,11 +330,16 @@ export const EXPORT_TABLES = Object.freeze({
       'height',
       'thumbnail',
       'thumbnail_url',
+      'uploader_config_id',
       'created_at',
     ],
     skippedColumns: {
       synced_to_cp: 'operational: cell↔control-plane moderation-sync bookkeeping, not portable',
       removed: 'instance/CP-owned moderation state; a fresh instance starts it at the default 0',
+      ref:
+        'driver-local delete handle (object/disk key). Deliberately NOT carried: the bytes it names ' +
+        'live on the SOURCE instance’s disk/bucket, so a reap driven by it on the target would be ' +
+        'either a no-op or, worse, aimed at someone else’s object with the same key (#514)',
     },
   },
 
@@ -393,7 +420,66 @@ export const EXPORT_TABLES = Object.freeze({
     columns: ['user_id', 'message_id', 'created_at'],
   },
 
+  // A user's OWN configured uploaders (#514). This became exportable the moment
+  // the legacy uploads.* user_settings keys were deleted: those keys used to be
+  // what carried a user's provider config across an export, and with them gone
+  // these rows are the only record of "I upload to my own Zipline".
+  //
+  // 'partial' because most of the row is deliberately left behind:
+  //   - secrets_enc is NOT exported. It's sealed with the SOURCE instance's
+  //     LURKER_SECRET_KEY, so on a keyed cell it would be undecryptable garbage on
+  //     the target (decryptSecret throws on an unknown key id) — and on a keyless
+  //     self-host the envelope is plaintext passthrough, so exporting it would put
+  //     the user's catbox userhash / S3 secret key in the clear inside a zip. A
+  //     restored uploader therefore arrives credential-less and must be re-entered;
+  //     the Uploads pane says so. (Deliberately NOT declared in encryptedColumns:
+  //     that would make the exporter decrypt it into data.json, which is the whole
+  //     thing we're avoiding.)
+  //   - the instance-policy flags are omitted so the DDL defaults apply on insert
+  //     (offered_to_users/locked/is_default → 0), which is exactly right for a
+  //     personal uploader — an imported row can't smuggle itself in as an offered
+  //     instance default. Same trick upload_history uses above.
+  // `scope` IS carried (NOT NULL with a CHECK and no default, so omitting it would
+  // fail the insert); the exporter only ever selects scope='user' rows, so its
+  // value is always the literal 'user'.
+  uploader_config: {
+    mode: 'partial',
+    scope: 'owned_uploaders',
+    section: 'data',
+    pk: 'id',
+    // upload_history.uploader_config_id and the uploads.uploader_id user setting
+    // are both rewritten through this map on import.
+    rekeyOnImport: true,
+    fkRekey: { owner_user_id: 'users' },
+    columns: ['id', 'scope', 'owner_user_id', 'driver', 'label', 'config_json', 'created_at'],
+    skippedColumns: {
+      secrets_enc:
+        'credentials sealed with the source instance key: undecryptable on the target when keyed, ' +
+        'and plaintext-in-the-zip when not. Re-entered by the user after import (#514)',
+      enabled: 'local state; a restored uploader starts enabled (DDL default 1)',
+      offered_to_users:
+        'instance policy, not user data; DDL default 0 keeps an imported row personal',
+      locked: 'instance policy (the hosted operator-managed row); DDL default 0',
+      is_default:
+        'instance policy; DDL default 0 so an import can never seize the instance default',
+      updated_at: 'tracked locally by each instance',
+    },
+  },
+
   // ---- skipped ----
+
+  instance_settings: {
+    mode: 'skip',
+    reason: 'instance-level operational settings (e.g. uploads.allow_user_defined), not user data',
+  },
+
+  instance_network: {
+    mode: 'skip',
+    reason:
+      'the networks THIS instance recommends (#298) — admin config, not user data. A user’s own ' +
+      'networks live in `networks` and export normally; the presets belong to whichever instance ' +
+      'they are imported into, which may recommend something else entirely',
+  },
 
   sessions: {
     mode: 'skip',
@@ -554,9 +640,12 @@ export function encryptedColumnsByTable(): Record<string, string[]> {
 export const IMPORT_ORDER = Object.freeze([
   // FK-roots first.
   'networks',
-  'channels',
+  'buffers',
   'highlight_rules',
   'highlight_rule_networks',
+  // Before user_settings (whose `uploads.uploader_id` value is rewritten through
+  // this table's id map) and before upload_history (which FK-rekeys against it).
+  'uploader_config',
   'user_settings',
   'ignored_masks',
   'user_nick_notes',
@@ -565,7 +654,6 @@ export const IMPORT_ORDER = Object.freeze([
   'nicklist_collapsed',
   'channel_notify_settings',
   'user_drafts',
-  'closed_buffers',
   'user_away_state',
   'input_history',
   'upload_history',

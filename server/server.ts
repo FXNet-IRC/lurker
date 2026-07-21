@@ -13,6 +13,7 @@ import { nodeUploadConfigured } from './services/uploadProviders/nodeUpload.js';
 import * as systemLog from './services/systemLog.js';
 import { purgeExpiredSessions } from './db/sessions.js';
 import { backfillEncryptColumns } from './db/secretBackfill.js';
+import { assertPushCredentials } from './services/push/credentials.js';
 import { resolveSessionSecret } from './utils/sessionSecret.js';
 import { getEdition, isNodeMode } from './utils/edition.js';
 import { startOrchestratorClient, stopOrchestratorClient } from './services/orchestratorClient.js';
@@ -23,6 +24,9 @@ import {
   isIdentdEnabled,
   identdPort,
   identdBindHost,
+  isOidentdFileEnabled,
+  initOidentdFile,
+  stopOidentdFile,
 } from './services/identd.js';
 import {
   startBouncer,
@@ -39,6 +43,7 @@ import {
 import { startIgnoreSweeper, stopIgnoreSweeper } from './services/ignoreSweeper.js';
 import { startGuestReaper, stopGuestReaper } from './services/guestReaper.js';
 import { isPublicModeEnabled } from './utils/publicMode.js';
+import { sweepTempUploads } from './routes/uploads.js';
 import { startEventLoopMonitor, stopEventLoopMonitor } from './services/eventLoopMonitor.js';
 
 const PORT = Number(process.env.PORT || 8010);
@@ -62,9 +67,9 @@ if (isNodeMode() && !nodeUploadConfigured()) {
     '[lurker] node edition is active but LURKER_NODE_UPLOAD_URL / LURKER_NODE_UPLOAD_API_KEY are unset — image and text uploads will fail (400) until they are configured',
   );
 }
-if (isNodeMode() && !isIdentdEnabled()) {
+if (isNodeMode() && !isIdentdEnabled() && !isOidentdFileEnabled()) {
   console.warn(
-    '[lurker] node edition is active but LURKER_IDENTD_ENABLED is unset — IRC networks cannot attribute individual users; they will appear with an unverified ~ident behind the cell IP',
+    '[lurker] node edition is active but neither LURKER_IDENTD_ENABLED nor LURKER_OIDENTD_FILE is set — IRC networks cannot attribute individual users; they will appear with an unverified ~ident behind the cell IP',
   );
 }
 
@@ -88,6 +93,27 @@ startEventLoopMonitor();
 if (isIdentdEnabled()) {
   startIdentd(identdPort(), identdBindHost());
 }
+
+// Alternative ident delivery: instead of binding :113 ourselves, maintain an
+// oidentd config file for a host-installed ident daemon (opt-in via
+// LURKER_OIDENTD_FILE). Write the initial (empty) file before initAll connects
+// networks, so a stale file from a prior run can't serve dead mappings. The two
+// modes are independent; running both is usually a misconfiguration, so warn.
+if (isOidentdFileEnabled()) {
+  if (isIdentdEnabled()) {
+    console.warn(
+      '[lurker] both LURKER_IDENTD_ENABLED and LURKER_OIDENTD_FILE are set — Lurker will bind :113 AND maintain the oidentd file; running both is usually unintended, pick one',
+    );
+  }
+  initOidentdFile();
+}
+
+// Parse any native push credentials now, so a misconfiguration is a failed boot
+// with a name attached rather than a silent non-delivery. Unset is normal and
+// passes: a self-hosted server holds no Apple/Google key and uses Web Push.
+// Deliberately loud — at delivery time the same error is swallowed as a failed
+// push and nobody ever sees it (#490).
+assertPushCredentials();
 
 // Wrap any plaintext secret columns at rest now that the DB schema is ready and
 // before IRC connects — network secrets, +k channel keys, and the RPE2E keyring
@@ -135,6 +161,12 @@ startOrchestratorClient();
 // didn't reach the control plane at upload time. No-op in standalone.
 startModerationReporter();
 
+// Uploads stream through a temp file, and the request handler removes it on every
+// exit — except a crash mid-upload, which is what this cleans up (#543).
+void sweepTempUploads().catch((err: unknown) => {
+  console.warn('[lurker] upload temp sweep failed:', (err as Error).message);
+});
+
 server.listen(PORT, HOST, () => {
   console.log(`[lurker] listening on http://${HOST || '0.0.0.0'}:${PORT}`);
   systemLog.log({ scope: 'server', text: `Listening on port ${PORT}` });
@@ -146,6 +178,7 @@ function shutdown(signal: string): void {
   stopOrchestratorClient();
   stopModerationReporter();
   stopIdentd();
+  stopOidentdFile();
   stopBouncer();
   shutdownExportJobs();
   stopIgnoreSweeper();

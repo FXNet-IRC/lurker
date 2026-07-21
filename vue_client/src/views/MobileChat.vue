@@ -209,10 +209,17 @@
       @close="showSearch = false"
       @jump="onJumpToMessage"
     />
-    <ImageViewerModal
-      v-if="imageModal.isOpen && imageModal.url !== null"
-      :url="imageModal.url"
-      @close="imageModal.close()"
+    <MediaViewerModal
+      v-if="viewer.isOpen && viewer.url !== null"
+      :url="viewer.url"
+      :filename="viewer.current?.filename ?? null"
+      :index="viewer.index"
+      :count="viewer.count"
+      :has-prev="viewer.hasPrev"
+      :has-next="viewer.hasNext"
+      @close="viewer.close()"
+      @prev="viewer.prev()"
+      @next="viewer.next()"
     />
     <UserProfileModal
       v-if="whois.viewer.open && whois.viewer.networkId != null"
@@ -262,14 +269,14 @@ import SearchModal from '../components/SearchModal.vue';
 import NickNoteModal from '../components/NickNoteModal.vue';
 import ConfigureFriendModal from '../components/ConfigureFriendModal.vue';
 import UserProfileModal from '../components/UserProfileModal.vue';
-import ImageViewerModal from '../components/ImageViewerModal.vue';
+import MediaViewerModal from '../components/MediaViewerModal.vue';
 import { useNickNotesStore } from '../stores/nickNotes.js';
 import { useFriendsStore } from '../stores/friends.js';
 import { useDccStore } from '../stores/dcc.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useChannelListModal } from '../composables/useChannelListModal.js';
 import { useJoinChannelModal } from '../composables/useJoinChannelModal.js';
-import { useImageModal } from '../composables/useImageModal.js';
+import { useMediaViewer } from '../composables/useMediaViewer.js';
 import { useNetworkEditor } from '../composables/useNetworkEditor.js';
 import { useJumpToMessage } from '../composables/useJumpToMessage.js';
 import { useVisualViewport } from '../composables/useVisualViewport.js';
@@ -282,9 +289,8 @@ const config = useConfigStore();
 const buffers = useBuffersStore();
 const auth = useAuthStore();
 
-// Admin panel entry in the mobile top bar — admin-only, and only when the
-// instance enabled LURKER_NEW_ADMIN_PANEL. With the flag off it never renders.
-const showAdminEntry = computed(() => config.newAdminPanel && auth.isAdmin);
+// Admin panel entry in the mobile top bar.
+const showAdminEntry = computed(() => auth.isAdmin);
 const { connected } = useSocket();
 const { keyboardOpen } = useVisualViewport();
 const {
@@ -329,7 +335,7 @@ function openSystemConsole() {
 // land on the buffer screen with no active buffer.
 const channelListModal = reactive(useChannelListModal());
 const joinChannelModal = reactive(useJoinChannelModal());
-const imageModal = reactive(useImageModal());
+const viewer = reactive(useMediaViewer());
 const networkEditor = reactive(useNetworkEditor());
 const screen = ref('list');
 const showBookmarks = ref(false);

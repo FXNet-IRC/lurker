@@ -51,10 +51,14 @@
     >
       <i class="fa-solid fa-circle-arrow-up"></i>
     </button>
+    <!-- Matches what the server actually accepts (image + text). It only listed
+         images, so a .txt — which the upload route has always taken, and which is
+         the passthrough path — could not be picked at all: macOS greys out
+         non-matching files, with no "All Files" escape. Widens further in #515. -->
     <input
       ref="fileInputEl"
       type="file"
-      accept="image/*"
+      :accept="ACCEPTED_FILE_TYPES"
       class="file-hidden"
       @change="onFileSelected"
     />
@@ -143,7 +147,8 @@ import { formatColumns } from '../lib/commands/output.js';
 import { REGISTRY, getOption, optionVisible, CATEGORIES } from '../utils/settingsRegistry.js';
 import type { SettingOption } from '../../../shared/settingsRegistry.js';
 import { useConfigStore } from '../stores/config.js';
-import { useBuffersStore } from '../stores/buffers.js';
+import { bufferKey, useBuffersStore } from '../stores/buffers.js';
+import { useRecentBuffersStore } from '../stores/recentBuffers.js';
 import { useAuthStore } from '../stores/auth.js';
 import { useInputHistoryStore } from '../stores/inputHistory.js';
 import { useDraftStore } from '../stores/drafts.js';
@@ -157,6 +162,8 @@ import { useHighlightRulesStore, type HighlightRule } from '../stores/highlightR
 import { parseIgnoreArgs } from '../../../shared/parseIgnore.js';
 import { parseHighlightArgs } from '../../../shared/parseHighlight.js';
 import { highlightRuleDetailParts } from '../utils/highlightFormat.js';
+import { joinMeta } from '../utils/metaLine.js';
+import { ACCEPTED_FILE_TYPES, isUploadableType } from '../utils/uploaders.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useChanlistStore } from '../stores/chanlist.js';
 import { useChannelListModal } from '../composables/useChannelListModal.js';
@@ -167,6 +174,7 @@ import {
   chunkCountForSay,
   chunkCountForAction,
   multilineMessageCount,
+  splitGateFor,
   type MultilineLimits,
 } from '../utils/messageSplit.js';
 import { applySpoilerMarkup } from '../utils/spoilerMarkup.js';
@@ -205,6 +213,7 @@ import type { Buffer } from '../stores/buffers.js';
 
 const networks = useNetworksStore();
 const buffers = useBuffersStore();
+const recentBuffers = useRecentBuffersStore();
 const auth = useAuthStore();
 const inputHistory = useInputHistoryStore();
 const drafts = useDraftStore();
@@ -563,11 +572,19 @@ function endTypingTo(target: { networkId: number; target: string } | null | unde
 interface CompletionState {
   prefix: string;
   tail: string;
-  token: string;
-  isChannel: boolean;
-  atLineStart: boolean;
+  // What follows the pick: ': ' for a nick being addressed at line start, ' '
+  // for a channel committed out of the ChannelPicker, '' otherwise. Stored on
+  // the session rather than re-derived on each cycle so every Tab reproduces
+  // the same shape of insertion the first one made — the picker commits with a
+  // trailing space, in-place completion doesn't, and a cycle seeded from the
+  // picker has to keep the space it already put there.
+  suffix: string;
   matches: string[];
   index: number;
+  // Caret position after the last insertion, used to detect a session the user
+  // has since abandoned: if the caret has moved somewhere we didn't put it
+  // (a click, a tap), the prefix/tail offsets no longer describe the text and
+  // the session must not be applied.
   caret: number;
 }
 let completion: CompletionState | null = null;
@@ -681,14 +698,20 @@ function buildNickStripItems(buf: Buffer, networkId: number, prefix: string): Ni
     .map((c) => ({ nick: c.nick, color: nickColors.color(c.nick) }));
 }
 
+// Same recency ordering the ChannelPicker uses, so in-place Tab-completion and
+// the popover can't disagree about which channel leads. The buffer you're in is
+// rank 0, so `#`+Tab offers the current channel first (standard IRC behavior)
+// and repeat-Tab walks back through recently-visited channels.
 function buildChannelMatches(networkId: number, prefix: string): string[] {
-  return buildChannelCandidates(buffers.forNetwork(networkId), prefix);
+  return buildChannelCandidates(buffers.forNetwork(networkId), prefix, (target) =>
+    recentBuffers.rank(bufferKey(networkId, target)),
+  );
 }
 
 function applyCompletion() {
   if (!completion || !completion.matches.length) return;
   const pick = completion.matches[completion.index];
-  const suffix = completion.atLineStart && !completion.isChannel ? ': ' : '';
+  const suffix = completion.suffix;
   // Tab-completion owns the input now; any open @-picker or mobile suggestion
   // strip would be stale (cycling suppresses onInput → refreshPicker doesn't
   // fire, so they wouldn't close on their own).
@@ -707,6 +730,52 @@ function applyCompletion() {
     el.setSelectionRange(caret, caret);
     if (completion) completion.caret = caret;
   });
+}
+
+// Commit a pick from one of the composer's selection UIs — the `@` nick picker,
+// the `#` channel picker, the mobile nick strip — as a Tab-completion session
+// rather than a one-shot insert, so a repeat Tab keeps cycling.
+//
+// Without the session a pick is a dead end: all three UIs close on select and
+// their insertion ends in a space, so the next Tab finds no token under the
+// caret (tokenAtCursor stops at whitespace) and returns early — Tab could never
+// walk past the first match.
+//
+// The caller rebuilds `matches` from the same builder its own list came from, so
+// the walk continues through exactly the list the user was just looking at —
+// and without that UI's display cap (50 rows in the popovers, 30 in the strip),
+// so a cycle can reach a candidate the list truncated.
+// Named rather than positional: `start`/`end` and `pick`/`suffix` are adjacent
+// same-typed arguments, so a transposition would typecheck cleanly and only
+// show up as a garbled insertion at runtime.
+function commitCompletion(opts: {
+  // The span of `text` the pick replaces — the token under the cursor, sigil
+  // included ('@ali', '#ap').
+  start: number;
+  end: number;
+  pick: string;
+  suffix: string;
+  matches: string[];
+}): void {
+  const { start, end, pick, suffix, matches } = opts;
+  const value = text.value;
+  const found = matches.indexOf(pick);
+  completion = {
+    prefix: value.slice(0, start),
+    tail: value.slice(end),
+    suffix,
+    // Fall back to the pick alone when it isn't in the rebuilt list (no network,
+    // a member parting mid-keystroke): the insertion still lands, there's just
+    // nothing to cycle through.
+    matches: found === -1 ? [pick] : matches,
+    index: found === -1 ? 0 : found,
+    caret: 0,
+  };
+  // A pointer-selected row leaves focus on the popover/strip. applyCompletion
+  // only sets the caret, so take focus back first or setSelectionRange lands on
+  // a textarea the user isn't in.
+  inputEl.value?.focus();
+  applyCompletion(); // inserts, closes the open UIs, parks the caret
 }
 
 function resetCompletion() {
@@ -1089,6 +1158,14 @@ function onKeydown(e: KeyboardEvent): void {
   const el = inputEl.value;
   if (!el) return;
 
+  // A live session cycles — but only if the caret is still where the last
+  // insertion left it. A click or tap inside the textarea moves the caret
+  // without any keydown we'd see, which would leave prefix/tail pointing at
+  // offsets that no longer describe the text; applying the session then would
+  // rewrite the wrong span. Drop it and start a fresh completion from whatever
+  // token is under the cursor now.
+  if (completion && (el.selectionStart ?? -1) !== completion.caret) resetCompletion();
+
   if (completion) {
     const dir = e.shiftKey ? -1 : 1;
     const n = completion.matches.length;
@@ -1108,7 +1185,12 @@ function onKeydown(e: KeyboardEvent): void {
   const networkId = active.value.networkId;
 
   const isChannel = token.startsWith('#');
-  const stripped = isChannel ? token.slice(1) : token;
+  // Strip the sigil off both forms. '#' is part of a channel name so it stays in
+  // the *result*, but neither sigil belongs in the *prefix* we match on: asking
+  // buildNickCandidates for nicks starting with '@' matches nothing, which is
+  // how `@ali`+Tab used to silently do nothing once the picker had been
+  // dismissed with Escape (the picker owns Tab only while it's open).
+  const stripped = isChannel || token.startsWith('@') ? token.slice(1) : token;
   const matches = isChannel
     ? buildChannelMatches(networkId, token)
     : buildNickMatches(buf, networkId, stripped);
@@ -1116,9 +1198,11 @@ function onKeydown(e: KeyboardEvent): void {
 
   const prefix = value.slice(0, start);
   const tail = value.slice(end);
-  const atLineStart = isAtLineStart(prefix);
+  // A nick at line start is being *addressed* and wants an opening ': '.
+  // Channels never take one — the '#' is already part of the name.
+  const suffix = !isChannel && isAtLineStart(prefix) ? ': ' : '';
 
-  completion = { prefix, tail, token, isChannel, atLineStart, matches, index: 0, caret: 0 };
+  completion = { prefix, tail, suffix, matches, index: 0, caret: 0 };
   applyCompletion();
 }
 
@@ -1371,78 +1455,70 @@ function refreshPicker() {
 }
 
 function onPickerSelect(nick: string): void {
-  const value = text.value;
   if (pickerTokenStart < 0) {
     closePicker();
     return;
   }
-  const before = value.slice(0, pickerTokenStart);
-  const after = value.slice(pickerTokenEnd);
-  // A nick at the start of a line is being addressed → ': '; mid-sentence
-  // gets a bare space. Identical to the mobile strip (onStripSelect). Tab-
+  const buf = buffer.value;
+  const networkId = active.value?.networkId;
+  // A nick at the start of a line is being addressed → ': '; mid-sentence gets
+  // a bare space. Identical to the mobile strip (onStripSelect). In-place Tab-
   // completion shares the isAtLineStart() check but appends nothing
-  // mid-sentence, since it cycles the completion in place.
-  const suffix = isAtLineStart(before) ? ': ' : ' ';
-  cycling = true;
-  text.value = before + nick + suffix + after;
-  cycling = false;
-  closePicker();
-  queueMicrotask(() => {
-    const el = inputEl.value;
-    if (!el) return;
-    const caret = before.length + nick.length + suffix.length;
-    el.focus();
-    el.setSelectionRange(caret, caret);
+  // mid-sentence — which is exactly why the suffix rides on the session instead
+  // of being re-derived on each cycle: a walk seeded from here has to keep
+  // reproducing the space the picker already inserted.
+  const suffix = isAtLineStart(text.value.slice(0, pickerTokenStart)) ? ': ' : ' ';
+  // pickerQuery is the token minus its '@' — the bare prefix buildNickMatches
+  // expects. Read before commitCompletion, which closes the picker and clears it.
+  commitCompletion({
+    start: pickerTokenStart,
+    end: pickerTokenEnd,
+    pick: nick,
+    suffix,
+    matches: buf && networkId != null ? buildNickMatches(buf, networkId, pickerQuery.value) : [],
   });
 }
 
 function onChannelPickerSelect(channel: string): void {
-  const value = text.value;
   if (channelPickerTokenStart < 0) {
     closeChannelPicker();
     return;
   }
-  const before = value.slice(0, channelPickerTokenStart);
-  const after = value.slice(channelPickerTokenEnd);
+  const networkId = active.value?.networkId;
+  const token = text.value.slice(channelPickerTokenStart, channelPickerTokenEnd);
   // Channels just get a trailing space — there's no "addressing" form like
   // nicks' ': ', and the '#' is already part of the inserted name. The sent
   // `#channel` renders as a clickable join link for the recipient
   // (RenderSegments → openChannel), which is the whole point (issue #154).
-  cycling = true;
-  text.value = before + channel + ' ' + after;
-  cycling = false;
-  closeChannelPicker();
-  queueMicrotask(() => {
-    const el = inputEl.value;
-    if (!el) return;
-    const caret = before.length + channel.length + 1;
-    el.focus();
-    el.setSelectionRange(caret, caret);
+  commitCompletion({
+    start: channelPickerTokenStart,
+    end: channelPickerTokenEnd,
+    pick: channel,
+    suffix: ' ',
+    matches: networkId == null ? [] : buildChannelMatches(networkId, token),
   });
 }
 
 function onStripSelect(nick: string): void {
-  const value = text.value;
   if (stripTokenStart < 0) {
     closeStrip();
     return;
   }
-  const before = value.slice(0, stripTokenStart);
-  const after = value.slice(stripTokenEnd);
+  const buf = buffer.value;
+  const networkId = active.value?.networkId;
   // A nick at the start of a line is being addressed → ': '; mid-sentence
   // gets a bare space (what the old @-menu was missing — task #198). Shares
   // isAtLineStart() with Tab-completion and the desktop picker.
-  const suffix = isAtLineStart(before) ? ': ' : ' ';
-  cycling = true;
-  text.value = before + nick + suffix + after;
-  cycling = false;
-  closeStrip();
-  queueMicrotask(() => {
-    const el = inputEl.value;
-    if (!el) return;
-    const caret = before.length + nick.length + suffix.length;
-    el.focus();
-    el.setSelectionRange(caret, caret);
+  const suffix = isAtLineStart(text.value.slice(0, stripTokenStart)) ? ': ' : ' ';
+  // The strip is prefix-less: its token is the bare word under the cursor, which
+  // is already the prefix buildNickMatches wants (no '@' to strip).
+  const token = text.value.slice(stripTokenStart, stripTokenEnd);
+  commitCompletion({
+    start: stripTokenStart,
+    end: stripTokenEnd,
+    pick: nick,
+    suffix,
+    matches: buf && networkId != null ? buildNickMatches(buf, networkId, token) : [],
   });
 }
 
@@ -1504,6 +1580,21 @@ function onHistorySelect(entry: string): void {
 }
 
 function onInput() {
+  // These two run AHEAD of the `cycling` guard: they're facts about the text
+  // itself, not about who wrote it, so they have to hold for programmatic
+  // rewrites (history recall, completion, emoji/URL insert) too.
+  //
+  // Any change to the body invalidates the "second press confirms" override —
+  // otherwise the user could be holding a flood-confirm token from an entirely
+  // different draft. That was live: setInputAndCaretEnd holds `cycling` across
+  // a microtask, so recalling a long line from history after a confirm-armed
+  // Send used to send it with no gate at all. Cheap to clear unconditionally.
+  pendingSplitConfirm = false;
+  // Republish composing state on every change so StatusBar's SPLIT/FLOOD
+  // indicator stays live — a recalled line has to re-estimate too. We do this
+  // even on :server: buffers and slash commands (computeChunks handles both —
+  // most return 0 chunks).
+  publishComposing(text.value);
   if (cycling) return;
   // User edited the recalled line — exit walk mode but keep what they typed.
   // Done before the sendable gate so this still fires on :server: buffers
@@ -1513,14 +1604,6 @@ function onInput() {
   // must fire before the sendable gate so it also closes on :server: buffers
   // (editable but not "sendable"), where the menu can be open over /raw history.
   closeHistoryPicker();
-  // Any edit invalidates the "second press confirms" override — otherwise the
-  // user could be holding a flood-confirm token from an entirely different
-  // draft. Cheap to clear unconditionally.
-  pendingSplitConfirm = false;
-  // Republish composing state on every keystroke so StatusBar's SPLIT/FLOOD
-  // indicator stays live. We do this even on :server: buffers and slash
-  // commands (computeChunks handles both — most return 0 chunks).
-  publishComposing(text.value);
   if (!sendable.value || !active.value) return;
   if (completion) resetCompletion();
   // Inline-convert a just-completed `:shortcode:`, then refresh the suggester
@@ -1665,7 +1748,10 @@ onMounted(() => {
 });
 
 function blobFromClipboardItem(item: DataTransferItem): File | null {
-  if (!item || !item.type || !item.type.startsWith('image/')) return null;
+  // Same gate as drop, from the same definition — pasting a video file from Finder
+  // used to silently do nothing. `kind === 'file'` keeps pasted rich text from being
+  // hijacked into an upload; the server has the final say on the type.
+  if (!item || item.kind !== 'file' || !isUploadableType(item.type)) return null;
   const file = item.getAsFile();
   return file || null;
 }
@@ -1748,7 +1834,7 @@ function onDrop(e: DragEvent): void {
   dragOver.value = false;
   if (!sendable.value) return;
   const file = e.dataTransfer?.files?.[0];
-  if (!file || !file.type.startsWith('image/')) return;
+  if (!file || !isUploadableType(file.type)) return;
   uploads.upload(file, file.name).catch(() => {});
 }
 
@@ -1856,12 +1942,11 @@ async function submit() {
     return;
   }
   if (count > 1) {
-    const flood = count >= 3;
     const allowSplit = !!settings.effective('chat.allow_split_messages');
-    const blocked = flood || !allowSplit;
-    if (blocked && !pendingSplitConfirm) {
+    const gate = splitGateFor({ count, allowSplit, confirmed: pendingSplitConfirm });
+    if (gate !== 'send') {
       pendingSplitConfirm = true;
-      if (flood) {
+      if (gate === 'upload') {
         // 3+ messages: offer the upload-as-.txt modal. If they cancel, the
         // already-set pendingSplitConfirm makes the next Send press the
         // override (matching the prior send-again-to-confirm behavior).
@@ -1870,14 +1955,13 @@ async function submit() {
         longMessageMultiline.value = multiline;
         longMessageModalOpen.value = true;
       } else {
-        // 2 messages with chat.allow_split_messages=off: keep the existing
-        // toast confirmation — uploading would be overkill for a two-message
-        // send.
+        // 2 messages: the cheap toast confirmation — uploading would be
+        // overkill for a two-message send.
         toasts.push({
           title: multiline
             ? `Will send as ${count} messages — Send again to confirm`
             : `Will split into ${count} lines — Send again to confirm`,
-          body: 'Enable "Allow auto-split messages" in Settings to send splits without confirming.',
+          body: 'Enable "Allow long messages to split" in Settings to send splits without confirming.',
           kind: 'warn',
           ttlMs: 7000,
         });
@@ -1988,7 +2072,7 @@ function formatIgnoreEntry(entry: IgnoreEntry, idx: number, global = false): str
   return `  ${idx}. ${summarizeIgnoreEntry(entry, global)}`;
 }
 
-// "QUACK! · whole word · #chan" — a highlight rule's dimensions, no index. The
+// "QUACK! • whole word • #chan" — a highlight rule's dimensions, no index. The
 // subject (mask/pattern) and scope are framed here; the secondary descriptors
 // come from the shared formatter the settings pane also uses.
 function summarizeHighlightEntry(entry: HighlightRule, global = false): string {
@@ -1996,7 +2080,7 @@ function summarizeHighlightEntry(entry: HighlightRule, global = false): string {
   const parts = [subject];
   if (global) parts.push('global');
   parts.push(...highlightRuleDetailParts(entry));
-  return parts.join(' · ');
+  return joinMeta(parts);
 }
 
 // One indexed line for the /highlight listing.

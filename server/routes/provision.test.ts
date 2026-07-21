@@ -16,7 +16,7 @@ process.env.LURKER_FORCED_NETWORK_HOST = 'irc.fxnet.org';
 
 let app: Express;
 let listNetworksForUser: typeof import('../db/networks.js').listNetworksForUser;
-let listChannels: typeof import('../db/networks.js').listChannels;
+let listChannelsForNetwork: typeof import('../db/buffers.js').listChannelsForNetwork;
 let findUserByUsername: typeof import('../db/users.js').findUserByUsername;
 let getPasswordHash: typeof import('../db/users.js').getPasswordHash;
 let verifyPassword: typeof import('../services/password.js').verifyPassword;
@@ -26,7 +26,8 @@ beforeAll(async () => {
   resetForcedNetworkCacheForTests();
 
   const router = (await import('./provision.js')).default;
-  ({ listNetworksForUser, listChannels } = await import('../db/networks.js'));
+  ({ listNetworksForUser } = await import('../db/networks.js'));
+  ({ listChannelsForNetwork } = await import('../db/buffers.js'));
   ({ findUserByUsername, getPasswordHash } = await import('../db/users.js'));
   ({ verifyPassword } = await import('../services/password.js'));
 
@@ -90,7 +91,7 @@ describe('POST /api/provision/users', () => {
     expect(nets[0].host).toBe('irc.fxnet.org');
     expect(nets[0].nick).toBe('alice');
 
-    const channels = listChannels(nets[0].id).map((c) => c.name);
+    const channels = listChannelsForNetwork(nets[0].id).map((c) => c.target);
     expect(channels).toEqual(expect.arrayContaining(['#chat', '#help', '#fxnet']));
   });
 
