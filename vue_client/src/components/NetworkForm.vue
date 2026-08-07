@@ -122,11 +122,12 @@
               rows="4"
               autocomplete="off"
               spellcheck="false"
-              placeholder="AUTH <user> <password> etc…"
+              :placeholder="connectCommandsPlaceholder"
             />
             <small
-              >One per line, e.g. for opering up on connect. If you need to add a (eg, 15 sec) delay
-              between commands, you can write: WAIT 15</small
+              >Raw IRC protocol lines (not /commands), one per line, sent to the server verbatim
+              once connected — e.g. for identifying or opering up. A line like
+              <code>WAIT 15</code> pauses that many seconds before the next one.</small
             >
           </label>
           <label class="check">
@@ -282,6 +283,14 @@ const showSaslHint = computed(() => {
 // When SASL is effectively required (a hosted cell on a network that blocks
 // unauthenticated cloud IPs), drop the "(optional)" qualifier on the labels.
 const saslRequired = computed(() => showSaslHint.value);
+
+// A worked example beats prose here: raw wire lines, not slash commands, and
+// the WAIT pseudo-command in context. (#540)
+const connectCommandsPlaceholder = [
+  'PRIVMSG NickServ :IDENTIFY hunter2',
+  'WAIT 5',
+  'OPER admin hunter2',
+].join('\n');
 
 // Placeholder echoes the prefilled default if the user clears the field.
 const channelPlaceholder = computed(() => {

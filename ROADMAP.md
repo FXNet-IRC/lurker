@@ -135,5 +135,5 @@ Not scheduled. Ideas, big bets, cleanups, and work blocked on external dependenc
 - #414 RPE2E DMs — _blocked on repartee's DM E2E_
 - #55 Accessibility: screen-reader support for completion UIs
 - #485 Schema-driven export/import at-rest encryption
-- #146 Remove redundant asyncHandler wrapper · #184 Revisit node:22 Docker pin
+- #146 Remove redundant asyncHandler wrapper
 - #2 Containerized IRCD + Lurker guide

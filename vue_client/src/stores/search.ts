@@ -49,13 +49,6 @@ export const useSearchStore = defineStore('search', {
     setQuery(raw: string) {
       this.query = raw;
     },
-    // Set the query and run it immediately. Shared by the "view activity" entry
-    // points (Friends overview), which open the Search modal pre-filled and
-    // executed; the view still owns its own modal visibility/scope.
-    runQuery(raw: string) {
-      this.setQuery(raw);
-      this.runSearch();
-    },
     // Build the structured WS payload from the raw query. Returns null when
     // there's nothing to search on (no free text and no structured filter).
     buildPayload(before: number | null) {

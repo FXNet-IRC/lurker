@@ -3,11 +3,20 @@
 
 import Database from 'better-sqlite3';
 import { foldMutedIntoIgnoreRules } from './migrateMutedFold.js';
+import { migrateSmartFilterToEventMode } from './migrateEventMode.js';
+import { seedFavoritesFromContacts } from './contactsToFavoritesSeed.js';
 import path from 'path';
 import fs from 'fs';
 import { isNodeMode } from '../utils/edition.js';
 import { isPublicModeEnabled } from '../utils/publicMode.js';
 import { foldBufferCase } from './foldBufferCase.js';
+import {
+  normalizeMessagesBufferIds,
+  messagesBackfillDone,
+  mintSentinelBuffers,
+  mintOrphanBuffersFromSatellites,
+  rebuildSatellitesToBufferId,
+} from './normalizeBuffers.js';
 import {
   seedUploaderConfig,
   reconcileBuiltInUploaders,
@@ -62,7 +71,7 @@ function migrate() {
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
       user_id INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       expires_at TEXT NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
@@ -82,7 +91,7 @@ function migrate() {
       realname TEXT,
       server_password TEXT,
       autoconnect INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_networks_user ON networks(user_id);
@@ -110,7 +119,7 @@ function migrate() {
       state TEXT NOT NULL DEFAULT 'open',
       autojoin INTEGER NOT NULL DEFAULT 0,
       key TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       closed_at TEXT,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
@@ -132,7 +141,10 @@ function migrate() {
       extra TEXT,
       FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
     );
-    CREATE INDEX IF NOT EXISTS idx_messages_buffer ON messages(network_id, target, id DESC);
+    -- The per-buffer index lives further down as idx_messages_unread, because it
+    -- needs columns (type, from_ignored, notable) this CREATE TABLE predates and
+    -- ensureColumn adds later. It supersedes the old idx_messages_buffer, which
+    -- is dropped there.
 
     -- network_id is nullable: NULL keys the app-scoped system buffer (#355),
     -- which has no network. The composite PK stays (network buffers dedupe on it,
@@ -152,7 +164,6 @@ function migrate() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
     );
-    CREATE INDEX IF NOT EXISTS idx_buffer_reads_user ON buffer_reads(user_id);
 
     -- User-level self-presence state. /away applies across every IRC connection
     -- the user has, so the truth lives once per user. The completed-pair shape
@@ -197,7 +208,7 @@ function migrate() {
       case_sensitive INTEGER NOT NULL DEFAULT 0,
       enabled INTEGER NOT NULL DEFAULT 1,
       auto_managed INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_highlight_rules_user ON highlight_rules(user_id);
@@ -222,7 +233,7 @@ function migrate() {
       auth TEXT NOT NULL,
       user_agent TEXT,
       enabled INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
@@ -239,7 +250,7 @@ function migrate() {
       network_id INTEGER NOT NULL,
       target TEXT NOT NULL,
       text TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
     );
@@ -252,7 +263,7 @@ function migrate() {
       expires_at TEXT,
       used_by_user_id INTEGER,
       used_at TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (used_by_user_id) REFERENCES users(id) ON DELETE SET NULL
     );
@@ -269,7 +280,7 @@ function migrate() {
       device_type TEXT,
       backed_up INTEGER NOT NULL DEFAULT 0,
       label TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       last_used_at TEXT,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
@@ -316,7 +327,7 @@ function migrate() {
       width INTEGER,
       height INTEGER,
       thumbnail BLOB,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_upload_history_user
@@ -365,7 +376,7 @@ function migrate() {
       crc_actual TEXT,
       crc_status TEXT,
       error TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       completed_at TEXT,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -401,13 +412,34 @@ function migrate() {
       network_id INTEGER NOT NULL,
       target TEXT NOT NULL,
       position INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       PRIMARY KEY (user_id, network_id, target),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_pinned_buffers_user_net
       ON pinned_buffers(user_id, network_id, position);
+
+    -- Per-user favorite buffer list (replaced the Friends/Contacts system).
+    -- Favorited channels surface in a "Favorites" section, favorited DMs in a
+    -- "Friends" section — one flag, kind-filtered client-side. Unlike pins
+    -- (per-network), position density is per USER: favorites span networks in
+    -- one user-controlled global order, and the kind-filtered sections stay
+    -- independently reorderable because a subset reorder preserves the
+    -- relative order of unmentioned rows. Born buffer_id-keyed at v19 — no
+    -- name-keyed generation ever existed. Close-buffer implies unfavorite
+    -- (same reasoning as pins; see wsHub close-buffer handler).
+    CREATE TABLE IF NOT EXISTS favorite_buffers (
+      user_id INTEGER NOT NULL,
+      buffer_id INTEGER NOT NULL,
+      position INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (user_id, buffer_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (buffer_id) REFERENCES buffers(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_favorite_buffers_user
+      ON favorite_buffers(user_id, position);
 
     -- Per-(user, network, channel) override for the desktop nicklist's
     -- collapsed state. Only channels the user has explicitly toggled get a
@@ -455,7 +487,6 @@ function migrate() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
     );
-    CREATE INDEX IF NOT EXISTS idx_user_drafts_user ON user_drafts(user_id);
 
     -- Per-user ignore list, irssi-style (issue #301, scoping #350). network_id
     -- NULL = a global rule that applies on every network (the default); a real
@@ -479,7 +510,7 @@ function migrate() {
       levels TEXT NOT NULL DEFAULT 'ALL',
       is_except INTEGER NOT NULL DEFAULT 0,
       expires_at TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
     );
@@ -514,42 +545,13 @@ function migrate() {
       network_id INTEGER NOT NULL,
       nick TEXT NOT NULL COLLATE NOCASE,
       pattern TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       PRIMARY KEY (user_id, network_id, nick),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_user_relay_bots_user_net
       ON user_relay_bots(user_id, network_id);
-
-    -- Friends / watch-list. A "contact" is a person, network-agnostic: it carries
-    -- the display name and the per-contact "toast me when they come online" flag.
-    -- contact_targets is the watch list — which (network, nick) to follow for
-    -- this person. A contact can have several nicks per network (alts/ghosts/
-    -- bouncer connections) and nicks across networks, so the key includes nick.
-    -- nick collates NOCASE; is_primary marks the one DM that opens on click.
-    -- Both cascade on user/network delete.
-    CREATE TABLE IF NOT EXISTS contacts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      display_name TEXT NOT NULL,
-      notify_online INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_contacts_user ON contacts(user_id);
-
-    CREATE TABLE IF NOT EXISTS contact_targets (
-      contact_id INTEGER NOT NULL,
-      network_id INTEGER NOT NULL,
-      nick TEXT NOT NULL COLLATE NOCASE,
-      is_primary INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (contact_id, network_id, nick),
-      FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE,
-      FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_contact_targets_net_nick
-      ON contact_targets(network_id, nick);
 
     -- Per-(user, message) bookmarks. Operator hits "Save" on a message in the
     -- context menu to pin it for later recall via the bookmarks modal. The
@@ -560,13 +562,34 @@ function migrate() {
     CREATE TABLE IF NOT EXISTS user_bookmarks (
       user_id INTEGER NOT NULL,
       message_id INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       PRIMARY KEY (user_id, message_id),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_user_bookmarks_user_msg
       ON user_bookmarks(user_id, message_id DESC);
+
+    -- Saved theme presets: per-user snapshots of the \`themed\` settings-registry
+    -- keys (shared/settingsRegistry.ts), stored as one JSON object per theme.
+    -- The built-in Dark/Light themes are code (shared/themePresets.ts), never
+    -- rows here. values_json is validated against the registry on every write
+    -- (services/themesService.ts). name is NOCASE + unique per user so "ocean"
+    -- and "Ocean" can't coexist; the service checks first for a friendly error,
+    -- the constraint backstops races. The look.theme.* user_settings values
+    -- reference id as a decimal string; deleting a theme resets any pointer
+    -- aimed at it (service-side), so no FK exists for that relationship.
+    CREATE TABLE IF NOT EXISTS user_themes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      name TEXT NOT NULL COLLATE NOCASE,
+      values_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      UNIQUE (user_id, name),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_themes_user ON user_themes(user_id);
 
     -- Per-user bearer tokens for the HTTP API + MCP server. token_hash is the
     -- hex SHA-256 of the raw token; the raw value is shown once at creation
@@ -579,7 +602,7 @@ function migrate() {
       name TEXT NOT NULL,
       token_hash TEXT NOT NULL UNIQUE,
       scope TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       last_used_at TEXT,
       revoked_at TEXT,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -608,7 +631,7 @@ function migrate() {
       byte_size INTEGER,
       token TEXT NOT NULL,
       error TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       started_at TEXT,
       completed_at TEXT,
       expires_at TEXT,
@@ -644,6 +667,86 @@ function migrate() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_system_messages_recent ON system_messages(user_id, id);
+
+    -- Resolved link-preview metadata, keyed by URL rather than by message or by
+    -- user: the whole point is that a link pasted in forty channels by forty
+    -- people is fetched once. Nothing here is per-account, so there's no
+    -- user_id and no FK — it's a cache, and dropping the table costs a refetch.
+    --
+    -- FAILURES ARE CACHED TOO, and that's load-bearing rather than an
+    -- optimisation. A dead link, a 403 from a datacenter-IP block, or a page
+    -- with no metadata sits in old scrollback forever; without a negative entry
+    -- every scroll past it reopens a socket, and hammering a host that just
+    -- challenged us is how a rate-limit becomes a ban. status is
+    -- 'ok' | 'unavailable', and unavailable rows get a much shorter TTL so a
+    -- site that was merely down gets another chance before long.
+    --
+    -- Not part of the export contract (derived public data, not the user's) —
+    -- see the 'skip' entry in db/exportSchema.ts.
+    CREATE TABLE IF NOT EXISTS link_previews (
+      url_hash TEXT PRIMARY KEY,
+      url TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'ok',
+      kind TEXT NOT NULL DEFAULT 'page',
+      title TEXT,
+      description TEXT,
+      site_name TEXT,
+      author TEXT,
+      image_url TEXT,
+      image_width INTEGER,
+      image_height INTEGER,
+      embed_url TEXT,
+      mime TEXT,
+      fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_link_previews_expires ON link_previews(expires_at);
+
+    -- Bookkeeping for the preview BYTE cache (issue #681). ⚠ Metadata only — the
+    -- bytes live on disk or in a bucket, never here. The DB is Litestream-replicated
+    -- to R2, so blobs in a table would continuously ship every cached image to object
+    -- storage, which is the expensive mistake that looks convenient at the time.
+    --
+    -- Existence lives here rather than being probed from the backend because the
+    -- point of the cache is to avoid a round trip: a HEAD to S3 on every byte request
+    -- would trade an origin fetch for a bucket fetch. It also gives the local backend its LRU
+    -- accounting for free — a SUM(size) and an ORDER BY beat a readdir and N stats.
+    CREATE TABLE IF NOT EXISTS preview_cache (
+      cache_key TEXT PRIMARY KEY,
+      backend TEXT NOT NULL,
+      content_type TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      -- ⚠ ISO-8601 WITH Z, not datetime('now'). Two reasons, and the second is a
+      -- measured bug: this column is read back into Date.parse, and
+      -- "YYYY-MM-DD HH:MM:SS" is not ISO, so V8 parses it as LOCAL time — stored
+      -- 08:01:12 UTC came back as 15:01:12Z on a UTC-7 machine, skewing the age
+      -- bound by the operator's offset. It is also what link_previews already
+      -- stores (see NOW_ISO there), because ISO-with-Z is lexicographically
+      -- ordered and so compares correctly as TEXT in SQL.
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      last_access TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    -- ⚠ COMPOSITE, and COVERING. Both eviction reads filter on backend and order by
+    -- last_access, so an index on last_access alone still scans — and the size
+    -- column has to be in it too, or SUM(size) fetches every matching row from the
+    -- table instead of reading the index. These run synchronously on the one shared
+    -- connection that also serves WebSocket fan-out and IRC sockets, on the byte
+    -- path, so at a 2 GiB ceiling that is tens of thousands of row reads per store.
+    -- (No backticks in here: this is inside a JS template literal.)
+    CREATE INDEX IF NOT EXISTS idx_preview_cache_evict
+      ON preview_cache(backend, last_access, created_at, size);
+    -- ⚠⚠ A SECOND index, for the age sweep, because the eviction one cannot serve
+    -- it. That one leads (backend, last_access), so a query filtering
+    -- created_at < ? and ordering by created_at gets
+    -- "SEARCH ... (backend=?) + USE TEMP B-TREE FOR ORDER BY" — it reads and sorts
+    -- EVERY row for the backend before LIMIT can discard any of them. Harmless for
+    -- local, whose row count is bounded by its size ceiling; not harmless for s3,
+    -- which has no ceiling and no eviction by design and so grows for the life of
+    -- the instance. This runs hourly on the one shared connection that also serves
+    -- WebSocket fan-out and IRC sockets, which is the stall the comment above is
+    -- about. With this index the same query is a range SEARCH and stops at LIMIT.
+    CREATE INDEX IF NOT EXISTS idx_preview_cache_age
+      ON preview_cache(backend, created_at);
 
     -- RPE2E end-to-end-encryption keyring (issue #382). Secrets — the identity
     -- private key and the session keys — are stored as secretCrypto envelopes
@@ -767,7 +870,7 @@ function migrate() {
       offered_to_users INTEGER NOT NULL DEFAULT 0,
       locked INTEGER NOT NULL DEFAULT 0,
       is_default INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
     );
@@ -806,7 +909,7 @@ function migrate() {
       channels_json TEXT NOT NULL DEFAULT '[]',
       enabled INTEGER NOT NULL DEFAULT 1,
       position INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
@@ -836,6 +939,10 @@ function columnExists(table: string, column: string): boolean {
 
 function tableExists(table: string): boolean {
   return !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table);
+}
+
+function indexExists(name: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?`).get(name);
 }
 
 // Recovery for pre-role SELF-HOSTED installs: if no admin exists, promote the
@@ -895,7 +1002,16 @@ ensureColumn('peer_presence_state', 'away_message', 'TEXT');
 // notifications too). The column is retained (always written 0) so older images
 // still satisfy the schema; the boot migration below converts any lingering
 // muted=1 rows into ignore rules. No new code reads or sets it.
-ensureColumn('channel_notify_settings', 'muted', 'INTEGER NOT NULL DEFAULT 0');
+// Only while the table is still name-keyed (pre-v18 shape): the v18 rebuild
+// drops `muted` for good, and an ungated ensureColumn here would RE-ADD it on
+// every later boot — which then re-arms the muted→ignore fold below against a
+// table whose network_id no longer exists (a warn on every startup). The
+// elif self-heals databases bitten by the window where that happened.
+if (columnExists('channel_notify_settings', 'target')) {
+  ensureColumn('channel_notify_settings', 'muted', 'INTEGER NOT NULL DEFAULT 0');
+} else if (columnExists('channel_notify_settings', 'muted')) {
+  db.exec(`ALTER TABLE channel_notify_settings DROP COLUMN muted`);
+}
 
 ensureColumn('messages', 'extra', 'TEXT');
 // nick!user@host of the sender, captured at ingest so client-side hostmask
@@ -918,6 +1034,11 @@ ensureColumn('networks', 'position', 'INTEGER NOT NULL DEFAULT 0');
 // behind the shared gateway instead of everyone sharing the gateway's one IP.
 // NULL when unknown (then no WEBIRC is sent and behavior is exactly as before).
 ensureColumn('networks', 'last_client_ip', 'TEXT');
+// The server-declared ISUPPORT CASEMAPPING, captured on connect (#707). NULL
+// until the network first declares one; target folding falls back to the
+// legacy Unicode-lowercase rule until then (db/casemapping.ts). A change is
+// what triggers the per-network re-fold (db/refoldBuffers.ts).
+ensureColumn('networks', 'casemapping', 'TEXT');
 ensureColumn('users', 'password_hash', 'TEXT');
 ensureColumn('users', 'last_seen_at', 'TEXT');
 // Account access state, orthogonal to role. A paused account keeps all its data
@@ -926,6 +1047,12 @@ ensureColumn('users', 'last_seen_at', 'TEXT');
 // control plane (node edition) when a hosted account is suspended / past-due /
 // canceled; the cell stays billing-blind and only mirrors this one verdict.
 ensureColumn('users', 'is_paused', 'INTEGER NOT NULL DEFAULT 0');
+
+// Admin-set ident override for the built-in identd (#643). NULL — the norm —
+// means "derive it from the account username"; see shared/ident.ts. Deliberately
+// not user-writable: the ident is how a network operator tells one member of a
+// shared IP from another, so letting members pick it defeats the identd.
+ensureColumn('users', 'ident', 'TEXT');
 
 // Roles: 'admin' can manage invites and other users; 'user' is everyone else.
 // On a fresh install the first user (created via /api/auth/setup) is promoted
@@ -944,19 +1071,78 @@ ensureColumn('users', 'role', `TEXT NOT NULL DEFAULT 'user'`);
 ensureColumn('users', 'is_guest', 'INTEGER NOT NULL DEFAULT 0');
 backfillFirstAdmin();
 
+// Case-insensitive uniqueness for usernames, enforced by the DB so it can't be
+// bypassed by a path that forgets to ask (the `username TEXT UNIQUE` above only
+// stops an EXACT repeat, which let 'Brad' and 'brad' coexist as two accounts).
+//
+// Deliberately guarded rather than a plain migration: on an instance that ALREADY
+// has such a pair, creating this index fails, and an unguarded CREATE at boot
+// would take the whole server down in a crash-loop over two legacy rows nobody
+// has complained about. Those accounts are grandfathered instead (see
+// listGrandfatheredUsernames + shared/username.ts), the route-level check still
+// refuses new collisions, and this retries every boot so it self-heals the
+// moment the operator renames or deletes one of the pair.
+try {
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase
+       ON users(username COLLATE NOCASE)`,
+  );
+} catch (err) {
+  // ONLY the duplicate-pair case is survivable. A blanket catch would also
+  // swallow a transient SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT — the exact boot
+  // failure a Litestream-backed cell has hit before (fix #603) — silently
+  // leaving the DB-level backstop absent for the life of the process while
+  // sending the operator hunting for a case-twin pair that doesn't exist.
+  // Anything else rethrows and fails the boot like every other statement in
+  // this file, so a restart retries it.
+  const code = (err as { code?: string }).code;
+  if (code !== 'SQLITE_CONSTRAINT_UNIQUE' && code !== 'SQLITE_CONSTRAINT_PRIMARYKEY') throw err;
+  console.warn(
+    '[db] case-insensitive username index not created — two accounts differ only by case. ' +
+      'They keep working; rename or delete one to enforce it at the DB level. ' +
+      `(${(err as Error).message})`,
+  );
+}
+
+// Buffer identity (#695): every read path keys messages by buffer_id → buffers(id);
+// `target` remains as an insert-time observation only. Added here (nullable —
+// ALTER ADD COLUMN can't add NOT NULL without a constant default, and the
+// backfill is resumable across boots); "never NULL" is the application
+// invariant, enforced by insertMessage and established for existing rows by
+// the flag-driven backfill after the version blocks below. CASCADE rather
+// than NO ACTION because user/network deletes cascade into buffers and
+// messages in unspecified order — NO ACTION could abort a legitimate account
+// deletion mid-cascade. deleteBuffer's "only when no history" contract stays
+// a code contract (and sentinel rows are undeletable by kind guard).
+ensureColumn('messages', 'buffer_id', 'INTEGER REFERENCES buffers(id) ON DELETE CASCADE');
+
 // Persist which rule matched each message so the highlights modal can read
 // from disk instead of scanning whatever happens to be loaded in client memory.
 // Partial index keeps it cheap — only matched rows live in the index.
+//
+// The index itself (idx_messages_matched_buf) is built after the buffer_id
+// backfill below — its key is buffer_id. Its (network_id, target) predecessor
+// is no longer created: no statement issues that predicate shape anymore, and
+// module load is linear, so even a transition boot never queries between here
+// and the swap. The old index is dropped there.
 ensureColumn('messages', 'matched_rule_id', 'INTEGER');
-db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_matched
-         ON messages(network_id, target, id DESC)
-         WHERE matched_rule_id IS NOT NULL`);
 
 // Per-(network, target) alt-row parity, computed at insert time so the client
 // can stripe chat lines without doing its own counting. Only chat-shaped types
 // (message/action/notice) flip the bit; system events store 0 and are never
 // styled with .line.alt. See schemaVersion < 2 backfill below.
 ensureColumn('messages', 'alt', 'INTEGER NOT NULL DEFAULT 0');
+
+// IRCv3 server-assigned message id (#450), captured from the msgid tag on
+// message-tags networks (own sends learn theirs via echo-message). Foundation
+// for react/reply, which reference a target message by msgid. Deliberately
+// NON-unique: the closed-buffer NOTICE mirror and a replaying upstream may
+// legitimately produce duplicates, and a constraint failure inside publish()
+// would drop the message. Partial index — untagged rows stay out of it.
+ensureColumn('messages', 'msgid', 'TEXT');
+db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_msgid
+         ON messages(network_id, msgid)
+         WHERE msgid IS NOT NULL`);
 
 // Sender matched the network owner's ignore list at insert time. Stamped on
 // the row so countNewer/countHighlightsNewer can exclude ignored senders
@@ -991,6 +1177,19 @@ ensureColumn('messages', 'notable', 'INTEGER NOT NULL DEFAULT 1');
 // behavior applies to existing history too. Gated on the column having been
 // absent, so it runs exactly once — never a repeated full scan on later boots.
 if (!hadNotableColumn) demoteLegacyServerStatusNotices();
+
+// The per-buffer covering index (#469's design, re-keyed by buffer_id) is
+// built after the buffer_id backfill below — its key column doesn't have
+// values until then. The full rationale (covering payload columns, warn-probe
+// idiom, measured costs) lives at that build site. Warn threshold shared with
+// it:
+const INDEX_BUILD_WARN_ROWS = 250_000;
+
+// Retire the ancient idx_messages_buffer (network_id, target, id DESC) on DBs
+// old enough to still carry it — superseded twice over by now. (Its
+// replacement idx_messages_unread is itself dropped after the buffer_id
+// backfill below.)
+db.exec(`DROP INDEX IF EXISTS idx_messages_buffer`);
 
 // #470 backfill body, split out so it can be unit-tested against seeded rows
 // (a hoisted declaration, so the gated call above reaches it). Demotes only
@@ -1062,7 +1261,7 @@ ensureColumn('push_subscriptions', 'transport', "TEXT NOT NULL DEFAULT 'webpush'
 // Schema versioning lets us retire one-shot recovery blocks once every
 // production DB has run through them. Bump SCHEMA_VERSION when adding a new
 // recovery block, and delete blocks for versions far enough in the past.
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 19;
 const schemaVersionRow = db
   .prepare(`SELECT value FROM app_meta WHERE key = 'schema_version'`)
   .get() as { value: string } | undefined;
@@ -1138,7 +1337,7 @@ if (schemaVersion < 1) {
           case_sensitive INTEGER NOT NULL DEFAULT 0,
           enabled INTEGER NOT NULL DEFAULT 1,
           auto_managed INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )
       `);
@@ -1205,17 +1404,70 @@ if (schemaVersion < 3) {
     CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
       INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
     END;
-    CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-      INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
-      INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
-    END;
   `);
+  // messages_au is created unconditionally below rather than here — see there.
+  // Nothing updates `messages` between this block and that one, so the window
+  // in which the update trigger doesn't exist carries no rows.
+
   // Index every existing row, NULL text included. The insert trigger does the
   // same for new rows; keeping the backfill consistent with it means the
   // delete/update triggers (which replay old.text) always have a matching
   // index entry to remove — skipping NULL rows here would desync an
   // external-content FTS5 table and risk index corruption on later deletes.
   db.exec(`INSERT INTO messages_fts(rowid, text) SELECT id, text FROM messages`);
+}
+
+// The FTS update trigger. Defined here rather than in the v3 block because its
+// definition changed after v3 shipped, and an already-migrated DB would keep the
+// old one forever under CREATE IF NOT EXISTS.
+//
+// Recreated only when what's stored doesn't match what we want, so a steady-state
+// boot writes nothing. That matters more than the microseconds saved: an
+// unconditional DROP + CREATE dirties sqlite_master on every single boot, and
+// Litestream faithfully replicates each one.
+//
+// The WHEN clause is the point. messages_fts indexes ONLY `text`, keyed by
+// rowid = messages.id, but the unguarded trigger fired on any column update and
+// paid a full FTS delete+reinsert for each row regardless. That made a
+// buffer rename — `UPDATE messages SET target = ?`, which touches neither
+// indexed column — reindex the entire channel's text for nothing. Measured on a
+// synthetic 1M-row channel: 3.55s -> 1.18s (3.0x) and 40MB less database
+// growth, because each delete+reinsert pair leaves tombstone and duplicate
+// entries behind in the FTS b-tree until a merge reclaims them.
+//
+// Both indexed inputs are in the guard, so it cannot skip work the FTS index
+// actually needs: `text` is the indexed content, and `id` is the rowid the
+// entry is keyed by. `IS NOT` rather than `<>` so a NULL on either side
+// compares correctly — text is nullable, and `NULL <> NULL` is NULL (falsy),
+// which would silently skip a row transitioning to or from NULL.
+const MESSAGES_AU_SQL = `CREATE TRIGGER messages_au AFTER UPDATE ON messages
+  WHEN old.text IS NOT new.text OR old.id IS NOT new.id BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
+  END`;
+// Existence-gated on messages_fts, which the v3 block creates. Every real
+// database at v3 or above has it, but a trigger whose body names a missing table
+// is not inert: SQLite reparses the entire schema during any ALTER TABLE ...
+// RENAME, and an unresolvable trigger body fails that statement. So a database
+// without FTS would get a live trigger that breaks the next table rebuild
+// migration somewhere else entirely. Matching the v3 block's own condition keeps
+// the trigger and the table it writes to inseparable.
+if (tableExists('messages_fts')) {
+  const messagesAuSql = (
+    db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_au'`)
+      .get() as { sql: string } | undefined
+  )?.sql;
+  if (messagesAuSql !== MESSAGES_AU_SQL) {
+    // One transaction: between a bare DROP and its CREATE the database has FTS
+    // insert/delete triggers but no update trigger. The next boot repairs that,
+    // but any `UPDATE messages SET text = ...` in the interim desyncs
+    // messages_fts — an external-content table, so nothing detects or heals it.
+    db.transaction(() => {
+      db.exec(`DROP TRIGGER IF EXISTS messages_au`);
+      db.exec(MESSAGES_AU_SQL);
+    })();
+  }
 }
 
 if (schemaVersion < 4) {
@@ -1267,7 +1519,7 @@ if (schemaVersion < 5) {
           width INTEGER,
           height INTEGER,
           thumbnail BLOB,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )
       `);
@@ -1408,7 +1660,7 @@ if (schemaVersion < 10) {
           levels TEXT NOT NULL DEFAULT 'ALL',
           is_except INTEGER NOT NULL DEFAULT 0,
           expires_at TEXT,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
           FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
         )
@@ -1460,7 +1712,7 @@ if (schemaVersion < 11) {
           levels TEXT NOT NULL DEFAULT 'ALL',
           is_except INTEGER NOT NULL DEFAULT 0,
           expires_at TEXT,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
           FOREIGN KEY (network_id) REFERENCES networks(id) ON DELETE CASCADE
         )
@@ -1491,9 +1743,11 @@ if (schemaVersion < 11) {
 // Issue #359: fold the old display-only per-channel `muted` flag into the ignore
 // engine (see migrateMutedFold.ts). Runs after the ignored_masks rebuild above so
 // the table is in its final shape. Best-effort — a failure leaves muted=1 rows to
-// retry on the next boot.
+// retry on the next boot. Gated on the column: the v18 satellite rebuild (below)
+// drops `muted` outright — any lingering muted=1 rows were folded on an earlier
+// boot by this very call, which always precedes it.
 try {
-  foldMutedIntoIgnoreRules(db);
+  if (columnExists('channel_notify_settings', 'muted')) foldMutedIntoIgnoreRules(db);
 } catch (err) {
   // Log rather than swallow: the self-gating retry masks a deterministic bug as
   // a transient failure, so surface it or a broken fold vanishes silently.
@@ -1581,7 +1835,7 @@ try {
           auth TEXT,
           user_agent TEXT,
           enabled INTEGER NOT NULL DEFAULT 1,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
           fail_count INTEGER NOT NULL DEFAULT 0,
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -1635,7 +1889,7 @@ try {
           case_sensitive INTEGER NOT NULL DEFAULT 0,
           enabled INTEGER NOT NULL DEFAULT 1,
           auto_managed INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )
       `);
@@ -1793,6 +2047,138 @@ if (schemaVersion < 16 && tableExists('channels')) {
   cutover.immediate();
 }
 
+// --- v17: buffer identity normalization (#695) -------------------------------
+//
+// messages.buffer_id becomes the read key (see the ensureColumn above and
+// server/db/messages.ts); this section establishes it for existing rows.
+// Placed AFTER the v16 block on purpose: on a pre-16 database the buffers
+// registry is itself derived by that block, and the backfill resolves against
+// it.
+//
+// Flag-driven rather than version-gated: normalizeMessagesBufferIds is
+// self-terminating on an app_meta done-flag, each chunk commits its own
+// progress cursor, and a mid-run kill resumes on the next boot — the
+// restart-loop failure mode of the one-shot idx_messages_unread build (a
+// supervisor killing a long non-resumable stall, SQLite rolling it back, the
+// next boot starting from zero) structurally cannot happen. Chunking across
+// transactions is safe here solely because this runs synchronously at module
+// load, before the server accepts work — see normalizeBuffers.ts.
+{
+  if (
+    !messagesBackfillDone(db) &&
+    db.prepare(`SELECT 1 FROM messages LIMIT 1 OFFSET ?`).get(INDEX_BUILD_WARN_ROWS)
+  ) {
+    console.warn(
+      `[db] backfilling messages.buffer_id over ${INDEX_BUILD_WARN_ROWS.toLocaleString()}+ ` +
+        `messages — one-time, blocks startup. Resumable: if the process is killed, the next ` +
+        `boot continues from where it stopped.`,
+    );
+  }
+  normalizeMessagesBufferIds(db);
+
+  {
+    // Deliberately NOT gated on the done-flag: reaching this line means the
+    // chunk loop ran to the end of the table (a kill never gets here), so the
+    // only not-done case is the stragglers warn above — a handful of rows a
+    // future boot retries. Gating would leave that server running buffer_id
+    // predicates with no buffer_id index: a full-scan cliff on every read,
+    // which is a far worse failure than indexing early.
+    //
+    // The per-buffer covering index (#469's design, one key column narrower:
+    // a 4-byte int replaces int+text). (buffer_id) is the equality prefix,
+    // `id DESC` matches the ORDER BY that lets unread-count LIMITs stop
+    // early, and (type, from_ignored, notable) ride along purely as payload
+    // so the counts are index-ONLY — they must come last or they'd break the
+    // range scan. Verify with EXPLAIN QUERY PLAN: "USING COVERING INDEX
+    // idx_messages_buf_unread" (messagesEqp.test.ts pins it).
+    //
+    // This build IS one-shot and non-resumable (an index build can't
+    // checkpoint), hence the warn above covers it too; it's a sort over one
+    // integer key — measured on the 2.08M-row reference account the old
+    // build was ~1s on NVMe, and this one is narrower.
+    if (
+      !indexExists('idx_messages_buf_unread') &&
+      db.prepare(`SELECT 1 FROM messages LIMIT 1 OFFSET ?`).get(INDEX_BUILD_WARN_ROWS)
+    ) {
+      console.warn(
+        `[db] building idx_messages_buf_unread — one-time, blocks startup, not resumable. ` +
+          `Do not kill the process.`,
+      );
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_buf_unread
+             ON messages(buffer_id, id DESC, type, from_ignored, notable)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_matched_buf
+             ON messages(buffer_id, id DESC)
+             WHERE matched_rule_id IS NOT NULL`);
+    // Only after both successors exist: retire the name-keyed generation.
+    // Keeping them would be two dead b-trees maintained on every INSERT (no
+    // statement issues their predicate shape anymore); ordering the drops
+    // after the creates means no boot ever holds neither generation.
+    db.exec(`DROP INDEX IF EXISTS idx_messages_unread`);
+    db.exec(`DROP INDEX IF EXISTS idx_messages_matched`);
+  }
+}
+
+// --- v18: satellite tables onto buffer_id (#695) -----------------------------
+//
+// The six per-buffer view-state tables (read pointers, input history, pins,
+// nicklist toggles, notify flags, drafts) rebuild onto (user_id, buffer_id)
+// keys and lose their name columns entirely; see normalizeBuffers.ts for the
+// bodies and the case-twin merge policies. The e2e tables deliberately do NOT
+// join them — their `channel` is an IRC-side crypto-context string (DM
+// pseudochannels, peer-supplied names), not a buffer reference; see
+// bufferKeyedTables.ts 'wire-context'.
+//
+// Version + shape gated: the block re-runs harmlessly after a kill between
+// the transaction and the version bump (columnExists turns it into a no-op),
+// and the whole rebuild is ONE immediate transaction — these tables are
+// thousands of rows, so atomic-and-quick, with the write lock taken up front
+// (the Litestream deferred-BEGIN snapshot race, see the v16 block).
+if (schemaVersion < 18 && columnExists('buffer_reads', 'target')) {
+  mintSentinelBuffers(db);
+  mintOrphanBuffersFromSatellites(db, [
+    'buffer_reads',
+    'input_history',
+    'pinned_buffers',
+    'nicklist_collapsed',
+    'channel_notify_settings',
+    'user_drafts',
+  ]);
+  const rebuild = db.transaction(() => rebuildSatellitesToBufferId(db));
+  const prevFk = db.pragma('foreign_keys', { simple: true });
+  db.pragma('foreign_keys = OFF');
+  try {
+    rebuild.immediate();
+  } finally {
+    db.pragma(`foreign_keys = ${prevFk ? 'ON' : 'OFF'}`);
+  }
+}
+
+// One placement per buffer: a favorite and a pin are mutually exclusive
+// (favorite⇒unpin and pin⇒unfavorite in the wsHub verbs). Enforce it on every
+// boot for rows that predate the invariant — chiefly v19 migrations that
+// seeded a favorite onto an already-pinned DM before the seed learned to drop
+// the pin. The favorite wins (matching the seed's intent); idempotent, and a
+// no-op once clean. Position holes are harmless (ORDER BY tolerates gaps,
+// pinBuffer appends at MAX+1, the next unpin/reorder re-densifies).
+db.exec(`DELETE FROM pinned_buffers WHERE EXISTS (
+  SELECT 1 FROM favorite_buffers f
+  WHERE f.user_id = pinned_buffers.user_id AND f.buffer_id = pinned_buffers.buffer_id
+)`);
+
+// v19: buffer favorites replace the Friends/Contacts system. Seed a favorite
+// (an open DM buffer, minted/reopened if need be) from each contact's primary
+// target, then drop the contacts tables. Gated on the tables actually existing:
+// fresh installs never create them (their DDL left with the friends removal),
+// so the gate below is what distinguishes "old DB carrying friends data" from
+// "born after the feature". Runs in one transaction — a failure leaves the
+// contacts tables (and schema_version) untouched for a retry next boot.
+if (schemaVersion < 19 && tableExists('contacts')) {
+  const seeded = db.transaction(() => seedFavoritesFromContacts(db));
+  const count = seeded.immediate();
+  if (count > 0) console.log(`[db] migrated ${count} friend(s) into buffer favorites`);
+}
+
 // Issue #510: seed the uploader data model — instance x0/catbox rows +
 // per-user conversion of existing uploads.* settings (self-host), or a single
 // locked hosted uploader from env + allow_user_defined=0 (hosted). Behavior is
@@ -1858,6 +2244,15 @@ try {
   console.warn('[db] hosted uploader env reconcile failed:', err);
 }
 
+// Carry the retired `chat.smart_filter` switch onto the `chat.events` tier
+// (#666). Every boot, idempotent, self-terminating — see db/migrateEventMode.ts
+// for why it writes both the desktop and the mobile key.
+try {
+  migrateSmartFilterToEventMode(db);
+} catch (err) {
+  console.warn('[db] smart-filter→event-tier migration failed (will retry next boot):', err);
+}
+
 // Gate on uploaderSeedOk: if the uploader seed threw, leave schema_version
 // un-bumped so the seed retries on the next boot instead of being silently
 // skipped forever (the other version blocks are shape/data-gated, so re-running
@@ -1880,14 +2275,11 @@ db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_rule_unique
 db.exec(`CREATE INDEX IF NOT EXISTS idx_ignored_masks_user_net
          ON ignored_masks(user_id, network_id)`);
 
-// #355 buffer_reads uniqueness: coalesced so a NULL network_id (the app-scoped
-// system buffer) dedupes on upsert; a plain composite index would treat NULL as
-// distinct. Created here (not in migrate()) so it survives the schemaVersion < 12
-// rebuild and applies to fresh installs alike. idx_buffer_reads_user is also
-// recreated since the rebuild drops it.
-db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_buffer_reads_key
-         ON buffer_reads(user_id, IFNULL(network_id, 0), target)`);
-db.exec(`CREATE INDEX IF NOT EXISTS idx_buffer_reads_user ON buffer_reads(user_id)`);
+// (buffer_reads carries no extra indexes since the v18 rebuild: its
+// (user_id, buffer_id) PRIMARY KEY serves both the point lookups and the
+// per-user scans that idx_buffer_reads_key / idx_buffer_reads_user used to —
+// the coalesced-IFNULL uniqueness dance existed only because the name-keyed
+// composite treated a NULL network_id as distinct.)
 
 // #490: the push_subscriptions rebuild drops this with the table, and migrate()'s
 // CREATE already ran before it — so recreate here for both fresh and rebuilt

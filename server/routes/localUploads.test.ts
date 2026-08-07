@@ -94,6 +94,25 @@ describe('GET /uploads/:key', () => {
     expect(res.headers['x-content-type-options']).toBe('nosniff');
   });
 
+  it('serves a 3GPP voice memo inline rather than dropping it in Downloads', async () => {
+    // A Samsung voice recording sniffs as video/3gpp (see contentClass.ts). It is
+    // ordinary AAC in an ISO-BMFF container and browsers play it, so leaving it off
+    // the inline allowlist would have made accepting the upload a WORSE outcome than
+    // the 415 it replaced — the file arrives, and then won't play when you click it.
+    const bmff = Buffer.concat([
+      Buffer.from([0, 0, 0, 0x18]), // ftyp box, 24 bytes
+      Buffer.from('ftyp3gp4'),
+      Buffer.alloc(4), // minor version
+      Buffer.from('isom3gp4'), // compatible brands
+      Buffer.alloc(64),
+    ]);
+    const url = await put(bmff, 'memo.3gp', 'video/3gpp');
+    const res = await agent.get(url);
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('video/3gpp');
+    expect(res.headers['content-disposition']).toBe('inline');
+  });
+
   it('serves HTML as inert text/plain source, never executable', async () => {
     // HTML is valid UTF-8 → sniffs to text/plain (never text/html), and nosniff
     // stops the browser from re-sniffing it into an executable document.

@@ -45,6 +45,7 @@ function makeConn(): IrcConnection {
       sasl_password: null,
       connect_commands: null,
       position: 0,
+      casemapping: null,
       created_at: new Date().toISOString(),
       last_client_ip: null,
     },

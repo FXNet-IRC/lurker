@@ -3,6 +3,7 @@
 
 import { defineStore } from 'pinia';
 import { socketSend } from '../composables/useSocket.js';
+import { idFor } from './buffers.js';
 
 // Per-channel override. One flag is tracked here:
 //   notifyAlways — every message in the channel is a notification trigger for
@@ -62,7 +63,27 @@ export const useChannelNotifyStore = defineStore('channelNotify', {
       }
     },
     setNotifyAlways(networkId: number | string, target: string, notifyAlways: boolean) {
-      socketSend({ type: 'set-channel-notify-always', networkId, target, notifyAlways });
+      socketSend({
+        type: 'set-channel-notify-always',
+        networkId,
+        target,
+        notifyAlways,
+        bufferId: idFor(networkId, target),
+      });
+    },
+    // Lifecycle hooks (lib/bufferLifecycle.ts).
+    dropBuffer(networkId: number | string | null, target: string) {
+      if (networkId == null) return;
+      const map = this.byNetwork[networkId];
+      if (map && target in map) delete map[target];
+    },
+    rekeyBuffer(networkId: number | string | null, from: string, to: string) {
+      if (networkId == null) return;
+      const map = this.byNetwork[networkId];
+      if (!map || !(from in map)) return;
+      // Destination wins on a merge collision.
+      if (!(to in map)) map[to] = map[from];
+      delete map[from];
     },
   },
 });

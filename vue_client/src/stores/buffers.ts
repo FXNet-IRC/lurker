@@ -6,8 +6,27 @@ import { useNetworksStore } from './networks.js';
 import { useToastsStore } from './toasts.js';
 import { socketSend } from '../composables/useSocket.js';
 import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
+import { historyCountBy } from '../lib/historyPaging.js';
+import { isChannelTarget } from '../../../shared/channels.js';
 
 const MAX_PER_BUFFER = 500;
+// The most rows one INCREMENTAL merge (prepend/append) may take from a single
+// page. Deliberately well under MAX_PER_BUFFER, so a merge can never evict the
+// rows the reader is looking at.
+//
+// `countBy:'renderable'` makes this reachable: a page is sized in rows that
+// render standalone, and the presence churn rides along with them, so one page
+// can legitimately be several times the ring. Merging it wholesale would drop
+// the entire held slice — appendHistory would leave nothing of the previous
+// tail, MessageList would read both ends changing as a wholesale replace
+// (`MessageList.vue:1644`), and a detached reader's scrollTop would be left
+// pointing at content that no longer exists.
+//
+// Nothing is lost by trimming: we keep the end ADJACENT to what we already
+// hold, so the slice stays contiguous and the pager fetches the remainder on
+// the next scroll — which is why a trim forces the matching hasMore flag true
+// regardless of what the server reported for the full page.
+const MAX_MERGE_ROWS = 250;
 const MAX_SPEAKERS = 128;
 const TYPING_DURATIONS: Record<string, number> = { active: 6000, paused: 30000 };
 
@@ -22,6 +41,46 @@ const pendingJoins = new Map<string, ReturnType<typeof setTimeout>>();
 const PENDING_JOIN_TIMEOUT = 10000;
 function joinKey(networkId: number | string, channel: string) {
   return `${networkId}::${channel.toLowerCase()}`;
+}
+
+// Targets THIS tab has asked the server to open.
+//
+// `buffer-opened` carries two meanings now that the server fans it out. To the
+// tab that asked it's a reply — "here's the canonical casing, focus it". To the
+// user's other devices it's a state signal — "this buffer is open now" — and
+// acting on that by activating would yank someone to a buffer they opened on
+// their phone. The frame looks identical either way, so the only thing that can
+// tell them apart is whether we asked.
+//
+// Claimed once (a reply answers one request), and dropped on a timeout, on
+// socket close, and on logout — because "focus the next open of this target" is
+// a dangerous thing to leave armed. `open-buffer` can be refused outright (a
+// paused account answers `{kind:'error'}` and never sends `buffer-opened`), and
+// without a backstop that request would sit here for the life of the session and
+// then claim someone else's open from another device. Same reasoning and the
+// same backstop as `pendingJoins`.
+const pendingOpens = new Map<string, ReturnType<typeof setTimeout>>();
+const PENDING_OPEN_TIMEOUT = 10000;
+
+// bufferId → storage key. The id fast path for frame application: a frame
+// carrying a known bufferId resolves to its buffer even when the NAME
+// disagrees (a rename raced the frame), which string keys alone cannot do.
+// Module-level like typingTimers — cleared by resetTimers() on logout and
+// pruned by drop().
+const keyById = new Map<number, string>();
+
+/** The storage key for a server buffer id, when we've learned it. */
+export function bufferKeyForId(bufferId: number): string | undefined {
+  return keyById.get(bufferId);
+}
+
+/** The server id for (networkId, target), when we've learned it — the verb
+ *  send-sites attach this so the server can address by id (undefined keys are
+ *  dropped by JSON.stringify, so unknown ids simply omit the field). */
+export function idFor(networkId: number | string | null, target: string): number | undefined {
+  const store = useBuffersStore();
+  const k = resolveExistingKey(store.buffers, networkId, target);
+  return k ? store.buffers[k].id : undefined;
 }
 
 // Monotonic token tagged onto each loadAround / reattachToLive request. The
@@ -56,7 +115,7 @@ export function bufferKey(networkId: number | string | null, target: string) {
 // hand us divergent casing (#289 for channels; #327 for live DMs), so exact-key
 // identity alone forks duplicates. Exact key is tried first as the common fast
 // path; the O(n) folded scan only runs on a miss. The flat ':'-sentinels
-// (`:server:`, `:friends:`…) are fixed keys — exact only, never folded.
+// (`:server:`…) are fixed keys — exact only, never folded.
 function resolveExistingKey(
   buffers: Record<string, Buffer>,
   networkId: number | string | null,
@@ -139,12 +198,17 @@ export type BufferKind = 'channel' | 'dm' | 'server' | 'system';
 // are the system buffer today; network buffers split by target shape.
 function deriveKind(networkId: number | null, target: string): BufferKind {
   if (networkId == null) return 'system';
-  if (target.startsWith('#')) return 'channel';
+  if (isChannelTarget(target)) return 'channel';
   if (target.startsWith(':server:')) return 'server';
   return 'dm';
 }
 
 export interface Buffer {
+  // The server's stable buffer id (buffers.id on the wire, schema 17+).
+  // Undefined until the first id-carrying frame lands — a buffer created
+  // optimistically (typing /join, opening a DM) has no id until the server
+  // answers. Never changes once learned; a rename keeps it (that's the point).
+  id?: number;
   // null == app-scoped (the system buffer); a real id for every IRC buffer.
   networkId: number | null;
   kind: BufferKind;
@@ -253,20 +317,93 @@ function makeBuffer(networkId: number | string | null, target: string): Buffer {
   };
 }
 
+// Does this buffer need a `history latest` fetch before it can render real
+// content? One predicate shared by activate() (the click path) and the
+// hydration reconciler (useBufferHydration — the reconnect/retry path) so the
+// two can never disagree about what "unhydrated" means. True for: a buffer
+// whose slice was wiped on switch-away-from-detached (pendingRefetch), a
+// fresh-connect SHELL (unseeded), and a locally-materialized empty buffer
+// (brand-new DM, channel-joined pre-backlog). `hasMoreOlder` gates the empty
+// case so a genuinely-empty buffer (empty latest reply flipped it false)
+// doesn't refetch forever. Detached and in-flight buffers are never "in need"
+// — the jump slice is deliberate, and a pending fetch will resolve or be
+// failed by failInFlightHistory on socket close.
+/**
+ * Trim an `around` slice to at most `max` rows while KEEPING THE ANCHOR, with as
+ * much context either side as the budget allows.
+ *
+ * The naive `slice(-max)` keeps the newest rows, which is right for a `latest`
+ * reply and wrong for this one: the point of an around slice is the anchor and
+ * its surroundings. Reports which end(s) were trimmed so the pager flags stay
+ * honest — unlike the tail-only case, either end can now lose rows.
+ */
+export function windowAroundAnchor(
+  events: BufferMessage[],
+  anchorId: unknown,
+  max: number,
+): { events: BufferMessage[]; trimmedOlder: boolean; trimmedNewer: boolean } {
+  if (events.length <= max) return { events, trimmedOlder: false, trimmedNewer: false };
+  const idx = typeof anchorId === 'number' ? events.findIndex((e) => e.id === anchorId) : -1;
+  // Anchor not in the slice (or not told what it is) — nothing to centre on, so
+  // the newest rows are as good a choice as any.
+  if (idx === -1) return { events: events.slice(-max), trimmedOlder: true, trimmedNewer: false };
+  const half = Math.floor(max / 2);
+  // Clamp at both ends so an anchor near either edge still yields a full window
+  // rather than a short one.
+  let start = Math.max(0, idx - half);
+  const end = Math.min(events.length, start + max);
+  start = Math.max(0, end - max);
+  return {
+    events: events.slice(start, end),
+    trimmedOlder: start > 0,
+    trimmedNewer: end < events.length,
+  };
+}
+
+export function bufferNeedsHydration(buf: Buffer): boolean {
+  if (buf.networkId == null) return false;
+  if (buf.detached || buf.loadingHistory) return false;
+  if (buf.pendingRefetch) return true;
+  return (buf.messages.length === 0 || buf.unseeded) && buf.hasMoreOlder;
+}
+
 function ensureBuffer(
   state: { buffers: Record<string, Buffer> },
   networkId: number | string | null,
   target: string,
+  bufferId?: number | null,
 ): Buffer {
+  // Id fast path first: a frame carrying a bufferId we know resolves to that
+  // buffer even if the name disagrees (rename/casing races) — the id is the
+  // identity, the name is an attribute (CLIENT_PROTOCOL §5.2).
+  if (typeof bufferId === 'number') {
+    const known = keyById.get(bufferId);
+    if (known && state.buffers[known]) return state.buffers[known];
+  }
   // Resolve case-insensitively before creating: a DM/channel already open under
   // a different casing is the same buffer (#327), so reuse it rather than fork a
   // second entry. Only materialize when nothing exists under any casing — and
   // then under the target's own casing, so the first writer's case is canonical.
   const existing = resolveExistingKey(state.buffers, networkId, target);
-  if (existing) return state.buffers[existing];
+  if (existing) {
+    recordBufferId(state.buffers[existing], existing, bufferId);
+    return state.buffers[existing];
+  }
   const k = bufferKey(networkId, target);
   state.buffers[k] = makeBuffer(networkId, target);
+  recordBufferId(state.buffers[k], k, bufferId);
   return state.buffers[k];
+}
+
+/** Learn (or confirm) a buffer's server id. First id wins; the server never
+ *  reassigns one, so a conflicting id on the same key means the entry was
+ *  re-minted server-side — adopt the new id and drop the stale index entry. */
+function recordBufferId(buf: Buffer, key: string, bufferId?: number | null): void {
+  if (typeof bufferId !== 'number') return;
+  if (buf.id === bufferId && keyById.get(bufferId) === key) return;
+  if (buf.id !== undefined && buf.id !== bufferId) keyById.delete(buf.id);
+  buf.id = bufferId;
+  keyById.set(bufferId, key);
 }
 
 export const useBuffersStore = defineStore('buffers', {
@@ -280,6 +417,18 @@ export const useBuffersStore = defineStore('buffers', {
   getters: {
     list: (state) => Object.values(state.buffers),
     byKey: (state) => (k: string) => state.buffers[k] || null,
+    // Buffer by its server id — the REACTIVE counterpart to bufferKeyForId
+    // above. Both answer the same question, and the split is deliberate:
+    // bufferKeyForId reads the module-level keyById Map, which is the right
+    // shape for the hot frame-application path (O(1), no proxy) but is invisible
+    // to Vue, so a watcher built on it never re-fires when an id is learned.
+    // Anything reactive — the URL route resolver waiting on a cold-start deep
+    // link (#744) — has to come through here instead. O(buffers) per call, which
+    // is why it's for the route paths and not for frame application.
+    byId: (state) => (id: number) => {
+      for (const b of Object.values(state.buffers)) if (b.id === id) return b;
+      return null;
+    },
     // App-wide highlight total — the sum of every buffer's server-owned
     // `highlighted` count: channel mentions, every unread DM, and notable system
     // lines (see the server's computeUnreadFor). The active buffer always reads
@@ -294,9 +443,9 @@ export const useBuffersStore = defineStore('buffers', {
     // tell "open" from "closed/parted-away" before activating — activate() would
     // otherwise recreate an empty shell and strand the UI in a half-state. The
     // case fold matters because the toast/jump focus guards gate activate() on
-    // the raw server-cased target (highlight toast → event.target, friend-online
-    // → event.nick): an exact-key lookup would report a buffer that's open under
-    // a different casing as closed and refuse to focus its own notification.
+    // the raw server-cased target (highlight toast → event.target): an
+    // exact-key lookup would report a buffer that's open under a different
+    // casing as closed and refuse to focus its own notification.
     isOpen: (state) => (networkId: number | string, target: string) =>
       resolveExistingKey(state.buffers, networkId, target) !== null,
     forNetwork: (state) => (networkId: number | string) =>
@@ -325,11 +474,45 @@ export const useBuffersStore = defineStore('buffers', {
         }
         return undefined;
       },
+    // The peer's ident@hostname for a DM header (#695 QA follow-up — the slot
+    // a channel's topic occupies). Live shared-channel member data first (the
+    // freshest source, present even for a history-less DM opened from the
+    // nicklist); the DM's own persisted rows as fallback (covers a peer with
+    // no shared channel — every message row carries the sender's userhost).
+    userhostFor:
+      (state) =>
+      (networkId: number | string, nick: string): string | null => {
+        if (!nick) return null;
+        const lc = nick.toLowerCase();
+        const nid = Number(networkId);
+        for (const b of Object.values(state.buffers)) {
+          if (b.networkId !== nid) continue;
+          const m = b.members?.find(
+            (x) => typeof x === 'object' && (x.nick || '').toLowerCase() === lc,
+          );
+          if (m?.user && m?.host) return `${m.user}@${m.host}`;
+        }
+        for (const b of Object.values(state.buffers)) {
+          if (b.networkId !== nid || b.target.toLowerCase() !== lc) continue;
+          for (let i = b.messages.length - 1; i >= 0; i--) {
+            const msg = b.messages[i];
+            if (msg.self || (msg.nick || '').toLowerCase() !== lc) continue;
+            const uh = msg.userhost;
+            if (typeof uh === 'string' && uh) {
+              // Rows store the full mask (nick!user@host); the header wants
+              // the identity half.
+              const bang = uh.indexOf('!');
+              return bang === -1 ? uh : uh.slice(bang + 1);
+            }
+          }
+        }
+        return null;
+      },
     // The open DM buffer for a (network, nick), matched case-insensitively so we
     // resolve to whatever case is already open rather than forking a second
     // buffer that differs only by nick case. Channels and the flat virtual
-    // sentinels (`:server:`, `:friends:`…) are excluded. One home for the
-    // resolution the Friends sidebar, overview, and keyboard nav all need.
+    // sentinels (`:server:`…) are excluded. One home for the
+    // resolution the sidebar and keyboard nav both need.
     findDm:
       (state) =>
       (networkId: number | string, nick: string): Buffer | null => {
@@ -339,7 +522,7 @@ export const useBuffersStore = defineStore('buffers', {
             (b) =>
               b.networkId === Number(networkId) &&
               b.target.toLowerCase() === lower &&
-              !b.target.startsWith('#') &&
+              !isChannelTarget(b.target) &&
               !b.target.startsWith(':'),
           ) ?? null
         );
@@ -350,7 +533,7 @@ export const useBuffersStore = defineStore('buffers', {
     // (#289), so an exact-key lookup alone would miss the open buffer and drop
     // ephemeral signals (e.g. typing) on the floor. Exact key is tried first as
     // the common fast path; the folded scan only runs on a case mismatch. The
-    // flat ':'-sentinels (`:server:`, `:friends:`…) are fixed keys — exact only.
+    // flat ':'-sentinels (`:server:`…) are fixed keys — exact only.
     findByTarget:
       (state) =>
       (networkId: number | string | null, target: string): Buffer | null => {
@@ -359,12 +542,17 @@ export const useBuffersStore = defineStore('buffers', {
       },
   },
   actions: {
-    ensure(networkId: number | string, target: string) {
-      return ensureBuffer(this, networkId, target);
+    ensure(networkId: number | string, target: string, bufferId?: number | null) {
+      return ensureBuffer(this, networkId, target, bufferId);
     },
     pushMessage(event: BufferMessage) {
       if (!event.target) return false;
-      const buf = ensureBuffer(this, event.networkId, event.target);
+      const buf = ensureBuffer(
+        this,
+        event.networkId,
+        event.target,
+        typeof event.bufferId === 'number' ? event.bufferId : undefined,
+      );
       // Detached: the user is reading a historical slice that doesn't include
       // the live tail. Drop the event so nothing materializes inside the
       // slice, and bump the badge so the StatusBar "Return to present" button
@@ -382,8 +570,20 @@ export const useBuffersStore = defineStore('buffers', {
       // so it can skip unread/highlight side effects too.
       if (event.id != null && event.id <= prevMaxId) return false;
       buf.messages.push(event);
-      if (buf.messages.length > MAX_PER_BUFFER)
+      if (buf.messages.length > MAX_PER_BUFFER) {
         buf.messages.splice(0, buf.messages.length - MAX_PER_BUFFER);
+        // The ring just evicted the rows `oldestId` pointed at — reachable
+        // whenever paging up has grown the buffer past the cap, since
+        // prependHistory doesn't trim (the reader is walking backwards; the ring
+        // is re-imposed here, on the next live line). Leaving the cursor stale
+        // makes the next upward page ask for `before: <an id we no longer hold>`
+        // and prepend a slice that isn't contiguous with what's on screen — a
+        // silent hole between the two, with nothing to signal it. Re-anchor on
+        // what survived, and re-arm the pager: there is now provably more older
+        // history than we hold.
+        buf.oldestId = buf.messages[0]?.id ?? buf.oldestId;
+        buf.hasMoreOlder = true;
+      }
       if (buf.oldestId == null && event.id != null) buf.oldestId = event.id;
       // Active-divider tracking + live mark-read. Applies to the system buffer
       // too (#355): it's now a normal buffer with a server-owned read pointer
@@ -416,6 +616,7 @@ export const useBuffersStore = defineStore('buffers', {
             buf.lastReadId = event.id;
             socketSend({
               type: 'mark-read',
+              bufferId: buf.id,
               networkId: buf.networkId,
               target: buf.target,
               messageId: event.id,
@@ -440,9 +641,9 @@ export const useBuffersStore = defineStore('buffers', {
       speakers: SpeakerEntry[] | undefined,
       readState: any,
       joined: boolean | undefined,
-      opts: { reset?: boolean; hasMoreOlder?: boolean } = {},
+      opts: { reset?: boolean; hasMoreOlder?: boolean; bufferId?: number | null } = {},
     ) {
-      const buf = ensureBuffer(this, networkId, target);
+      const buf = ensureBuffer(this, networkId, target, opts.bufferId);
       // Detached: snapshot resume during detach is a no-op. The gap-fill
       // events would land at id values inside or past the detached slice and
       // either corrupt its boundaries or get conflated with paged-in history.
@@ -537,10 +738,14 @@ export const useBuffersStore = defineStore('buffers', {
       const fresh = events.filter(
         (e) => (e.id == null || !existing.has(e.id)) && e.type !== 'away' && e.type !== 'back',
       );
-      buf.messages = [...fresh, ...buf.messages];
+      // Keep the NEWEST rows of an oversized page — they're the ones adjacent to
+      // what we hold, so the merged slice stays contiguous.
+      const trimmed = fresh.length > MAX_MERGE_ROWS;
+      const page = trimmed ? fresh.slice(-MAX_MERGE_ROWS) : fresh;
+      buf.messages = [...page, ...buf.messages];
       const first = buf.messages[0];
       buf.oldestId = first?.id ?? buf.oldestId;
-      buf.hasMoreOlder = !!hasMoreOlder;
+      buf.hasMoreOlder = trimmed || !!hasMoreOlder;
       buf.loadingHistory = false;
       buf.unseeded = false;
       if (speakers !== undefined) this.seedSpeakers(networkId, target, speakers);
@@ -565,14 +770,21 @@ export const useBuffersStore = defineStore('buffers', {
       const fresh = events.filter(
         (e) => (e.id == null || !existing.has(e.id)) && e.type !== 'away' && e.type !== 'back',
       );
-      const combined = [...buf.messages, ...fresh];
-      buf.messages =
-        combined.length > MAX_PER_BUFFER
-          ? combined.slice(combined.length - MAX_PER_BUFFER)
-          : combined;
+      // Keep the OLDEST rows of an oversized page — the ones adjacent to our
+      // tail — so the merged slice stays contiguous and the reader's context
+      // survives the ring's eviction.
+      const trimmed = fresh.length > MAX_MERGE_ROWS;
+      const page = trimmed ? fresh.slice(0, MAX_MERGE_ROWS) : fresh;
+      const combined = [...buf.messages, ...page];
+      const evictedOlder = combined.length > MAX_PER_BUFFER;
+      buf.messages = evictedOlder ? combined.slice(combined.length - MAX_PER_BUFFER) : combined;
       buf.oldestId = buf.messages[0]?.id ?? buf.oldestId;
       buf.newestId = buf.messages[buf.messages.length - 1]?.id ?? buf.newestId;
-      buf.hasMoreNewer = !!hasMoreNewer;
+      buf.hasMoreNewer = trimmed || !!hasMoreNewer;
+      // We just evicted rows off the old edge, so there is provably more older
+      // history than we hold — whatever the pager thought before. Re-arming it
+      // here is what keeps the eviction from reading as "start of buffer".
+      if (evictedOlder) buf.hasMoreOlder = true;
       buf.loadingHistory = false;
       if (speakers !== undefined) this.seedSpeakers(networkId, target, speakers);
     },
@@ -616,9 +828,11 @@ export const useBuffersStore = defineStore('buffers', {
         mode: 'around',
         networkId,
         target,
+        bufferId: buf.id,
         anchorId,
         token,
         limit: halfLimit,
+        countBy: historyCountBy(),
       });
       // Same rollback rationale as reattachToLive — a failed send leaves no
       // response to clear the loading flag. Restoring detached to its prior
@@ -641,11 +855,21 @@ export const useBuffersStore = defineStore('buffers', {
       const filtered = (payload.events || []).filter(
         (e: BufferMessage) => e.type !== 'away' && e.type !== 'back',
       );
-      buf.messages = filtered.slice(-MAX_PER_BUFFER);
+      // Centred on the anchor, NOT `slice(-MAX)`. An `around` window is
+      // symmetrical about the anchor by construction (the server sends up to
+      // halfLimit either side), and a busy channel's noise easily pushes it past
+      // the ring — 963 rows for a 200-row request was the case that exposed
+      // this. Keeping the tail throws away the older half, which lands the
+      // anchor a handful of rows from the top with no context above it, and when
+      // more than MAX rows follow the anchor it discards the anchor itself and
+      // the jump reports that it couldn't find the message.
+      const win = windowAroundAnchor(filtered, payload.anchorId, MAX_PER_BUFFER);
+      buf.messages = win.events;
       buf.oldestId = buf.messages[0]?.id ?? null;
       buf.newestId = buf.messages[buf.messages.length - 1]?.id ?? null;
-      buf.hasMoreOlder = !!payload.hasMoreOlder;
-      buf.hasMoreNewer = !!payload.hasMoreNewer;
+      // Trimming can now happen at EITHER end, so each flag follows its own end.
+      buf.hasMoreOlder = win.trimmedOlder || !!payload.hasMoreOlder;
+      buf.hasMoreNewer = win.trimmedNewer || !!payload.hasMoreNewer;
       buf.pendingHistoryToken = null;
       buf.loadingHistory = false;
     },
@@ -653,13 +877,17 @@ export const useBuffersStore = defineStore('buffers', {
     // button. Same token discipline as loadAround — detached stays true
     // until the response lands, so any fanOut between request and response
     // continues to be dropped by pushMessage.
-    reattachToLive(networkId: number | string, target: string, limit = 200) {
+    // Returns true when the request actually went out over the socket, so
+    // callers (ensureHydrated) can decide whether to consume one-shot intent
+    // flags like pendingRefetch — a failed send must leave them armed for the
+    // next attempt.
+    reattachToLive(networkId: number | string, target: string, limit = 200): boolean {
       const buf = ensureBuffer(this, networkId, target);
       // No detached guard: this is also called by activate() to refetch
       // the live tail after a switch-away from a detached buffer wiped
       // the slice. In that case detached is already false. The applyLatestReplace
       // handler is idempotent (re-clearing already-clear flags is a no-op).
-      if (buf.loadingHistory) return;
+      if (buf.loadingHistory) return false;
       const token = nextHistoryToken();
       buf.pendingHistoryToken = token;
       buf.loadingHistory = true;
@@ -668,20 +896,104 @@ export const useBuffersStore = defineStore('buffers', {
         mode: 'latest',
         networkId,
         target,
+        bufferId: buf.id,
         token,
         limit,
+        // This is the hydrate — the fetch that fills the FIRST screenful, and so
+        // the one the spin-loop was most visible on.
+        countBy: historyCountBy(),
       });
       // socketSend returns false when the socket isn't open. No response will
-      // arrive to clear loadingHistory, and there's no reconnect handler that
-      // resets it per-buffer — so without this rollback the buffer would be
-      // permanently stranded "loading" and every subsequent fetch guard
-      // (this function's early-return, MessageList's requestMoreHistory) would
-      // block forever. Relevant when activate fires before the socket has
-      // (re)connected, e.g. push-notification deep-link into a cold PWA.
+      // arrive to clear loadingHistory — so without this rollback the buffer
+      // would be stranded "loading" until the socket-close sweep
+      // (failInFlightHistory) ran, and every fetch guard (this function's
+      // early-return, MessageList's requestMoreHistory) would block until then.
+      // Relevant when activate fires before the socket has (re)connected, e.g.
+      // push-notification deep-link into a cold PWA.
       if (!sent) {
         buf.loadingHistory = false;
         buf.pendingHistoryToken = null;
+        return false;
       }
+      return true;
+    },
+    // Fire the initial `latest` fetch for the active-path buffer if (and only
+    // if) it still needs one — see bufferNeedsHydration. Safe to call
+    // repeatedly: it no-ops once a fetch is in flight or the buffer is
+    // hydrated. pendingRefetch is consumed only when the request really went
+    // out; a send into a closed socket leaves it armed so the hydration
+    // reconciler retries on reconnect instead of silently downgrading the
+    // wiped-slice case to "maybe the empty-arm catches it".
+    ensureHydrated(networkId: number | string | null, target: string) {
+      const buf = this.findByTarget(networkId, target);
+      if (!buf || buf.networkId == null || !bufferNeedsHydration(buf)) return;
+      const sent = this.reattachToLive(buf.networkId, buf.target);
+      if (sent && buf.pendingRefetch) buf.pendingRefetch = false;
+    },
+    // Socket died. Any in-flight history request (latest/around/before/after)
+    // will never get a response, and every fetch path early-returns while
+    // loadingHistory is set — historically a permanently wedged, blank,
+    // un-refetchable buffer. Called from the socket 'close' handler (the same
+    // seam that fails pending ACKs) so the flags are clean before the
+    // reconnect's snapshot and the hydration reconciler's refetch arrive.
+    failInFlightHistory() {
+      for (const buf of Object.values(this.buffers)) {
+        if (buf.loadingHistory || buf.pendingHistoryToken != null) {
+          buf.loadingHistory = false;
+          buf.pendingHistoryToken = null;
+        }
+      }
+      // Same reasoning, different latch: a reply that can no longer arrive must
+      // not leave us primed to treat someone else's open as ours. See pendingOpens.
+      // Timers first — clearing the Map alone would leave them to fire into an
+      // empty Map across the reconnect.
+      for (const id of pendingOpens.values()) clearTimeout(id);
+      pendingOpens.clear();
+    },
+    // Ask the server to OPEN a buffer. This is a WRITE — it reopens a closed
+    // row, mints a DM row for a bare nick, or JOINs an unjoined channel — so it
+    // belongs to deliberate user intent ("open this DM", a clicked channel
+    // name), never to filling in a shell. Hydration goes through
+    // ensureHydrated/reattachToLive, which read and change nothing.
+    //
+    // The send lives here rather than at the call site so the pendingOpens
+    // bookkeeping can't be forgotten by the next caller that needs this verb —
+    // forgetting it doesn't fail loudly, it just makes another device's open
+    // steal this tab's focus.
+    openBuffer(networkId: number | string, target: string): boolean {
+      const key = joinKey(networkId, target);
+      const existing = pendingOpens.get(key);
+      if (existing) clearTimeout(existing);
+      pendingOpens.set(
+        key,
+        setTimeout(() => pendingOpens.delete(key), PENDING_OPEN_TIMEOUT),
+      );
+      const sent = socketSend({
+        type: 'open-buffer',
+        networkId,
+        target,
+        // Present only when the buffer already exists locally — the id form
+        // addresses an existing row; minting/JOINing is inherently name-first.
+        bufferId: idFor(networkId, target),
+        // The reply re-seeds history for a since-closed buffer, so it's a first
+        // screenful like any other hydrate (§8).
+        countBy: historyCountBy(),
+      });
+      if (!sent) {
+        clearTimeout(pendingOpens.get(key)!);
+        pendingOpens.delete(key);
+      }
+      return sent;
+    },
+    // Did THIS tab ask for `target` to be opened? Consumes the record, so the
+    // reply focuses exactly once.
+    claimPendingOpen(networkId: number | string, target: string): boolean {
+      const key = joinKey(networkId, target);
+      const timer = pendingOpens.get(key);
+      if (timer === undefined) return false;
+      clearTimeout(timer);
+      pendingOpens.delete(key);
+      return true;
     },
     applyLatestReplace(networkId: number | string, target: string, payload: any) {
       const buf = ensureBuffer(this, networkId, target);
@@ -690,9 +1002,24 @@ export const useBuffersStore = defineStore('buffers', {
         (e: BufferMessage) => e.type !== 'away' && e.type !== 'back',
       );
       buf.messages = filtered.slice(-MAX_PER_BUFFER);
+      // The ring dropped rows off the old edge. `payload.hasMoreOlder` was
+      // computed by the server against the WHOLE slice it sent, so honoring a
+      // `false` here would strand the pager on history we evicted ourselves —
+      // and countBy:'renderable' can legitimately make a slice bigger than the
+      // ring (a netsplit's worth of noise rides along with the page).
+      const evictedOlder = filtered.length > buf.messages.length;
       buf.oldestId = buf.messages[0]?.id ?? null;
       buf.newestId = buf.messages[buf.messages.length - 1]?.id ?? null;
-      buf.hasMoreOlder = !!payload.hasMoreOlder;
+      // A token-matched latest reply is TERMINAL hydration even when every row
+      // filtered out client-side (a legacy away/back tail can blank the whole
+      // slice). Honoring the server's hasMoreOlder on an empty slice would
+      // leave `messages.length === 0 && hasMoreOlder` standing forever —
+      // bufferNeedsHydration true, the reconciler refetching the same empty
+      // slice every throttle window, and the pane claiming a settled "No
+      // messages yet." between attempts. Clamping to false costs nothing: an
+      // empty buffer has no anchor row, so the upward pager can't page it
+      // anyway.
+      buf.hasMoreOlder = filtered.length > 0 ? evictedOlder || !!payload.hasMoreOlder : false;
       buf.hasMoreNewer = false;
       buf.detached = false;
       buf.liveDuringDetach = 0;
@@ -715,6 +1042,7 @@ export const useBuffersStore = defineStore('buffers', {
         buf.lastReadId = lastId;
         socketSend({
           type: 'mark-read',
+          bufferId: buf.id,
           networkId,
           target,
           messageId: lastId,
@@ -872,17 +1200,65 @@ export const useBuffersStore = defineStore('buffers', {
           typingTimers.delete(k);
         }
       }
+      if (buf.id !== undefined) keyById.delete(buf.id);
       delete this.buffers[bufKey];
+    },
+    // Lifecycle hooks (lib/bufferLifecycle.ts). This store must be swept
+    // FIRST — the others may resolve through it.
+    dropBuffer(networkId: number | string | null, target: string) {
+      if (networkId == null) return; // the system buffer is permanent
+      this.drop(networkId, target);
+    },
+    // Move the entry to its new name, keeping the same Buffer object (and
+    // therefore its id — a rename never changes identity). If an entry
+    // already exists under the destination (the server announced a merge and
+    // the frames raced), the destination wins and the source is dropped —
+    // matching the server's source-survives merge from the other side.
+    rekeyBuffer(networkId: number | string | null, from: string, to: string) {
+      if (networkId == null) return;
+      const fromKey = resolveExistingKey(this.buffers, networkId, from);
+      if (!fromKey) return;
+      const toKey = bufferKey(networkId, to);
+      if (fromKey === toKey) return;
+      if (this.buffers[toKey]) {
+        this.drop(networkId, from);
+        return;
+      }
+      const buf = this.buffers[fromKey];
+      // Move typing timers to the new composite prefix — their keys embed the
+      // canonical target.
+      const oldPrefix = `${buf.networkId}::${buf.target}::`;
+      const newPrefix = `${buf.networkId}::${to}::`;
+      const moved: Array<[string, ReturnType<typeof setTimeout>]> = [];
+      for (const [k, id] of typingTimers) {
+        if (k.startsWith(oldPrefix)) moved.push([k, id]);
+      }
+      for (const [k, id] of moved) {
+        typingTimers.delete(k);
+        typingTimers.set(newPrefix + k.slice(oldPrefix.length), id);
+      }
+      buf.target = to;
+      buf.kind = deriveKind(buf.networkId, to);
+      this.buffers[toKey] = buf;
+      delete this.buffers[fromKey];
+      if (buf.id !== undefined) keyById.set(buf.id, toKey);
     },
     // Called from useSessionReset before $reset(). The state reset will wipe
     // every buffer (and therefore every typing indicator), but the
     // module-level Map of pending setTimeouts isn't part of Pinia state —
     // clear it explicitly so timers don't linger after logout.
     resetTimers() {
+      keyById.clear();
       for (const id of typingTimers.values()) clearTimeout(id);
       typingTimers.clear();
       for (const id of pendingJoins.values()) clearTimeout(id);
       pendingJoins.clear();
+      // Also module-level, and logout doesn't reach the socket-close path that
+      // normally clears it (resetSocket aborts the listeners, so 'close' never
+      // fires). A latch surviving into the NEXT account's session would let a
+      // cross-device open of the same target steal that user's focus.
+      for (const id of pendingOpens.values()) clearTimeout(id);
+      pendingOpens.clear();
     },
     // Register intent to join a channel without opening its buffer yet (#260).
     // confirmPendingJoin() activates it on the channel-joined confirmation;
@@ -1028,19 +1404,37 @@ export const useBuffersStore = defineStore('buffers', {
     // that doesn't carry read-state fields doesn't blank them out.
     applyClearedState(networkId: number | string, target: string, payload: any) {
       const buf = ensureBuffer(this, networkId, target);
+      const wasCleared = buf.clearedBeforeId > 0;
       buf.clearedBeforeId = Number(payload?.clearedBeforeId) || 0;
       buf.clearedAt = payload?.clearedAt || null;
+      // UNCLEAR resets the buffer to the latest chat, it doesn't excavate.
+      // Whatever hidden rows accumulated in memory during the cleared state
+      // (up to a full page from before the clear) would otherwise all render
+      // at once — the user asked for their buffer back, not an archaeology
+      // dig. Trim to the newest standard page, flag that older history
+      // exists, and let the ordinary scroll pager re-fetch on demand. Local
+      // trim only — no refetch — so the multi-tab fan-out costs nothing.
+      // Detached views ignore the clear filter entirely and keep their slice.
+      if (wasCleared && buf.clearedBeforeId === 0 && !buf.detached) {
+        const KEEP = 200; // one standard backlog page (server's latest slice)
+        if (buf.messages.length > KEEP) {
+          buf.messages = buf.messages.slice(-KEEP);
+          buf.hasMoreOlder = true;
+        }
+        buf.oldestId = null;
+        buf.newestId = null;
+      }
     },
     // /clear: anchor the marker at the current tail (server picks the exact
     // boundary id). Best-effort send; the server's fan-out echoes back and
     // applyClearedState moves the local mirror to the authoritative value.
     clearBuffer(networkId: number | string, target: string) {
-      socketSend({ type: 'clear-buffer', networkId, target });
+      socketSend({ type: 'clear-buffer', networkId, target, bufferId: idFor(networkId, target) });
     },
     // Drop the /clear marker so hidden messages reappear. Fired by the
     // "Show earlier messages" affordance on the divider and by `/clear off`.
     unclearBuffer(networkId: number | string, target: string) {
-      socketSend({ type: 'unclear-buffer', networkId, target });
+      socketSend({ type: 'unclear-buffer', networkId, target, bufferId: idFor(networkId, target) });
     },
     // Switch to a buffer. We mark the entered buffer read on focus-IN (not
     // on focus-OUT of the previous one) so that a tab close / reload / lost
@@ -1113,55 +1507,30 @@ export const useBuffersStore = defineStore('buffers', {
           buf.lastReadId = lastId;
           socketSend({
             type: 'mark-read',
+            bufferId: buf.id,
             networkId,
             target: canonTarget,
             messageId: lastId,
           });
         }
       }
-      // Re-entry after the slice was wiped on switch-away-from-detached.
-      // Fire a fresh latest fetch so the user lands on live tail content
-      // instead of an empty buffer. The applyLatestReplace response will
-      // do its own mark-read against the new tail.
-      // Network-buffer only: the system buffer is seeded by its connect backlog
-      // and never detaches (its lines aren't searchable/jumpable), so it doesn't
-      // need the activate-refetch; the guard also excludes the FRIENDS overview.
-      if (networkId != null && buf.pendingRefetch) {
-        buf.pendingRefetch = false;
-        this.reattachToLive(networkId, canonTarget);
-      } else if (
-        networkId != null &&
-        (buf.messages.length === 0 || buf.unseeded) &&
-        buf.hasMoreOlder &&
-        !buf.detached &&
-        !buf.loadingHistory
-      ) {
-        // First-load fetch. The buffer shell exists but has no messages —
-        // either it's brand new (profile-modal "Send DM" to a nick we've
-        // never DM'd before) or it was pre-created by a side channel
-        // (the channel-joined handler calls ensure() before any backlog
-        // arrives) and the initial backlog snapshot only covers
-        // buffers that were already open at socket-connect. Push-notification
-        // deep-links land here too, since isOpen() is satisfied by any shell
-        // in the store regardless of message contents. Kick a latest fetch
-        // here so every entry path is uniformly seeded — the MessageList
-        // lifecycle's ensureViewportFilled() goes back to being a safety
-        // net rather than the load-bearing initial-fetch trigger.
-        //
-        // hasMoreOlder gates against the truly-empty case: a brand-new
-        // DM/channel with no server history returns an empty latest slice
-        // that leaves messages.length=0 but flips hasMoreOlder to false —
-        // without this guard we'd refire the same empty fetch on every
-        // re-activate.
-        this.reattachToLive(networkId, canonTarget);
-      }
+      // Fire the initial fetch if the buffer still needs one: a slice wiped on
+      // switch-away-from-detached (pendingRefetch), a fresh-connect SHELL
+      // (unseeded), or a locally-materialized empty buffer — profile-modal
+      // "Send DM" to a never-DM'd nick, the channel-joined handler's ensure()
+      // racing its backlog, a push-notification deep-link onto a shell. The
+      // decision (and its guards) lives in bufferNeedsHydration so this click
+      // path and the hydration reconciler (useBufferHydration — which retries
+      // when THIS send loses the race with a closed/half-dead socket) can
+      // never disagree about what "needs a fetch" means.
+      this.ensureHydrated(networkId, canonTarget);
       // For DMs, ask the server to WHOIS-probe the peer so the banner/sidebar
       // dim reflect current state rather than a possibly-stale cached value.
       // The probe is silent (no /whois reply in the server buffer); only the
       // resulting peer-presence event flows back to update local state.
       // DMs only — channels (#…) and the flat sentinels (:server:, :system:) have
       // no peer to probe.
-      if (canonTarget && !canonTarget.startsWith('#') && !canonTarget.startsWith(':')) {
+      if (canonTarget && !isChannelTarget(canonTarget) && !canonTarget.startsWith(':')) {
         socketSend({ type: 'probe-presence', networkId, nick: canonTarget });
       }
     },

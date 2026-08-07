@@ -150,21 +150,30 @@ describe('foldBufferCase', () => {
     expect(targetCounts(net)).toEqual({ '#CoolChan': 3, Bob: 2, bob: 1 });
   });
 
-  it('merges buffer_reads keeping the furthest read pointer', () => {
+  it('skips buffer_reads, where a case fork is unrepresentable (buffer_id key)', () => {
+    // Pre-v18 this test asserted the fold's name-keyed read-pointer merge.
+    // Read state is id-keyed now: both casings resolve to one buffer at WRITE
+    // time (the MAX clamp merges them on the spot), and the fold's
+    // buffer_reads section is shape-gated off — the fork it repaired cannot
+    // exist. The migration-path merge is covered by the v18 rebuild tests.
     const net = freshNetwork();
     seed(net, '#Chan', 2);
-    seed(net, '#chan', 1); // stray, lower message count -> not canonical
+    seed(net, '#chan', 1); // stray casing, same buffer
     setReadState(userId, net, '#Chan', 5);
-    setReadState(userId, net, '#chan', 10); // further read pointer on the stray case
+    setReadState(userId, net, '#chan', 10); // same buffer — clamps to MAX
 
-    foldBufferCase(db, { scope: 'all' });
+    foldBufferCase(db, { scope: 'all' }); // must not error on the id-keyed table
 
     const reads = db
-      .prepare(`SELECT target, last_read_message_id AS lr FROM buffer_reads WHERE network_id = ?`)
+      .prepare(
+        `SELECT b.target AS target, r.last_read_message_id AS lr
+         FROM buffer_reads r JOIN buffers b ON b.id = r.buffer_id
+         WHERE b.network_id = ?`,
+      )
       .all(net) as { target: string; lr: number }[];
     expect(reads).toHaveLength(1);
     expect(reads[0].target).toBe('#Chan');
-    expect(reads[0].lr).toBe(10); // MAX of the two merged pointers
+    expect(reads[0].lr).toBe(10);
   });
 
   it('still folds with report:false (the migration path), returning an empty report', () => {

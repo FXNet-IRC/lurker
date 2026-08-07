@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import { describe, it, expect } from 'vitest';
-import { splitTextByTokens, segmentInlineStyle, segmentHasStyle } from './nickColor.js';
+import {
+  splitTextByTokens,
+  segmentInlineStyle,
+  segmentHasStyle,
+  MIRC_PALETTE_FALLBACK,
+} from './nickColor.js';
+import { getOption } from '../../../shared/settingsRegistry.js';
 
 // IRC formatting control bytes used to build test fixtures.
 const C = '\x03'; // colour
@@ -13,6 +19,36 @@ const BOLD = '\x02';
 function parse(text: string) {
   return splitTextByTokens(text, null, null, null);
 }
+
+describe('MIRC_PALETTE_FALLBACK', () => {
+  // The bug that prompted this: slot 1 ("black") was var(--bg), which IS the
+  // surface the text is drawn on — so black text rendered in precisely the
+  // colour behind it and vanished.
+  //
+  // The rule is narrow on purpose. Theme variables are RIGHT for the mono-ish
+  // slots: look.color.bg and look.color.fg are user-settable, so a slot pinned
+  // to a literal near-white would vanish the moment someone sets a light
+  // background — the same bug mirrored. What can never appear is the background
+  // itself, which is the one value guaranteed to match its own surface.
+  it('never paints a slot in the background colour', () => {
+    for (const [i, entry] of MIRC_PALETTE_FALLBACK.entries()) {
+      expect(entry, `slot ${i}`).not.toMatch(/var\(\s*--bg\b/);
+    }
+  });
+
+  it('has all 16 slots', () => {
+    expect(MIRC_PALETTE_FALLBACK).toHaveLength(16);
+  });
+
+  // Two copies exist: this one (the render-time fallback) and the registry
+  // default the user's customisable palette starts from. They are the same
+  // palette, and a drift between them means chat renders one way until the user
+  // opens Settings and a different way afterwards.
+  it('matches the look.color.mirc_colors registry default exactly', () => {
+    const opt = getOption('look.color.mirc_colors');
+    expect(opt?.default).toEqual([...MIRC_PALETTE_FALLBACK]);
+  });
+});
 
 describe('splitTextByTokens — background colour', () => {
   it('keeps both foreground and background of a \\x03FG,BG run', () => {
@@ -155,11 +191,12 @@ describe('segmentInlineStyle / segmentHasStyle — background colour', () => {
   });
 
   it('renders a background even when the foreground is the default (99)', () => {
-    // \x0399,01 — default text on the "black" slot. The fallback "black" is
-    // var(--bg) so the box adapts to whatever theme is active.
+    // \x0399,01 — default text on the "black" slot. Black is a literal colour,
+    // not var(--bg): a slot that resolved to the surface it's painted on would
+    // render as no box at all.
     const style = segmentInlineStyle({ text: 'x', fg: 99, bg: 1 }, null);
     expect(style.color).toBeUndefined();
-    expect(style.backgroundColor).toBe('var(--bg)');
+    expect(style.backgroundColor).toBe('#000000');
   });
 
   it('honours a caller-supplied palette over the fallback', () => {

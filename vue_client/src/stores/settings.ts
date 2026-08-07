@@ -3,8 +3,9 @@
 
 import { defineStore } from 'pinia';
 import { api } from '../api.js';
-import { REGISTRY, getDefault } from '../utils/settingsRegistry.js';
+import { REGISTRY, getDefault, getOption } from '../utils/settingsRegistry.js';
 import type { SettingValue } from '../../../shared/settingsRegistry.js';
+import { useThemesStore } from './themes.js';
 
 function valuesEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -24,25 +25,49 @@ export const useSettingsStore = defineStore('settings', {
   }),
   getters: {
     registry: () => REGISTRY,
+    /**
+     * What a key renders as WITHOUT a per-key override: the active theme's
+     * value for `themed` keys, the registry default otherwise. Split out from
+     * effective() because isModified() compares against this — an override is
+     * only a modification relative to what removing it would show.
+     */
+    baseline() {
+      return (key: string): SettingValue | undefined => {
+        if (getOption(key)?.themed) {
+          const themed = useThemesStore().activeThemeValues?.[key];
+          if (themed !== undefined) return themed;
+        }
+        return getDefault(key);
+      };
+    },
     effective(state) {
-      return (key: string) => (key in state.values ? state.values[key] : getDefault(key));
+      return (key: string) => (key in state.values ? state.values[key] : this.baseline(key));
     },
     isModified(state) {
       return (key: string) => {
         if (!(key in state.values)) return false;
-        // Defensive: the server normally drops rows whose value equals the
-        // default, but stale rows can survive from older versions. Treat
-        // them as unmodified so the UI stays correct.
-        return !valuesEqual(state.values[key], getDefault(key));
+        // Defensive: stale rows can survive from older versions with a value
+        // equal to the baseline. Treat them as unmodified so the UI stays
+        // correct. (The server only auto-drops rows for non-themed keys.)
+        return !valuesEqual(state.values[key], this.baseline(key));
       };
+    },
+    /** Themed keys currently overridden away from the active theme — the "(modified)" drift. */
+    themeDriftKeys(state): string[] {
+      return Object.keys(state.values).filter(
+        (key) => getOption(key)?.themed && !valuesEqual(state.values[key], this.baseline(key)),
+      );
     },
   },
   actions: {
     async fetchAll() {
       if (this.loading) return this.loading;
       this.loading = (async () => {
-        const { values } = await api('/api/settings/bootstrap');
+        const { values, themes } = await api('/api/settings/bootstrap');
         this.values = { ...values };
+        // Saved themes ride the bootstrap so the theme resolver never runs
+        // against values whose pointed-at theme is still in flight.
+        if (Array.isArray(themes)) useThemesStore().hydrate(themes);
         this.loaded = true;
       })();
       try {
@@ -74,9 +99,26 @@ export const useSettingsStore = defineStore('settings', {
       }
     },
     async setValue(key: string, value: SettingValue) {
+      // A themed key written at exactly its current baseline is "no override" —
+      // persist it as a reset, not a row. The row would be invisible everywhere
+      // (isModified is baseline-relative) yet spring back as a wrong-theme
+      // override the next time the active theme changes under it (mode switch,
+      // OS light/dark flip — neither clears overrides; only applying does).
+      const opt = getOption(key);
+      if (opt?.themed && valuesEqual(value, this.baseline(key))) {
+        await this.patchMany({}, [key]);
+        return;
+      }
+      await this.patchMany({ [key]: value });
+    },
+    /**
+     * One PATCH carrying writes and deletions together — applying a theme sets
+     * its pointer and clears every themed override atomically.
+     */
+    async patchMany(changes: Record<string, SettingValue>, resets: string[] = []) {
       const { values } = await api('/api/settings', {
         method: 'PATCH',
-        body: { changes: { [key]: value } },
+        body: { changes, resets },
       });
       this.values = { ...values };
     },
@@ -86,17 +128,28 @@ export const useSettingsStore = defineStore('settings', {
       });
       this.values = { ...values };
     },
-    applyRemote({ changes }: { changes?: Record<string, SettingValue> }) {
-      if (!changes) return;
+    applyRemote({
+      changes,
+      resets,
+    }: {
+      changes?: Record<string, SettingValue>;
+      resets?: string[];
+    }) {
       const next = { ...this.values };
-      for (const [key, value] of Object.entries(changes)) {
+      for (const [key, value] of Object.entries(changes || {})) {
         const def = getDefault(key);
-        if (def !== undefined && valuesEqual(value, def)) {
+        // A deletion still arrives as { key: default } in `changes` (the frame
+        // shape pre-resets clients understand); dropping the local entry keeps
+        // this map override-only. Themed keys are exempt — a default-valued
+        // override is a real statement under a non-default theme, so only the
+        // explicit resets list below may remove those.
+        if (!getOption(key)?.themed && def !== undefined && valuesEqual(value, def)) {
           delete next[key];
         } else {
           next[key] = value;
         }
       }
+      for (const key of resets || []) delete next[key];
       this.values = next;
     },
   },

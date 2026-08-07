@@ -91,7 +91,7 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const data = event.notification.data || {};
-  const { networkId, target, messageId } = data;
+  const { networkId, target, messageId, bufferId } = data;
   event.waitUntil(
     (async () => {
       const list = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
@@ -103,11 +103,23 @@ self.addEventListener('notificationclick', (event) => {
         }
       }
       if (self.clients.openWindow) {
-        const params = new URLSearchParams();
-        if (networkId != null) params.set('net', String(networkId));
-        if (target != null) params.set('buf', String(target));
-        if (messageId != null) params.set('msg', String(messageId));
-        const url = `/?${params.toString()}`;
+        // Cold launch: the app isn't running, so the only channel for the jump
+        // target is the URL (a postMessage would race the not-yet-registered
+        // listener). Prefer the id form — it's a real client route, so the app
+        // routes into the buffer normally instead of parsing a query string,
+        // and no channel or DM name ends up in browser history (#744). The
+        // name form stays as the fallback for a payload with no buffer row.
+        const msg = messageId != null ? `?msg=${encodeURIComponent(String(messageId))}` : '';
+        let url;
+        if (bufferId != null) {
+          url = `/buffer/${encodeURIComponent(String(bufferId))}${msg}`;
+        } else {
+          const params = new URLSearchParams();
+          if (networkId != null) params.set('net', String(networkId));
+          if (target != null) params.set('buf', String(target));
+          if (messageId != null) params.set('msg', String(messageId));
+          url = `/?${params.toString()}`;
+        }
         await self.clients.openWindow(url);
       }
     })(),

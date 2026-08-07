@@ -97,12 +97,25 @@ export function missingRequired(
 }
 
 // What the upload route accepts: images, text, and the media we can strip metadata
-// from (mp4/mov/m4v/m4a/mp3 — see server/services/contentClass.ts). ONE definition,
-// so the file picker's `accept` and the drag-drop gate can't drift apart.
+// from (mp4/mov/m4v/m4a/m4b/3gp/3g2/mp3 — see server/services/contentClass.ts).
+//
+// This is the file PICKER's `accept` attribute, and nothing else. The drop and paste
+// gates deliberately do not share it — they go through the looser isUploadableType()
+// below, whose job is to ignore things that obviously aren't uploads rather than to
+// enforce policy. (An earlier version of this comment claimed the two shared "ONE
+// definition"; they never did, and reading it that way would make the looser gate
+// look like a bug to be fixed.)
 //
 // Extensions are listed alongside the MIME types because browsers disagree about
 // what they call an .m4a (audio/x-m4a vs audio/mp4) and macOS greys out anything
 // the attribute doesn't match, with no "All Files" escape.
+//
+// So every accepted MIME needs its extensions listed too, or the dialog greys out a
+// file the server would have taken. `.3gp`/`.3g2` are for a file HONESTLY named — the
+// Samsung voice memo that motivated 3GPP support is a 3GPP container the recorder
+// calls `.m4a`, so it already got through on the `.m4a` entry. `.m4b`/`.f4a`/`.f4b`
+// are the three brands `audio/mp4` was added for, and have no other entry covering
+// them at all.
 export const ACCEPTED_FILE_TYPES = [
   'image/*',
   'text/plain',
@@ -110,6 +123,8 @@ export const ACCEPTED_FILE_TYPES = [
   'video/mp4',
   'video/quicktime',
   'video/x-m4v',
+  'video/3gpp',
+  'video/3gpp2',
   'audio/mpeg',
   'audio/mp4',
   'audio/x-m4a',
@@ -117,6 +132,11 @@ export const ACCEPTED_FILE_TYPES = [
   '.mov',
   '.m4v',
   '.m4a',
+  '.m4b',
+  '.f4a',
+  '.f4b',
+  '.3gp',
+  '.3g2',
   '.mp3',
 ].join(',');
 

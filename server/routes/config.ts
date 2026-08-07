@@ -7,6 +7,7 @@ import { getEdition } from '../utils/edition.js';
 import { isNetworkLockEnabled } from '../utils/forcedNetwork.js';
 import { isPublicModeEnabled } from '../utils/publicMode.js';
 import { PROTOCOL_VERSION, MIN_PROTOCOL_VERSION } from '../protocol.js';
+import { previewsEnabled } from '../utils/previews.js';
 
 const router = Router();
 
@@ -30,6 +31,12 @@ router.get('/', (_req: Request, res: Response) => {
     publicMode: isPublicModeEnabled(),
     protocolVersion: PROTOCOL_VERSION,
     minProtocolVersion: MIN_PROTOCOL_VERSION,
+    // Feature flags. `linkPreviews` is off unless the operator opted in
+    // (LURKER_LINK_PREVIEWS); clients use it to hide the two user settings entirely rather than
+    // presenting toggles that can't do anything.
+    features: {
+      linkPreviews: previewsEnabled(),
+    },
   });
 });
 

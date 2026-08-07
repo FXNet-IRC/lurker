@@ -124,10 +124,9 @@
 
     <footer class="modal-footer">
       <!-- Primary actions only. Send DM is meaningless on yourself and while the
-           peer is offline (a DM would bounce), so it's hidden then. Add Friend
-           works regardless of presence — you can watch an offline peer — so it
-           isn't gated on isOffline. Everything else (Ignore, relay-bot toggle,
-           Refresh) lives in the More menu so the footer never crowds or wraps. -->
+           peer is offline (a DM would bounce), so it's hidden then. Everything
+           else (Ignore, relay-bot toggle, Refresh) lives in the More menu so the
+           footer never crowds or wraps. -->
       <button
         v-if="!isOffline && !isSelf"
         type="button"
@@ -136,16 +135,6 @@
         @click="onSendDm"
       >
         <i class="fa-solid fa-envelope"></i> <span class="label">Send DM</span>
-      </button>
-      <button
-        v-if="!isSelf"
-        type="button"
-        class="btn-secondary"
-        :title="isFriend ? 'Edit Friend' : 'Add Friend'"
-        @click="onAddFriend"
-      >
-        <i class="fa-solid fa-user-group"></i>
-        <span class="label">{{ isFriend ? 'Edit Friend' : 'Add Friend' }}</span>
       </button>
       <span class="spacer"></span>
       <button type="button" class="btn-secondary" title="More actions" @click="openMoreMenu">
@@ -171,7 +160,6 @@ import IgnoreModal from './IgnoreModal.vue';
 import { useWhoisStore } from '../stores/whois.js';
 import { useNickNotesStore } from '../stores/nickNotes.js';
 import { useRelayBotsStore } from '../stores/relayBots.js';
-import { useFriendsStore } from '../stores/friends.js';
 import { useContextMenu, type ContextMenuItem } from '../composables/useContextMenu.js';
 import { useNetworksStore } from '../stores/networks.js';
 import { useBuffersStore } from '../stores/buffers.js';
@@ -187,13 +175,11 @@ const props = defineProps<{
 const whoisStore = useWhoisStore();
 const nickNotes = useNickNotesStore();
 const relayBots = useRelayBotsStore();
-const friends = useFriendsStore();
 const contextMenu = useContextMenu();
 const networks = useNetworksStore();
 const buffers = useBuffersStore();
 const ignoreOpen = ref(false);
 
-const isFriend = computed(() => !!friends.contactForTarget(props.networkId, props.nick));
 const isRelay = computed(() => relayBots.isRelay(props.networkId, props.nick));
 
 const entry = computed(() => whoisStore.entryFor(props.networkId, props.nick));
@@ -375,12 +361,6 @@ function onIgnore() {
 
 function openNoteEditor() {
   nickNotes.openEditor(props.networkId, props.nick);
-}
-
-function onAddFriend() {
-  // Opens the Configure Friend modal on top of the profile (same as the note
-  // editor) — a sub-edit, so we don't close the viewer here.
-  friends.openEditorForNick(props.networkId, props.nick);
 }
 
 function onToggleRelay() {

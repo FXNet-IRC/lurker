@@ -5,6 +5,10 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+// Pure, no DB side effects — safe to import statically alongside the lazy
+// db-layer imports below.
+import { CONSOLIDATABLE_TYPES } from '../../shared/consolidate.js';
+import { NOISE_TYPES } from '../../shared/eventFilter.js';
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lurker-test-'));
 process.env.DATABASE_PATH = path.join(tmpDir, 'test.db');
@@ -14,8 +18,10 @@ let createNetwork: typeof import('./networks.js').createNetwork;
 let insertMessage: typeof import('./messages.js').insertMessage;
 let listMessages: typeof import('./messages.js').listMessages;
 let listMessagesAround: typeof import('./messages.js').listMessagesAround;
+let listMessagesCounted: typeof import('./messages.js').listMessagesCounted;
 let searchMessages: typeof import('./messages.js').searchMessages;
 let countNewer: typeof import('./messages.js').countNewer;
+let hasMoreThan: typeof import('./messages.js').hasMoreThan;
 let countServerBufferUnread: typeof import('./messages.js').countServerBufferUnread;
 let typeCountsForUnread: typeof import('./messages.js').typeCountsForUnread;
 let countHighlightsNewer: typeof import('./messages.js').countHighlightsNewer;
@@ -36,8 +42,10 @@ beforeAll(async () => {
     insertMessage,
     listMessages,
     listMessagesAround,
+    listMessagesCounted,
     searchMessages,
     countNewer,
+    hasMoreThan,
     countServerBufferUnread,
     typeCountsForUnread,
     countHighlightsNewer,
@@ -222,8 +230,11 @@ describe('listBufferTargets (loose-index-scan)', () => {
       chat(n, 'dave', 'dave', 'z');
     }
     chat(n, ':server:1', 'lurker', 'notice');
-    // Binary collation: '#'(0x23) < ':'(0x3A) < 'a' < 'd'.
-    expect(listBufferTargets(n)).toEqual(['#alpha', '#zeta', ':server:1', 'dave']);
+    // Binary collation: '#'(0x23) < ':'(0x3A) < 'a' < 'd'. The stray
+    // ':server:1' (a foreign network number, the shape a legacy import
+    // produces) resolves into THIS network's own server buffer — targets come
+    // back canonical from the registry, so the list reports :server:<n>.
+    expect(listBufferTargets(n)).toEqual(['#alpha', '#zeta', `:server:${n}`, 'dave']);
   });
 
   it('returns [] for a network with no messages', () => {
@@ -466,6 +477,30 @@ describe('searchMessages', () => {
 
     const hits = searchMessages(user.id, { query: 'ping', target: '#A' });
     expect(hits.map((m) => m.target)).toEqual(['#a']);
+  });
+
+  it('unscoped in: folds per network, not with one legacy fold (#707)', async () => {
+    // On an rfc1459 network '#chat[dev]' is stored under fold '#chat{dev}'.
+    // The unscoped search used to bind ONE legacy-folded string, which
+    // matches no per-network fold — zero results that look like missing data.
+    const user = createUser('search-refold');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'search-refold',
+    });
+    chat(net!.id, '#chat[dev]', 'alice', 'deploy went fine');
+    const { refoldNetworkBuffers } = await import('./refoldBuffers.js');
+    refoldNetworkBuffers(user.id, net!.id, 'rfc1459');
+
+    // Either bracket spelling finds it, with and without the network scope.
+    expect(searchMessages(user.id, { query: 'deploy', target: '#chat[dev]' })).toHaveLength(1);
+    expect(searchMessages(user.id, { query: 'deploy', target: '#chat{dev}' })).toHaveLength(1);
+    expect(
+      searchMessages(user.id, { query: 'deploy', target: '#chat[dev]', networkId: net!.id }),
+    ).toHaveLength(1);
   });
 
   it('filters by networkId (on:)', () => {
@@ -847,6 +882,64 @@ describe('messages.alt parity (insert result)', () => {
   });
 });
 
+describe('messages.msgid (#450)', () => {
+  it('round-trips through insertMessage → listMessages; absent when the row has none', () => {
+    const user = createUser('msgid-roundtrip');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'msgid-roundtrip',
+    });
+    insertMessage({
+      networkId: net!.id,
+      target: '#m',
+      time: new Date().toISOString(),
+      type: 'message',
+      nick: 'alice',
+      text: 'tagged',
+      self: false,
+      msgid: 'abc-123',
+    });
+    insertMessage({
+      networkId: net!.id,
+      target: '#m',
+      time: new Date().toISOString(),
+      type: 'message',
+      nick: 'bob',
+      text: 'untagged',
+      self: false,
+    });
+    const [tagged, untagged] = listMessages(net!.id, '#m');
+    expect(tagged.msgid).toBe('abc-123');
+    // Absent, not null — untagged backlogs must not grow a msgid field.
+    expect(untagged).not.toHaveProperty('msgid');
+  });
+
+  it('coerces an empty-string msgid to NULL so it is never stored or indexed', () => {
+    const user = createUser('msgid-empty');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'msgid-empty',
+    });
+    insertMessage({
+      networkId: net!.id,
+      target: '#m',
+      time: new Date().toISOString(),
+      type: 'message',
+      nick: 'alice',
+      text: 'empty tag',
+      self: false,
+      msgid: '',
+    });
+    expect(listMessages(net!.id, '#m')[0]).not.toHaveProperty('msgid');
+  });
+});
+
 describe('from_ignored excludes ignored senders from unread/highlight counts', () => {
   function chatWith(
     networkId: number,
@@ -1086,5 +1179,366 @@ describe('chathistory window queries', () => {
       100,
     );
     expect(targets.map((t) => t.target)).toEqual(['#b', '#a']); // #old outside window; :server:/#joinonly excluded
+  });
+});
+
+// A page sized in the unit the reader perceives (WS_PROTOCOL_FIXES #10). The
+// property under test throughout is the one that makes it safe to do at the
+// server: the result is a CONTIGUOUS id range, exactly like a listMessages
+// slice, so it can never open a hole in the client's scrollback.
+describe("listMessagesCounted unit: 'renderable'", () => {
+  function netFor(name: string): number {
+    const user = createUser(name);
+    return createNetwork(user.id, { name: 'n', host: 'h', port: 6697, tls: true, nick: name })!.id;
+  }
+
+  /** Every id in the buffer between the slice's ends, in order. */
+  function idRange(networkId: number, target: string, from: number, to: number): number[] {
+    return listMessages(networkId, target, { limit: 10_000 })
+      .map((e) => e.id)
+      .filter((id) => id >= from && id <= to);
+  }
+
+  /** Assert the slice is a gapless run of the buffer's ids. */
+  function expectContiguous(rows: Array<{ id: number }>, networkId: number, target: string): void {
+    expect(rows.length).toBeGreaterThan(0);
+    const ids = rows.map((r) => r.id);
+    expect(ids).toEqual(idRange(networkId, target, ids[0], ids[ids.length - 1]));
+  }
+
+  it('fills the page with renderable rows where an event-counted page would not', () => {
+    const net = netFor('rend-fill');
+    // 20 messages, each buried under a netsplit's worth of presence churn — the
+    // shape that made the client fetch, fold to nothing, and fetch again.
+    for (let i = 1; i <= 20; i += 1) {
+      for (let j = 0; j < 30; j += 1) event(net, '#a', 'join', `n${j}`);
+      chat(net, '#a', 'alice', `m${i}`);
+    }
+
+    const eventCounted = listMessages(net, '#a', { limit: 10 });
+    const renderable = listMessagesCounted(net, '#a', 'renderable', { limit: 10 });
+
+    // Today's page: ten rows, nine of them noise that folds into one line.
+    expect(eventCounted).toHaveLength(10);
+    expect(eventCounted.filter((e) => e.type === 'message')).toHaveLength(1);
+    // The new page: ten actual messages, with their runs along for the ride.
+    expect(renderable.filter((e) => e.type === 'message')).toHaveLength(10);
+    expectContiguous(renderable, net, '#a');
+  });
+
+  it('stops ON the limit-th renderable row, leaving its run to the next page', () => {
+    const net = netFor('rend-boundary');
+    for (let i = 1; i <= 5; i += 1) {
+      for (let j = 0; j < 4; j += 1) event(net, '#a', 'part', `n${j}`);
+      chat(net, '#a', 'alice', `m${i}`);
+    }
+    const rows = listMessagesCounted(net, '#a', 'renderable', { limit: 2 });
+    // Oldest row is the boundary message itself, not the joins that precede it:
+    // the next page picks that run up whole, so consolidation summarizes it once
+    // rather than splitting it across two pages.
+    expect(rows[0].type).toBe('message');
+    expect(rows[0].text).toBe('m4');
+    expect(rows.filter((e) => e.type === 'message').map((e) => e.text)).toEqual(['m4', 'm5']);
+  });
+
+  it('pages backward through `before` without a gap or an overlap', () => {
+    const net = netFor('rend-page');
+    for (let i = 1; i <= 12; i += 1) {
+      for (let j = 0; j < 3; j += 1) event(net, '#a', 'quit', `n${j}`);
+      chat(net, '#a', 'alice', `m${i}`);
+    }
+    const page1 = listMessagesCounted(net, '#a', 'renderable', { limit: 4 });
+    const page2 = listMessagesCounted(net, '#a', 'renderable', { limit: 4, before: page1[0].id });
+    expect(page1.filter((e) => e.type === 'message').map((e) => e.text)).toEqual([
+      'm9',
+      'm10',
+      'm11',
+      'm12',
+    ]);
+    expect(page2.filter((e) => e.type === 'message').map((e) => e.text)).toEqual([
+      'm5',
+      'm6',
+      'm7',
+      'm8',
+    ]);
+    // Joined end to end, the two pages are still one gapless run — the paging
+    // cursor is unchanged from the event-counted case (`before: oldest id`).
+    expectContiguous([...page2, ...page1], net, '#a');
+    expect(page2[page2.length - 1].id).toBeLessThan(page1[0].id);
+  });
+
+  it('pages forward through `afterId`, exclusive of the cursor', () => {
+    const net = netFor('rend-after');
+    const ids: number[] = [];
+    for (let i = 1; i <= 10; i += 1) {
+      for (let j = 0; j < 3; j += 1) event(net, '#a', 'join', `n${j}`);
+      ids.push(chat(net, '#a', 'alice', `m${i}`).id);
+    }
+    const rows = listMessagesCounted(net, '#a', 'renderable', { afterId: ids[2], limit: 3 });
+    expect(rows.every((r) => r.id > ids[2])).toBe(true);
+    expect(rows.filter((e) => e.type === 'message').map((e) => e.text)).toEqual(['m4', 'm5', 'm6']);
+    expectContiguous(rows, net, '#a');
+  });
+
+  it('returns the whole buffer when it holds fewer renderable rows than the limit', () => {
+    const net = netFor('rend-short');
+    for (let j = 0; j < 8; j += 1) event(net, '#a', 'join', `n${j}`);
+    chat(net, '#a', 'alice', 'only one');
+    const rows = listMessagesCounted(net, '#a', 'renderable', { limit: 100 });
+    expect(rows).toHaveLength(9);
+    expect(rows.filter((e) => e.type === 'message')).toHaveLength(1);
+  });
+
+  it('returns an all-noise buffer rather than an empty page', () => {
+    // No renderable row exists to spend the budget on. Returning [] here would
+    // read to a client as "start of history" and stop its pager dead.
+    const net = netFor('rend-allnoise');
+    for (let j = 0; j < 40; j += 1) event(net, '#a', 'join', `n${j}`);
+    const rows = listMessagesCounted(net, '#a', 'renderable', { limit: 100 });
+    expect(rows).toHaveLength(40);
+  });
+
+  it('returns an empty page for a buffer with nothing in it', () => {
+    const net = netFor('rend-empty');
+    expect(listMessagesCounted(net, '#nothing', 'renderable', { limit: 100 })).toEqual([]);
+  });
+
+  it('bounds the scan (and so the payload) at maxScan', () => {
+    // The whole safety story: a netsplit can put tens of thousands of joins
+    // between two sentences. Past the cap the page ships fewer renderable rows
+    // than asked and the caller's hasMoreOlder stays true — the pathological
+    // buffer degrades to today's behavior instead of a 50 MB frame.
+    const net = netFor('rend-cap');
+    for (let j = 0; j < 300; j += 1) event(net, '#a', 'join', `n${j}`);
+    chat(net, '#a', 'alice', 'the one message');
+    const rows = listMessagesCounted(net, '#a', 'renderable', { limit: 50, maxScan: 100 });
+    expect(rows).toHaveLength(100);
+    expect(rows.filter((e) => e.type === 'message')).toHaveLength(1);
+    expectContiguous(rows, net, '#a');
+    // Still contiguous with the tail, so the next page's cursor is valid.
+    expect(rows[rows.length - 1].text).toBe('the one message');
+  });
+
+  it('spends the budget on standalone lines that consolidation deliberately excludes', () => {
+    // kick/mode/topic each render as their own line — counting only
+    // message/action/notice would under-fill a buffer whose traffic is those.
+    const net = netFor('rend-standalone');
+    for (const type of ['kick', 'mode', 'topic', 'kick', 'mode']) {
+      event(net, '#a', type, 'alice');
+    }
+    const rows = listMessagesCounted(net, '#a', 'renderable', { limit: 2 });
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.type)).toEqual(['kick', 'mode']);
+  });
+
+  it('treats every type shared/consolidate folds — and only those — as free', () => {
+    // Drift guard: the server must fold on the EXACT set the clients fold on,
+    // or a page is sized in a unit nobody renders.
+    const net = netFor('rend-types');
+    for (const type of CONSOLIDATABLE_TYPES) event(net, '#a', type, 'alice');
+    const noiseCount = CONSOLIDATABLE_TYPES.size;
+    chat(net, '#a', 'alice', 'the only renderable row');
+
+    const rows = listMessagesCounted(net, '#a', 'renderable', { limit: 1 });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].text).toBe('the only renderable row');
+    // ...and asking for two pulls in the whole noise run behind it.
+    expect(listMessagesCounted(net, '#a', 'renderable', { limit: 2 })).toHaveLength(noiseCount + 1);
+  });
+});
+
+describe("listMessagesCounted unit: 'chat' (#666)", () => {
+  function netFor(name: string): number {
+    const user = createUser(name);
+    return createNetwork(user.id, { name: 'n', host: 'h', port: 6697, tls: true, nick: name })!.id;
+  }
+
+  it("delegates to the plain pager at unit 'event'", () => {
+    // 'event' has no scan pass to do — every stored row counts — so it must be
+    // indistinguishable from listMessages, cursor semantics included.
+    const net = netFor('unit-event');
+    for (let i = 1; i <= 6; i += 1) chat(net, '#a', 'alice', `m${i}`);
+    expect(listMessagesCounted(net, '#a', 'event', { limit: 3 })).toEqual(
+      listMessages(net, '#a', { limit: 3 }),
+    );
+  });
+
+  it('excludes mode rows from the budget where renderable would spend it', () => {
+    // The reason this unit exists: a reader on the `none` tier draws nothing for
+    // a mode row, so counting it hands them a page that renders short. An op
+    // handing out +v to a room is exactly the shape that produces this.
+    const net = netFor('unit-chat-mode');
+    for (let i = 1; i <= 10; i += 1) {
+      for (let j = 0; j < 5; j += 1) event(net, '#a', 'mode', `n${j}`);
+      chat(net, '#a', 'alice', `m${i}`);
+    }
+
+    const renderable = listMessagesCounted(net, '#a', 'renderable', { limit: 6 });
+    const chatUnit = listMessagesCounted(net, '#a', 'chat', { limit: 6 });
+
+    // 'renderable' counts modes as their own line, so six slots buy one message.
+    expect(renderable.filter((e) => e.type === 'message')).toHaveLength(1);
+    // 'chat' spends all six on messages.
+    expect(chatUnit.filter((e) => e.type === 'message')).toHaveLength(6);
+  });
+
+  it('still spends the budget on kicks, topics and invites', () => {
+    // The `none` tier hides churn, not events that carry information. If these
+    // were free the page would over-fetch on a buffer made mostly of them.
+    const net = netFor('unit-chat-standalone');
+    for (const type of ['kick', 'topic', 'invite', 'kick', 'topic']) {
+      event(net, '#a', type, 'alice');
+    }
+    const rows = listMessagesCounted(net, '#a', 'chat', { limit: 2 });
+    expect(rows.map((r) => r.type)).toEqual(['kick', 'topic']);
+  });
+
+  it('treats exactly NOISE_TYPES as free', () => {
+    // Drift guard, matching the renderable one above: the server must size the
+    // page in the same unit the client renders, or the whole exercise is moot.
+    const net = netFor('unit-chat-types');
+    for (const type of NOISE_TYPES) event(net, '#a', type, 'alice');
+    chat(net, '#a', 'alice', 'the only chat row');
+
+    const rows = listMessagesCounted(net, '#a', 'chat', { limit: 1 });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].text).toBe('the only chat row');
+    expect(listMessagesCounted(net, '#a', 'chat', { limit: 2 })).toHaveLength(NOISE_TYPES.size + 1);
+  });
+
+  it('returns an all-noise buffer rather than an empty page', () => {
+    // Same trap as the renderable case: [] reads to a client as "start of
+    // history" and stops its pager dead.
+    const net = netFor('unit-chat-allnoise');
+    for (let j = 0; j < 12; j += 1) event(net, '#a', 'mode', `n${j}`);
+    expect(listMessagesCounted(net, '#a', 'chat', { limit: 50 })).toHaveLength(12);
+  });
+
+  it('pages backward through `before` without a gap or an overlap', () => {
+    const net = netFor('unit-chat-page');
+    for (let i = 1; i <= 8; i += 1) {
+      event(net, '#a', 'mode', 'op');
+      event(net, '#a', 'join', `n${i}`);
+      chat(net, '#a', 'alice', `m${i}`);
+    }
+    const page1 = listMessagesCounted(net, '#a', 'chat', { limit: 3 });
+    const page2 = listMessagesCounted(net, '#a', 'chat', { limit: 3, before: page1[0].id });
+    expect(page1.filter((e) => e.type === 'message').map((e) => e.text)).toEqual([
+      'm6',
+      'm7',
+      'm8',
+    ]);
+    expect(page2.filter((e) => e.type === 'message').map((e) => e.text)).toEqual([
+      'm3',
+      'm4',
+      'm5',
+    ]);
+  });
+});
+
+describe('listMessagesAround countBy', () => {
+  it('sizes each side in renderable rows when asked', () => {
+    // A jump is a hydrate for any client that enters a buffer with a pending
+    // anchor (push tap, highlight, jump-to-first-unread), so an event-counted
+    // window lands them on the same near-blank screen (#10).
+    const user = createUser('around-renderable');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'me',
+    })!;
+    const ids: number[] = [];
+    for (let i = 1; i <= 20; i += 1) {
+      for (let j = 0; j < 10; j += 1) event(net.id, '#a', 'join', `n${j}`);
+      ids.push(chat(net.id, '#a', 'alice', `m${i}`).id);
+    }
+    const anchorId = ids[9]; // m10
+
+    const eventCounted = listMessagesAround(net.id, '#a', anchorId, 11);
+    const renderable = listMessagesAround(net.id, '#a', anchorId, 3, 'renderable');
+    const texts = (s: {
+      events: ReadonlyArray<{ type: string; text: string | null }>;
+    }): unknown[] => s.events.filter((e) => e.type === 'message').map((e) => e.text);
+
+    // 11 rows a side is one message either way — the churn ate the window.
+    expect(texts(eventCounted)).toEqual(['m9', 'm10', 'm11']);
+    // 3 renderable a side is three messages either way, anchor in the middle.
+    expect(texts(renderable)).toEqual(['m7', 'm8', 'm9', 'm10', 'm11', 'm12', 'm13']);
+    expect(renderable.events.find((e) => e.id === anchorId)).toBeDefined();
+    // Still one contiguous run, so the paging cursors either side stay valid.
+    const rendIds = renderable.events.map((e) => e.id);
+    expect(rendIds.at(-1)! - rendIds[0] + 1).toBe(rendIds.length);
+  });
+});
+
+describe('hasMoreThan (#469 resume-gap probe)', () => {
+  // The connect snapshot decides append-vs-replace on this one boolean, so its
+  // boundary IS the protocol decision: one off-by-one silently flips a gap-fill
+  // into a wholesale replace and throws away the client's scrollback.
+  const setup = (name: string) => {
+    const user = createUser(name);
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: name,
+    });
+    return net!.id;
+  };
+
+  it('is exclusive at the boundary: exactly `count` rows is NOT more than `count`', () => {
+    const net = setup('hmt-boundary');
+    const since = chat(net, '#b', 'a', 'cursor').id;
+    const ids = Array.from({ length: 10 }, (_, i) => chat(net, '#b', 'a', `m${i}`).id);
+    expect(hasMoreThan(net, '#b', since, 10)).toBe(false); // exactly 10 after
+    expect(hasMoreThan(net, '#b', since, 9)).toBe(true); // 10 > 9
+    chat(net, '#b', 'a', 'one more');
+    expect(hasMoreThan(net, '#b', since, 10)).toBe(true); // now 11
+    // Anchored on the CURSOR, not on the buffer's size.
+    expect(hasMoreThan(net, '#b', ids[4], 6)).toBe(false); // 6 rows after ids[4]
+    expect(hasMoreThan(net, '#b', ids[4], 5)).toBe(true);
+  });
+
+  it('counts only THIS buffer, since message ids are a global sequence', () => {
+    // The reason the probe uses OFFSET rather than id arithmetic. Interleaving a
+    // second buffer inflates the id span without adding rows here, so any
+    // `afterId + count` shortcut would report the gap as overflowed.
+    const net = setup('hmt-global-ids');
+    const since = chat(net, '#quiet', 'a', 'cursor').id;
+    for (let i = 0; i < 50; i++) chat(net, '#loud', 'a', `noise${i}`);
+    chat(net, '#quiet', 'a', 'only one more');
+    expect(hasMoreThan(net, '#quiet', since, 1)).toBe(false);
+    expect(hasMoreThan(net, '#quiet', since, 0)).toBe(true);
+    expect(hasMoreThan(net, '#loud', since, 49)).toBe(true);
+    expect(hasMoreThan(net, '#loud', since, 50)).toBe(false);
+  });
+
+  it('handles an empty gap, an unknown buffer, and a cursor past the tail', () => {
+    const net = setup('hmt-edges');
+    const tail = chat(net, '#e', 'a', 'only').id;
+    expect(hasMoreThan(net, '#e', tail, 0)).toBe(false); // nothing after the tail
+    expect(hasMoreThan(net, '#e', 0, 0)).toBe(true); // one row from the start
+    expect(hasMoreThan(net, '#e', tail + 1000, 0)).toBe(false); // cursor past the end
+    expect(hasMoreThan(net, '#nope', 0, 0)).toBe(false); // no such buffer
+  });
+
+  it('agrees with the read-then-measure test it replaced', () => {
+    // The probe exists to avoid READING the gap, so pin it against the thing it
+    // replaced: "the capped read filled up AND another row exists past its last".
+    // Any divergence here is a behaviour change wearing a performance label.
+    const net = setup('hmt-oracle');
+    const since = chat(net, '#o', 'a', 'cursor').id;
+    const CAP = 8;
+    for (let n = 0; n <= 12; n++) {
+      if (n > 0) chat(net, '#o', 'a', `m${n}`);
+      const gap = listMessages(net, '#o', { afterId: since, limit: CAP });
+      const lastGapId = gap.length ? gap[gap.length - 1].id : since;
+      const oracle =
+        gap.length >= CAP && listMessages(net, '#o', { afterId: lastGapId, limit: 1 }).length > 0;
+      expect(hasMoreThan(net, '#o', since, CAP)).toBe(oracle);
+    }
   });
 });

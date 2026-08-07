@@ -43,10 +43,53 @@ describe('update', () => {
     expect(!res.ok && res.key).toBe('look.font.weight');
   });
 
-  it('writing the registry default drops the override row', () => {
-    settingsService.update(user.id, { 'look.font.size': 20 });
+  it('writing the registry default drops the override row (non-themed key)', () => {
+    settingsService.update(user.id, { 'look.message.collapse_authors_window': 10 });
+    const res = settingsService.update(user.id, { 'look.message.collapse_authors_window': 5 });
+    expect(res.ok && res.values['look.message.collapse_authors_window']).toBeUndefined();
+  });
+
+  it('KEEPS a themed key written at its registry default', () => {
+    // Themed keys fall back to the active theme, not the registry default, so
+    // "set it to the default value" is a real override and must persist.
     const res = settingsService.update(user.id, { 'look.font.size': 14 });
+    expect(res.ok && res.values['look.font.size']).toBe(14);
+    settingsService.reset(user.id, 'look.font.size');
+  });
+
+  it('deletes keys named in resets, atomically with changes', () => {
+    settingsService.update(user.id, { 'look.font.size': 20 });
+    const res = settingsService.update(user.id, { 'look.theme.active': 'light' }, [
+      'look.font.size',
+    ]);
     expect(res.ok && res.values['look.font.size']).toBeUndefined();
+    expect(res.ok && res.values['look.theme.active']).toBe('light');
+    settingsService.reset(user.id, 'look.theme.active');
+  });
+
+  it('rejects an unknown reset key without persisting anything', () => {
+    settingsService.update(user.id, { 'look.font.size': 20 });
+    const res = settingsService.update(user.id, { 'look.font.size': 22 }, ['no.such.key']);
+    expect(res.ok).toBe(false);
+    const after = settingsService.update(user.id, {});
+    expect(after.ok && after.values['look.font.size']).toBe(20);
+    settingsService.reset(user.id, 'look.font.size');
+  });
+
+  it('emits both the legacy default-valued change and the explicit resets list for deletions', () => {
+    settingsService.update(user.id, { 'look.message.collapse_authors_window': 10 });
+    type EventPayload = { changes?: Record<string, unknown>; resets?: string[] };
+    let seen: EventPayload | null = null;
+    settingsService.once('event', (payload: EventPayload) => {
+      seen = payload;
+    });
+    // Writing the default back auto-drops this non-themed key: the event must
+    // carry { key: default } in changes (pre-resets frame shape) AND name the
+    // key in resets so new clients delete rather than store it.
+    settingsService.update(user.id, { 'look.message.collapse_authors_window': 5 });
+    expect(seen).not.toBeNull();
+    expect(seen!.changes!['look.message.collapse_authors_window']).toBe(5);
+    expect(seen!.resets).toContain('look.message.collapse_authors_window');
   });
 
   it('handles array values with the array-equality short-circuit', () => {

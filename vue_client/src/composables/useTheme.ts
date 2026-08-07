@@ -32,6 +32,45 @@ const COLOR_VARS: Record<string, string> = {
 
 let installed = false;
 
+// UA hint for scrollbars / form controls / system surfaces, derived from the
+// effective background rather than any theme metadata — a hand-picked palette
+// deserves the right chrome as much as the built-in Light theme does.
+// Perceived luminance (ITU-R BT.601) > 140 reads as a light surface.
+function schemeFromLuma(r: number, g: number, b: number): 'light' | 'dark' {
+  return 0.299 * r + 0.587 * g + 0.114 * b > 140 ? 'light' : 'dark';
+}
+
+// Hex fallback for environments where computed style is unavailable (jsdom).
+function colorSchemeFor(bg: string): 'light' | 'dark' {
+  const hex = /^#(?:([0-9a-f]{3})|([0-9a-f]{6}))$/i.exec(bg.trim());
+  if (!hex) return 'dark';
+  const digits = hex[2] ?? hex[1].replace(/./g, (c) => c + c);
+  const n = parseInt(digits, 16);
+  return schemeFromLuma((n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff);
+}
+
+// Color settings are free-text strings (the server accepts any string; the row
+// editor is a text input), so the background is NOT guaranteed to be hex —
+// 'white', 'rgb(252,252,250)', or an oklch() must still flip the chrome. Ask
+// the engine instead: the body paints `background: var(--bg)` (main.css), and
+// getComputedStyle resolves any color form to rgb()/rgba() synchronously,
+// including the vars this same watchEffect just wrote. Fall back to hex
+// parsing when there's no usable answer (jsdom, transparent).
+function computedColorScheme(fallbackBg: string): 'light' | 'dark' {
+  const resolved = document.body ? getComputedStyle(document.body).backgroundColor : '';
+  const m = /^rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+([\d.]+%?))?\s*\)$/.exec(
+    resolved || '',
+  );
+  if (m) {
+    // Numeric alpha, not a string compare: browsers canonically serialize a
+    // transparent computed color as `rgba(0, 0, 0, 0)`, but `0.0`/`0%` forms
+    // must fall through to the fallback too — their RGB is meaningless.
+    const alpha = m[4] === undefined ? 1 : parseFloat(m[4]) / (m[4].endsWith('%') ? 100 : 1);
+    if (alpha > 0) return schemeFromLuma(Number(m[1]), Number(m[2]), Number(m[3]));
+  }
+  return colorSchemeFor(fallbackBg);
+}
+
 export function useTheme(): void {
   if (installed) return;
   installed = true;
@@ -56,5 +95,6 @@ export function useTheme(): void {
       macSmoothing ? 'subpixel-antialiased' : 'auto',
     );
     root.style.setProperty('--font-smoothing-moz', 'auto');
+    root.style.colorScheme = computedColorScheme(String(settings.effective('look.color.bg')));
   });
 }

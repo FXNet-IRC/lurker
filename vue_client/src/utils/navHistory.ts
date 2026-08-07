@@ -10,8 +10,8 @@
 // networks.activeKey and to buffer activation.
 
 // Stack entries are activeKey strings exactly as networks.activeKey holds them:
-// `${networkId}::${target}` for real buffers, or a bare sentinel (:system:,
-// :friends:) for the virtual panes.
+// `${networkId}::${target}` for real buffers, or a bare sentinel (:system:)
+// for the virtual panes.
 export interface NavHistory {
   stack: string[];
   index: number; // cursor into stack; -1 when empty

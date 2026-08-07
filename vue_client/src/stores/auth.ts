@@ -3,7 +3,7 @@
 
 import { defineStore } from 'pinia';
 import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
-import { api } from '../api.js';
+import { api, clearAuthRecoveryGuard } from '../api.js';
 import { resetSession } from '../composables/useSessionReset.js';
 import { useConfigStore } from './config.js';
 
@@ -32,6 +32,12 @@ export interface Passkey {
   createdAt: string;
 }
 
+// Shared in-flight fetch so concurrent callers — the router guard and App.vue's
+// boot — coalesce onto one GET /api/auth/me instead of each spending a request
+// against the auth-surface rate limiter. Module-scoped (not store state) so it
+// stays non-reactive, matching the config store.
+let inflight: Promise<AuthUser | null> | null = null;
+
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     user: null as AuthUser | null,
@@ -53,21 +59,52 @@ export const useAuthStore = defineStore('auth', {
     isAdmin: (s): boolean => s.user?.role === 'admin',
   },
   actions: {
+    // Adopt a freshly-established session. Every sign-in / setup / invite path
+    // lands here rather than assigning `user` itself, so none of them can forget
+    // to re-arm api.ts's one-shot stale-session bounce: without the clear, a tab
+    // that bounced once and then signed in would never recover from a LATER
+    // session loss.
+    adoptSession(user: AuthUser) {
+      this.user = user;
+      this.checked = true;
+      clearAuthRecoveryGuard();
+    },
     // Live flip from the server's 'account-state' WS event, so an open tab
     // enters/leaves read-only without a reload.
     setPaused(paused: boolean) {
       if (this.user) this.user.is_paused = paused;
     },
     async fetchMe() {
+      if (inflight) return inflight; // a fetch is in flight — share its result
+      inflight = (async () => {
+        try {
+          const { user } = await api('/api/auth/me');
+          this.user = user;
+          this.checked = true;
+          // A live session is the ONLY thing that re-arms api.ts's one-shot
+          // stale-session bounce. Anything weaker (any 2xx) disarms it on a
+          // logged-out page and loops the tab — see clearAuthRecoveryGuard.
+          if (user) clearAuthRecoveryGuard();
+        } catch (err: any) {
+          // Only a 401 proves "not signed in". A network blip, a 5xx, or a 429
+          // from the auth-surface limiter says nothing about the session — and
+          // since the guard and App.vue now share one coalesced call, a page
+          // load gets exactly one attempt. Latching `checked` on those would
+          // strand a signed-in user at /login?next=/ for the whole document off
+          // a single blip. Leave it false so a later navigation retries, the
+          // same self-heal the config store uses.
+          if (err?.status === 401) {
+            this.user = null;
+            this.checked = true;
+          }
+        }
+        return this.user;
+      })();
       try {
-        const { user } = await api('/api/auth/me');
-        this.user = user;
-      } catch (_err) {
-        this.user = null;
+        return await inflight;
       } finally {
-        this.checked = true;
+        inflight = null;
       }
-      return this.user;
     },
     // On a hosted cell the account's real identity — its email — lives on the
     // control plane; the cell only knows a synthetic `acct-N` username. This
@@ -106,8 +143,7 @@ export const useAuthStore = defineStore('auth', {
           method: 'POST',
           body: { response },
         });
-        this.user = user;
-        this.checked = true;
+        this.adoptSession(user);
         return user as AuthUser;
       } catch (err: any) {
         this.error = friendlyError(err, 'login failed');
@@ -126,8 +162,7 @@ export const useAuthStore = defineStore('auth', {
           method: 'POST',
           body: { response },
         });
-        this.user = user;
-        this.checked = true;
+        this.adoptSession(user);
         this.setupStatus = { needsSetup: false };
         return user as AuthUser;
       } catch (err: any) {
@@ -145,8 +180,7 @@ export const useAuthStore = defineStore('auth', {
           method: 'POST',
           body: { username, password },
         });
-        this.user = user;
-        this.checked = true;
+        this.adoptSession(user);
         this.setupStatus = { needsSetup: false };
         return user as AuthUser;
       } catch (err: any) {
@@ -161,8 +195,7 @@ export const useAuthStore = defineStore('auth', {
           method: 'POST',
           body: { username, password },
         });
-        this.user = user;
-        this.checked = true;
+        this.adoptSession(user);
         return user as AuthUser;
       } catch (err: any) {
         this.error = friendlyError(err, 'login failed');
@@ -247,8 +280,7 @@ export const useAuthStore = defineStore('auth', {
         // onclose reconnect arm sees no user (matches the logout pattern).
         this.user = null;
         resetSession();
-        this.user = user;
-        this.checked = true;
+        this.adoptSession(user);
         return user as AuthUser;
       } catch (err: any) {
         this.error = friendlyError(err, 'invite redemption failed');
@@ -268,8 +300,7 @@ export const useAuthStore = defineStore('auth', {
         });
         this.user = null;
         resetSession();
-        this.user = user;
-        this.checked = true;
+        this.adoptSession(user);
         return user as AuthUser;
       } catch (err: any) {
         this.error = friendlyError(err, 'invite redemption failed');

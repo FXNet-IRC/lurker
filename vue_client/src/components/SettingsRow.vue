@@ -6,7 +6,7 @@
 <template>
   <li
     class="row"
-    :class="{ modified }"
+    :class="{ modified, inactive: !!hint }"
     :data-setting-key="opt.key"
     :title="modified ? 'modified from default' : ''"
   >
@@ -26,6 +26,7 @@
         <input
           type="checkbox"
           :checked="!!value"
+          :disabled="!!hint"
           @change="$emit('commit', ($event.target as HTMLInputElement).checked)"
         />
         <span>{{ value ? 'on' : 'off' }}</span>
@@ -36,26 +37,37 @@
         :min="opt.min"
         :max="opt.max"
         :value="value"
+        :disabled="!!hint"
         @change="$emit('commit', Number(($event.target as HTMLInputElement).value))"
       />
       <select
         v-else-if="opt.type === 'enum'"
         :value="value"
+        :disabled="!!hint"
         @change="$emit('commit', ($event.target as HTMLSelectElement).value)"
       >
-        <option v-for="c in opt.choices" :key="c" :value="c">{{ c }}</option>
+        <!--
+          `choiceLabels` is optional: an enum whose values already read as
+          English (auto / standard / compact) renders them raw, and one whose
+          values are ids gets prose without those ids having to change.
+        -->
+        <option v-for="c in opt.choices" :key="c" :value="c">
+          {{ opt.choiceLabels?.[c] ?? c }}
+        </option>
       </select>
       <span v-else-if="opt.type === 'color'" class="color-edit">
         <span class="swatch" :style="{ background: value as string }"></span>
         <input
           type="text"
           :value="value"
+          :disabled="!!hint"
           @change="$emit('commit', ($event.target as HTMLInputElement).value)"
         />
       </span>
       <textarea
         v-else-if="opt.type === 'string-list'"
         :value="(Array.isArray(value) ? value : []).join('\n')"
+        :disabled="!!hint"
         @change="
           $emit(
             'commit',
@@ -73,6 +85,7 @@
           autocomplete="off"
           spellcheck="false"
           :value="value"
+          :disabled="!!hint"
           @change="$emit('commit', ($event.target as HTMLInputElement).value)"
         />
         <button type="button" class="link reveal" @click="revealed = !revealed">
@@ -83,11 +96,19 @@
         v-else
         type="text"
         :value="value"
+        :disabled="!!hint"
         @change="$emit('commit', ($event.target as HTMLInputElement).value)"
       />
     </div>
+    <!--
+      Why this row is greyed out, and which setting to change to wake it up.
+      The value behind it is untouched — see optionEnabled() — so flipping the
+      dependency back restores exactly what was here.
+    -->
+    <p v-if="hint" class="dep-hint">{{ hint }}</p>
     <div v-if="modified" class="default-line">
-      default: <code>{{ formatDefault(opt) }}</code>
+      default:
+      <code>{{ formatDefault(opt, baseline !== undefined ? baseline : opt.default) }}</code>
     </div>
   </li>
 </template>
@@ -101,10 +122,25 @@ withDefaults(
     opt: SettingOption;
     value?: SettingValue;
     modified?: boolean;
+    /**
+     * What resetting this row would restore. Defaults to `opt.default`, but a
+     * themed key under a non-default theme resets to the THEME's value — the
+     * annotation must advertise the value reset actually produces, so the
+     * caller passes the resolved baseline (settings.baseline(key)).
+     */
+    baseline?: SettingValue;
+    /**
+     * Non-empty when the setting's `dependsOn` clauses don't currently hold:
+     * the explanation to show, and the flag that greys the editor out. Empty
+     * (the default) for an ordinary live row.
+     */
+    hint?: string;
   }>(),
   {
     value: undefined,
     modified: false,
+    baseline: undefined,
+    hint: '',
   },
 );
 
@@ -115,10 +151,13 @@ defineEmits<{
 
 const revealed = ref(false);
 
-function formatDefault(opt: SettingOption): string {
-  const v = opt.default;
+function formatDefault(opt: SettingOption, v: SettingValue): string {
   if (Array.isArray(v)) return v.join(', ');
   if (typeof v === 'boolean') return v ? 'on' : 'off';
+  // Same lookup the <select> does. This line exists to tell the user what they
+  // changed away from, so it has to name it the way the control does — showing
+  // the id here while the dropdown above shows prose reads as a different value.
+  if (opt.type === 'enum') return opt.choiceLabels?.[String(v)] ?? String(v);
   return String(v);
 }
 </script>
@@ -144,6 +183,19 @@ function formatDefault(opt: SettingOption): string {
 }
 .row.modified .headline {
   color: var(--warn);
+}
+
+/* Dimmed, not hidden: an inactive setting still tells the reader it exists and
+   what it would do, which is how they learn the tier controls it. */
+.row.inactive .headline,
+.row.inactive .desc,
+.row.inactive .editor {
+  opacity: 0.55;
+}
+.dep-hint {
+  margin: 0;
+  color: var(--fg-muted);
+  font-style: italic;
 }
 
 .head {

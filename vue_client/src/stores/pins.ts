@@ -3,6 +3,7 @@
 
 import { defineStore } from 'pinia';
 import { socketSend } from '../composables/useSocket.js';
+import { idFor } from './buffers.js';
 
 // Pinned buffers per network, in user-controlled order. The server is the
 // source of truth: mutations send a WS message and wait for the `pins-changed`
@@ -29,13 +30,34 @@ export const usePinsStore = defineStore('pins', {
       this.byNetwork = next;
     },
     pin(networkId: number | string, target: string) {
-      socketSend({ type: 'pin-buffer', networkId, target });
+      socketSend({ type: 'pin-buffer', networkId, target, bufferId: idFor(networkId, target) });
     },
     unpin(networkId: number | string, target: string) {
-      socketSend({ type: 'unpin-buffer', networkId, target });
+      socketSend({ type: 'unpin-buffer', networkId, target, bufferId: idFor(networkId, target) });
     },
     reorder(networkId: number | string, targets: string[]) {
       socketSend({ type: 'reorder-pins', networkId, targets });
+    },
+    // Lifecycle hooks (lib/bufferLifecycle.ts). Belt-and-suspenders for pins:
+    // the server's pins-changed echo is authoritative, but the sweep keeps the
+    // local mirror honest in the gap.
+    dropBuffer(networkId: number | string | null, target: string) {
+      if (networkId == null) return;
+      const list = this.byNetwork[networkId];
+      if (list?.includes(target)) {
+        this.byNetwork[networkId] = list.filter((t) => t !== target);
+      }
+    },
+    rekeyBuffer(networkId: number | string | null, from: string, to: string) {
+      if (networkId == null) return;
+      const list = this.byNetwork[networkId];
+      if (!list?.includes(from)) return;
+      // Destination wins on a rename/merge collision (matching the buffers
+      // store): if `to` is already pinned, mapping `from` onto it would
+      // duplicate the entry — drop the source pin instead.
+      this.byNetwork[networkId] = list.includes(to)
+        ? list.filter((t) => t !== from)
+        : list.map((t) => (t === from ? to : t));
     },
   },
 });

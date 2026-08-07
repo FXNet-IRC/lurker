@@ -7,6 +7,9 @@ import type { WebSocket } from 'ws';
 import type { User } from '../db/users.js';
 import type { LogLine } from './systemLog.js';
 import type { MessageEvent } from '../db/messages.js';
+import type { PageUnit } from '../../shared/eventFilter.js';
+import { asPageUnit } from '../../shared/eventFilter.js';
+import { isChannelTarget } from '../../shared/channels.js';
 import { WebSocketServer } from 'ws';
 import cookie from 'cookie';
 import cookieParser from 'cookie-parser';
@@ -15,6 +18,7 @@ import type { IrcConnection } from './ircConnection.js';
 import { e2eManager } from './e2e/manager.js';
 import { MAX_IMPORT_BYTES } from './e2e/portable.js';
 import settingsService from './settingsService.js';
+import themesService from './themesService.js';
 import highlightRulesService from './highlightRulesService.js';
 import draftsService from './draftsService.js';
 import * as systemLog from './systemLog.js';
@@ -27,11 +31,14 @@ import { findUserById, touchUserLastSeen, deleteUser } from '../db/users.js';
 import { setClientIpForAllUserNetworks } from '../db/networks.js';
 import { clientIpFromHeaders, shouldTrustProxy } from '../utils/clientIp.js';
 import { isPublicModeEnabled, guestDisconnectGraceSeconds } from '../utils/publicMode.js';
+import { effectiveUploadCapBytes } from './uploadLimits.js';
 import {
   listMessages,
+  listMessagesCounted,
   listMessagesAround,
   hasOlderRow,
   hasNewerRow,
+  hasMoreThan,
   hasMessageForTarget,
   listSpeakers,
   countNewer,
@@ -71,24 +78,33 @@ import {
   setAutojoin as setBufferAutojoin,
   listStatesForUser as listBufferStatesForUser,
   kindForTarget,
+  foldTargetFor,
 } from '../db/buffers.js';
+import { resolveBuffer, requireBufferForUser } from '../db/bufferResolve.js';
+import { getDraftForBuffer } from '../db/drafts.js';
 import type { BufferStateRow } from '../db/buffers.js';
 import {
   pinBuffer,
   unpinBuffer,
   unpinBufferCaseInsensitive,
   reorderPins,
-  listPinnedForUserNetwork,
+  listPinnedWithIds,
 } from '../db/pinnedBuffers.js';
+import {
+  favoriteBuffer,
+  unfavoriteBuffer,
+  reorderFavorites,
+  listFavoritesForUser,
+  isFavoriteDmPeer,
+} from '../db/favoriteBuffers.js';
 import { setNicklistCollapsed } from '../db/nicklistCollapsed.js';
-import { addBookmark, removeBookmark, listBookmarkIdsForUser } from '../db/bookmarks.js';
+import { addBookmark, removeBookmark } from '../db/bookmarks.js';
 import {
   getChannelNotifyAlways,
   setChannelNotifyAlways,
   getChannelFlags,
 } from '../db/channelNotify.js';
 import { getUserAwayState } from '../db/userAwayState.js';
-import { findNotifyContactForTarget } from '../db/contacts.js';
 import { ownsNetwork, listNetworksForUser } from '../db/networks.js';
 import * as chanlistDb from '../db/chanlist.js';
 import { getUserSettings } from '../db/settings.js';
@@ -112,6 +128,11 @@ interface LurkerWebSocket extends WebSocket {
   // visible=true) and userHasVisibleClient() stays true forever, permanently
   // suppressing auto-away.
   isAlive?: boolean;
+  // The current no-progress streak on this socket's outbound queue, or undefined
+  // when it isn't over MAX_BUFFERED_BYTES. `since` is when the streak began,
+  // `at` when we last looked, `floor` the lowest bufferedAmount seen during it.
+  // See dropIfBackpressured for why all three are needed.
+  backpressure?: { since: number; at: number; floor: number };
   // Mirrors the account's is_paused at connect time, then flipped live by the
   // user-suspended / user-resumed handlers so the read-only write guard never
   // needs a per-message DB read. (Named accountPaused, not isPaused, to avoid
@@ -245,6 +266,42 @@ export function parseProtocolParam(rawUrl: string): number | null {
 
 // Generic payload for outgoing WS messages.
 type WsPayload = Record<string, unknown>;
+
+// How a client must fold a `backlog` frame's `events` into what it already
+// holds for that buffer. Shipped on EVERY backlog frame as of #668.
+//
+// Why this exists: the frame used to carry only `reset`, a boolean that wasn't
+// one. `reset:false` meant "append this gap" on a resume, but "replace with
+// this slice" on a fresh connect and on the system buffer — three meanings, two
+// values, disambiguated by reading a DIFFERENT field (`networkId`) and by
+// out-of-band knowledge of whether the socket sent `?since`. Both first-party
+// clients derived it differently (iOS branched on networkId; the web client
+// inferred from id non-overlap), and a third-party author had no way to get it
+// right from the wire alone. The server always knew which slice it built; it
+// just never said so.
+//
+//   'replace' — this slice stands alone; it is authoritative for the range it
+//               covers and is NOT contiguous with your tail. (Resume-gap
+//               overflow, fresh connect, an open-buffer/reopen hydrate, the
+//               system buffer.) The invariant is "don't create a hole", not
+//               "destroy everything": a client MAY keep older rows it already
+//               holds when the incoming slice OVERLAPS them, and must replace
+//               wholesale when it doesn't. That distinction matters because the
+//               system buffer and offline :server: buffers ship a replace frame
+//               on EVERY snapshot — reading this as unconditional truncation
+//               throws away the user's paged-in scrollback each resync. See
+//               CLIENT_PROTOCOL.md §8 rule 5.
+//   'append'  — a contiguous gap-fill; splice onto your existing tail.
+//   'shell'   — buffer EXISTS but no events are shipped (`events: []`). Do NOT
+//               treat this as replace-with-empty: a shell for a buffer you have
+//               already hydrated must leave its contents alone (the "never
+//               un-hydrate" rule). Fetch content when the user opens it.
+//
+// `reset` is still sent wherever it was sent before, unchanged, for clients that
+// predate this field — note that's only the resume/system frames; shells and
+// open-buffer replies have never carried it. New clients should read `mode` and
+// ignore `reset` entirely.
+export type BacklogMode = 'replace' | 'append' | 'shell';
 
 // Inbound message types that mutate IRC state or produce outbound IRC traffic.
 // A paused account is read-only, so these are rejected while reads (snapshot,
@@ -412,12 +469,41 @@ export function reopensClosedBuffer(type: string, id: unknown): boolean {
 // DMs. Shared by isDirect (event path) and computeUnreadFor (read-state counts)
 // so the two never drift on what counts as a DM.
 function isDmTarget(target: string): boolean {
-  return !!target && !target.startsWith('#') && !target.startsWith(':server:');
+  return !!target && !isChannelTarget(target) && !target.startsWith(':server:');
 }
 
 function isDirect(event: MessageEvent): boolean {
   if (!DM_ELIGIBLE_TYPES.has(event.type)) return false;
   return isDmTarget(event.target || '');
+}
+
+// The user's ignore verdict for an event, off the cached compiled rule set (no
+// DB scan per event). Shared by decorateMessage's notify fold, the push gate,
+// and the closed-buffer reopen guard. Evaluates even for a nick-less event so a
+// scope mute (mask null — a muted channel/network) still vetoes it; a
+// sender-specific rule simply won't match a null nick.
+function ignoreVerdictForEvent(
+  userId: number,
+  networkId: number,
+  ev: {
+    nick?: string | null;
+    userhost?: string | null;
+    target: string;
+    text?: string | null;
+    type: string;
+    isDm: boolean;
+  },
+): IgnoreVerdict {
+  const compiled = ignoreRulesService.getCompiled(userId, networkId);
+  if (!compiled.length) return { hide: false, nohilight: false, nonotify: false };
+  return evaluateIgnores(compiled, {
+    nick: ev.nick ?? null,
+    userhost: ev.userhost ?? null,
+    target: ev.target,
+    text: ev.text ?? '',
+    type: ev.type,
+    isDm: ev.isDm,
+  });
 }
 
 // Match state is persisted on each message at insert time (see
@@ -426,16 +512,64 @@ function isDirect(event: MessageEvent): boolean {
 // backlog reads. This decoration adds the per-broadcast `dm` and
 // `notifyAlways` content signals and the derived `notify` delivery decision,
 // and normalizes the match fields so non-persisted events (typing, names,
-// etc.) don't surface as undefined. Content signals stay separate on the
-// wire so clients can route toast/sound per signal type; `notify` is the
-// union and is the single gate consulted by push delivery and the in-client
-// notifier.
-export function decorateMessage(userId: number, event: MessageEvent): DecoratedEvent {
+// etc.) don't surface as undefined. The raw content signals stay separate on
+// the wire so clients can route toast/sound per signal type; `notify` is the
+// authoritative delivery gate — the union of those signals WITH the ignore/mute
+// veto folded in (see below), consulted by push delivery and by every live
+// client (web toast, native buzz).
+/**
+ * Whether a target can carry a notify-always setting at all.
+ *
+ * ONE definition, consulted by `decorateMessage`'s per-event guard and by `bufferNotifyAlways`
+ * below, so the guard and the hoisted lookup cannot drift into disagreeing — which would show up
+ * either as a query nothing reads, or as a hoisted answer the guard then throws away.
+ */
+function notifyAlwaysApplies(target: string): boolean {
+  // ⚠ All four channel prefixes, not just `#` (#724). `set-channel-notify-always` has accepted
+  // any of them since it moved to `kindForTarget`, so a `#`-only test here meant the setting
+  // could be STORED for an `&`/`+`/`!` channel and then never consulted when a message arrived —
+  // the toggle looked on and did nothing.
+  return isChannelTarget(target);
+}
+
+/**
+ * The notify-always answer for a whole single-buffer slice, or `undefined` when the target can't
+ * have one.
+ *
+ * ⚠ The guard matters as much as the hoist. `decorateMessage` short-circuits before the query for
+ * DMs and `:server:` buffers, so hoisting unconditionally would turn ZERO queries into one for
+ * exactly those slices — making the common DM backlog slower, not faster, in the name of a
+ * speedup. `undefined` keeps the per-event guard the authority: the `??` it feeds is only ever
+ * reached once `isChannel` has already passed, so it can never trigger the query it replaced.
+ */
+export function bufferNotifyAlways(
+  userId: number,
+  networkId: number,
+  target: string,
+): boolean | undefined {
+  return notifyAlwaysApplies(target)
+    ? getChannelNotifyAlways(userId, networkId, target)
+    : undefined;
+}
+
+// `channelNotifyAlways` lets a caller that decorates MANY rows of ONE buffer
+// pass the notify-always answer in, instead of paying a DB point query per row
+// for a value that's constant across the slice (#679 — 52k lookups / 51.9ms on
+// a 104-buffer resume, vs 19 lookups / 0.047ms hoisted). Only the DB answer is
+// hoisted; the per-event guards below (CTCP, self, channel) still run per row.
+// Omit it on the single-event live path, which is what the function was written
+// for, and on any slice spanning multiple buffers (search results) where the
+// answer genuinely varies per row.
+export function decorateMessage(
+  userId: number,
+  event: MessageEvent,
+  channelNotifyAlways?: boolean,
+): DecoratedEvent {
   const matched = !!event.matched;
   const matchedRuleId = event.matchedRuleId ?? null;
   const dm = isDirect(event) && !event.self;
   const target = event.target || '';
-  const isChannel = target.startsWith('#');
+  const isChannel = notifyAlwaysApplies(target);
   // CTCP request/reply/echo lines are status, not conversation — never notify,
   // even when routed to a notify-always channel (otherwise running /ctcp from
   // such a channel would self-notify on your own echo). (#263)
@@ -444,8 +578,35 @@ export function decorateMessage(userId: number, event: MessageEvent): DecoratedE
     !isStatus &&
     isChannel &&
     !event.self &&
-    getChannelNotifyAlways(userId, event.networkId, target);
-  const notify = !isStatus && (matched || dm || notifyAlways);
+    // `??`, not `||`: a hoisted `false` is a real answer and must not fall
+    // through to the query it was computed to replace.
+    (channelNotifyAlways ?? getChannelNotifyAlways(userId, event.networkId, target));
+  // Content says this line is notification-worthy: a highlight, a DM, or a
+  // notify-always channel.
+  const contentNotify = !isStatus && (matched || dm || notifyAlways);
+  // Fold the ignore/mute veto into `notify` so it is the single authoritative
+  // "alert the user" gate every consumer can trust — push, the web toast, and
+  // native clients all read this one flag instead of each re-deriving the
+  // verdict (a per-channel mute leaked through to native clients that trusted
+  // `notify`; issue #359). The predicate mirrors the push path exactly: a
+  // hide-level or NONOTIFY rule suppresses; a NOHIGHLIGHT rule does NOT — it's
+  // display-only (decideStamp already nulled `matched`, and the message stays
+  // visible and counted). Recomputed per serve off the cached compiled rules,
+  // so /unignore reveals reactively. Only pay for the verdict when the content
+  // is otherwise notify-worthy — most backlog rows aren't, so history serves
+  // stay cheap.
+  let notify = contentNotify;
+  if (contentNotify) {
+    const verdict = ignoreVerdictForEvent(userId, event.networkId, {
+      nick: event.nick,
+      userhost: event.userhost,
+      target,
+      text: event.text,
+      type: event.type,
+      isDm: dm,
+    });
+    if (verdict.hide || verdict.nonotify) notify = false;
+  }
   return {
     ...event,
     matched,
@@ -512,6 +673,9 @@ function computeUnreadFor(
 export interface UserBufferTarget {
   networkId: number | null; // null == the app-scoped system buffer
   target: string;
+  // buffers(id) — null only for the defensive no-row yield (a live-joined
+  // channel the registry forgot mid-session).
+  bufferId: number | null;
   conn: IrcConnection | null; // the live connection, or null (offline / system)
 }
 
@@ -536,30 +700,62 @@ export interface UserBufferTarget {
 // never-spoken empty buffer is still enumerated — the client counts it from
 // lastReadId 0, and callers use getReadState (defaults to 0) the same way.
 export function* eachUserBufferTarget(userId: number): Generator<UserBufferTarget> {
-  // System buffer first — app-scoped (networkId null), uncloseable.
-  yield { networkId: null, target: SYSTEM_TARGET, conn: null };
   const liveById = new Map<number, IrcConnection>(
     ircManager.listConnections(userId).map((c) => [c.network.id, c]),
   );
+  // One pass over the registry sorts rows into per-network lists AND harvests
+  // the sentinel row ids — the walk yields sentinels in their own fixed slots,
+  // so their registry copies are skipped from the lists but their ids ride
+  // along rather than costing a resolve per network.
+  let systemBufferId: number | null = null;
+  const serverBufferIdByNetwork = new Map<number, number>();
   const rowsByNetwork = new Map<number, BufferStateRow[]>();
   for (const row of listBufferStatesForUser(userId)) {
-    if (row.networkId == null) continue; // app-scoped rows are synthesized above
+    if (row.networkId == null) {
+      if (row.target === SYSTEM_TARGET) systemBufferId = row.id;
+      continue; // app-scoped rows are yielded in the fixed slot below
+    }
+    if (row.target.startsWith(':')) {
+      if (row.target === `:server:${row.networkId}`) {
+        serverBufferIdByNetwork.set(row.networkId, row.id);
+      }
+      continue;
+    }
     let list = rowsByNetwork.get(row.networkId);
     if (!list) rowsByNetwork.set(row.networkId, (list = []));
     list.push(row);
   }
+  // System buffer first — app-scoped (networkId null), uncloseable.
+  yield { networkId: null, target: SYSTEM_TARGET, bufferId: systemBufferId, conn: null };
   for (const net of listNetworksForUser(userId)) {
     const conn = liveById.get(net.id) ?? null;
-    yield { networkId: net.id, target: `:server:${net.id}`, conn };
+    yield {
+      networkId: net.id,
+      target: `:server:${net.id}`,
+      bufferId: serverBufferIdByNetwork.get(net.id) ?? null,
+      conn,
+    };
+    // One folded view of the live channel set per network: both probes below
+    // compare against registry folds (per-network since #707), and the
+    // channels map's own keys are legacy-lowercased wire names, which diverge
+    // from those folds on a declared network ('#a[b]' joined vs '#a{b}'
+    // stored). Probing the map raw double-yielded the bracket variants.
+    const joinedFolded = conn
+      ? new Set(Array.from(conn.channels.values(), (ch) => foldTargetFor(net.id, ch.name)))
+      : undefined;
     const seen = new Set<string>();
     for (const row of rowsByNetwork.get(net.id) ?? []) {
       seen.add(row.targetFolded);
-      if (row.state === 'closed' && !conn?.channels.has(row.targetFolded)) continue;
-      yield { networkId: net.id, target: row.target, conn };
+      if (row.state === 'closed' && !joinedFolded?.has(row.targetFolded)) continue;
+      yield { networkId: net.id, target: row.target, bufferId: row.id, conn };
     }
     if (conn) {
       for (const ch of conn.channels.values()) {
-        if (!seen.has(ch.name.toLowerCase())) yield { networkId: net.id, target: ch.name, conn };
+        if (!seen.has(foldTargetFor(net.id, ch.name))) {
+          // Defensive: a live-joined channel whose row was forgotten
+          // mid-session — genuinely no id to carry.
+          yield { networkId: net.id, target: ch.name, bufferId: null, conn };
+        }
       }
     }
   }
@@ -594,11 +790,17 @@ export function computeTotalHighlights(userId: number): number {
 // dimmed). `conn` is optional — an offline network passes none, which folds a
 // #channel to parted. Centralized so the four snapshot/backlog sites can't drift
 // (channel-case folding already bit this codebase — see #289/#269).
-function channelJoined(
-  target: string,
-  conn?: { channels: { has(name: string): boolean } } | null,
-): boolean {
-  return target.startsWith('#') ? !!conn?.channels.has(target.toLowerCase()) : true;
+function channelJoined(target: string, conn?: JoinedProbe | null): boolean {
+  return isChannelTarget(target) ? !!conn?.isChannelJoined(target) : true;
+}
+
+// The one membership surface (IrcConnection.isChannelJoined): fold-aware per
+// the network's declared CASEMAPPING, so a refold-merged registry spelling
+// still reads joined, and a Unicode case-twin on an ascii network doesn't.
+// Never probe conn.channels with `.has(x.toLowerCase())` here — the map is
+// keyed by legacy-lowercased wire names, which is the pre-#707 rule.
+interface JoinedProbe {
+  isChannelJoined(name: string): boolean;
 }
 
 // The per-buffer read/unread/cleared block shared by every backlog frame
@@ -615,8 +817,12 @@ function bufferStateFields(
   precomputed?: {
     lastReadId?: number;
     cleared?: { clearedBeforeId: number; clearedAt: string | null };
+    /** The buffer's id when the caller already holds it (the snapshot walk
+     *  carries it); otherwise resolved here — one idx_buffers_key seek. */
+    bufferId?: number | null;
   },
 ): {
+  bufferId: number | null;
   lastReadId: number;
   unread: number;
   highlights: number;
@@ -624,10 +830,18 @@ function bufferStateFields(
   clearedBeforeId: number;
   clearedAt: string | null;
 } {
+  // `bufferId` rides every backlog variant: the connect burst doubles as the
+  // client's id⇄name directory (docs/CLIENT_PROTOCOL.md §5.2). null only for
+  // the defensive no-row case (a live-joined channel the registry forgot).
+  const bufferId =
+    precomputed?.bufferId !== undefined
+      ? precomputed.bufferId
+      : (resolveBuffer(userId, networkId, target)?.id ?? null);
   const lastReadId = precomputed?.lastReadId ?? getReadState(userId, networkId, target);
   const counts = computeUnreadFor(userId, networkId, target, lastReadId);
   const cleared = precomputed?.cleared ?? getClearedState(userId, networkId, target);
   return {
+    bufferId,
     lastReadId: counts.lastReadId,
     unread: counts.unread,
     highlights: counts.highlights,
@@ -641,16 +855,41 @@ function bufferStateFields(
 // buffer is reopened (the user clicked its channel name). Unlike the snapshot
 // loop this ignores the resume cursor and always ships the recent slice; the
 // client dedupes by id, so it's safe even if the buffer is already open.
-export function buildBufferBacklog(userId: number, networkId: number, target: string): WsPayload {
+// `countBy` is the same knob `history` carries (#10) and matters for the same
+// reason: for a client that hydrates with `open-buffer` rather than
+// `{mode:'latest'}` — iOS does — this frame IS the first screenful, so sizing it
+// in stored rows is what leaves a netsplit-heavy channel looking blank on open.
+// Defaults to 'event' so the snapshot's offline `:server:` frames (which have no
+// caller to ask) are untouched.
+export function buildBufferBacklog(
+  userId: number,
+  networkId: number,
+  target: string,
+  countBy: PageUnit = 'event',
+): WsPayload {
   const conn = ircManager.getConnection(userId, networkId);
-  const events = listMessages(networkId, target, { limit: 200 }).map((e) =>
-    decorateMessage(userId, e),
-  );
+  const rows = listMessagesCounted(networkId, target, countBy, { limit: 200 });
+  const notifyAlways = bufferNotifyAlways(userId, networkId, target);
+  const events = rows.map((e) => decorateMessage(userId, e, notifyAlways));
+  const oldestId = rows.length ? (rows[0].id ?? 0) : 0;
   return {
     kind: 'backlog',
     networkId,
     target,
     events,
+    // Always the recent slice, never a gap — see the header comment.
+    mode: 'replace' satisfies BacklogMode,
+    // This frame answers `open-buffer`, i.e. it is a client's ONE hydrate of this
+    // buffer, and omitting this field stranded the empty case forever.
+    //
+    // A shell is `events: [] + hasMoreOlder: true`, and a client that can't see
+    // `hasMoreOlder` has to assume the shell reading — anything else would mark a
+    // buffer hydrated that isn't and render it permanently blank. So on a buffer
+    // with no messages this frame (`events: []`, field absent) was indistinguishable
+    // from "fetch me later": the client stayed unhydrated, sat on its loading
+    // spinner, and never asked again because it had already spent its one request.
+    // Non-empty buffers hid the bug — any event at all reads as hydrated.
+    hasMoreOlder: oldestId > 0 && hasOlderRow(networkId, target, oldestId),
     speakers: listSpeakers(networkId, target),
     joined: channelJoined(target, conn),
     ...bufferStateFields(userId, networkId, target),
@@ -680,6 +919,7 @@ export function buildBufferShell(
   precomputed?: {
     lastReadId?: number;
     cleared?: { clearedBeforeId: number; clearedAt: string | null };
+    bufferId?: number | null;
   },
 ): WsPayload {
   return {
@@ -699,6 +939,10 @@ export function buildBufferShell(
     // Shell marker: no messages loaded yet, but there IS history to fetch on
     // open. The client's empty-seed branch honors this flag (see replaceBacklog).
     hasMoreOlder: true,
+    // The empty `events` above is "nothing shipped", NOT "this buffer is empty".
+    // 'shell' says so on the wire so a client can't read it as replace-with-
+    // empty and wipe a buffer it already hydrated.
+    mode: 'shell' satisfies BacklogMode,
     ...bufferStateFields(userId, networkId, target, precomputed),
   };
 }
@@ -706,10 +950,10 @@ export function buildBufferShell(
 // Upper bound on how many missed rows a resume frame ships per buffer. Wider
 // than the first-connect default so a normal flap fills in one shot, but
 // bounded so a long disconnect can't produce an unbounded payload.
-const RESUME_GAP_CAP = 500;
+export const RESUME_GAP_CAP = 500;
 // When the gap exceeds the cap we fall back to a fresh latest slice; size it
 // to match the first-connect default.
-const RESUME_LATEST_LIMIT = 200;
+export const RESUME_LATEST_LIMIT = 200;
 
 // Per-buffer input-history slice shipped for up-arrow recall (on a :server:
 // backlog, a resume frame, or a shell's 'history' latest hydrate). This is the
@@ -736,7 +980,7 @@ interface SnapshotBreakdown {
   bufferCount: number;
   fresh: boolean; // true = fresh connect → online loop shipped shells, not resume frames
   networksMs: number; // ircManager.snapshotForUser (serializes channel member lists)
-  seedsMs: number; // drafts/bookmarks/system/contacts + the bulk read/cleared/closed maps
+  seedsMs: number; // drafts/system + the bulk read/cleared/closed maps
   onlineMs: number; // the live per-buffer loop (shells: unread counts; resume: +reads/speakers)
   offlineMs: number; // buildOfflineBacklogFrames
   // Online-loop op split (the rest of onlineMs is sends/input-history/overhead).
@@ -776,12 +1020,21 @@ export function buildResumeSlice(
   networkId: number,
   target: string,
   sinceId: number,
-): { events: DecoratedEvent[]; reset: boolean; hasMoreOlder: boolean } {
+): { events: DecoratedEvent[]; reset: boolean; mode: BacklogMode; hasMoreOlder: boolean } {
+  // One query for the whole slice, whichever branch below ships it (#679).
+  const notifyAlways = bufferNotifyAlways(userId, networkId, target);
   if (sinceId > 0) {
-    const gap = listMessages(networkId, target, { afterId: sinceId, limit: RESUME_GAP_CAP });
-    const lastGapId = gap.length ? (gap[gap.length - 1].id ?? sinceId) : sinceId;
-    const truncated = gap.length >= RESUME_GAP_CAP && hasNewerRow(networkId, target, lastGapId);
-    if (!truncated) {
+    // Ask whether the gap overflows BEFORE reading it. The truncation test used to
+    // be "read RESUME_GAP_CAP rows, and if we filled the cap, is there another one
+    // after the last?" — which meant a buffer that overflowed paid for a full
+    // capped read plus a decorate pass, then discarded every row and re-read a
+    // latest slice. That is the common case on a busy account after any real
+    // disconnect (every channel overflows), so the discarded work dominated the
+    // resume path. hasMoreThan settles the same question with one index-only
+    // probe. Equivalent by construction: "more than CAP rows exist after the
+    // cursor" is exactly what the old length-plus-hasNewerRow pair detected.
+    if (!hasMoreThan(networkId, target, sinceId, RESUME_GAP_CAP)) {
+      const gap = listMessages(networkId, target, { afterId: sinceId, limit: RESUME_GAP_CAP });
       // hasMoreOlder must be accurate even though a LOADED buffer ignores it
       // (gap-fill just appends): a client holding this buffer only as an empty
       // SHELL (the fresh-connect optimization) empty-seeds from this frame, and a
@@ -791,8 +1044,9 @@ export function buildResumeSlice(
       // older than what we shipped).
       const anchor = gap.length ? (gap[0].id ?? sinceId + 1) : sinceId + 1;
       return {
-        events: gap.map((e) => decorateMessage(userId, e)),
+        events: gap.map((e) => decorateMessage(userId, e, notifyAlways)),
         reset: false,
+        mode: 'append',
         hasMoreOlder: hasOlderRow(networkId, target, anchor),
       };
     }
@@ -801,11 +1055,17 @@ export function buildResumeSlice(
   const latest = listMessages(networkId, target, { limit: RESUME_LATEST_LIMIT });
   const oldestId = latest.length ? (latest[0].id ?? 0) : 0;
   return {
-    events: latest.map((e) => decorateMessage(userId, e)),
+    events: latest.map((e) => decorateMessage(userId, e, notifyAlways)),
     // Only signal a replace on a real resume. First connect (sinceId<=0) lands
     // on the client's empty-buffer seed path, which already replaces — flagging
     // reset there is harmless but needlessly noisy.
     reset: sinceId > 0,
+    // ...but `mode` says what the frame MEANS, not what's noisy, and both
+    // branches here mean the same thing: this slice stands alone, replace with
+    // it. That divergence is exactly why `reset` alone was never decodable —
+    // `reset:false` reads as "append" for the gap branch above and as "replace"
+    // here, and only the out-of-band `sinceId` told them apart.
+    mode: 'replace',
     hasMoreOlder: oldestId > 0 && hasOlderRow(networkId, target, oldestId),
   };
 }
@@ -858,6 +1118,9 @@ export function buildSystemBacklog(userId: number): WsPayload {
     kind: 'backlog',
     networkId: null,
     target: SYSTEM_TARGET,
+    // The app-scoped sentinel row's id (minted at account creation) — the
+    // system console speaks the same id-keyed dialect as every other buffer.
+    bufferId: resolveBuffer(userId, null, SYSTEM_TARGET)?.id ?? null,
     events: rows.map(systemLineToEvent),
     speakers: [],
     joined: true,
@@ -868,7 +1131,12 @@ export function buildSystemBacklog(userId: number): WsPayload {
     clearedBeforeId: cleared.clearedBeforeId,
     clearedAt: cleared.clearedAt,
     inputHistory: [],
+    // `reset:false` here has ALWAYS meant "replace" — the system buffer ships a
+    // standalone latest slice and never a gap (it ignores the socket's ?since
+    // cursor, having its own id sequence). Kept as-is for old clients; `mode`
+    // states the real contract.
     reset: false,
+    mode: 'replace' satisfies BacklogMode,
     hasMoreOlder: oldestId > 0 && hasOlderSystem(userId, oldestId),
   };
 }
@@ -885,6 +1153,7 @@ export function buildSystemHistoryReply(userId: number, msg: WsPayload): WsPaylo
     kind: 'history',
     networkId: null,
     target: SYSTEM_TARGET,
+    bufferId: resolveBuffer(userId, null, SYSTEM_TARGET)?.id ?? null,
     mode,
     token: msg.token ?? null,
     speakers: [] as never[],
@@ -966,10 +1235,15 @@ export function buildSystemHistoryReply(userId: number, msg: WsPayload): WsPaylo
 // No live conn, so channelJoined folds #channels to parted and DMs to joined
 // (they never dim). Shared by buildOfflineBacklogFrames and the snapshot's single
 // enumeration pass so the offline carve-out lives in exactly one place.
-function buildOfflineFrame(userId: number, networkId: number, target: string): WsPayload {
+function buildOfflineFrame(
+  userId: number,
+  networkId: number,
+  target: string,
+  bufferId: number | null = null,
+): WsPayload {
   return target.startsWith(':server:')
     ? buildBufferBacklog(userId, networkId, target)
-    : buildBufferShell(userId, networkId, target, channelJoined(target));
+    : buildBufferShell(userId, networkId, target, channelJoined(target), { bufferId });
 }
 
 // `targets` lets the snapshot hand in the enumeration it already materialized for
@@ -983,14 +1257,14 @@ export function buildOfflineBacklogFrames(
   timings?: { serverMs: number; shellMs: number },
 ): WsPayload[] {
   const frames: WsPayload[] = [];
-  for (const { networkId, target, conn } of targets) {
+  for (const { networkId, target, bufferId, conn } of targets) {
     // Offline backlog only: the app-scoped system buffer ships via its own frame,
     // and live networks are handled by the snapshot's live loop. eachUserBufferTarget
     // has already applied the closed-flag carve-out (nothing is joined offline, so
     // there's no autorejoin race to defend against here — unlike the live loop).
     if (networkId == null || conn) continue;
     const t0 = timings ? Date.now() : 0;
-    frames.push(buildOfflineFrame(userId, networkId, target));
+    frames.push(buildOfflineFrame(userId, networkId, target, bufferId));
     if (timings) {
       const dt = Date.now() - t0;
       if (target.startsWith(':server:')) timings.serverMs += dt;
@@ -1000,20 +1274,65 @@ export function buildOfflineBacklogFrames(
   return frames;
 }
 
+// The pins-changed frame's dual payload: `pinned` (names, the original wire
+// shape) and `pinnedIds` (parallel-indexed buffer ids) from one read.
+export function pinsChangedFrame(userId: number, networkId: number): WsPayload {
+  const rows = listPinnedWithIds(userId, networkId);
+  return {
+    kind: 'pins-changed',
+    networkId,
+    pinned: rows.map((r) => r.target),
+    pinnedIds: rows.map((r) => r.bufferId),
+  };
+}
+
+// The user's full favorites list in global order — one frame shape for the
+// connect-burst seed and every later correction (clients replace wholesale,
+// so a handler written for either covers both). Entry objects rather than
+// pins' parallel arrays: favorites span networks, so each entry needs its own
+// networkId and the parallel-array shape was pins-only back-compat anyway.
+export function favoritesChangedFrame(userId: number): WsPayload {
+  return { kind: 'favorites-changed', favorites: listFavoritesForUser(userId) };
+}
+
+// Resolve a verb's optional id-form buffer address (docs/CLIENT_PROTOCOL §6):
+// a numeric `msg.bufferId` wins over `(networkId, target)` and is validated
+// for ownership. Returns the resolved address, `null` for an id that doesn't
+// resolve to this user's buffer (callers DROP the verb — same path as an
+// unknown name), or `undefined` when no id was supplied (fall back to names).
+function verbBuffer(
+  userId: number,
+  msg: WsPayload,
+): { networkId: number | null; target: string; bufferId: number } | null | undefined {
+  if (typeof msg.bufferId !== 'number') return undefined;
+  const b = requireBufferForUser(userId, msg.bufferId);
+  if (!b) return null;
+  return { networkId: b.networkId, target: b.target, bufferId: b.id };
+}
+
 // A buffer the user closed and isn't currently joined to is hidden from the
 // sidebar; broadcasting a read-state frame for it would resurrect it (#319).
 // The closed set is folded `${networkId}::${folded}` keys built from the
-// buffers registry (closedBufferKeySet); fold the target here too — servers
-// hand us inconsistently-cased names (#289). A currently-joined channel always
-// beats a stale closed flag (defensive against autorejoin/state races).
+// buffers registry (closedBufferKeySet); fold the target the same way —
+// per-network since #707, so 'john^' probes the 'john~' key an rfc1459
+// network stored (servers also hand us inconsistently-cased names, #289). A
+// currently-joined channel always beats a stale closed flag (defensive
+// against autorejoin/state races). The joined probe is the RAW membership
+// scan, not `channelJoined`: that helper answers true for anything that
+// isn't '#'-prefixed — right for the display field it feeds (a DM is always
+// "joined"), but here it would exempt every closed DM from hiding, and its
+// '#'-only test would strip the joined-beats-closed defense from '&'/'+'/'!'
+// channels, which the membership map covers regardless of prefix.
 function isHiddenClosedBuffer(
   closed: Set<string>,
-  joined: { has(name: string): boolean },
+  conn: JoinedProbe | null | undefined,
   networkId: number,
   target: string,
 ): boolean {
-  const lower = target.toLowerCase();
-  return closed.has(`${networkId}::${lower}`) && !joined.has(lower);
+  return (
+    closed.has(`${networkId}::${foldTargetFor(networkId, target)}`) &&
+    !conn?.isChannelJoined(target)
+  );
 }
 
 // The folded closed-buffer key set for isHiddenClosedBuffer, from the registry.
@@ -1043,14 +1362,41 @@ export function handleOpenBuffer(
   userId: number,
   networkId: number,
   requested: string,
+  countBy: PageUnit = 'event',
 ): void {
   if (!networkId || !requested || requested.startsWith(':server:')) return;
   const row = getBuffer(userId, networkId, requested);
-  if (row && hasMessageForTarget(networkId, row.target)) {
+  // A channel we are CURRENTLY IN answers with its backlog even when that backlog is
+  // empty. Gating purely on `hasMessageForTarget` sent a channel you're sitting in but
+  // have no persisted lines for — freshly joined, or one whose history was cleared —
+  // down the join branch below, which replies with `buffer-opened` and no `backlog` at
+  // all. A client that hydrates on demand has then spent its one request on something
+  // that can never be answered, and sits on a loading spinner for the rest of the
+  // connection. `open-buffer` must always produce a backlog for a buffer that exists.
+  // Live membership, checked for EVERY channel prefix rather than through
+  // `channelJoined`. That helper answers `true` for anything not starting with '#',
+  // which is right for the display field it feeds (a DM is always "joined") but wrong
+  // as a branch condition: `kindForTarget` counts '&', '+' and '!' as channels too, so
+  // routing through it would report an unjoined `&local` as joined and hand back a
+  // backlog for a channel we aren't in. Fold-aware (#707): a refold-merged
+  // buffer's registry spelling can differ from the joined wire spelling, and
+  // a raw map probe would send a channel we're sitting in down the join
+  // branch — the no-echo spinner this comment exists to prevent.
+  const conn = ircManager.getConnection(userId, networkId);
+  const inChannel = kindForTarget(requested) === 'channel' && !!conn?.isChannelJoined(requested);
+  if (row && (hasMessageForTarget(networkId, row.target) || inChannel)) {
     reopenBufferRow(userId, networkId, row.target);
-    send(ws, buildBufferBacklog(userId, networkId, row.target));
-    send(ws, { kind: 'buffer-opened', networkId, target: row.target });
+    send(ws, buildBufferBacklog(userId, networkId, row.target, countBy));
+    send(ws, { kind: 'buffer-opened', networkId, target: row.target, bufferId: row.id });
+    announceOpen(ws, userId, networkId, row.target, conn, row.id);
+    // ⚠ `#`-only on purpose, and NOT an oversight in the #724 sweep: this branch JOINs a channel
+    // that has no registry row yet, and the join wiring below only exists for `#`. Widening it made
+    // `open-buffer` on a never-visited `&local` mint an open kind='channel' row that never receives
+    // a JOIN — a permanently dead buffer, which two tests in wsHub.test.ts exist to prevent.
+    // `/join &local` reaches the real join path and works; this is the click-an-unvisited-row case.
   } else if (requested.startsWith('#')) {
+    // No row yet — the JOIN echo mints it — so this is the one ack that
+    // cannot carry a bufferId; the id arrives with the channel's first frames.
     ircManager.joinChannel(userId, networkId, requested);
     send(ws, { kind: 'buffer-opened', networkId, target: requested });
   } else if (kindForTarget(requested) === 'dm') {
@@ -1060,9 +1406,49 @@ export function handleOpenBuffer(
     // buffer that never JOINs — those fall through as a no-op, exactly as the
     // pre-registry code behaved.
     const { record } = ensureBufferOpen(userId, networkId, requested);
-    send(ws, buildBufferBacklog(userId, networkId, record.target));
-    send(ws, { kind: 'buffer-opened', networkId, target: record.target });
+    send(ws, buildBufferBacklog(userId, networkId, record.target, countBy));
+    send(ws, { kind: 'buffer-opened', networkId, target: record.target, bufferId: record.id });
+    announceOpen(ws, userId, networkId, record.target, conn, record.id);
   }
+}
+
+// Tell the user's OTHER devices that a buffer is now open.
+//
+// Until this existed, an open was invisible to them until their next snapshot —
+// a reconnect, or the in-band resync a hidden tab fires — so a user's devices
+// quietly disagreed about whether a buffer existed. That was tolerable only
+// while every hydration was accidentally an open; now that opening is deliberate
+// (`{type:'history', mode:'latest'}` carries the reads), it's worth announcing.
+//
+// **The shell is what makes this safe, and it isn't optional.** `buffer-opened`
+// is a reply first: the requesting client reads it as "here's the canonical
+// target — focus it" (`useSocket.ts:787`). Fanned out on its own it would yank
+// every other tab to a buffer the user opened somewhere else. Sending a shell
+// alongside means the other devices already have the row when it lands, so the
+// frame is a state signal there rather than an instruction — and it matches how
+// every other buffer-materializing frame travels (§9.1: `buffer-opened` rides
+// with a `backlog`).
+//
+// A shell rather than the full backlog on purpose: those devices may never look
+// at this buffer, and a shell is precisely "it exists, fetch on open" — the same
+// thing a fresh connect ships. They fill it in with `{type:'history',
+// mode:'latest'}` if the user actually goes there.
+function announceOpen(
+  requester: LurkerWebSocket,
+  userId: number,
+  networkId: number,
+  target: string,
+  conn: JoinedProbe | null | undefined,
+  bufferId: number | null = null,
+): void {
+  // Pass the live connection: `channelJoined` folds a #channel to parted without
+  // one, which would land the other devices' rows dimmed for a channel we're
+  // sitting in, until some later frame corrected them.
+  const shell = buildBufferShell(userId, networkId, target, channelJoined(target, conn), {
+    bufferId,
+  });
+  fanOut(userId, shell, { exceptWs: requester });
+  fanOut(userId, { kind: 'buffer-opened', networkId, target, bufferId }, { exceptWs: requester });
 }
 
 // Per-user socket bookkeeping lives at module scope so the verb registry can
@@ -1115,9 +1501,104 @@ export function scheduleGuestDisconnect(userId: number): void {
   t.unref?.();
   guestDisconnectTimers.set(userId, t);
 }
+// How many bytes of un-drained outbound frames a socket may hold before it
+// counts as backpressured, and how long it must STAY that way before we give up
+// on it.
+//
+// The heartbeat reaps DEAD sockets (no pong within a sweep, ~60s). It does not
+// reap SLOW ones, and those are a different failure: a phone on a degraded link
+// is genuinely OPEN and may still pong while its TCP window is closed. `ws`
+// queues everything we hand it in the Node heap with no bound, so every live
+// event fanned out to such a socket is memory we never get back — a leak whose
+// only symptom is RSS climbing on a busy cell.
+//
+// Size alone is NOT the signal, and that's the whole subtlety here.
+// `bufferedAmount` is one number covering everything queued on the socket,
+// including the synchronous snapshot burst — legitimately megabytes on a large
+// account (up to RESUME_GAP_CAP rows per buffer, across every buffer), taking
+// real seconds to flush on a real link. A bare size check fires on the first
+// live event that lands mid-drain, kills the socket, and the client reconnects
+// into an identical burst: a permanent disconnect loop for exactly the accounts
+// the cap is meant to protect.
+//
+// So the cap only decides when to START WATCHING. What condemns a socket is
+// making no downward progress for the grace period — see dropIfBackpressured.
+// A slow client drains steadily and is never touched; one whose window has
+// closed goes flat and is dropped.
+const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+const BACKPRESSURE_GRACE_MS = 30_000;
 
 function send(ws: LurkerWebSocket, payload: WsPayload): void {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
+}
+
+// Drop a socket that has been unable to drain for a full grace period. Called
+// per fan-out; the first over-cap observation only starts the clock.
+//
+// `terminate()`, NOT `close(1013)`. A courteous close queues the close frame
+// BEHIND the megabytes already stuck — on a socket that by definition isn't
+// moving, the handshake can't complete, and `ws` only destroys the connection
+// after its 30s closeTimeout (`ws/lib/websocket.js` setCloseTimer). The bytes
+// this exists to reclaim would sit in the heap for another 30 seconds, and the
+// socket would linger in socketsByUser, which inverts the whole point.
+// Terminating frees both now. The client sees an abnormal close, reconnects
+// through its normal path, and resumes from `?since` — so this costs a
+// reconnect, not history, and the close code it doesn't get is one it could
+// never have received anyway.
+//
+// Deliberately NOT applied to `send`, which is what the snapshot burst uses:
+// judging a socket by the size of a burst the server itself just queued is what
+// the grace period above exists to avoid, and inside the burst there hasn't even
+// been an event-loop turn in which to drain.
+//
+// Exported (and pure over its arguments, like sweepWsHeartbeat) so the
+// drop/keep decision is unit-testable without a live WSS. `now` is injectable
+// for the same reason.
+export function dropIfBackpressured(ws: LurkerWebSocket, now: number = Date.now()): boolean {
+  const queued = ws.bufferedAmount;
+  if (queued <= MAX_BUFFERED_BYTES) {
+    // Under the line — it was a burst, not a wedge.
+    ws.backpressure = undefined;
+    return false;
+  }
+  const streak = ws.backpressure;
+  // Restart the streak on a first sighting, OR when the last observation is
+  // older than the grace period. We only look during fan-out, so a quiet
+  // account can go minutes between calls — and a streak we weren't watching is
+  // no evidence of anything. Without this, a socket that went over the cap
+  // once, drained unobserved, and went over again on a later burst would be
+  // judged against a timestamp from minutes ago and killed on the FIRST
+  // sighting of the new burst, which is exactly what the grace exists to
+  // prevent.
+  if (streak === undefined || now - streak.at > BACKPRESSURE_GRACE_MS) {
+    ws.backpressure = { since: now, at: now, floor: queued };
+    return false;
+  }
+  // Did anything actually leave the machine? We only ever ADD on this path, so
+  // a new low can only come from the socket flushing. That — not absolute size
+  // — is what separates "slow but working" from "stopped".
+  //
+  // This is the difference between a big snapshot to a phone on a weak link
+  // (megabytes queued, grinding steadily down, never dropped) and a socket
+  // whose window has closed (queue flat or climbing, dropped after the grace).
+  // Judging by size alone would kill the first case while it was behaving
+  // correctly, and it would reconnect into an identical burst — a permanent
+  // loop for exactly the clients least able to afford one.
+  if (queued < streak.floor) {
+    ws.backpressure = { since: now, at: now, floor: queued };
+    return false;
+  }
+  streak.at = now;
+  if (now - streak.since < BACKPRESSURE_GRACE_MS) return false;
+  console.warn(
+    `[wsHub] socket made no progress on ${queued} queued bytes for ${now - streak.since}ms; terminating (client resumes via ?since)`,
+  );
+  try {
+    ws.terminate();
+  } catch (_err) {
+    // Already tearing down; the close handler prunes it either way.
+  }
+  return true;
 }
 
 function fanOut(userId: number, payload: WsPayload, opts: FanOutOpts = {}): void {
@@ -1128,6 +1609,11 @@ function fanOut(userId: number, payload: WsPayload, opts: FanOutOpts = {}): void
   for (const ws of set) {
     if (opts.exceptWs && ws === opts.exceptWs) continue;
     if (ws.readyState === ws.OPEN) {
+      // Checked BEFORE the send: once a socket is provably wedged, adding to
+      // its queue is exactly what we're trying to stop. The cursor is
+      // deliberately not advanced for a dropped socket either — it never
+      // received the event, and claiming it did would make the resume skip it.
+      if (dropIfBackpressured(ws)) continue;
       ws.send(json);
       // Advance the per-socket cursor so a subsequent sendSnapshot ships
       // only the gap newer than what this socket has already received.
@@ -1405,17 +1891,23 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
   // counts are now." Used by mark-read echo and by the live IRC-event fan-out
   // below — the client doesn't increment locally anymore, so this is the
   // only source of badge state.
+  // `bufferId` is threaded from callers that already hold it (the live pipe's
+  // decorated event, an id-addressed mark-read) — this runs per countable
+  // event, so the resolve is a fallback, not a habit.
   function broadcastReadState(
     userId: number,
     networkId: number | null,
     target: string,
     lastReadId: number,
+    bufferId?: number | null,
   ): void {
     const counts = computeUnreadFor(userId, networkId, target, lastReadId);
     fanOut(userId, {
       kind: 'read-state',
       networkId,
       target,
+      bufferId:
+        bufferId !== undefined ? bufferId : (resolveBuffer(userId, networkId, target)?.id ?? null),
       lastReadId: counts.lastReadId,
       unread: counts.unread,
       highlights: counts.highlights,
@@ -1443,22 +1935,16 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     return false;
   }
 
-  // The user's ignore verdict for an event, off the cached compiled rule set (no
-  // DB scan per event). senderHidden reads .hide for the render/reopen path;
-  // maybePush additionally honors .nonotify (issue #359 — a NONOTIFY mute rule
-  // freezes push without hiding the message).
+  // The user's ignore verdict for a decorated event. Thin wrapper over the
+  // module-level ignoreVerdictForEvent; senderHidden reads .hide for the
+  // render/reopen path (the .nonotify veto is already folded into `notify` by
+  // decorateMessage, so the push gate no longer needs this).
   function ignoreVerdictFor(userId: number, decorated: DecoratedEvent): IgnoreVerdict {
-    const compiled = ignoreRulesService.getCompiled(userId, decorated.networkId);
-    if (!compiled.length) return { hide: false, nohilight: false, nonotify: false };
-    // Evaluate even for a nick-less event: a scope mute (mask null — a muted
-    // channel/network) must still veto its notification, so a nick-less line
-    // (e.g. a server notice in a notify_always channel) doesn't slip past. A
-    // sender-specific rule simply won't match a null nick.
-    return evaluateIgnores(compiled, {
-      nick: decorated.nick ?? null,
-      userhost: decorated.userhost ?? null,
+    return ignoreVerdictForEvent(userId, decorated.networkId, {
+      nick: decorated.nick,
+      userhost: decorated.userhost,
       target: decorated.target,
-      text: decorated.text ?? '',
+      text: decorated.text,
       type: decorated.type,
       isDm: !!decorated.dm,
     });
@@ -1479,15 +1965,16 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // the badge total below (it's an O(buffers) scan). deliver() would no-op on
     // an empty subscription set anyway — bail before the work (#451 review).
     if (!pushService.hasSubscriptions(userId)) return;
-    // Suppress push for events the user's ignore rules would hide OR mute
-    // (NONOTIFY, e.g. a muted channel/network — issue #359). This is the one
-    // piece of the ignore/mute feature that has to live server-side: push fires
-    // while no client is open, so a client-side filter can't intercept. The
-    // unread badge and render filter stay reactive client-side, so /unignore
-    // still reveals; only push delivery is frozen here. A NOHIGHLIGHT rule does
-    // NOT freeze push — the message is still visible, it just doesn't highlight.
-    const pushVerdict = ignoreVerdictFor(userId, decorated);
-    if (pushVerdict.hide || pushVerdict.nonotify) return;
+    // The ignore/mute veto — a hide-level or NONOTIFY rule (a muted
+    // channel/network/sender — issue #359) — is already folded into
+    // `decorated.notify` by decorateMessage, so the `notify` gate above has
+    // suppressed those before we reach here; no separate verdict check needed.
+    // This decision must live server-side (push fires while no client is open,
+    // so a client-side filter can't intercept), and folding it into `notify` is
+    // what lets every live client trust the one flag too. The unread badge and
+    // render filter stay reactive client-side, so /unignore still reveals. A
+    // NOHIGHLIGHT rule deliberately does NOT freeze push — the message is still
+    // visible, it just doesn't highlight.
     // Signal kind in priority order: DM beats matched beats always_notify.
     // The `kind` doubles as the settings-key namespace, so picking a single
     // priority winner here means a DM that also matched a rule still
@@ -1502,6 +1989,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         networkId: decorated.networkId,
         networkName: network?.name || `net:${decorated.networkId}`,
         target: decorated.target,
+        bufferId: decorated.bufferId,
         nick: decorated.nick,
         text: decorated.text,
         time: decorated.time,
@@ -1514,20 +2002,25 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
       .catch((err) => console.warn('[push] deliver failed:', err?.message || err));
   }
 
-  // Came-online push: fired from a peer-presence offline→online transition for
-  // a friend the user flagged "notify when online", when no client is visible
-  // (the in-app toast owns the visible case). The same enabled/quiet/away gates
-  // as message pushes apply, keyed off the friend_online settings namespace.
-  function maybePushFriendOnline(
+  // Came-online push: fired from a peer-presence offline→online transition
+  // for the peer of a FAVORITED DM (someone under FRIENDS), when no client is
+  // visible (the in-app toast owns the visible case). The same
+  // enabled/quiet/away gates as message pushes apply, keyed off the
+  // friend_online settings namespace — the same key names the contacts-era
+  // push used, so preferences set back then revive untouched.
+  function maybePushFavoriteOnline(
     userId: number,
     networkId: number,
     nick: string | null | undefined,
   ): void {
     if (!nick) return;
+    // Same early bail the message path uses: deliver() runs ensureVapid()
+    // BEFORE its own empty-subscription check, so without this every
+    // came-online event on a push-less account still does VAPID + DB work.
+    if (!pushService.hasSubscriptions(userId)) return;
     if (userHasVisibleClient(userId)) return;
     if (!effectiveSetting(userId, 'notifications.friend_online.enabled')) return;
-    const contact = findNotifyContactForTarget(userId, networkId, nick);
-    if (!contact) return;
+    if (!isFavoriteDmPeer(userId, networkId, nick)) return;
     if (pushQuietOrAway(userId)) return;
     const network = ircManager.getConnection(userId, networkId)?.network;
     pushService
@@ -1537,7 +2030,17 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         networkName: network?.name || `net:${networkId}`,
         // target is the friend's nick so a notification tap opens their DM.
         target: nick,
-        displayName: contact.displayName,
+        // The DM row is guaranteed to exist — isFavoriteDmPeer above resolved
+        // one to check the favorite — so this always lands, letting a cold tap
+        // launch straight into /buffer/<id> (#744). resolveBuffer, not
+        // getBuffer: identity is all that's wanted, and getBuffer materializes
+        // the full record including +k key decryption, which throws outright on
+        // a rotated key-id. No push path should be able to fail that way.
+        bufferId: resolveBuffer(userId, networkId, nick)?.id,
+        // The contacts model had a display name distinct from the nick; a
+        // favorite IS its buffer, so they coincide now. Kept in the payload
+        // so shipped iOS builds' tap-routing sees the shape it expects.
+        displayName: nick,
         // No `badge` here on purpose (#451 review): a friend coming online isn't
         // a highlight, so the total can't have changed since the last message
         // push set it. The SW no-ops when data.badge is absent, so omitting it
@@ -1557,6 +2060,59 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         kind: 'dcc-transfer',
         transfer: (event as unknown as { transfer: unknown }).transfer,
       });
+      return;
+    }
+    // A buffer changed names (a DM peer's NICK; later, channel RENAME). This
+    // is a lifecycle frame, not a message — intercept before decoration so it
+    // can't leak to clients as a kind:'irc' row. Fanned to EVERY socket
+    // including any originator: it describes a fact, not an instruction
+    // (docs §9.7). Follow-ups ride behind it on a merge, because the merged
+    // counts/pins/draft changed server-side and an idle buffer would
+    // otherwise never learn.
+    if ((event as { type?: string }).type === 'buffer-renamed') {
+      const ev = event as unknown as {
+        networkId: number;
+        from: string;
+        to: string;
+        bufferId: number;
+        merged?: boolean;
+        mergedFromBufferId?: number;
+        draftChanged?: boolean;
+      };
+      fanOut(eventUserId, {
+        kind: 'buffer-renamed',
+        networkId: ev.networkId,
+        from: ev.from,
+        to: ev.to,
+        bufferId: ev.bufferId,
+        merged: !!ev.merged,
+        ...(ev.mergedFromBufferId != null ? { mergedFromBufferId: ev.mergedFromBufferId } : {}),
+      });
+      if (ev.merged) {
+        broadcastReadState(
+          eventUserId,
+          ev.networkId,
+          ev.to,
+          getReadState(eventUserId, ev.networkId, ev.to),
+          ev.bufferId,
+        );
+        fanOut(eventUserId, pinsChangedFrame(eventUserId, ev.networkId));
+        // The merge may have adopted the absorbed row's favorite onto the
+        // survivor (renameBuffer.absorbBufferRow) — clients hold favorites by
+        // bufferId, so without a re-publish they'd render a ghost entry for
+        // the absorbed id until the next favorites mutation or reconnect.
+        fanOut(eventUserId, favoritesChangedFrame(eventUserId));
+        if (ev.draftChanged) {
+          const draft = getDraftForBuffer(eventUserId, ev.bufferId);
+          fanOut(eventUserId, {
+            kind: 'draft-updated',
+            networkId: ev.networkId,
+            target: ev.to,
+            bufferId: ev.bufferId,
+            body: draft?.body ?? '',
+          });
+        }
+      }
       return;
     }
     const decorated = decorateMessage(eventUserId, event);
@@ -1580,6 +2136,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
           kind: 'buffer-reopened',
           networkId: decorated.networkId,
           target,
+          bufferId: (decorated as { bufferId?: number }).bufferId ?? null,
         });
       } else if (state === undefined && decorated.id != null) {
         // A persisted event for a target with no registry row mints one — this
@@ -1596,7 +2153,14 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // A friend coming online is a presence transition, not a message, so it
     // bypasses maybePush (no `notify`); push it on its own path.
     if (event.type === 'peer-presence' && (event as { cameOnline?: boolean }).cameOnline) {
-      maybePushFriendOnline(eventUserId, event.networkId, event.nick);
+      maybePushFavoriteOnline(eventUserId, event.networkId, event.nick);
+    }
+    // A server-side path deleted a favorited buffer outright (evictChannel's
+    // 470-forget is the one such path today) — the FK cascade took the
+    // favorite row with it, so re-publish the authoritative list or every
+    // client keeps a ghost entry for the dead buffer id.
+    if ((event as { favoritesChanged?: boolean }).favoritesChanged) {
+      fanOut(eventUserId, favoritesChangedFrame(eventUserId));
     }
 
     // Countable persisted events change the buffer's unread/highlight counts
@@ -1612,7 +2176,13 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
       typeCountsForUnread(decorated.target, decorated.type)
     ) {
       const lastReadId = getReadState(eventUserId, decorated.networkId, decorated.target);
-      broadcastReadState(eventUserId, decorated.networkId, decorated.target, lastReadId);
+      broadcastReadState(
+        eventUserId,
+        decorated.networkId,
+        decorated.target,
+        lastReadId,
+        (decorated as { bufferId?: number }).bufferId ?? null,
+      );
     }
 
     if (event.type === 'chanlist-end' && event.networkId) {
@@ -1655,8 +2225,23 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     }
   });
 
-  settingsService.on('event', ({ userId, changes }) => {
-    fanOut(userId, { kind: 'settings', changes: changes || {} });
+  settingsService.on('event', ({ userId, changes, resets }) => {
+    // #627: the raw setting isn't the effective cap — it still has to clear the
+    // transport ceiling and any operator-baked policy cap. The user's OWN change
+    // already has a delivery path right here, so recompute rather than leaving
+    // them compressing against a stale number until they next reconnect (lower it
+    // and every upload 413s; raise it and they over-compress for nothing).
+    const touchedCap = changes && 'uploads.image.max_upload_mb' in changes;
+    fanOut(userId, {
+      kind: 'settings',
+      changes: changes || {},
+      ...(Array.isArray(resets) && resets.length ? { resets } : {}),
+      ...(touchedCap
+        ? {
+            maxUploadBytes: effectiveUploadCapBytes(userId, findUserById(userId)?.role === 'admin'),
+          }
+        : {}),
+    });
     // If the user toggled / shortened auto-away while disconnected, re-evaluate
     // the pending timer with the new value.
     const touchedAway =
@@ -1669,6 +2254,13 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
 
   highlightRulesService.on('change', ({ userId }) => {
     fanOut(userId, { kind: 'highlight-rules-changed' });
+  });
+
+  // Saved theme presets changed (create/update/delete, this or another device).
+  // Refetch-on-any-change like highlight rules: the list is small and the event
+  // needs no payload contract that way.
+  themesService.on('change', ({ userId }: { userId: number }) => {
+    fanOut(userId, { kind: 'themes-changed' });
   });
 
   // System-console fan-out. User-scoped lines reach just that user's tabs;
@@ -1695,10 +2287,10 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
   // that triggered the change (if any) and gets excluded so the originator
   // doesn't clobber its own optimistic state with a stale echo. HTTP-driven
   // writes (sendBeacon on tab close) pass null and reach every tab.
-  draftsService.on('change', ({ userId, networkId, target, body, originWs }) => {
+  draftsService.on('change', ({ userId, networkId, target, bufferId, body, originWs }) => {
     fanOut(
       userId,
-      { kind: 'draft-updated', networkId, target, body },
+      { kind: 'draft-updated', networkId, target, bufferId, body },
       originWs ? { exceptWs: originWs } : undefined,
     );
   });
@@ -1839,7 +2431,10 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
   // Wrapper around the (synchronous) snapshot builder. Two jobs: (1) time it,
   // so a stall serving one connect is visible; (2) contain any throw so a bad
   // snapshot for ONE client can't take down the process and drop every user's
-  // IRC. There is no global unhandledRejection guard, so this is the backstop.
+  // IRC. Still load-bearing after #442's global fatal handler: that handler
+  // records the failure and EXITS (a process in unknown state must not limp
+  // on) — it does not make uncontained throws survivable, so removing this
+  // catch would turn one bad snapshot into every user's IRC dropping.
   function sendSnapshot(
     ws: LurkerWebSocket,
     userId: number,
@@ -1905,6 +2500,12 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // full gap-fill path untouched.
     const isFreshConnect = (ws.sinceId || 0) === 0;
     const cursor = isFreshConnect ? maxMessageId() : 0;
+    // #627: the effective upload cap rides the snapshot so a client can size media
+    // to fit BEFORE it starts an upload — lurker-ios compresses video against this
+    // number, and hardcoded a Cloudflare-safe guess until it existed. Advisory: it
+    // is resolved for the user's DEFAULT uploader at connect time, so a per-upload
+    // override or an operator change mid-session is still settled by the 413.
+    const maxUploadBytes = effectiveUploadCapBytes(userId, findUserById(userId)?.role === 'admin');
     // Global ignore rules (network_id NULL) aren't tied to any one network blob,
     // so they ride alongside the per-network snapshot as their own field (#350).
     send(ws, {
@@ -1913,6 +2514,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
       // connected without pre-checking GET /api/config still learns what the
       // server speaks and can degrade knowingly.
       protocolVersion: PROTOCOL_VERSION,
+      maxUploadBytes,
       networks,
       globalIgnores: ircManager.listGlobalIgnoresFor(userId),
       ...(isFreshConnect ? { cursor } : {}),
@@ -1921,11 +2523,13 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // the keying is global to the user, not per-buffer, so a single message is
     // cheaper than fanning a body field into every backlog row.
     send(ws, { kind: 'draft-snapshot', drafts: draftsService.snapshotForUser(userId) });
-    // Lightweight id-only seed for the bookmarks store. Per-row payloads are
-    // lazy-loaded by the BookmarksModal via REST when the user opens it; this
-    // snapshot exists solely so the message context menu can flip its label
-    // ("Save" ↔ "Remove bookmark") without a network round-trip.
-    send(ws, { kind: 'bookmark-ids-snapshot', ids: listBookmarkIdsForUser(userId) });
+    // No bookmark seed here on purpose. There used to be an id-only snapshot so
+    // the message context menu could flip its label ("Save" ↔ "Remove bookmark")
+    // without a round-trip — but it shipped EVERY id the account had ever saved,
+    // on every connect, and unlike drafts that set only ever grows.
+    // Bookmark state now rides on the message rows themselves (`bookmarked`, see
+    // db/messages.ts BOOKMARKED_COL), so a client learns what it saved from the
+    // lines it actually renders and holds state bounded by what it has loaded.
     // System buffer seed: the app-scoped system log rides the same 'backlog'
     // frame network buffers use (events + read-state + hasMoreOlder), so the
     // client treats it like any other buffer — no bespoke system-log path (#355).
@@ -1933,11 +2537,10 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // `?since` cursor); the client dedupes/gap-fills by id, so a re-snapshot on
     // resync is safe. See buildSystemBacklog.
     send(ws, buildSystemBacklog(userId));
-    // Friends/contacts seed: the user's full contact list (display name, notify
-    // flag, per-network watch targets). User-level, so one message rather than a
-    // per-network field. Drives the FRIENDS overview/sidebar + the came-online
-    // toast gate.
-    send(ws, { kind: 'contacts-snapshot', contacts: ircManager.listContacts(userId) });
+    // Favorites seed: the same frame later corrections use, so one client
+    // handler covers connect and every favorite/unfavorite/reorder after it.
+    // User-level (favorites span networks), one frame per snapshot.
+    send(ws, favoritesChangedFrame(userId));
     const readState = listReadStateForUser(userId);
     const clearedState = listClearedStateForUser(userId);
     // Walk the shared enumerator ONCE per snapshot and reuse it for both the live
@@ -1961,7 +2564,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // Live loop: the enumerator yields the system buffer and offline networks too —
     // skip both here. The system buffer ships via its own frame above, and offline
     // networks are handled by buildOfflineBacklogFrames below (same materialized set).
-    for (const { networkId: nid, target, conn } of allTargets) {
+    for (const { networkId: nid, target, bufferId, conn } of allTargets) {
       if (nid == null || !conn) continue;
       // Fresh-network branch: this connection just came online, so the client
       // has never received a backlog frame for any of its buffers this
@@ -1987,6 +2590,8 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
       const precomputed = {
         lastReadId: readState[key] || 0,
         cleared: clearedState[key] ?? { clearedBeforeId: 0, clearedAt: null },
+        // The walk already carries the id — bufferStateFields skips its resolve.
+        bufferId,
       };
       if ((isFreshConnect || isFreshNetwork) && !target.startsWith(':server:')) {
         // Shell path: the only per-buffer work is buildBufferShell's unread
@@ -2043,6 +2648,9 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         // a fresh latest slice — the client must replace its buffer, not
         // append, or it splices a permanent hole (issue #205).
         reset: slice.reset,
+        // The same decision, stated so a client doesn't have to re-derive it
+        // from `reset` + `networkId` + whether it sent ?since.
+        mode: slice.mode,
         hasMoreOlder: slice.hasMoreOlder,
         joined: channelJoined(target, conn),
         ...stateFields,
@@ -2076,6 +2684,27 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // handed the client — otherwise a later re-snapshot on this socket would
     // re-gap-fill everything the shells deliberately skipped.
     ws.sinceId = Math.max(maxSentId, cursor);
+    // Terminal frame (#635). Everything above ships synchronously with nothing
+    // marking the end, so until now "no row for this buffer yet" and "no such
+    // buffer" were the same observation no matter how long a client waited.
+    // That wedges any client that navigates by KEY rather than by tapping an
+    // existing row — a native app restoring its last buffer, or opening one
+    // from a notification — on a permanent "Loading messages…".
+    //
+    // The absence has to be provable here rather than inferred: `snapshot`'s
+    // per-network `channels` is empty for every network with no live
+    // connection and is read before auto-rejoin JOINs land even for one that
+    // has it, so it is NOT authoritative for buffer existence; and probing with
+    // `open-buffer` is worse still, since handleOpenBuffer treats an unknown
+    // `#channel` as a request to JOIN it.
+    //
+    // Deliberately inside sendSnapshotInner, so a throw mid-burst suppresses
+    // it: a truncated snapshot has NOT proved anything about the buffers it
+    // never reached, and a client is better left on today's spinner than told
+    // a buffer it owns doesn't exist. Sent on every snapshot (connect, in-band
+    // resync, and the fresh-network re-emit) — it terminates whichever burst
+    // just went out, and carries no state of its own.
+    send(ws, { kind: 'backlog-complete' });
     return {
       bufferCount,
       fresh: isFreshConnect,
@@ -2316,15 +2945,24 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
           msg.key as string | undefined,
         );
         break;
-      case 'open-buffer':
+      case 'open-buffer': {
         // A clicked channel name — handleOpenBuffer resolves reopen-vs-join.
+        // A WRITE: it reopens a closed row, mints a DM row, or JOINs, and now
+        // announces that to the user's other devices. Filling in a shell is
+        // `{type:'history', mode:'latest'}`, which reads and changes nothing.
+        // The id form addresses an EXISTING row only — a buffer being minted
+        // has no id yet, so the name form stays the mint/JOIN path.
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
         handleOpenBuffer(
           ws,
           userId,
-          Number(msg.networkId),
-          typeof msg.target === 'string' ? msg.target : '',
+          addr ? Number(addr.networkId) : Number(msg.networkId),
+          addr ? addr.target : typeof msg.target === 'string' ? msg.target : '',
+          asPageUnit(msg.countBy),
         );
         break;
+      }
       case 'part':
         ircManager.partChannel(
           userId,
@@ -2334,10 +2972,16 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         );
         break;
       case 'close-buffer': {
-        const networkId = Number(msg.networkId);
-        const target = typeof msg.target === 'string' ? msg.target : '';
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         // Server pseudo-buffer can't be closed (it's the per-network log).
         if (!networkId || !target || target.startsWith(':server:')) break;
+        // Resolved BEFORE the close so the buffer-closed frame below can carry
+        // the id even though the row's state just flipped.
+        const closedBufferId =
+          addr?.bufferId ?? resolveBuffer(userId, networkId, target)?.id ?? null;
         closeBufferRow(userId, networkId, target);
         // The client renders the pinned section by intersecting pins with open
         // buffers, so a pin on a now-closed buffer is invisible — and leaving
@@ -2346,11 +2990,16 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         // closed buffers folded, so a differently-cased close would otherwise
         // hide the buffer while leaving the exact-cased pin row stranded — an
         // invisible orphan (issue #405).
-        const pinned = unpinBufferCaseInsensitive(userId, networkId, target);
-        if (pinned) {
-          fanOut(userId, { kind: 'pins-changed', networkId, pinned });
+        if (unpinBufferCaseInsensitive(userId, networkId, target)) {
+          fanOut(userId, pinsChangedFrame(userId, networkId));
         }
-        if (target.startsWith('#')) {
+        // Same reasoning for favorites: the sections render favorites ∩ open
+        // buffers, so a favorite on a closed buffer is an invisible orphan.
+        // Close implies unfavorite.
+        if (unfavoriteBuffer(userId, networkId, target)) {
+          fanOut(userId, favoritesChangedFrame(userId));
+        }
+        if (isChannelTarget(target)) {
           // Send PART if connected; partChannel also lowers autojoin. If
           // disconnected, partChannel is a no-op, so lower autojoin here to
           // keep the channel from auto-rejoining the next time the network
@@ -2371,7 +3020,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         // Drop any draft for the now-closed buffer. The client mirror also
         // drops it on `buffer-closed`, so the cleanup happens on both sides.
         draftsService.clear(userId, networkId, target, ws);
-        fanOut(userId, { kind: 'buffer-closed', networkId, target });
+        fanOut(userId, { kind: 'buffer-closed', networkId, target, bufferId: closedBufferId });
         break;
       }
       case 'snapshot':
@@ -2481,23 +3130,31 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         );
         break;
       case 'mark-read': {
-        const target = msg.target as string;
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const target = addr ? addr.target : (msg.target as string);
         const requested = Number(msg.messageId);
         if (!target || !Number.isFinite(requested) || requested <= 0) break;
         // The app-scoped system buffer (#355) has no network — its read pointer
         // keys on a NULL network_id. Everything else needs a real network id.
-        const networkId = target === SYSTEM_TARGET ? null : Number(msg.networkId);
+        const networkId = addr
+          ? addr.networkId
+          : target === SYSTEM_TARGET
+            ? null
+            : Number(msg.networkId);
         if (networkId !== null && !networkId) break;
         const lastReadId = setReadState(userId, networkId, target, requested);
-        broadcastReadState(userId, networkId, target, lastReadId);
+        broadcastReadState(userId, networkId, target, lastReadId, addr?.bufferId);
         break;
       }
       case 'clear-buffer': {
         // /clear: anchor the marker at the current tail. Server-computed so
         // a message persisted between client send and server receive gets
         // hidden too — the user's intent is "everything visible right now."
-        const networkId = Number(msg.networkId);
-        const target = typeof msg.target === 'string' ? msg.target : '';
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         if (!networkId || !target) break;
         const boundary = maxIdForBuffer(networkId, target);
         // Empty buffer: nothing to clear; don't write a no-op row.
@@ -2507,6 +3164,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
           kind: 'buffer-cleared',
           networkId,
           target,
+          bufferId: addr?.bufferId ?? resolveBuffer(userId, networkId, target)?.id ?? null,
           clearedBeforeId: next.clearedBeforeId,
           clearedAt: next.clearedAt,
         });
@@ -2516,14 +3174,17 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         // Drop the clear marker so previously-hidden messages reappear.
         // Fired by the "Show earlier messages" affordance on the divider
         // and by `/clear off`.
-        const networkId = Number(msg.networkId);
-        const target = typeof msg.target === 'string' ? msg.target : '';
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         if (!networkId || !target) break;
         setClearedState(userId, networkId, target, 0, null);
         fanOut(userId, {
           kind: 'buffer-cleared',
           networkId,
           target,
+          bufferId: addr?.bufferId ?? resolveBuffer(userId, networkId, target)?.id ?? null,
           clearedBeforeId: 0,
           clearedAt: null,
         });
@@ -2551,99 +3212,202 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
             const before = getReadState(userId, networkId, target);
             if (before >= maxId) continue;
             const after = setReadState(userId, networkId, target, maxId);
-            if (isHiddenClosedBuffer(closed, conn.channels, networkId, target)) continue;
+            if (isHiddenClosedBuffer(closed, conn, networkId, target)) continue;
             broadcastReadState(userId, networkId, target, after);
           }
         }
         break;
       }
       case 'input-history-add': {
-        const networkId = Number(msg.networkId);
-        const target = typeof msg.target === 'string' ? msg.target : '';
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         const text = typeof msg.text === 'string' ? msg.text : '';
         if (!networkId || !target || !text) break;
         addInputHistory(userId, networkId, target, text);
         // Other tabs/devices need this for cross-client up-arrow consistency.
         // The originating socket already added it optimistically, so skip it
         // to avoid a duplicate append.
-        fanOut(userId, { kind: 'input-history-added', networkId, target, text }, { exceptWs: ws });
+        fanOut(
+          userId,
+          {
+            kind: 'input-history-added',
+            networkId,
+            target,
+            bufferId: addr?.bufferId ?? resolveBuffer(userId, networkId, target)?.id ?? null,
+            text,
+          },
+          { exceptWs: ws },
+        );
         break;
       }
       case 'draft-set': {
-        const networkId = Number(msg.networkId);
-        const target = typeof msg.target === 'string' ? msg.target : '';
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         const body = typeof msg.body === 'string' ? msg.body : '';
         if (!networkId || !target || target.startsWith(':server:')) break;
         draftsService.set(userId, networkId, target, body, ws);
         break;
       }
       case 'draft-clear': {
-        const networkId = Number(msg.networkId);
-        const target = typeof msg.target === 'string' ? msg.target : '';
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         if (!networkId || !target) break;
         draftsService.clear(userId, networkId, target, ws);
         break;
       }
       case 'pin-buffer': {
-        const networkId = Number(msg.networkId);
-        const target = typeof msg.target === 'string' ? msg.target : '';
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         // Server pseudo-buffer is the network header row, not a pinnable item.
         if (!networkId || !target || target.startsWith(':server:')) break;
-        const pinned = pinBuffer(userId, networkId, target);
-        fanOut(userId, { kind: 'pins-changed', networkId, pinned });
+        pinBuffer(userId, networkId, target);
+        fanOut(userId, pinsChangedFrame(userId, networkId));
+        // Pin implies unfavorite — the mirror of favorite⇒unpin (one placement
+        // per buffer). Without it, pinning a favorited buffer would recreate
+        // the invisible-pin state the favorite side just closed off.
+        if (unfavoriteBuffer(userId, networkId, target)) {
+          fanOut(userId, favoritesChangedFrame(userId));
+        }
         break;
       }
       case 'unpin-buffer': {
-        const networkId = Number(msg.networkId);
-        const target = typeof msg.target === 'string' ? msg.target : '';
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         if (!networkId || !target) break;
-        const pinned = unpinBuffer(userId, networkId, target);
-        fanOut(userId, { kind: 'pins-changed', networkId, pinned });
+        unpinBuffer(userId, networkId, target);
+        fanOut(userId, pinsChangedFrame(userId, networkId));
+        break;
+      }
+      case 'favorite-buffer': {
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
+        // Server/system pseudo-buffers aren't favoritable rows.
+        if (!networkId || !target || target.startsWith(':')) break;
+        if (favoriteBuffer(userId, networkId, target)) {
+          fanOut(userId, favoritesChangedFrame(userId));
+          // Favorite implies unpin (the mirror of close⇒unpin): a favorited
+          // buffer renders in its FRIENDS/FAVORITES section instead of its
+          // network group, so a surviving pin row would be invisible — and a
+          // hidden pin gets silently demoted by every subset reorder of the
+          // pins the user CAN see (#405's accepted semantics turned into
+          // data loss). One placement per buffer: unfavorite returns it to
+          // the network group unpinned.
+          if (unpinBufferCaseInsensitive(userId, networkId, target)) {
+            fanOut(userId, pinsChangedFrame(userId, networkId));
+          }
+        }
+        break;
+      }
+      case 'unfavorite-buffer': {
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
+        if (!networkId || !target) break;
+        if (unfavoriteBuffer(userId, networkId, target)) {
+          fanOut(userId, favoritesChangedFrame(userId));
+        }
+        break;
+      }
+      case 'reorder-favorites': {
+        // Id-form only: favorites span networks, so bare target strings can't
+        // address them, and every client has the ids from favorites-changed.
+        // No per-id ownership probe: reorderFavorites accepts only ids in the
+        // USER'S favorite set (membership implies ownership — every insert
+        // path is user-keyed), and a foreign/stale/duplicate id makes it
+        // return null without writing. Both outcomes echo the authoritative
+        // order — success carries the new order, mismatch snaps the
+        // originating tab back (reorder-pins' stale-set policy).
+        if (!Array.isArray(msg.bufferIds)) break;
+        const raw = msg.bufferIds as unknown[];
+        if (raw.every((bid): bid is number => typeof bid === 'number')) {
+          reorderFavorites(userId, raw);
+        }
+        fanOut(userId, favoritesChangedFrame(userId));
         break;
       }
       case 'reorder-pins': {
         const networkId = Number(msg.networkId);
-        if (!networkId || !Array.isArray(msg.targets)) break;
-        const targets = (msg.targets as unknown[]).filter(
-          (t): t is string => typeof t === 'string' && !!t,
-        );
-        const next = reorderPins(userId, networkId, targets);
+        if (!networkId || (!Array.isArray(msg.targets) && !Array.isArray(msg.bufferIds))) break;
+        // `bufferIds` is the id-form alternative to `targets`. An id that
+        // doesn't resolve to this user's buffer means the client's set is
+        // stale — same as the name-form mismatch, so fall through to the
+        // authoritative echo rather than dropping silently.
+        let targets: string[] | null = null;
+        if (Array.isArray(msg.bufferIds)) {
+          targets = [];
+          for (const bid of msg.bufferIds as unknown[]) {
+            const b = typeof bid === 'number' ? requireBufferForUser(userId, bid) : undefined;
+            if (!b || b.networkId !== networkId) {
+              targets = null;
+              break;
+            }
+            targets.push(b.target);
+          }
+        } else {
+          targets = (msg.targets as unknown[]).filter(
+            (t): t is string => typeof t === 'string' && !!t,
+          );
+        }
+        const next = targets === null ? null : reorderPins(userId, networkId, targets);
         if (next === null) {
           // Set mismatch (concurrent pin/unpin from another tab landed before
           // this reorder). Echo the authoritative current order so the
           // originating client snaps back to truth instead of staying out of
           // sync.
-          fanOut(userId, {
-            kind: 'pins-changed',
-            networkId,
-            pinned: listPinnedForUserNetwork(userId, networkId),
-          });
+          fanOut(userId, pinsChangedFrame(userId, networkId));
           break;
         }
-        fanOut(userId, { kind: 'pins-changed', networkId, pinned: next });
+        fanOut(userId, pinsChangedFrame(userId, networkId));
         break;
       }
       case 'set-nicklist-collapsed': {
-        const networkId = Number(msg.networkId);
-        const target = typeof msg.target === 'string' ? msg.target : '';
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         // Only channels have a nicklist; server/DM buffers are never tracked.
-        if (!networkId || !target.startsWith('#')) break;
+        // (The guard runs on the RESOLVED target, so the id form is policed
+        // identically to the name form.)
+        if (!networkId || !isChannelTarget(target)) break;
         const collapsed = !!msg.collapsed;
         setNicklistCollapsed(userId, networkId, target, collapsed);
-        fanOut(userId, { kind: 'nicklist-collapsed-changed', networkId, target, collapsed });
+        fanOut(userId, {
+          kind: 'nicklist-collapsed-changed',
+          networkId,
+          target,
+          bufferId: addr?.bufferId ?? resolveBuffer(userId, networkId, target)?.id ?? null,
+          collapsed,
+        });
         break;
       }
       case 'set-channel-notify-always': {
-        const networkId = Number(msg.networkId);
-        const target = typeof msg.target === 'string' ? msg.target : '';
+        const addr = verbBuffer(userId, msg);
+        if (addr === null) break;
+        const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
+        const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         // Always-notify is a channel-level concept. DMs are blanket-controlled
         // by notifications.dm.enabled; server pseudo-buffers can't carry it.
-        if (!networkId || !target.startsWith('#')) break;
+        // kindForTarget, not a '#' probe: '&'/'+'/'!' channels carry it too.
+        if (!networkId || kindForTarget(target) !== 'channel') break;
         setChannelNotifyAlways(userId, networkId, target, !!msg.notifyAlways);
         fanOut(userId, {
           kind: 'channel-notify-changed',
           networkId,
           target,
+          bufferId: addr?.bufferId ?? resolveBuffer(userId, networkId, target)?.id ?? null,
           ...getChannelFlags(userId, networkId, target),
         });
         break;
@@ -2684,37 +3448,6 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
           );
         } catch (_) {
           /* boundary already filtered bad networkId; ignore */
-        }
-        break;
-      }
-      case 'set-contact': {
-        // Verb owns validation, the per-(network,nick) uniqueness guard, the
-        // live MONITOR diff, and the fanOut. Thin delegator, same as nick-note.
-        try {
-          callVerb(
-            'set_contact',
-            { userId, scope: 'read-write', transport: 'ws' },
-            {
-              contactId: msg.contactId,
-              displayName: msg.displayName,
-              notifyOnline: msg.notifyOnline,
-              targets: msg.targets,
-            },
-          );
-        } catch (_) {
-          /* invalid input / not owned; ignore */
-        }
-        break;
-      }
-      case 'delete-contact': {
-        try {
-          callVerb(
-            'delete_contact',
-            { userId, scope: 'read-write', transport: 'ws' },
-            { contactId: msg.contactId },
-          );
-        } catch (_) {
-          /* not owned / gone; ignore */
         }
         break;
       }
@@ -2778,13 +3511,18 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         break;
       }
       case 'history': {
-        const histNetworkId = msg.networkId as number;
-        const histTarget = msg.target as string;
+        const histAddr = verbBuffer(userId, msg);
+        if (histAddr === null) break;
+        const histNetworkId = histAddr ? (histAddr.networkId as number) : (msg.networkId as number);
+        let histTarget = histAddr ? histAddr.target : (msg.target as string);
 
         // System buffer: app-scoped, no IRC connection — dispatch to the
         // system_messages keyset access. Reply shapes match the network path
         // below exactly, so the client's history handlers are identical (#355).
-        if (msg.networkId == null && histTarget === SYSTEM_TARGET) {
+        if (
+          (histAddr ? histAddr.networkId : msg.networkId) == null &&
+          histTarget === SYSTEM_TARGET
+        ) {
           send(ws, buildSystemHistoryReply(userId, msg));
           break;
         }
@@ -2800,18 +3538,53 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
           send(ws, { kind: 'error', text: 'unknown network' });
           break;
         }
+        // Resolve the caller's casing to the row's, the way `open-buffer` always
+        // has. IRC target names are case-insensitive, but `messages.target` is
+        // BINARY-collated TEXT and rows keep whatever casing the network handed
+        // us (`#idleRPG` stays `#idleRPG` — foldBufferCase.ts:26), so an exact
+        // match against a divergently-cased request finds NOTHING. That reads as
+        // an empty buffer with `hasMoreOlder:false`: hydrated, permanently blank,
+        // and unpageable.
+        //
+        // Newly load-bearing because hydration moved onto this verb: a client can
+        // legitimately hold a key it built before the row existed (iOS synthesizes
+        // one from the typed name when joining, and the row arrives later with the
+        // server's casing), and its store folds case so the two never look
+        // different to it. The registry lookup folds; no row (a `:server:`
+        // pseudo-buffer, or a target with history but no row) falls through to
+        // what was asked. See feedback_irc_target_case_insensitive.
+        const histRow = getBuffer(userId, histNetworkId, histTarget);
+        histTarget = histRow?.target ?? histTarget;
         const limit = Math.min(Math.max(Number(msg.limit) || 100, 1), 500);
         const mode = typeof msg.mode === 'string' ? msg.mode : 'before';
+        // What `limit` counts (#10). 'renderable' sizes the page in the unit the
+        // reader perceives — consolidatable presence churn rides along for free
+        // instead of eating the budget — so one fetch fills a screen even on a
+        // channel that just came back from a netsplit. Default is today's
+        // behavior; an unknown value degrades to it rather than erroring, since
+        // this is an additive field an older client simply never sends.
+        //
+        // Only the CLIENT knows whether it actually folds those runs (web gates
+        // on chat.consolidate_joins), which is why this is a request field and
+        // not a server-side default: for a client rendering every event as its
+        // own line, 'event' is already the right unit. 'chat' is the same
+        // argument one rung further for a client on the `none` event tier (#666),
+        // which draws no event rows at all.
+        const countBy = asPageUnit(msg.countBy);
         const token = msg.token ?? null;
         const speakers = listSpeakers(histNetworkId, histTarget);
         const baseReply = {
           kind: 'history',
           networkId: histNetworkId,
           target: histTarget,
+          bufferId: histAddr?.bufferId ?? histRow?.id ?? null,
           mode,
           token,
           speakers,
         };
+        // Every mode below pages ONE buffer, so the notify-always answer is
+        // constant across whichever slice we ship (#679).
+        const histNotifyAlways = bufferNotifyAlways(userId, histNetworkId, histTarget);
 
         if (mode === 'around') {
           // Detached jump path. The DB lookup enforces (networkId, target);
@@ -2829,8 +3602,8 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
           // halfLimit caps each side at the request's limit (default 100,
           // clamped 1..500). Total slice length tops out at 2*limit + 1.
           const halfLimit = limit;
-          const slice = listMessagesAround(histNetworkId, histTarget, anchorId, halfLimit);
-          const events = slice.events.map((e) => decorateMessage(userId, e));
+          const slice = listMessagesAround(histNetworkId, histTarget, anchorId, halfLimit, countBy);
+          const events = slice.events.map((e) => decorateMessage(userId, e, histNotifyAlways));
           send(ws, {
             ...baseReply,
             anchorId,
@@ -2851,9 +3624,8 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
             send(ws, { kind: 'error', text: 'invalid afterId' });
             break;
           }
-          const events = listMessages(histNetworkId, histTarget, { afterId, limit }).map((e) =>
-            decorateMessage(userId, e),
-          );
+          const rows = listMessagesCounted(histNetworkId, histTarget, countBy, { afterId, limit });
+          const events = rows.map((e) => decorateMessage(userId, e, histNotifyAlways));
           const newestId = events.length ? events[events.length - 1].id : afterId;
           send(ws, {
             ...baseReply,
@@ -2874,9 +3646,8 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
           // upward paging cleanly, plus inputHistory so up-arrow recall is
           // restored for a shell (fresh-connect shells omit it, so this is the
           // only place a reloaded client gets its per-buffer recall back).
-          const events = listMessages(histNetworkId, histTarget, { limit }).map((e) =>
-            decorateMessage(userId, e),
-          );
+          const rows = listMessagesCounted(histNetworkId, histTarget, countBy, { limit });
+          const events = rows.map((e) => decorateMessage(userId, e, histNotifyAlways));
           const oldestId = events.length ? events[0].id : 0;
           send(ws, {
             ...baseReply,
@@ -2905,10 +3676,11 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
             'recent_messages',
             { userId, scope: 'read-write', transport: 'ws' },
             {
-              networkId: msg.networkId,
-              target: msg.target,
+              networkId: histNetworkId,
+              target: histTarget,
               before,
               limit,
+              countBy,
             },
           ) as { messages: WsPayload[]; hasOlder: boolean };
         } catch (_) {
@@ -2938,7 +3710,13 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
             {
               query: msg.query,
               networkId: msg.networkId || undefined,
-              target: typeof msg.target === 'string' && msg.target ? msg.target : undefined,
+              // `bufferId` narrows the in:-scope by id; resolved to the
+              // canonical name since search's scope filter is name-shaped.
+              target:
+                (typeof msg.bufferId === 'number'
+                  ? requireBufferForUser(userId, msg.bufferId)?.target
+                  : undefined) ??
+                (typeof msg.target === 'string' && msg.target ? msg.target : undefined),
               nick: typeof msg.nick === 'string' && msg.nick ? msg.nick : undefined,
               nicks: Array.isArray(msg.nicks) ? msg.nicks : undefined,
               before: msg.before ? Number(msg.before) : undefined,

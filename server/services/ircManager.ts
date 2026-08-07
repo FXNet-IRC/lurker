@@ -6,6 +6,7 @@ import { IrcConnection } from './ircConnection.js';
 import * as systemLog from './systemLog.js';
 import connectScheduler from './connectScheduler.js';
 import { listNetworksForUser, getNetwork, setNetworkClientIp } from '../db/networks.js';
+import type { Network } from '../db/networks.js';
 import {
   ensureOpen as ensureOpenBuffer,
   setAutojoin as setBufferAutojoin,
@@ -36,16 +37,7 @@ import {
   removeRelayBot as removeRelayBotRow,
 } from '../db/relayBots.js';
 import type { RelayBotResult } from '../db/relayBots.js';
-import {
-  createContact,
-  updateContactMeta,
-  setContactTargets,
-  deleteContact as deleteContactRow,
-  getContact,
-  listContactsForUser,
-  findContactIdByTarget,
-} from '../db/contacts.js';
-import type { ContactRecord } from '../db/contacts.js';
+import { unfavoriteBuffer } from '../db/favoriteBuffers.js';
 import { splitSay, splitAction, hasInteriorNewline } from './messageSplit.js';
 import { e2eManager } from './e2e/manager.js';
 import { contextKey, isChannelContext } from './e2e/context.js';
@@ -183,36 +175,99 @@ class IrcManager extends EventEmitter {
     for (const id of userIds) this.initForUser(id);
   }
 
+  /**
+   * May this user hold a live IRC connection to this network, right now?
+   *
+   * THE connect gate. Every path that opens a socket clears it here rather than
+   * repeating the checks:
+   *
+   * - The network still exists and belongs to this user. (A retry's backoff can
+   *   outlive the row it was scheduled for.)
+   * - Paused accounts never hold a live IRC connection. This is the linchpin of
+   *   the pause feature — it covers boot-time autoconnect (initForUser →
+   *   initAll), the explicit connect/reconnect routes, restartNetwork, and
+   *   (since #616) the auto-reconnect controller's own retries. The boundary
+   *   guards (REST/WS) exist only to return a clean "account paused" instead of
+   *   a silent no-op.
+   * - The instance network lockdown (#298). Gating only the create route would
+   *   leave it trivially bypassable by anyone who already had the network — and
+   *   would do nothing at all on the next restart, when initAll reconnects it.
+   *
+   * The refusal reason is human-readable because auto-reconnect shows it to the
+   * user: a connection that stops retrying has to say why, or it reads as a bug.
+   *
+   * Hands back the network row it had to read anyway. startNetwork needs the same
+   * row immediately afterwards, and re-reading would double the synchronous
+   * SQLite work on every connect and autoconnect — the boot-time fan-out across
+   * every network of every user is exactly the path #460 showed can starve the
+   * event loop.
+   */
+  connectGate(
+    userId: number,
+    networkId: number,
+  ): { ok: true; network: Network } | { ok: false; reason: string } {
+    if (findUserById(userId)?.is_paused) return { ok: false, reason: 'this account is paused' };
+    const network = getNetwork(networkId, userId);
+    if (!network) return { ok: false, reason: 'this network no longer exists' };
+    if (!isNetworkHostAllowed(network.host)) {
+      return { ok: false, reason: `${network.host} is not permitted by this instance` };
+    }
+    return { ok: true, network };
+  }
+
+  /**
+   * connectGate for the auto-reconnect path, plus the bookkeeping a refusal
+   * implies (#616).
+   *
+   * Dropping the connection from the map is the load-bearing half. A refused
+   * retry leaves an IrcConnection that is disconnected and will never retry
+   * again — and startNetwork is a documented no-op when a connection object
+   * already exists, "even if it's in a disconnected state" (see restartNetwork).
+   * Leaving it there would mean the network never comes back after the condition
+   * clears: resumeUser → initForUser → startNetwork would find the corpse and
+   * return it, and the /connect route would answer `ok: true` having done
+   * nothing. That would trade #616's "reconnect resurrects a forbidden
+   * connection" for a worse "connection never returns after unpause".
+   *
+   * Deleting here (before the connection publishes its refusal) is safe: the
+   * event path is the onEvent closure, not a map lookup, so the client still
+   * receives the error and the terminal 'disconnected' state.
+   */
+  private gateReconnect(
+    userId: number,
+    networkId: number,
+  ): { ok: true } | { ok: false; reason: string } {
+    const gate = this.connectGate(userId, networkId);
+    if (!gate.ok) this.connectionsForUser(userId).delete(networkId);
+    // The network row goes no further: the retry reconnects the IrcConnection it
+    // already has, rather than building one from a fresh row.
+    return gate.ok ? { ok: true } : gate;
+  }
+
   startNetwork(
     userId: number,
     networkId: number,
     opts: { deferrable?: boolean; clientIp?: string } = {},
   ): IrcConnection | null {
-    // Paused accounts never hold a live IRC connection. This single gate is the
-    // linchpin of the pause feature: it covers boot-time autoconnect
-    // (initForUser → initAll), the explicit connect/reconnect routes, and
-    // restartNetwork — so a paused user can produce no IRC traffic no matter
-    // which path is taken. The boundary guards (REST/WS) exist only to return a
-    // clean "account paused" instead of a silent no-op.
-    if (findUserById(userId)?.is_paused) return null;
-    // Stamp the latest browser IP onto the row BEFORE we read it, so the freshly
-    // built connection carries it into WEBIRC on connect (FXNet real-IP path).
+    // FXNet WEBIRC: stamp the latest browser IP onto the row BEFORE the gate
+    // reads it, so the freshly built connection carries it into WEBIRC on
+    // connect (real-IP path). connectGate calls getNetwork internally, so this
+    // has to land first for the fresh IP to reach the connection. The pause and
+    // instance-lockdown checks that used to sit here now live in connectGate.
     if (opts.clientIp) setNetworkClientIp(networkId, userId, opts.clientIp);
-    const network = getNetwork(networkId, userId);
-    if (!network) return null;
-    // The instance network lockdown (#298), gated in the same place and for the
-    // same reason as the pause check above: every connect path funnels through
-    // here, so one check covers boot-time autoconnect, the connect/reconnect
-    // routes and restartNetwork. Gating only the create route would leave the
-    // lockdown trivially bypassable by anyone who already had the network — and
-    // would do nothing at all on the next restart, when initAll reconnects it.
-    if (!isNetworkHostAllowed(network.host)) return null;
+    const gate = this.connectGate(userId, networkId);
+    if (!gate.ok) return null;
+    const network = gate.network;
     let conn = this.getConnection(userId, networkId);
     if (conn) return conn;
 
     conn = new IrcConnection({
       network,
       onEvent: (event) => this.emit('event', event),
+      // #616: the retry controller asks this before each attempt opens a socket,
+      // so a reconnect re-clears the same gates the initial connect did. Read
+      // live (not captured), because pause/lockdown can change mid-backoff.
+      reconnectGate: () => this.gateReconnect(userId, networkId),
     });
     this.connectionsForUser(userId).set(networkId, conn);
     // Seed self-presence from the per-user truth before the IRC handshake. The
@@ -333,7 +388,11 @@ class IrcManager extends EventEmitter {
     // write the row (and any key) directly — and do NOT stash the key, since
     // no echo will ever consume it and an orphaned stash would be misapplied
     // by some later join's echo.
-    if (conn.channels.has(name.toLowerCase())) {
+    // Fold-aware (#707): '/join #ops{1}' while joined as '#ops[1]' on an
+    // rfc1459 network IS the already-in case — a raw map probe would miss it,
+    // stash a key no echo will consume, and hand the orphaned stash to the
+    // next join's echo (the exact hazard above).
+    if (conn.isChannelJoined(name)) {
       ensureOpenBuffer(userId, networkId, name, {
         kind: 'channel',
         autojoin: true,
@@ -364,11 +423,14 @@ class IrcManager extends EventEmitter {
   forgetChannel(userId: number, networkId: number, name: string): void {
     // With history the buffer (and its messages) must survive — just stop the
     // auto-rejoin and drop the stored key. Without history there is nothing
-    // left to show, so the row itself goes.
+    // left to show, so the row itself goes — after dropping any favorite, so
+    // the cascade can't leave a position hole (evictChannel does the same;
+    // callers of this method must re-publish favorites if it mattered).
     if (hasMessageForTarget(networkId, name)) {
       setBufferAutojoin(userId, networkId, name, false);
       setBufferChannelKey(userId, networkId, name, null);
     } else {
+      unfavoriteBuffer(userId, networkId, name);
       deleteBuffer(userId, networkId, name);
     }
   }
@@ -456,7 +518,14 @@ class IrcManager extends EventEmitter {
         return false;
       }
       if (outcome.kind === 'encrypted') {
-        for (const line of outcome.lines) conn.say(target, line);
+        for (const line of outcome.lines) {
+          conn.say(target, line);
+          // Registered so the message handler can recognize (and drop) the
+          // echo-message reflection of our own ciphertext by content — see
+          // consumeSentCiphertext. Unconditional: echoActive() can flip
+          // between here and the echo's arrival.
+          conn.noteSentCiphertext(line);
+        }
         conn.publish({
           type: 'message',
           target,
@@ -479,16 +548,28 @@ class IrcManager extends EventEmitter {
     // (not a bare newline) so "hello\n" stays a single-line send — splitMultiline
     // trims edge blanks, and the client's multilineMessageCount gates the same
     // way, so the two stay in sync. (#381)
+    // With upstream echo-message ACKed, the server reflects our sends back and
+    // the ircConnection message handler adopts that echo as the persisted self
+    // row (real msgid + server time, #450) — so the optimistic publish below is
+    // skipped or it would duplicate. Wire writes still happen unconditionally
+    // (say/sendMultiline own the noteUserSend/trackDmPeer side effects). The
+    // E2E branch above is exempt: its echo is ciphertext, so the plaintext self
+    // row can only come from here.
+    const adoptEcho = conn.echoActive();
     if (hasInteriorNewline(text) && conn.supportsMultiline()) {
       const nick = conn.client.user?.nick;
-      for (const echo of conn.sendMultiline(target, text)) {
-        conn.publish({ type: 'message', target, nick, text: echo, kind: 'privmsg', self: true });
+      const echoes = conn.sendMultiline(target, text);
+      if (!adoptEcho) {
+        for (const echo of echoes) {
+          conn.publish({ type: 'message', target, nick, text: echo, kind: 'privmsg', self: true });
+        }
       }
       return true;
     }
     const chunks = splitSay(text);
     for (const chunk of chunks) {
       conn.say(target, chunk);
+      if (adoptEcho) continue;
       conn.publish({
         type: 'message',
         target,
@@ -528,31 +609,39 @@ class IrcManager extends EventEmitter {
     const conn = this.getConnection(userId, networkId);
     if (!conn) return false;
     if (this.refuseCleartextOnE2eChannel(conn, userId, networkId, target, 'action')) return true;
+    // Same echo-adoption gating as send() — see the comment there.
+    const adoptEcho = conn.echoActive();
     const chunks = splitAction(text);
     for (const chunk of chunks) {
       conn.action(target, chunk);
+      if (adoptEcho) continue;
       conn.publish({
         type: 'action',
         target,
         nick: conn.client.user?.nick,
         text: chunk,
+        // Shape parity with the adopted echo, which stamps kind:'action'.
+        kind: 'action',
         self: true,
       });
     }
     return true;
   }
 
-  // IRC servers don't echo your own NOTICE back (and Lurker doesn't request the
-  // echo-message cap), so — exactly like send/action — we publish a self copy
-  // locally per wire chunk. splitSay applies because NOTICE shares PRIVMSG's
-  // length budget.
+  // NOTICE shares send()'s echo model: echo-message servers DO reflect your
+  // own NOTICEs (the cap covers PRIVMSG/NOTICE/TAGMSG alike), so the local
+  // self copy is published only where the cap is absent — exactly like
+  // send/action. splitSay applies because NOTICE shares PRIVMSG's length
+  // budget.
   notice(userId: number, networkId: number, target: string, text: string): boolean {
     const conn = this.getConnection(userId, networkId);
     if (!conn) return false;
     if (this.refuseCleartextOnE2eChannel(conn, userId, networkId, target, 'notice')) return true;
+    const adoptEcho = conn.echoActive();
     const chunks = splitSay(text);
     for (const chunk of chunks) {
       conn.notice(target, chunk);
+      if (adoptEcho) continue;
       conn.publish({
         type: 'notice',
         target,
@@ -857,98 +946,6 @@ class IrcManager extends EventEmitter {
       return null;
     }
     return setRelayBotRow({ userId, networkId, nick, pattern });
-  }
-
-  listContacts(userId: number): ContactRecord[] {
-    return listContactsForUser(userId);
-  }
-
-  // Create or update a contact and its per-network watch targets, then apply the
-  // target diff to live connections so MONITOR starts/stops without a reconnect.
-  // Targets are filtered to the caller's own networks, and a given (network,
-  // nick) maps to at most one contact (others keep it). Returns the saved record,
-  // or null if editing a contact the caller doesn't own.
-  setContact(
-    userId: number,
-    input: {
-      contactId?: number | null;
-      displayName: string;
-      notifyOnline: boolean;
-      targets: Array<{ networkId: number; nick: string; isPrimary?: boolean }>;
-    },
-  ): ContactRecord | null {
-    const displayName = (input.displayName || '').trim();
-    if (!displayName) {
-      throw Object.assign(new Error('displayName is empty'), { code: 'invalid_input' });
-    }
-    const ownedNetworkIds = new Set(listNetworksForUser(userId).map((n) => n.id));
-    const cleaned: Array<{ networkId: number; nick: string; isPrimary: boolean }> = [];
-    for (const t of input.targets || []) {
-      const networkId = Number(t.networkId);
-      const nick = typeof t.nick === 'string' ? t.nick.trim() : '';
-      if (!nick || !ownedNetworkIds.has(networkId)) continue;
-      const lower = nick.toLowerCase();
-      // (network, nick) maps to at most one contact, and no exact dupes within
-      // this contact's own list — but multiple nicks on one network are allowed.
-      const owner = findContactIdByTarget(userId, networkId, nick);
-      if (owner != null && owner !== input.contactId) continue;
-      if (cleaned.some((c) => c.networkId === networkId && c.nick.toLowerCase() === lower))
-        continue;
-      cleaned.push({ networkId, nick, isPrimary: !!t.isPrimary });
-    }
-    // Exactly one primary — the DM that opens when the friend is clicked. Honor
-    // the flagged target if one survived filtering; otherwise the first.
-    if (cleaned.length) {
-      const wanted = cleaned.find((t) => t.isPrimary);
-      cleaned.forEach((t) => (t.isPrimary = false));
-      (wanted ?? cleaned[0]).isPrimary = true;
-    }
-
-    let contactId = input.contactId ?? null;
-    let prevTargets: Array<{ networkId: number; nick: string; isPrimary: boolean }> = [];
-    if (contactId != null) {
-      const existing = getContact(contactId, userId);
-      if (!existing) return null;
-      prevTargets = existing.targets;
-      updateContactMeta({ contactId, userId, displayName, notifyOnline: !!input.notifyOnline });
-    } else {
-      contactId = createContact({ userId, displayName, notifyOnline: !!input.notifyOnline });
-    }
-    setContactTargets(contactId, cleaned);
-    this.applyContactTargetDiff(userId, contactId, prevTargets, cleaned);
-    return getContact(contactId, userId);
-  }
-
-  deleteContact(userId: number, contactId: number): boolean {
-    const existing = getContact(contactId, userId);
-    if (!existing) return false;
-    for (const t of existing.targets) {
-      this.getConnection(userId, t.networkId)?.untrackFriend(t.nick);
-    }
-    return deleteContactRow(contactId, userId);
-  }
-
-  // Track newly-added targets and untrack removed ones on the matching live
-  // connection (keyed by network+lowernick). Targets present in both are left
-  // alone — their friend watch is unchanged.
-  private applyContactTargetDiff(
-    userId: number,
-    contactId: number,
-    prev: Array<{ networkId: number; nick: string }>,
-    next: Array<{ networkId: number; nick: string }>,
-  ): void {
-    const keyOf = (t: { networkId: number; nick: string }) =>
-      `${t.networkId}::${t.nick.toLowerCase()}`;
-    const prevKeys = new Set(prev.map(keyOf));
-    const nextKeys = new Set(next.map(keyOf));
-    for (const t of prev) {
-      if (nextKeys.has(keyOf(t))) continue;
-      this.getConnection(userId, t.networkId)?.untrackFriend(t.nick);
-    }
-    for (const t of next) {
-      if (prevKeys.has(keyOf(t))) continue;
-      this.getConnection(userId, t.networkId)?.trackFriend(t.nick, contactId);
-    }
   }
 }
 

@@ -141,12 +141,34 @@ describe('classifyUpload — media', () => {
       ['v.mov', bmff('qt  ', []), 'video/quicktime', 'mov'],
       ['v.m4v', bmff('M4V '), 'video/x-m4v', 'm4v'],
       ['a.m4a', bmff('M4A '), 'audio/x-m4a', 'm4a'],
+      // An ISO-BMFF stamped with one of the four audio brands (M4B/F4A/F4B) sniffs as
+      // audio/mp4, not audio/x-m4a. Same box structure → served as .m4a.
+      ['a.m4b', bmff('M4B ', []), 'audio/mp4', 'm4a'],
+      ['a.f4a', bmff('F4A ', []), 'audio/mp4', 'm4a'],
+      // Samsung's stock voice recorder writes a 3GPP container and names it `.m4a`.
+      // Still ISO-BMFF → scrubbable, and served under its honest extension.
+      ['rec.m4a', bmff('3gp4', ['isom', '3gp4']), 'video/3gpp', '3gp'],
+      ['v.3g2', bmff('3g2a', []), 'video/3gpp2', '3g2'],
       ['a.mp3', mp3Frame, 'audio/mpeg', 'mp3'],
     ];
     for (const [name, bytes, mime, ext] of cases) {
       const c = await classifyUpload(write(name, bytes), 'application/octet-stream');
       expect({ name, ...c }).toEqual({ name, contentClass: 'media', mime, ext });
     }
+  });
+
+  it('does NOT treat audio/mp4 as "the audio-only MIME"', async () => {
+    // The trap this pins: file-type keys ISO-BMFF off the major `ftyp` brand alone and
+    // has no idea whether there's a video track. An audio-only recording with an
+    // ordinary `mp42`/`isom` brand — which is most of them — falls to the switch's
+    // DEFAULT and sniffs as video/mp4. Only M4B/F4A/F4B ever produce audio/mp4.
+    //
+    // A comment in contentClass.ts once claimed otherwise, and the claim is invisible
+    // in production because both MIMEs are accepted and scrub identically. It would
+    // only surface as a wrong `ext`, so it needs a test rather than prose.
+    const c = await classifyUpload(write('audio-only.m4a', bmff('mp42', ['isom'])), 'audio/x-m4a');
+    expect(c.mime).toBe('video/mp4');
+    expect(c.ext).toBe('mp4');
   });
 
   it('rejects media we have no scrubber for, rather than leaking its metadata', async () => {

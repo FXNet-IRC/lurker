@@ -11,6 +11,16 @@ export interface ApiRequestOptions {
   method?: string;
   body?: unknown;
   headers?: Record<string, string>;
+  /**
+   * Abort the request.
+   *
+   * ⚠ Without one, a `fetch` here can hang FOREVER — there is no default timeout in any browser
+   * for a socket that stays open, so a dead NAT mapping, a sleeping laptop or a proxy that
+   * accepts and never answers leaves the promise pending for the life of the tab. Racing a timer
+   * against it is not the same thing: the request keeps its socket, still downloads and parses
+   * the body, and resolves into a handler that has already given up.
+   */
+  signal?: AbortSignal;
 }
 
 // One-shot guard so an unrecoverable 401 can't loop the page reload.
@@ -60,9 +70,17 @@ function bounceToLoginOnAuthFailure(url: string, status: number): void {
   window.location.assign('/');
 }
 
-function clearAuthRecoveryGuard(): void {
-  // A request succeeded → the session works; clear the marker so a later session
-  // loss can recover again.
+// Clear the one-shot marker so a LATER session loss can recover again. The bar
+// is proof that a session exists, and only the auth store can supply it: either
+// `/api/auth/me` came back with a user (fetchMe) or one was just established by
+// a sign-in / setup / invite (adoptSession). Nothing else may call this.
+// Clearing it on any 2xx (which this used to do) silently disarmed the guard and
+// turned the bounce into an infinite full-page reload loop: on a logged-out `/`,
+// App.vue fires /api/config (public, 200 — cleared the flag) alongside
+// /api/settings/bootstrap (requireAuth, 401 — set it and bounced). config's 200
+// almost always won the race, so every reload re-armed the bounce and the tab
+// ping-ponged until the auth rate limiter answered 429.
+export function clearAuthRecoveryGuard(): void {
   try {
     sessionStorage.removeItem(AUTH_RECOVERY_FLAG);
   } catch {
@@ -74,10 +92,11 @@ function clearAuthRecoveryGuard(): void {
 // that want a checked shape can pass it explicitly: `api<{ user: User }>(url)`.
 export async function api<T = any>(
   url: string,
-  { method = 'GET', body, headers }: ApiRequestOptions = {},
+  { method = 'GET', body, headers, signal }: ApiRequestOptions = {},
 ): Promise<T> {
   const res = await fetch(url, {
     method,
+    signal,
     credentials: 'include',
     headers: {
       Accept: 'application/json',
@@ -103,7 +122,6 @@ export async function api<T = any>(
     err.data = data;
     throw err;
   }
-  clearAuthRecoveryGuard();
   return data as T;
 }
 
@@ -139,7 +157,6 @@ export function apiMultipart<T = any>(
         }
       }
       if (xhr.status >= 200 && xhr.status < 300) {
-        clearAuthRecoveryGuard();
         resolve(data as T);
       } else {
         bounceToLoginOnAuthFailure(url, xhr.status);

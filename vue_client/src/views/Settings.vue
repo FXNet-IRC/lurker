@@ -16,7 +16,7 @@
 <template>
   <div class="settings-page">
     <header class="bar">
-      <RouterLink to="/" class="back">← back</RouterLink>
+      <RouterLink :to="chatEntry" class="back">← back</RouterLink>
       <h1>settings</h1>
     </header>
 
@@ -46,6 +46,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue';
 import type { Component } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
+import { canGoBack } from '../utils/routerBack.js';
 import { useSettingsStore } from '../stores/settings.js';
 import { useAuthStore } from '../stores/auth.js';
 import { useConfigStore } from '../stores/config.js';
@@ -53,6 +54,7 @@ import { useSocket } from '../composables/useSocket.js';
 import { CATEGORIES, GROUPS, REGISTRY, categoryVisible } from '../utils/settingsRegistry.js';
 import SettingsSidebar from '../components/SettingsSidebar.vue';
 import RegistryPane from '../components/settings-panes/RegistryPane.vue';
+import AppearancePane from '../components/settings-panes/AppearancePane.vue';
 import NotificationsPane from '../components/settings-panes/NotificationsPane.vue';
 import HighlightsPane from '../components/settings-panes/HighlightsPane.vue';
 import IgnoresPane from '../components/settings-panes/IgnoresPane.vue';
@@ -71,11 +73,29 @@ const config = useConfigStore();
 const route = useRoute();
 const router = useRouter();
 
+// Where "← back" returns to, captured ONCE on entry rather than read at click
+// time. Since #744 the chat URL names a specific buffer, so a hard-coded `/`
+// silently drops it — you return to chat still looking at #foo while the URL
+// says `/`, and copying or refreshing then lands somewhere else. Reading
+// history.state.back live wouldn't do either: every settings category is its
+// own push (SettingsSidebar), so it would walk back through the categories
+// browsed instead of leaving. Falls back to `/` when Settings was opened cold.
+//
+// Settings-internal entries are rejected, not just missing ones: vue-router
+// state survives a reload, so after an intra-settings refresh state.back names
+// the PREVIOUS CATEGORY — a back link that switches categories once and then
+// goes dead, with no other way out of the Settings shell. `/` always exits.
+const entryCandidate = canGoBack()
+  ? (window.history.state as { back?: string } | null)?.back
+  : null;
+const chatEntry = entryCandidate && !entryCandidate.startsWith('/settings') ? entryCandidate : '/';
+
 const error = ref('');
 
 // One component per bespoke category. Registry-driven categories all share
 // RegistryPane and pick out their items by `categoryId` prop.
 const BESPOKE_PANES: Record<string, Component> = {
+  appearance: AppearancePane,
   notifications: NotificationsPane,
   highlights: HighlightsPane,
   ignores: IgnoresPane,
@@ -116,7 +136,9 @@ interface SettingsSubsection {
 
 const appearanceSubsections = computed<SettingsSubsection[]>(() => {
   const seen = new Set<string>();
-  const subsections: SettingsSubsection[] = [];
+  // Themes leads the pane but isn't a registry group — ThemesSection renders
+  // its own [data-setting-group="themes"] heading for the scroll-spy.
+  const subsections: SettingsSubsection[] = [{ id: 'themes', label: 'Themes' }];
   for (const opt of REGISTRY) {
     if (opt.category !== 'appearance') continue;
     const id = opt.group || '_';
@@ -295,6 +317,7 @@ watch(
     if (!hash) return;
     await nextTick();
     await nextTick();
+    // ⚠ NOT a channel test (#724): this `#` is the URL fragment marker. Left alone on purpose.
     const target = hash.startsWith('#') ? hash.slice(1) : hash;
     const root = contentEl.value;
     if (!root) return;

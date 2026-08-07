@@ -1,6 +1,13 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
+// FIRST import on purpose: it installs the dead-pty stdout/stderr guards as an
+// import side effect (#442), and module evaluation follows import-declaration
+// order — dotenv's injection banner and the db module's boot-migration logs
+// write to stdout during the import phase, before any statement in this file
+// runs. Moving this down (or installing from this file's body, as a previous
+// revision did) re-opens the boot-time crash window this exists to close.
+import { onStdioSuppressed, installFatalExceptionExit } from './utils/processGuards.js';
 import 'dotenv/config';
 import http from 'http';
 
@@ -12,6 +19,9 @@ import { getNodeSecret } from './middleware/nodeAuth.js';
 import { nodeUploadConfigured } from './services/uploadProviders/nodeUpload.js';
 import * as systemLog from './services/systemLog.js';
 import { purgeExpiredSessions } from './db/sessions.js';
+import { sweepExpiredPreviews } from './db/linkPreviews.js';
+import { sweepPreviewCache } from './services/previewCache/index.js';
+import { listGrandfatheredUsernames } from './db/users.js';
 import { backfillEncryptColumns } from './db/secretBackfill.js';
 import { assertPushCredentials } from './services/push/credentials.js';
 import { resolveSessionSecret } from './utils/sessionSecret.js';
@@ -45,6 +55,36 @@ import { startGuestReaper, stopGuestReaper } from './services/guestReaper.js';
 import { isPublicModeEnabled } from './utils/publicMode.js';
 import { sweepTempUploads } from './routes/uploads.js';
 import { startEventLoopMonitor, stopEventLoopMonitor } from './services/eventLoopMonitor.js';
+import * as systemMessages from './db/systemMessages.js';
+
+// Wired here rather than inside processGuards (which must stay import-free —
+// see its header): both records target the DB-backed system log, which only
+// exists once the import phase is over. The breadcrumb makes "console logging
+// stopped" (dead pty, or the consumer of `npm start | tee` exiting)
+// discoverable instead of a silent weeks-long gap in the log file.
+onStdioSuppressed((detail) => {
+  systemLog.log({
+    scope: 'server',
+    level: 'warn',
+    text: `Console stream write failed (${detail}) — stdout/stderr logging is suspended; the system log is unaffected`,
+  });
+});
+
+// Fatal exceptions (and, under Node's default mode, unhandled rejections)
+// still exit — see installFatalExceptionExit for the ordering contract. The
+// record writes via systemMessages.insert directly, NOT systemLog.log: log()
+// synchronously runs the full wsHub fan-out (per-user reads, frame queuing)
+// for frames the exit(1) is about to discard mid-crash.
+installFatalExceptionExit((text) =>
+  systemMessages.insert({
+    userId: null,
+    ts: new Date().toISOString(),
+    level: 'error',
+    scope: 'server',
+    source: 'server',
+    text,
+  }),
+);
 
 const PORT = Number(process.env.PORT || 8010);
 // Optional bind address for the web/API server (HOST). Unset keeps upstream
@@ -79,6 +119,20 @@ attachWsHub(server, SESSION_SECRET);
 
 purgeExpiredSessions();
 setInterval(purgeExpiredSessions, 60 * 60 * 1000).unref();
+
+// link_previews is a cache with a TTL, so lapsed rows have to actually go — without this it
+// only ever grows. Deliberately NOT gated on previewsEnabled(): an operator who turns the
+// feature off still has whatever it cached while it was on, and that should still expire.
+sweepExpiredPreviews();
+setInterval(sweepExpiredPreviews, 60 * 60 * 1000).unref();
+
+// The BYTE cache's index needs the same treatment, and for `s3` it is not merely
+// hygiene: nothing else bounds that table, and a row that outlives its object has
+// `toDescriptor` minting a public URL that 404s for everyone. `void` because the
+// sweep touches a bucket-backed backend and answers with a count nobody waits on;
+// it swallows its own failures, like every other path in that module.
+void sweepPreviewCache();
+setInterval(() => void sweepPreviewCache(), 60 * 60 * 1000).unref();
 
 systemLog.log({ scope: 'server', text: `Lurker server starting up (edition: ${EDITION})` });
 
@@ -124,6 +178,20 @@ const wrapped = backfillEncryptColumns();
 if (wrapped.encrypted > 0) {
   console.log(`[lurker] encrypted ${wrapped.encrypted} secret column value(s) at rest`);
   systemLog.log({ scope: 'server', text: `Encrypted ${wrapped.encrypted} secret column value(s)` });
+}
+
+// Name any account whose username couldn't be created under today's rules — a
+// space, or a case-twin of another account. They keep working (grandfathered),
+// but the operator should learn about them here rather than from a user who
+// can't tell which of two lookalike accounts is theirs. Silent on the
+// overwhelmingly common instance where every name already conforms.
+const legacyNames = listGrandfatheredUsernames();
+if (legacyNames.length > 0) {
+  console.warn(
+    `[lurker] ${legacyNames.length} account name(s) predate the username rules and are ` +
+      'grandfathered (they keep logging in with them): ' +
+      legacyNames.map((u) => `#${u.id} "${u.username}" — ${u.why}`).join('; '),
+  );
 }
 
 ircManager.initAll();

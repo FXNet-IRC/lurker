@@ -126,7 +126,6 @@ beforeEach(() => {
     'notifications.dm.enabled',
     'notifications.highlight.enabled',
     'notifications.always_notify.enabled',
-    'notifications.friend_online.enabled',
     'notifications.push.mute_when_away',
     'notifications.push.quiet_hours.enabled',
     'notifications.push.quiet_hours.start',

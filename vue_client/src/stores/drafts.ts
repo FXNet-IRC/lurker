@@ -21,6 +21,23 @@ function key(networkId: number | string, target: string) {
 const flushTimers = new Map<string, ReturnType<typeof setTimeout>>(); // key -> setTimeout id
 const pending = new Map<string, { networkId: number | string; target: string }>(); // key -> { networkId, target }
 
+// The buffer the composer is actively IME-composing into (compositionstart →
+// compositionend), or null. Dropping v-model gave the composer live text
+// during composition, but also dropped vModelText's beforeUpdate guard that
+// deferred WRITES to a composing textarea — this flag re-establishes that
+// protection at the store, where every dangerous write originates. While set,
+// for that one buffer:
+//   - remote updates and snapshot seeds are DROPPED: the in-flight composition
+//     is by definition newer (last-write-wins), and the next local flush
+//     overwrites the server copy anyway — while a write-through would repaint
+//     the focused textarea under a live preedit and destroy the word;
+//   - the debounce flush is DEFERRED, so a mid-word pause can't ship raw
+//     phonetic preedit as the durable cross-device draft (and `pending` stays
+//     armed for the whole composition instead of disarming at the 500ms mark).
+// The pagehide beacon still ships the store as-is: a killed app keeps its
+// draft, possibly with a trailing preedit — better than losing the line.
+let composingKey: string | null = null;
+
 // Mirrors the server's per-buffer drafts table. Server is the source of truth
 // on snapshot (initial connect, visibility-resync). Local writes go in
 // optimistically and flush on a debounce so the input bar doesn't feel
@@ -51,7 +68,7 @@ export const useDraftStore = defineStore('drafts', {
         for (const d of list) {
           if (!d) continue;
           const k = key(d.networkId, d.target);
-          if (pending.has(k)) {
+          if (pending.has(k) || k === composingKey) {
             const existing = this.drafts[k];
             if (typeof existing === 'string' && existing.length > 0) next[k] = existing;
             continue;
@@ -61,8 +78,10 @@ export const useDraftStore = defineStore('drafts', {
       }
       // Bring along pending-only buffers the snapshot didn't include (typed
       // locally before this client ever flushed, so the server doesn't know
-      // about them yet).
-      for (const [k] of pending) {
+      // about them yet). The composing buffer rides along too: compositionstart
+      // fires before the first input event, so there's a gap where it isn't
+      // pending yet.
+      for (const k of composingKey ? [...pending.keys(), composingKey] : pending.keys()) {
         if (next[k] != null) continue;
         const existing = this.drafts[k];
         if (typeof existing === 'string' && existing.length > 0) next[k] = existing;
@@ -74,7 +93,11 @@ export const useDraftStore = defineStore('drafts', {
     // one by updated_at.
     applyRemoteUpdate(networkId: number | string, target: string, body: string) {
       const k = key(networkId, target);
-      if (pending.has(k)) return;
+      // The composing check is load-bearing on its own: `pending` disarms when
+      // the debounced flush fires, which a >500ms mid-word pause used to allow —
+      // leaving a remote update free to repaint the focused, composing textarea
+      // through the :value binding and destroy the in-flight word.
+      if (pending.has(k) || k === composingKey) return;
       const text = typeof body === 'string' ? body : '';
       if (text.length > 0) this.drafts[k] = text;
       else delete this.drafts[k];
@@ -103,6 +126,46 @@ export const useDraftStore = defineStore('drafts', {
       delete this.drafts[k];
       this.clearTimer(k);
       pending.delete(k);
+      if (composingKey === k) composingKey = null;
+    },
+    // Lifecycle hooks (lib/bufferLifecycle.ts). rekey moves the body AND the
+    // module-level debounce bookkeeping — a pending flush keyed by the dead
+    // name would otherwise fire a draft-set for a buffer the server just
+    // renamed away.
+    dropBuffer(networkId: number | string | null, target: string) {
+      if (networkId == null) return;
+      this.drop(networkId, target);
+    },
+    rekeyBuffer(networkId: number | string | null, from: string, to: string) {
+      if (networkId == null) return;
+      const fromKey = key(networkId, from);
+      const toKey = key(networkId, to);
+      // Destination wins on a merge collision: if the destination buffer has
+      // ANY local draft state (body, pending flush, armed timer), the
+      // source's is dropped rather than clobbering what the user typed there
+      // — mirroring the server's merge (survivor's non-empty draft wins).
+      const destHasState =
+        this.drafts[toKey] != null || pending.has(toKey) || flushTimers.has(toKey);
+      const fromTimer = flushTimers.get(fromKey);
+      if (fromTimer) {
+        // Never move the old timeout: its closure captured the OLD name.
+        clearTimeout(fromTimer);
+        flushTimers.delete(fromKey);
+      }
+      if (destHasState) {
+        delete this.drafts[fromKey];
+        pending.delete(fromKey);
+        return;
+      }
+      if (this.drafts[fromKey] != null) {
+        this.drafts[toKey] = this.drafts[fromKey];
+        delete this.drafts[fromKey];
+      }
+      if (pending.has(fromKey)) {
+        pending.delete(fromKey);
+        pending.set(toKey, { networkId, target: to });
+      }
+      if (fromTimer) this.scheduleFlush(networkId, to);
     },
     // Beacon path used on tab close: ship every un-flushed buffer in one POST
     // since a WS send may already be in teardown. Returns whether anything
@@ -133,10 +196,29 @@ export const useDraftStore = defineStore('drafts', {
       for (const id of flushTimers.values()) clearTimeout(id);
       flushTimers.clear();
       pending.clear();
+      composingKey = null;
+    },
+    // The composer's composition handlers. beginComposition marks the buffer;
+    // endComposition clears WHICHEVER buffer was marked (buffer-switch and blur
+    // call it too, so a missed compositionend can never suppress remote updates
+    // forever) and arms the flush that scheduleFlush deferred meanwhile.
+    beginComposition(networkId: number | string, target: string) {
+      composingKey = key(networkId, target);
+    },
+    endComposition() {
+      if (composingKey == null) return;
+      const k = composingKey;
+      composingKey = null;
+      const ref = pending.get(k);
+      if (ref) this.scheduleFlush(ref.networkId, ref.target);
     },
     scheduleFlush(networkId: number | string, target: string) {
       const k = key(networkId, target);
       this.clearTimer(k);
+      // Deferred while this buffer is mid-composition: flushing now would ship
+      // raw preedit as the durable cross-device draft AND disarm `pending`.
+      // endComposition re-arms the flush; `pending` stays set meanwhile.
+      if (k === composingKey) return;
       const id = setTimeout(() => {
         flushTimers.delete(k);
         this.sendForBuffer(networkId, target);

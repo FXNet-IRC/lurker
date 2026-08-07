@@ -34,5 +34,20 @@ export const useInputHistoryStore = defineStore('inputHistory', {
     drop(networkId: number | string, target: string) {
       delete this.history[key(networkId, target)];
     },
+    // Lifecycle hooks (lib/bufferLifecycle.ts).
+    dropBuffer(networkId: number | string | null, target: string) {
+      if (networkId == null) return;
+      this.drop(networkId, target);
+    },
+    rekeyBuffer(networkId: number | string | null, from: string, to: string) {
+      if (networkId == null) return;
+      const fromKey = key(networkId, from);
+      const toKey = key(networkId, to);
+      if (!this.history[fromKey]) return;
+      // Destination wins on a merge collision; the source mirror is dropped
+      // (the server's merged slice re-seeds on next open anyway).
+      if (!this.history[toKey]) this.history[toKey] = this.history[fromKey];
+      delete this.history[fromKey];
+    },
   },
 });

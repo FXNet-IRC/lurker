@@ -4,18 +4,15 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { setActivePinia, createPinia } from 'pinia';
 
-// navHistory dispatches hops through the buffers/friends stores. Stub both: byKey
-// reports liveness from a Set, activate echoes its key back through record() the
-// way the real activeKey watcher does (so the re-entrancy guard is exercised),
-// and friends.open() echoes the :friends: sentinel. ':friends:' is inlined here
-// because vi.hoisted runs before the virtualBuffers import binding exists.
+// navHistory dispatches hops through the buffers store. Stub it: byKey reports
+// liveness from a Set, activate echoes its key back through record() the way
+// the real activeKey watcher does (so the re-entrancy guard is exercised).
 const h = vi.hoisted(() => ({
   live: new Set<string>(),
   record: null as null | ((key: string) => void),
   activate: vi.fn<(networkId: number | null, target: string) => void>((networkId, target) => {
     h.record?.(networkId == null ? target : `${networkId}::${target}`);
   }),
-  friendsOpen: vi.fn<() => void>(() => h.record?.(':friends:')),
 }));
 
 vi.mock('./buffers.js', () => ({
@@ -24,12 +21,9 @@ vi.mock('./buffers.js', () => ({
     activate: h.activate,
   }),
 }));
-vi.mock('./friends.js', () => ({
-  useFriendsStore: () => ({ open: h.friendsOpen }),
-}));
 
 import { useNavHistoryStore } from './navHistory.js';
-import { FRIENDS_KEY, SYSTEM_KEY } from '../lib/virtualBuffers.js';
+import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
 
 // Create the store and wire the simulated activeKey watcher (activate/open echo
 // back into record), matching how useKeyboardShortcuts hooks it up live.
@@ -47,8 +41,6 @@ beforeEach(() => {
   h.activate.mockImplementation((networkId: number | null, target: string) => {
     h.record?.(networkId == null ? target : `${networkId}::${target}`);
   });
-  h.friendsOpen.mockReset();
-  h.friendsOpen.mockImplementation(() => h.record?.(':friends:'));
 });
 
 describe('record', () => {
@@ -103,18 +95,6 @@ describe('back / forward dispatch', () => {
     nav.back();
 
     expect(h.activate).toHaveBeenCalledWith(null, SYSTEM_KEY);
-  });
-
-  it('routes the friends sentinel through the friends store', () => {
-    const nav = mkStore();
-    h.live.add('1::#a');
-    nav.record(FRIENDS_KEY);
-    nav.record('1::#a');
-
-    nav.back();
-
-    expect(h.friendsOpen).toHaveBeenCalledOnce();
-    expect(h.activate).not.toHaveBeenCalled();
   });
 
   it('skips a buffer that was closed since it was visited', () => {

@@ -3,6 +3,7 @@
 
 import type { ContextMenuItem } from './useContextMenu.js';
 import { useBookmarksStore } from '../stores/bookmarks.js';
+import { useBuffersStore } from '../stores/buffers.js';
 import { useContextMenu } from './useContextMenu.js';
 
 export interface MessageLike {
@@ -11,8 +12,16 @@ export interface MessageLike {
   text?: string;
   self?: boolean;
   userhost?: string;
-  networkId?: number;
-  network_id?: number;
+  // Null on the app-scoped system buffer, which has no owning network — see the
+  // bookmark gate in buildActions.
+  networkId?: number | null;
+  network_id?: number | null;
+  // The buffer the line belongs to. Present on every real message row; the
+  // fallback for resolving the buffer id "Copy link" addresses.
+  target?: string;
+  // buffers(id), as it rides on the server's message events — the direct
+  // answer, when the row came from the server rather than being minted here.
+  bufferId?: number;
 }
 
 export interface MessageContext {
@@ -21,7 +30,7 @@ export interface MessageContext {
   onIgnore(message: MessageLike): void;
 }
 
-export type MessageActionKey = 'reply' | 'copy' | 'save' | 'ignore';
+export type MessageActionKey = 'reply' | 'copy' | 'link' | 'save' | 'ignore';
 
 export interface MessageAction {
   key: MessageActionKey;
@@ -63,7 +72,49 @@ export interface MessageActionsAPI {
 // `context` shape: { networkId, onReply(message), onIgnore(message) }
 export function useMessageActions(): MessageActionsAPI {
   const bookmarks = useBookmarksStore();
+  const buffers = useBuffersStore();
   const menu = useContextMenu();
+
+  // Absolute permalink to one message, or null when the line can't have one.
+  // The buffer route addresses by server id (#744), so this needs the message's
+  // id AND its buffer's — and it deliberately refuses the two kinds of line a
+  // link couldn't actually land on:
+  //
+  //   - app-scoped system lines (networkId null), which have no buffer route
+  //     that a per-message jump accepts
+  //   - `:server:` consoles, which useJumpToMessage rejects outright ("Cannot
+  //     jump in server buffer") — a link there would open the buffer and then
+  //     toast at the user instead of scrolling
+  //
+  // Prefers the id the row already carries — server message events ship
+  // `bufferId` and the store keeps the event object whole, so the usual case
+  // needs no lookup at all. That matters because buildActions runs for EVERY
+  // rendered row (up to MAX_PER_BUFFER of them) on every re-render, and
+  // findByTarget's exact-key fast path degrades to an O(buffers) folded scan
+  // whenever the message's server-cased target differs from the buffer key —
+  // the #327 case — which would make it O(rows x buffers) per render.
+  // findByTarget stays as the fallback for rows minted locally.
+  //
+  // Split in two — linkBufferId answers "can this line link, and to which
+  // buffer", messageLink formats the URL — so buildActions' per-row
+  // eligibility test stays allocation-free: building the string just to test
+  // truthiness was waste at that call frequency.
+  function linkBufferId(message: MessageLike): number | null {
+    const networkId = message.networkId ?? message.network_id;
+    if (message.id == null || networkId == null) return null;
+    if (!message.target || message.target.startsWith(':server:')) return null;
+    const bufferId =
+      typeof message.bufferId === 'number'
+        ? message.bufferId
+        : buffers.findByTarget(networkId, message.target)?.id;
+    return bufferId ?? null;
+  }
+
+  function messageLink(message: MessageLike): string | null {
+    const bufferId = linkBufferId(message);
+    if (bufferId == null) return null;
+    return `${window.location.origin}/buffer/${bufferId}?msg=${message.id}`;
+  }
 
   function buildActions(message: MessageLike | null | undefined): MessageAction[] {
     if (!message) return [];
@@ -81,8 +132,26 @@ export function useMessageActions(): MessageActionsAPI {
       actions.push({ key: 'copy', label: 'Copy text', icon: 'fa-regular fa-copy' });
     }
 
-    // Bookmarks are only meaningful for messages with a stable server id.
-    if (message.id != null) {
+    // Sits next to Copy text because it's the other "take this away with you"
+    // action: a permalink to bookmark, or to open in a new window.
+    if (linkBufferId(message) != null) {
+      actions.push({ key: 'link', label: 'Copy link to message', icon: 'fa-solid fa-link' });
+    }
+
+    // Bookmarks need a stable server id AND an owning network.
+    //
+    // The network gate is not cosmetic. Bookmarking is ownership-checked by
+    // joining the message to its network (db/bookmarks.ts), so a system-buffer
+    // line — `networkId: null`, app-scoped — can never be saved: the insert
+    // writes nothing and the server sends no echo back. Offering "Save message"
+    // there was a button that did nothing, forever, with no feedback.
+    //
+    // It also closes a mislabel. System lines come from their own table with
+    // their own id sequence (`systemLineToEvent`), so system line #42 and
+    // message #42 coexist; asking `isSaved(42)` for the former would light up
+    // "Remove bookmark" on a line nobody ever saved.
+    const networkId = message.networkId ?? message.network_id;
+    if (message.id != null && networkId != null) {
       const saved = bookmarks.isSaved(message.id);
       actions.push({
         key: 'save',
@@ -109,6 +178,14 @@ export function useMessageActions(): MessageActionsAPI {
           navigator.clipboard.writeText(String(message.text || '')).catch(() => {});
         }
         break;
+      case 'link': {
+        // Fire-and-forget with no tick, matching its neighbour above — the
+        // action bar renders stateless descriptors, and useCopyFeedback calls
+        // out the copy-message action as deliberately not that shape.
+        const url = messageLink(message);
+        if (url && navigator.clipboard) navigator.clipboard.writeText(url).catch(() => {});
+        break;
+      }
       case 'save':
         bookmarks.toggle(message);
         break;

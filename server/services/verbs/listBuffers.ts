@@ -4,6 +4,7 @@
 import { registerVerb } from '../verbRegistry.js';
 import { listNetworksForUser } from '../../db/networks.js';
 import { listBuffersForNetwork } from '../../db/messages.js';
+import { isChannelTarget } from '../../../shared/channels.js';
 
 /** Authenticated caller context passed to every verb handler. */
 interface VerbContext {
@@ -12,7 +13,7 @@ interface VerbContext {
 }
 
 function bufferKind(target: string): 'channel' | 'dm' {
-  if (target.startsWith('#')) return 'channel';
+  if (isChannelTarget(target)) return 'channel';
   return 'dm';
 }
 

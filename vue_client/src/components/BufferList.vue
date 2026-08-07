@@ -84,62 +84,74 @@
         :class="{ 'unread-bold': unreadBold }"
         @scroll="scheduleRecompute"
       >
-        <!-- FRIENDS pseudo-network: a cross-network gathering of DM shortcuts. The
-           header opens the compilation feed (:friends:); each row opens that
-           friend's DM on their primary network. -->
-        <div v-if="friends.contacts.length || isFriendsActive" class="net friends-net">
-          <div
-            class="net-head"
-            :class="{ active: isFriendsActive }"
-            title="Open Friends feed"
-            @click="selectFriends"
-          >
-            <span class="indicator" :class="friendsPresence" :title="friendsStatusTitle"></span>
-            <span class="name">FRIENDS</span>
-            <div class="net-actions">
-              <button
-                type="button"
-                class="net-action net-add"
-                title="Add friend"
-                aria-label="Add friend"
-                @click.stop="friends.openEditorNew()"
-                @contextmenu.stop.prevent
-              >
-                <i class="fa-solid fa-plus"></i>
-              </button>
-            </div>
+        <!-- FRIENDS / FAVORITES: two kind-filtered views of the one global
+             favorites list (queries vs channels). Rows are real buffers —
+             presence dots, badges, menus all behave like any DM/channel row —
+             shown here INSTEAD of their network group (dedupe, like the old
+             FRIENDS section). Each section drag-reorders independently: the
+             server floats the sent subset and keeps unmentioned favorites'
+             relative order, so reordering Friends never scrambles Favorites. -->
+        <div v-for="section in favoriteSections" :key="section.name" class="net">
+          <div class="net-head section-head">
+            <span class="name">{{ section.name }}</span>
           </div>
-          <ul v-if="friends.contacts.length" class="channels">
-            <li
-              v-for="c in friends.contacts"
-              :key="c.id"
-              :class="friendRowClasses(c)"
-              :title="`Open DM with ${c.displayName}`"
-              @click="openFriendDm(c)"
-              @contextmenu.prevent="openFriendActions($event, c)"
-            >
-              <span class="label">{{ c.displayName }}</span>
-              <span
-                v-if="friendHighlights(c) > 0 && showHighlightBadge"
-                class="badge highlight"
-                title="unread highlight"
-                >●</span
+          <draggable
+            :list="section.rows"
+            item-key="key"
+            tag="ul"
+            class="channels"
+            :animation="120"
+            ghost-class="drag-ghost"
+            :delay="200"
+            :delay-on-touch-only="true"
+            :touch-start-threshold="5"
+            @start="dragging = true"
+            @end="onFavoriteDragEnd(section.rows)"
+          >
+            <template #item="{ element: row }">
+              <li
+                :class="rowClasses(row.buf, row.networkId)"
+                :title="sectionRowTitle(row)"
+                @click="select(row.networkId, row.buf.target)"
+                @contextmenu.prevent="onBufferContextMenu($event, row.buf)"
               >
-              <span v-if="friendUnread(c) > 0" class="badge">{{
-                unreadLabel(friendUnread(c))
-              }}</span>
-              <button
-                type="button"
-                class="row-actions"
-                title="Edit friend"
-                aria-label="Edit friend"
-                @click.stop="friends.openEditorForContact(c)"
-                @contextmenu.stop.prevent
-              >
-                <i class="fa-solid fa-user-pen"></i>
-              </button>
-            </li>
-          </ul>
+                <span class="label"
+                  >{{ labelFor(row.buf)
+                  }}<span
+                    v-if="duplicateFavoriteNames.has(row.buf.target.toLowerCase())"
+                    class="net-hint"
+                    >{{ networkAbbrevs.get(row.networkId) || row.networkName }}</span
+                  ></span
+                >
+                <span
+                  v-if="hasDraft(row.buf)"
+                  class="badge draft"
+                  title="unsent draft"
+                  aria-label="unsent draft"
+                  ><i class="fa-solid fa-pencil"></i
+                ></span>
+                <span
+                  v-if="row.buf.highlighted > 0 && showHighlightBadge"
+                  class="badge highlight"
+                  :title="`${row.buf.highlighted} highlight${row.buf.highlighted === 1 ? '' : 's'}`"
+                  >●</span
+                >
+                <span v-if="displayCount(row.buf) > 0" class="badge">{{
+                  unreadLabel(displayCount(row.buf))
+                }}</span>
+                <button
+                  type="button"
+                  class="row-actions"
+                  title="Actions"
+                  aria-label="Buffer actions"
+                  @click.stop="onRowActionsClick($event, row.buf)"
+                  @contextmenu.stop.prevent
+                >
+                  <i class="fa-solid fa-ellipsis-vertical"></i>
+                </button>
+              </li>
+            </template>
+          </draggable>
         </div>
 
         <div v-for="net in networks.networks" :key="net.id" class="net">
@@ -338,11 +350,11 @@ import { useRouter } from 'vue-router';
 import draggable from 'vuedraggable';
 import { useNetworksStore, type Network, type PeerPresenceEntry } from '../stores/networks.js';
 import { useBuffersStore, type Buffer } from '../stores/buffers.js';
-import { useFriendsStore, primaryTargetOf, type Contact } from '../stores/friends.js';
-import { FRIENDS_KEY, SYSTEM_KEY } from '../lib/virtualBuffers.js';
+import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
 import { connected as lurkerConnected } from '../composables/useSocket.js';
 import { useDraftStore } from '../stores/drafts.js';
 import { usePinsStore } from '../stores/pins.js';
+import { useFavoritesStore, type FavoriteEntry } from '../stores/favorites.js';
 import { useIgnoresStore } from '../stores/ignores.js';
 import { useSettingsStore } from '../stores/settings.js';
 import { useAuthStore } from '../stores/auth.js';
@@ -350,17 +362,19 @@ import { useBufferActions } from '../composables/useBufferActions.js';
 import { useNetworkActions } from '../composables/useNetworkActions.js';
 import { useNetworkEditor } from '../composables/useNetworkEditor.js';
 import { useJoinChannelModal } from '../composables/useJoinChannelModal.js';
-import { useContextMenu } from '../composables/useContextMenu.js';
+import { unreadLabel } from '../utils/unreadLabel.js';
 import {
   isPeerOffline as derivePeerOffline,
   isPeerAway as derivePeerAway,
 } from '../utils/peerPresence.js';
+import { isChannelTarget } from '../../../shared/channels.js';
+import { bufferSortKey } from '../utils/bufferOrder.js';
 
 const networks = useNetworksStore();
 const buffers = useBuffersStore();
-const friends = useFriendsStore();
 const drafts = useDraftStore();
 const pins = usePinsStore();
+const favorites = useFavoritesStore();
 const ignores = useIgnoresStore();
 const settings = useSettingsStore();
 const auth = useAuthStore();
@@ -368,7 +382,6 @@ const bufferActions = useBufferActions();
 const networkActions = useNetworkActions();
 const networkEditor = useNetworkEditor();
 const joinChannelModal = useJoinChannelModal();
-const friendMenu = useContextMenu();
 const router = useRouter();
 
 // The + in the LURKER header opens the add-network editor (the button moved off
@@ -461,7 +474,7 @@ function isServerBuffer(buf: Buffer): boolean {
 }
 
 function isDmBuffer(buf: Buffer): boolean {
-  return !isServerBuffer(buf) && !buf.target.startsWith('#');
+  return !isServerBuffer(buf) && !isChannelTarget(buf.target);
 }
 
 function serverTarget(networkId: number): string {
@@ -480,12 +493,6 @@ function serverHighlights(networkId: number): number {
   return serverBuf(networkId)?.highlighted || 0;
 }
 
-// Keep the unread chip narrow — a four-figure count would stretch the row
-// and isn't more actionable than "a lot".
-function unreadLabel(count: number): string {
-  return count > 999 ? '>999' : String(count);
-}
-
 function hasDraft(buf: Buffer): boolean {
   return buf.networkId != null && drafts.hasDraft(buf.networkId, buf.target);
 }
@@ -495,24 +502,35 @@ function labelFor(buf: Buffer): string {
 }
 
 function bufferOrder(buf: Buffer): number {
-  if (buf.target.startsWith('#')) return 0;
+  if (isChannelTarget(buf.target)) return 0;
   return 1;
 }
 
-// Strip leading hashes so ##anime sorts next to #anime, not before #aardvark
+// Strip leading sigils so ##anime sorts next to #anime, not before #aardvark
 // (raw localeCompare would weight every leading '#' as sort-significant).
-function sortKey(target: string): string {
-  return target.replace(/^#+/, '').toLowerCase();
+//
+// ⚠⚠ This is the RENDERED sidebar's key, and `bufferOrder.ts`'s `bufferSortKey` is the one
+// keyboard nav and the quick switcher use — whose docblock promises they "walk the same order
+// the user sees in the sidebar". Two implementations of one rule: they must be changed together
+// or the promise quietly breaks, which is exactly what happened when only one of them learned
+// about `&`/`+`/`!` (#724). Delegated rather than re-implemented so there is nothing to keep in
+// sync next time.
+const sortKey = bufferSortKey;
+
+// A favorited buffer renders in its FRIENDS/FAVORITES section instead of its
+// network group (dedupe, matching the old FRIENDS behavior) — filtered from
+// both the unpinned list and the pinned mirror below.
+function isFavoriteBuf(b: Buffer): boolean {
+  return (
+    b.networkId != null && favorites.favoriteKeys.has(`${b.networkId}::${b.target.toLowerCase()}`)
+  );
 }
 
 function unpinnedBufs(networkId: number): Buffer[] {
   const pinnedSet = new Set(pins.forNetwork(networkId));
   return buffers
     .forNetwork(networkId)
-    .filter(
-      (b) =>
-        !isServerBuffer(b) && !pinnedSet.has(b.target) && !isFriendPrimaryDm(b.networkId, b.target),
-    )
+    .filter((b) => !isServerBuffer(b) && !pinnedSet.has(b.target) && !isFavoriteBuf(b))
     .toSorted((a, b) => {
       const oa = bufferOrder(a);
       const ob = bufferOrder(b);
@@ -532,7 +550,7 @@ function syncPinned(): void {
     for (const b of buffers.forNetwork(net.id)) bufByTarget.set(b.target, b);
     const list = targets
       .map((t) => bufByTarget.get(t))
-      .filter((b): b is Buffer => !!b && !isFriendPrimaryDm(b.networkId, b.target));
+      .filter((b): b is Buffer => !!b && !isFavoriteBuf(b));
     if (!pinnedBufsByNet[net.id]) {
       pinnedBufsByNet[net.id] = list;
     } else {
@@ -548,17 +566,17 @@ function syncPinned(): void {
 }
 
 // Only re-sync when something structurally relevant changes — pin order, the
-// set of networks, the set of buffer keys, or the friend primary DMs the mirror
-// filters out (so flipping a friend/primary doesn't leave a stale duplicate row
-// in the pinned section). Per-buffer state churn (unread counts, member list,
-// messages) doesn't affect which buffers belong in the pinned list and shouldn't
-// re-walk this whole map on every keystroke.
+// set of networks, the set of buffer keys, or the favorites the mirror
+// filters out (so favoriting a pinned buffer doesn't leave a stale duplicate
+// row in the pinned section). Per-buffer state churn (unread counts, member
+// list, messages) doesn't affect which buffers belong in the pinned list and
+// shouldn't re-walk this whole map on every keystroke.
 watch(
   () => [
     pins.byNetwork,
     networks.networks.map((n) => n.id),
     Object.keys(buffers.buffers),
-    [...friends.primaryDmKeys],
+    favorites.entries,
   ],
   syncPinned,
   { deep: true, immediate: true },
@@ -571,6 +589,132 @@ function onPinDragEnd(networkId: number): void {
     networkId,
     list.map((b) => b.target),
   );
+  // Both mirrors share the one `dragging` guard, so a favorites echo that
+  // landed mid-drag was skipped with nothing left to re-fire its watch —
+  // catch the OTHER mirror up now that the guard is down. Deliberately NOT
+  // this mirror: the store still holds the pre-echo order, and re-splicing
+  // from it would snap the row the user just dropped back to its old slot
+  // for a round-trip (and corrupt a quick second drag). The pins-changed
+  // echo re-syncs it authoritatively.
+  syncFavorites();
+}
+
+// The FRIENDS/FAVORITES sections: the global favorites list resolved to
+// concrete buffers and split by kind. Mirrored into stable reactive arrays
+// (the syncPinned pattern) so vuedraggable's array refs survive re-syncs;
+// entries whose buffer hasn't materialized yet (favorites-changed can outrun
+// hydration) are skipped and picked up when the buffer lands.
+interface FavoriteRow {
+  key: string;
+  bufferId: number;
+  // The entry's network id, numeric by construction (only real IRC buffers
+  // are favoritable) — the template needs it non-null where Buffer.networkId
+  // is nullable for the app-scoped system buffer.
+  networkId: number;
+  networkName: string;
+  buf: Buffer;
+}
+
+// Section rows are cross-network, so two favorites can share a name (#lurker
+// on two networks) and be otherwise pixel-identical. The network hint renders
+// ONLY for those collisions — when every name is unique it says nothing the
+// row doesn't, and the tooltip still names the network for everyone.
+const duplicateFavoriteNames = computed(() => {
+  const counts = new Map<string, number>();
+  for (const r of [...friendRows, ...favoriteChannelRows]) {
+    const k = r.buf.target.toLowerCase();
+    counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  return new Set([...counts].filter(([, n]) => n > 1).map(([k]) => k));
+});
+
+// The hint text itself: the shortest prefix of the network name that is
+// unique among the user's networks ('l' for libera next to mansionNET, but
+// 'li'/'lu' when libera and lurkernet coexist) — a full name next to a nick
+// read as clutter at every length we tried. Tooltip carries the full name.
+const networkAbbrevs = computed(() => {
+  const names = networks.networks.map((n) => [n.id, n.name.toLowerCase()] as const);
+  const out = new Map<number, string>();
+  for (const [id, name] of names) {
+    let len = 1;
+    while (
+      len < name.length &&
+      names.some(([otherId, other]) => otherId !== id && other.startsWith(name.slice(0, len)))
+    ) {
+      len += 1;
+    }
+    out.set(id, name.slice(0, len));
+  }
+  return out;
+});
+
+function sectionRowTitle(row: FavoriteRow): string {
+  const presence = dmTitle(row.buf);
+  return presence ? `${presence} — ${row.networkName}` : `${row.buf.target} — ${row.networkName}`;
+}
+const friendRows = reactive<FavoriteRow[]>([]);
+const favoriteChannelRows = reactive<FavoriteRow[]>([]);
+// Only non-empty sections render — an empty `.net` div still carries padding
+// and the `.net + .net` separator, which would stack dead chrome above the
+// first network for everyone with no favorites (the default state).
+const favoriteSections = computed(() =>
+  [
+    { name: 'FRIENDS', rows: friendRows },
+    { name: 'FAVORITES', rows: favoriteChannelRows },
+  ].filter((s) => s.rows.length > 0),
+);
+
+function syncFavorites(): void {
+  if (dragging.value) return;
+  const toRows = (entries: FavoriteEntry[]): FavoriteRow[] =>
+    entries.flatMap((e) => {
+      const buf = buffers.findByTarget(e.networkId, e.target);
+      return buf
+        ? [
+            {
+              key: `${e.networkId}::${buf.target}`,
+              bufferId: e.bufferId,
+              networkId: e.networkId,
+              networkName: networks.networkById(e.networkId)?.name || `net:${e.networkId}`,
+              buf,
+            },
+          ]
+        : [];
+    });
+  const secs = favorites.sections;
+  friendRows.splice(0, friendRows.length, ...toRows(secs.friends));
+  favoriteChannelRows.splice(0, favoriteChannelRows.length, ...toRows(secs.channels));
+}
+
+watch(() => [favorites.entries, Object.keys(buffers.buffers)], syncFavorites, {
+  deep: true,
+  immediate: true,
+});
+
+function onFavoriteDragEnd(rows: FavoriteRow[]): void {
+  dragging.value = false;
+  // Send the FULL global order, not just this section's rows: the store's
+  // entry order with the dragged section's ids permuted in place. A
+  // section-only subset would float those ids to the front — silently and
+  // globally demoting any favorite this tab has no materialized buffer for
+  // yet (favorites-changed can outrun hydration) and every entry of the
+  // OTHER section that sorted ahead. Full-list reorder moves exactly what
+  // the user moved.
+  // The store can have moved under a frozen mirror (an echo landing
+  // mid-drag): drop dragged rows the store no longer knows, so the slot
+  // count always matches and the permutation can't misalign. Anything still
+  // stale after that is caught by the server's set check → authoritative echo.
+  const known = new Set(favorites.entries.map((e) => e.bufferId));
+  const dragged = rows.filter((r) => known.has(r.bufferId));
+  const draggedIds = new Set(dragged.map((r) => r.bufferId));
+  let i = 0;
+  const full = favorites.entries.map((e) =>
+    draggedIds.has(e.bufferId) ? dragged[i++].bufferId : e.bufferId,
+  );
+  favorites.reorder(full);
+  // Catch the pins mirror up on any echo skipped mid-drag (see onPinDragEnd);
+  // this mirror keeps its dropped order until the favorites-changed echo.
+  syncPinned();
 }
 
 function onBufferContextMenu(e: MouseEvent, buf: Buffer): void {
@@ -605,118 +749,6 @@ function isActive(networkId: number, target: string): boolean {
   return networks.activeKey === `${networkId}::${target}`;
 }
 
-const isFriendsActive = computed(() => networks.activeKey === FRIENDS_KEY);
-// The FRIENDS dot is green only when friends are actually reachable: the lurker
-// service is up AND at least one IRC network is connected. If every network is
-// down, it's red even though the lurker session itself is fine.
-const anyNetworkConnected = computed(() =>
-  networks.networks.some((n) => networks.states[n.id]?.state === 'connected'),
-);
-const friendsConnected = computed(() => lurkerConnected.value && anyNetworkConnected.value);
-// FRIENDS dot reflects friend presence, not just connectivity (#367-adjacent
-// polish): green if any friend is actively online, yellow (warn) if friends are
-// present but all away, red otherwise (none online, or we're disconnected so
-// every peer reads offline).
-const friendsPresence = computed<'good' | 'warn' | 'bad'>(() => {
-  if (!friendsConnected.value) return 'bad';
-  let online = 0;
-  let away = 0;
-  for (const c of friends.contacts) {
-    const state = friends.primaryPresence(c.id);
-    if (state === 'online') online += 1;
-    else if (state === 'away') away += 1;
-  }
-  return online > 0 ? 'good' : away > 0 ? 'warn' : 'bad';
-});
-const friendsStatusTitle = computed(() => {
-  if (!lurkerConnected.value) return 'Disconnected from Lurker';
-  if (!anyNetworkConnected.value) return 'Not connected to any network';
-  return friendsPresence.value === 'good'
-    ? 'Friends online'
-    : friendsPresence.value === 'warn'
-      ? 'Online friends are away'
-      : 'No friends online';
-});
-function selectFriends(): void {
-  friends.open();
-}
-// Clicking a friend opens their DM on the primary network — the FRIENDS group
-// is a cross-network launcher/pin list for DMs. A target-less contact (none
-// watched) falls back to opening its editor.
-//
-// Resolve to an EXISTING DM buffer case-insensitively so we never fork a second
-// buffer that differs from the open one only by nick case. Computed once per
-// render as a contactId → buffer map so the per-row getters below (presence,
-// unread, highlight, active) don't each re-scan the network's buffers.
-const dmBufByContact = computed<Map<number, Buffer | null>>(() => {
-  const map = new Map<number, Buffer | null>();
-  for (const c of friends.contacts) {
-    const t = primaryTargetOf(c);
-    map.set(c.id, t ? buffers.findDm(t.networkId, t.nick) : null);
-  }
-  return map;
-});
-function friendDmBuffer(c: Contact): Buffer | null {
-  return dmBufByContact.value.get(c.id) ?? null;
-}
-function openFriendDm(c: Contact): void {
-  friends.openDm(c);
-}
-function isFriendDmActive(c: Contact): boolean {
-  const t = primaryTargetOf(c);
-  if (!t) return false;
-  const existing = friendDmBuffer(c);
-  return networks.activeKey === `${t.networkId}::${existing ? existing.target : t.nick}`;
-}
-function friendRowClasses(c: Contact): Record<string, boolean> {
-  // Reflect the PRIMARY DM's presence — that's the buffer this row opens, so an
-  // alt being online elsewhere must not make the row look reachable.
-  const state = friends.primaryPresence(c.id);
-  // Mirror rowClasses so an unread/highlighted friend DM colors its name like
-  // any other buffer (DMs are never muted, so no mute gate). An offline/away
-  // friend with unread still dims to gray — the peer-state rule wins on source
-  // order — but the accent-colored unread badge still flags it. (#307)
-  const buf = friendDmBuffer(c);
-  return {
-    active: isFriendDmActive(c),
-    unread: !!buf && buf.unread > 0,
-    highlighted: !!buf && buf.highlighted > 0,
-    'peer-offline': state === 'offline',
-    'peer-away': state === 'away',
-  };
-}
-function friendUnread(c: Contact): number {
-  const buf = friendDmBuffer(c);
-  return buf ? countFor(buf.unread, buf.highlighted) : 0;
-}
-function friendHighlights(c: Contact): number {
-  return friendDmBuffer(c)?.highlighted ?? 0;
-}
-// Kebab / right-click menu on a friend row. Edit only — removal lives behind
-// the modal's Remove button so a destructive action isn't one stray click away.
-function openFriendActions(e: MouseEvent, c: Contact): void {
-  const el = e.currentTarget as Element;
-  const rect = el.getBoundingClientRect();
-  friendMenu.open(
-    [
-      {
-        label: 'Edit Friend…',
-        icon: 'fa-solid fa-user-pen',
-        onClick: () => friends.openEditorForContact(c),
-      },
-    ],
-    rect.right,
-    rect.bottom,
-    el,
-  );
-}
-// A friend's primary DM is shown under FRIENDS, so hide it from its real
-// network's buffer list (dedupe).
-function isFriendPrimaryDm(networkId: number | null, target: string): boolean {
-  if (networkId == null) return false;
-  return friends.primaryDmKeys.has(`${networkId}::${target.toLowerCase()}`);
-}
-
 function stateClass(networkId: number): string {
   const s = networks.states[networkId]?.state;
   if (s === 'connected') return 'good';
@@ -729,7 +761,7 @@ function stateClass(networkId: number): string {
 // just a history view, not a live channel. DMs and server buffers have no
 // "joined" concept and are never dimmed by this rule.
 function isUnjoined(buf: Buffer, networkId: number): boolean {
-  if (!buf.target.startsWith('#')) return false;
+  if (!isChannelTarget(buf.target)) return false;
   if (buf.joined === false) return true;
   return networks.states[networkId]?.state !== 'connected';
 }
@@ -1036,8 +1068,8 @@ onBeforeUnmount(() => {
 .system-net .net-head {
   padding-block: var(--space-4);
   /* Trim the right padding to var(--space-2) so the always-visible inline
-     + / gear / << line up with the absolutely-positioned + that the network /
-     FRIENDS headers reveal at right: var(--space-2). Without this the LURKER
+     + / gear / << line up with the absolutely-positioned + that the network
+     headers reveal at right: var(--space-2). Without this the LURKER
      controls, being in normal flow, end at the wider var(--space-5) content edge
      and read ~6px too far left. (#411) */
   padding-inline-end: var(--space-2);
@@ -1054,6 +1086,20 @@ onBeforeUnmount(() => {
   border-left: 2px solid transparent;
   position: relative;
 }
+/* FRIENDS/FAVORITES section labels are headings, not buttons — no server
+   buffer behind them to open. */
+.net-head.section-head {
+  cursor: default;
+}
+/* Cross-network disambiguation on section rows: rides INSIDE the label, right
+   after the buffer name — anchored to what it describes, and immune to badges
+   appearing/disappearing at the row's right edge. Quiet; absent entirely on
+   single-network instances. The label's own ellipsis clips it on overflow. */
+.net-hint {
+  /* One font size across the UI: the hint demotes itself with color alone. */
+  color: var(--fg-muted);
+  margin-inline-start: var(--space-2);
+}
 /* Gate :hover behind (hover: hover) so iPad-in-desktop-layout (width > 768px,
    touch-only) doesn't get the iOS sticky-hover two-tap: with bare :hover the
    first tap is consumed as a hover preview, only the second activates. See
@@ -1068,7 +1114,7 @@ onBeforeUnmount(() => {
   border-left-color: var(--accent);
 }
 
-/* Network-row header actions (+ add channel/network/friend, kebab). Hidden by
+/* Network-row header actions (+ add channel/network, kebab). Hidden by
    default and revealed only when the row is engaged — hovered, selected
    (active), or keyboard-focused (#411) — so the corner stays quiet. At rest it
    shows the unread/highlight badge (or nothing); when the actions appear the
@@ -1106,7 +1152,7 @@ onBeforeUnmount(() => {
   opacity: 1;
   pointer-events: auto;
 }
-/* Only the network/FRIENDS headers hide their badge when the actions reveal —
+/* Only the network headers hide their badge when the actions reveal —
    their actions are absolute and would overlap it. The LURKER header keeps its
    actions inline and always-visible (below), so its count never needs to hide. */
 .net:not(.system-net) .net-head.active .badge,
@@ -1281,7 +1327,7 @@ onBeforeUnmount(() => {
 .channels li.not-joined {
   opacity: 0.5;
 }
-/* DM/friend peer state. Both away and offline render in muted gray (matching
+/* DM peer state. Both away and offline render in muted gray (matching
    away members in the channel nicklist); offline is additionally italicized,
    which is the offline tell. */
 .channels li.peer-away .label,
@@ -1311,8 +1357,8 @@ onBeforeUnmount(() => {
   color: var(--fg-muted);
 }
 
-/* Per-row settings affordance (the sliders on channel/DM rows, the kebab on
-   friend rows). Absolute so it overlays the badges rather than displacing them.
+/* Per-row settings affordance (the sliders on channel/DM rows).
+   Absolute so it overlays the badges rather than displacing them.
    Same reveal model as the header + buttons (#411): hidden at rest, surfaced
    when the row is hovered, selected (active), or keyboard-focused, with the
    badge stepping aside so the two never stack. Background matches the row's

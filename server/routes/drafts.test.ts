@@ -46,6 +46,13 @@ beforeAll(async () => {
     nick: 'bob',
   })!;
 
+  // Drafts are buffer_id-keyed (schema 18) — flush targets must be buffers
+  // the registry knows.
+  const { ensureExists } = await import('../db/buffers.js');
+  for (const t of ['#meta', '#nope', '#ok', '#clear-me', 'bob']) {
+    ensureExists(alice.id, aliceNet.id, t);
+  }
+
   app = createTestApp({ '/api/drafts': router });
   aliceAgent = await createAuthedAgent(app, alice.id);
 });

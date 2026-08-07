@@ -10,8 +10,13 @@ import { requireAuth } from '../middleware/auth.js';
 import { resolveDataDir } from '../utils/dataDir.js';
 import { randomId } from '../services/uploadProviders/objectKey.js';
 import { bufferSource, fileSource, type UploadSource } from '../services/uploadProviders/source.js';
-import { getUserSettings } from '../db/settings.js';
-import { defaultsAsObject } from '../services/settingsRegistry.js';
+import {
+  effectiveSettings,
+  userCapBytes,
+  clampUploadCapBytes,
+  effectiveUploadCapBytes,
+  formatCapMb,
+} from '../services/uploadLimits.js';
 import * as imagePipeline from '../services/imagePipeline.js';
 import { thumbnailFormat } from '../services/thumbnailFormat.js';
 import { makeUploadProgress } from '../services/uploadProgress.js';
@@ -39,19 +44,10 @@ import {
   getUploadForReap,
   deleteUpload,
 } from '../db/uploadHistory.js';
-import { asyncHandler } from '../utils/asyncHandler.js';
 import { reportUploadSoon } from '../services/moderationReport.js';
 
 const router = Router();
 router.use(requireAuth);
-
-// Resolve effective settings with registry defaults filled in. The per-user
-// image-pipeline settings (size cap, max dimension, JPEG quality) are the
-// fallback used when the resolved uploader carries no operator-baked policy caps
-// — i.e. every self-host uploader. Untyped (JS module) → Record<string, unknown>.
-function effectiveSettings(userId: number): Record<string, unknown> {
-  return { ...defaultsAsObject(), ...getUserSettings(userId) };
-}
 
 // The absolute origin (scheme + host) a `local` upload's relative URL is prefixed
 // with so the pasted link works from IRC. PUBLIC_BASE_URL wins (explicit,
@@ -123,41 +119,10 @@ function providerErrorStatus(e: { code?: string }): number {
 const TMP_DIR = path.join(resolveDataDir(), 'tmp', 'uploads');
 fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 });
 
-// The registry's own ceiling; a per-user cap can't exceed it, so neither can multer.
-const MAX_CAP_MB = 200;
-
-/** The user's size cap. effectiveSettings() has already merged the registry default
- *  in, so this reads it from ONE place — a second hardcoded default here would be a
- *  duplicate that quietly disagrees the next time the registry's changes. */
-function userCapMb(settings: Record<string, unknown>): number {
-  const n = Number(settings['uploads.image.max_upload_mb']);
-  return Number.isFinite(n) && n > 0 ? n : MAX_CAP_MB;
-}
-
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, TMP_DIR),
   filename: (_req, _file, cb) => cb(null, `up-${randomId()}`),
 });
-
-/** The cap to hand multer, resolved BEFORE a byte is read (requireAuth already
- *  ran, so we know who's asking). The old code gave multer a flat 200 MB and let
- *  the handler reject afterwards — which meant a user capped at 25 MB could still
- *  make the server ingest 200 MB before being told no. The per-upload `uploaderId`
- *  override lives in the multipart body, which isn't parsed yet, so this resolves
- *  the DEFAULT uploader's cap; the handler re-checks against the actually-resolved
- *  uploader, which is what catches an override with a tighter policy cap. */
-function capMbFor(userId: number, isAdmin: boolean): number {
-  const settings = effectiveSettings(userId);
-  const userCap = userCapMb(settings);
-  let cap = userCap;
-  try {
-    cap = resolveUploader({ userId, isAdmin, requestedId: null }).policy.maxMb ?? userCap;
-  } catch {
-    // No usable uploader → the handler will produce the real error. Fall back to
-    // the user's own cap so we still bound what we're willing to read.
-  }
-  return Math.max(1, Math.min(cap, MAX_CAP_MB));
-}
 
 /** Best-effort removal of an upload's temp file. Tolerates ENOENT: the `local`
  *  driver RENAMES the temp file into its storage dir (zero copies), so by the time
@@ -199,11 +164,18 @@ export async function sweepTempUploads(maxAgeMs = 60 * 60 * 1000): Promise<numbe
   return removed;
 }
 
+// The cap handed to multer is resolved BEFORE a byte is read (requireAuth already
+// ran, so we know who's asking). The old code gave multer a flat 200 MB and let the
+// handler reject afterwards — which meant a user capped at 25 MB could still make
+// the server ingest 200 MB before being told no. The per-upload `uploaderId`
+// override lives in the multipart body, which isn't parsed yet, so this resolves the
+// DEFAULT uploader's cap; the handler re-checks against the actually-resolved
+// uploader, which is what catches an override with a tighter policy cap.
 const uploadToDisk = (req: Request, res: Response, next: NextFunction): void => {
-  const capMb = capMbFor(req.user!.id, req.user!.role === 'admin');
+  const capBytes = effectiveUploadCapBytes(req.user!.id, req.user!.role === 'admin');
   const handler = multer({
     storage,
-    limits: { fileSize: capMb * 1024 * 1024, files: 1 },
+    limits: { fileSize: capBytes, files: 1 },
     // busboy decodes multipart params as LATIN-1 unless told otherwise, so any
     // non-ASCII filename arrives mangled — a macOS screen recording is named with a
     // narrow no-break space (U+202F) before AM/PM, whose UTF-8 bytes (E2 80 AF) then
@@ -214,299 +186,299 @@ const uploadToDisk = (req: Request, res: Response, next: NextFunction): void => 
     // multer aborts the stream and unlinks its partial file once the cap is hit,
     // so an oversized upload is refused mid-flight instead of after we've eaten it.
     if ((err as { code?: string })?.code === 'LIMIT_FILE_SIZE') {
-      res.status(413).json({ error: `file exceeds ${capMb} MB` });
+      res.status(413).json({ error: `file exceeds ${formatCapMb(capBytes)} MB` });
       return;
     }
     next(err as Error | undefined);
   });
 };
 
-router.post(
-  '/',
-  uploadToDisk,
-  asyncHandler(async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', uploadToDisk, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!req.file) {
+      res.status(400).json({ error: 'no file uploaded' });
+      return;
+    }
+
+    // Resolve the configured uploader. Every isNodeMode() branch the old route
+    // made (which provider, whose credentials, which caps, SVG policy, thumbnail
+    // strategy) is now derived from the resolved uploader's driver + policy.
+    // Per-upload override (design decision 9): send this one file somewhere
+    // other than your default. Multipart, so it arrives as a string field. An
+    // override that isn't in the caller's allowed set is a 400, never a silent
+    // reroute to their default (decision 15).
+    const requestedRaw = (req.body as { uploaderId?: unknown } | undefined)?.uploaderId;
+    const requestedId = requestedRaw == null || requestedRaw === '' ? null : Number(requestedRaw);
+    if (requestedId != null && !Number.isInteger(requestedId)) {
+      res.status(400).json({ error: 'uploaderId must be an integer' });
+      return;
+    }
+
+    let resolved: ResolvedUploader;
     try {
-      if (!req.file) {
-        res.status(400).json({ error: 'no file uploaded' });
+      resolved = resolveUploader({
+        userId: req.user!.id,
+        isAdmin: req.user!.role === 'admin',
+        requestedId,
+      });
+    } catch (err) {
+      // A locked instance default that the operator hasn't configured →
+      // server-side 503 (was: isNodeMode() && !nodeUploadConfigured()).
+      if (err instanceof UploaderNotConfiguredError) {
+        res.status(503).json({ error: err.message });
         return;
       }
-
-      // Resolve the configured uploader. Every isNodeMode() branch the old route
-      // made (which provider, whose credentials, which caps, SVG policy, thumbnail
-      // strategy) is now derived from the resolved uploader's driver + policy.
-      // Per-upload override (design decision 9): send this one file somewhere
-      // other than your default. Multipart, so it arrives as a string field. An
-      // override that isn't in the caller's allowed set is a 400, never a silent
-      // reroute to their default (decision 15).
-      const requestedRaw = (req.body as { uploaderId?: unknown } | undefined)?.uploaderId;
-      const requestedId = requestedRaw == null || requestedRaw === '' ? null : Number(requestedRaw);
-      if (requestedId != null && !Number.isInteger(requestedId)) {
-        res.status(400).json({ error: 'uploaderId must be an integer' });
+      // No usable uploader for this account → ask the user to pick one.
+      if (err instanceof UploaderUnavailableError) {
+        res.status(400).json({ error: err.message });
         return;
       }
+      throw err;
+    }
 
-      let resolved: ResolvedUploader;
-      try {
-        resolved = resolveUploader({
-          userId: req.user!.id,
-          isAdmin: req.user!.role === 'admin',
-          requestedId,
-        });
-      } catch (err) {
-        // A locked instance default that the operator hasn't configured →
-        // server-side 503 (was: isNodeMode() && !nodeUploadConfigured()).
-        if (err instanceof UploaderNotConfiguredError) {
-          res.status(503).json({ error: err.message });
-          return;
-        }
-        // No usable uploader for this account → ask the user to pick one.
-        if (err instanceof UploaderUnavailableError) {
-          res.status(400).json({ error: err.message });
-          return;
-        }
-        throw err;
-      }
+    // Correlation token for the progress events (#545). The client's own random
+    // string, arriving as a multipart text field like uploaderId does. Absent →
+    // makeUploadProgress returns a no-op and the client falls back to an
+    // indeterminate label; progress must never be a precondition for uploading.
+    const tokenRaw = (req.body as { progressToken?: unknown } | undefined)?.progressToken;
+    const progress = makeUploadProgress(
+      req.user!.id,
+      typeof tokenRaw === 'string' && tokenRaw ? tokenRaw.slice(0, 64) : null,
+      resolved.driver.label,
+    );
 
-      // Correlation token for the progress events (#545). The client's own random
-      // string, arriving as a multipart text field like uploaderId does. Absent →
-      // makeUploadProgress returns a no-op and the client falls back to an
-      // indeterminate label; progress must never be a precondition for uploading.
-      const tokenRaw = (req.body as { progressToken?: unknown } | undefined)?.progressToken;
-      const progress = makeUploadProgress(
-        req.user!.id,
-        typeof tokenRaw === 'string' && tokenRaw ? tokenRaw.slice(0, 64) : null,
-        resolved.driver.label,
-      );
+    const settings = effectiveSettings(req.user!.id);
+    // Size cap: operator-baked policy (hosted locked uploader) wins; otherwise
+    // the user's own setting. A tenant can't lift a policy cap because the
+    // policy is on the instance row, not their settings. Clamped to the
+    // instance's transport ceiling last (#627), so a body the proxy in front of
+    // us would have rejected anyway is refused with a real 413 rather than an
+    // edge-level connection reset.
+    const policyMb = resolved.policy.maxMb;
+    const maxBytes = clampUploadCapBytes(
+      policyMb == null ? userCapBytes(settings) : policyMb * 1024 * 1024,
+    );
+    if (req.file.size > maxBytes) {
+      res.status(413).json({ error: `file exceeds ${formatCapMb(maxBytes)} MB` });
+      return;
+    }
 
-      const settings = effectiveSettings(req.user!.id);
-      // Size cap: operator-baked policy (hosted locked uploader) wins; otherwise
-      // the user's own setting. A tenant can't lift a policy cap because the
-      // policy is on the instance row, not their settings.
-      const maxMb = resolved.policy.maxMb ?? userCapMb(settings);
-      if (req.file.size > maxMb * 1024 * 1024) {
-        res.status(413).json({ error: `file exceeds ${maxMb} MB` });
+    // Classify from the MAGIC BYTES, never the client's claimed MIME (#515). The
+    // claim used to decide this, which was survivable only while the alternative
+    // branch was the image pipeline — the moment a class means "passthrough", a
+    // claimed MIME is a route around imagePipeline.optimize(), and that's where
+    // the EXIF scrub lives. See services/contentClass.ts.
+    let classified: Classification;
+    try {
+      classified = await classifyUpload(req.file.path, req.file.mimetype);
+    } catch (err) {
+      if (err instanceof UnsupportedTypeError) {
+        res.status(415).json({ error: err.message });
         return;
       }
+      throw err;
+    }
+    const contentClass = classified.contentClass;
 
-      // Classify from the MAGIC BYTES, never the client's claimed MIME (#515). The
-      // claim used to decide this, which was survivable only while the alternative
-      // branch was the image pipeline — the moment a class means "passthrough", a
-      // claimed MIME is a route around imagePipeline.optimize(), and that's where
-      // the EXIF scrub lives. See services/contentClass.ts.
-      let classified: Classification;
-      try {
-        classified = await classifyUpload(req.file.path, req.file.mimetype);
-      } catch (err) {
-        if (err instanceof UnsupportedTypeError) {
-          res.status(415).json({ error: err.message });
-          return;
-        }
-        throw err;
-      }
-      const contentClass = classified.contentClass;
+    // Validate stage: the resolved driver must accept this class. This is what
+    // makes hosted (whose dropper takes images + text only) refuse media, without
+    // a policy flag anywhere.
+    if (!resolved.driver.capabilities.acceptsContentClasses.includes(contentClass)) {
+      res.status(415).json({
+        error: `${resolved.driver.label} does not accept ${contentClass} files`,
+      });
+      return;
+    }
 
-      // Validate stage: the resolved driver must accept this class. This is what
-      // makes hosted (whose dropper takes images + text only) refuse media, without
-      // a policy flag anywhere.
-      if (!resolved.driver.capabilities.acceptsContentClasses.includes(contentClass)) {
-        res.status(415).json({
-          error: `${resolved.driver.label} does not accept ${contentClass} files`,
-        });
-        return;
-      }
+    let outSource: UploadSource;
+    let outMime: string;
+    let outExt: string;
+    let outByteSize: number;
+    let outWidth: number | null = null;
+    let outHeight: number | null = null;
+    let thumb: Buffer | null = null;
 
-      let outSource: UploadSource;
-      let outMime: string;
-      let outExt: string;
-      let outByteSize: number;
-      let outWidth: number | null = null;
-      let outHeight: number | null = null;
-      let thumb: Buffer | null = null;
+    // Everything from here to the driver call is the pipeline: the sharp re-encode
+    // for images, the in-place metadata scrub for media. Both are native one-shots
+    // with no seam to count, so this phase is announced but not measured.
+    progress.processing();
 
-      // Everything from here to the driver call is the pipeline: the sharp re-encode
-      // for images, the in-place metadata scrub for media. Both are native one-shots
-      // with no seam to count, so this phase is announced but not measured.
-      progress.processing();
-
-      if (contentClass === 'text' || contentClass === 'media') {
-        // Passthrough: the bytes go out of the temp file exactly as they came in.
-        // Nothing reads them into memory — the driver streams the file (#543).
-        if (contentClass === 'media') {
-          // …except the metadata, which is stripped in place first. A phone's MP4
-          // carries GPS in moov/udta; passing it through untouched would re-open
-          // exactly the leak #516 closed for photos. The scrub is size-preserving,
-          // so req.file.size stays correct.
-          try {
-            await scrubMediaFile(req.file.path, classified.mime);
-          } catch (err) {
-            if (err instanceof MediaScrubError) {
-              res.status(415).json({ error: err.message });
-              return;
-            }
-            throw err;
-          }
-        }
-        // Re-stat rather than reuse req.file.size. The scrub is size-preserving by
-        // construction — that's the whole reason boxes are retyped to `free` instead
-        // of removed — but this size becomes the upload's Content-Length, and a
-        // wrong one truncates the body or hangs the request. Don't make a network
-        // framing invariant depend on a promise made in another module's comment.
-        const { size: bytesOnDisk } = await fs.promises.stat(req.file.path);
-        outSource = fileSource(req.file.path, bytesOnDisk);
-        outMime = classified.mime;
-        outExt = classified.ext;
-        outByteSize = bytesOnDisk;
-      } else {
-        // The output format is the user's, with no policy override: unlike maxDim/
-        // quality/maxMb it isn't a cost lever the operator needs to bake, and the
-        // hosted dropper accepts both webp and jpeg (#560).
-        const format: imagePipeline.OutputFormat =
-          settings['uploads.image.format'] === 'jpeg' ? 'jpeg' : 'webp';
-        const quality =
-          resolved.policy.quality ?? (Number(settings['uploads.image.quality']) || 85);
-        let optimized: imagePipeline.OptimizeResult;
+    if (contentClass === 'text' || contentClass === 'media') {
+      // Passthrough: the bytes go out of the temp file exactly as they came in.
+      // Nothing reads them into memory — the driver streams the file (#543).
+      if (contentClass === 'media') {
+        // …except the metadata, which is stripped in place first. A phone's MP4
+        // carries GPS in moov/udta; passing it through untouched would re-open
+        // exactly the leak #516 closed for photos. The scrub is size-preserving,
+        // so req.file.size stays correct.
         try {
-          optimized = await imagePipeline.optimize(req.file.path, {
-            maxDim:
-              resolved.policy.maxDim ?? (Number(settings['uploads.image.max_dimension']) || 2048),
-            quality,
-            format,
-            // SVG is rejected only where the resolved uploader's policy says so
-            // (the hosted locked uploader serves raster + .txt). Self-host keeps
-            // the SVG passthrough. Was: rasterOnly = isNodeMode().
-            rasterOnly: resolved.policy.rasterOnly,
-          });
+          await scrubMediaFile(req.file.path, classified.mime);
         } catch (err) {
-          const e = err as { code?: string; message?: string };
-          if (e.code === 'UNSUPPORTED_FORMAT') {
-            res.status(415).json({ error: e.message });
+          if (err instanceof MediaScrubError) {
+            res.status(415).json({ error: err.message });
             return;
           }
           throw err;
         }
-        thumb = await imagePipeline.thumbnail(req.file.path, { format });
-        // The optimized image is small and bounded (resized + re-encoded), so it
-        // stays a buffer — round-tripping it through another temp file would be
-        // pointless I/O. The heap blowup this PR removes was the ORIGINAL bytes.
-        outSource = bufferSource(optimized.buffer);
-        outMime = optimized.mime;
-        outExt = optimized.ext;
-        outByteSize = optimized.byteSize;
-        outWidth = optimized.width;
-        outHeight = optimized.height;
       }
-
-      const originalName = req.file.originalname || '';
-      const baseName = originalName.replace(/\.[^.]+$/, '') || `upload-${Date.now()}`;
-      const filename = `${baseName}.${outExt}`;
-
-      // The slow half on a home uplink, and the half the browser is blind to. Announce
-      // it before the first byte so the user learns which leg they're waiting on even
-      // for a driver that reports none (`local` renames the file — no wire to count).
-      progress.sending();
-
-      // provider.upload is from an untyped JS module boundary
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let result: any;
+      // Re-stat rather than reuse req.file.size. The scrub is size-preserving by
+      // construction — that's the whole reason boxes are retyped to `free` instead
+      // of removed — but this size becomes the upload's Content-Length, and a
+      // wrong one truncates the body or hangs the request. Don't make a network
+      // framing invariant depend on a promise made in another module's comment.
+      const { size: bytesOnDisk } = await fs.promises.stat(req.file.path);
+      outSource = fileSource(req.file.path, bytesOnDisk);
+      outMime = classified.mime;
+      outExt = classified.ext;
+      outByteSize = bytesOnDisk;
+    } else {
+      // The output format is the user's, with no policy override: unlike maxDim/
+      // quality/maxMb it isn't a cost lever the operator needs to bake, and the
+      // hosted dropper accepts both webp and jpeg (#560).
+      const format: imagePipeline.OutputFormat =
+        settings['uploads.image.format'] === 'jpeg' ? 'jpeg' : 'webp';
+      const quality = resolved.policy.quality ?? (Number(settings['uploads.image.quality']) || 85);
+      let optimized: imagePipeline.OptimizeResult;
       try {
-        result = await resolved.driver.upload(
-          outSource,
-          { filename, mime: outMime, contentClass, onProgress: progress.onBytes },
-          resolved.driverConfig,
-        );
+        optimized = await imagePipeline.optimize(req.file.path, {
+          maxDim:
+            resolved.policy.maxDim ?? (Number(settings['uploads.image.max_dimension']) || 2048),
+          quality,
+          format,
+          // SVG is rejected only where the resolved uploader's policy says so
+          // (the hosted locked uploader serves raster + .txt). Self-host keeps
+          // the SVG passthrough. Was: rasterOnly = isNodeMode().
+          rasterOnly: resolved.policy.rasterOnly,
+        });
       } catch (err) {
         const e = err as { code?: string; message?: string };
-        res.status(providerErrorStatus(e)).json({ error: e.message, provider: resolved.driverId });
-        return;
-      }
-
-      const storesRemotely = resolved.driver.capabilities.storesRemotely;
-      const mainUrl = absolutizeUrl(result.url as string, storesRemotely, req);
-
-      // Thumbnail strategy is a resolved policy value, not isNodeMode(): a
-      // hostsThumbnails uploader (the hosted in-house one) stores the thumb as a
-      // remote object under a `thumbs/` prefix so it doesn't bloat the cell DB /
-      // R2 backups; everyone else keeps the inline BLOB. Best-effort: a thumb
-      // upload failure falls back to the BLOB so a hiccup never blocks the user.
-      let thumbnailBlob: Buffer | null = thumb;
-      let thumbnailUrl: string | null = null;
-      if (resolved.policy.hostsThumbnails && thumb) {
-        try {
-          // Describe the bytes we actually produced, not the format thumbnails
-          // used to be: the dropper verifies the claimed mime against the magic
-          // bytes and 415s a webp announced as image/jpeg.
-          const thumbFmt = thumbnailFormat(thumb);
-          const tRes = await resolved.driver.upload(
-            bufferSource(thumb),
-            {
-              filename: `thumb.${thumbFmt.ext}`,
-              mime: thumbFmt.mime,
-              contentClass: 'image',
-              kind: 'thumb',
-            },
-            resolved.driverConfig,
-          );
-          if (tRes && typeof tRes.url === 'string') {
-            thumbnailUrl = absolutizeUrl(tRes.url, storesRemotely, req);
-            thumbnailBlob = null;
-          }
-        } catch {
-          // keep thumbnailBlob — fall back to the inline BLOB
+        if (e.code === 'UNSUPPORTED_FORMAT') {
+          res.status(415).json({ error: e.message });
+          return;
         }
+        throw err;
       }
-
-      const id = insertUpload(req.user!.id, {
-        provider: resolved.driverId,
-        url: mainUrl,
-        filename: originalName || null,
-        mime: outMime,
-        byte_size: outByteSize,
-        width: outWidth,
-        height: outHeight,
-        thumbnail: thumbnailBlob,
-        thumbnail_url: thumbnailUrl,
-        uploader_config_id: resolved.configId,
-        ref: (result.ref as string | undefined) ?? null,
-      });
-
-      // Report the upload to the control plane's moderation index. Self-gates to
-      // a no-op in standalone (no control plane configured), so it's called
-      // unconditionally; fire-and-forget, never blocks the response.
-      reportUploadSoon({
-        cell_upload_id: id,
-        cell_user_id: req.user!.id,
-        url: mainUrl,
-        thumb_url: thumbnailUrl,
-        mime: outMime,
-        byte_size: outByteSize,
-        width: outWidth,
-        height: outHeight,
-      });
-
-      // Deletability is decided at capture time (decision 8): the driver returned
-      // a ref only if this specific upload's bytes can be destroyed later.
-      const canDelete =
-        Boolean(result.ref) && deletableWith(resolved.driver, resolved.driverConfig);
-      res.json({
-        id,
-        url: mainUrl,
-        // The REAL mime, derived from the bytes — the client builds its optimistic
-        // history row from this rather than from what the browser guessed, so the
-        // row's type icon isn't a lie until the next refetch.
-        mime: outMime,
-        can_delete: canDelete,
-        ...(thumbnailUrl ? { thumbnail_url: thumbnailUrl } : {}),
-      });
-    } catch (err) {
-      next(err);
-    } finally {
-      // Every exit takes the temp file with it: success, 4xx/5xx, driver failure,
-      // or a throw. (A client abort never reaches the handler — multer unlinks its
-      // own partial file — and sweepTempUploads() catches anything a crash left.)
-      await discardTemp(req.file);
+      thumb = await imagePipeline.thumbnail(req.file.path, { format });
+      // The optimized image is small and bounded (resized + re-encoded), so it
+      // stays a buffer — round-tripping it through another temp file would be
+      // pointless I/O. The heap blowup this PR removes was the ORIGINAL bytes.
+      outSource = bufferSource(optimized.buffer);
+      outMime = optimized.mime;
+      outExt = optimized.ext;
+      outByteSize = optimized.byteSize;
+      outWidth = optimized.width;
+      outHeight = optimized.height;
     }
-  }),
-);
+
+    const originalName = req.file.originalname || '';
+    const baseName = originalName.replace(/\.[^.]+$/, '') || `upload-${Date.now()}`;
+    const filename = `${baseName}.${outExt}`;
+
+    // The slow half on a home uplink, and the half the browser is blind to. Announce
+    // it before the first byte so the user learns which leg they're waiting on even
+    // for a driver that reports none (`local` renames the file — no wire to count).
+    progress.sending();
+
+    // provider.upload is from an untyped JS module boundary
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let result: any;
+    try {
+      result = await resolved.driver.upload(
+        outSource,
+        { filename, mime: outMime, contentClass, onProgress: progress.onBytes },
+        resolved.driverConfig,
+      );
+    } catch (err) {
+      const e = err as { code?: string; message?: string };
+      res.status(providerErrorStatus(e)).json({ error: e.message, provider: resolved.driverId });
+      return;
+    }
+
+    const storesRemotely = resolved.driver.capabilities.storesRemotely;
+    const mainUrl = absolutizeUrl(result.url as string, storesRemotely, req);
+
+    // Thumbnail strategy is a resolved policy value, not isNodeMode(): a
+    // hostsThumbnails uploader (the hosted in-house one) stores the thumb as a
+    // remote object under a `thumbs/` prefix so it doesn't bloat the cell DB /
+    // R2 backups; everyone else keeps the inline BLOB. Best-effort: a thumb
+    // upload failure falls back to the BLOB so a hiccup never blocks the user.
+    let thumbnailBlob: Buffer | null = thumb;
+    let thumbnailUrl: string | null = null;
+    if (resolved.policy.hostsThumbnails && thumb) {
+      try {
+        // Describe the bytes we actually produced, not the format thumbnails
+        // used to be: the dropper verifies the claimed mime against the magic
+        // bytes and 415s a webp announced as image/jpeg.
+        const thumbFmt = thumbnailFormat(thumb);
+        const tRes = await resolved.driver.upload(
+          bufferSource(thumb),
+          {
+            filename: `thumb.${thumbFmt.ext}`,
+            mime: thumbFmt.mime,
+            contentClass: 'image',
+            kind: 'thumb',
+          },
+          resolved.driverConfig,
+        );
+        if (tRes && typeof tRes.url === 'string') {
+          thumbnailUrl = absolutizeUrl(tRes.url, storesRemotely, req);
+          thumbnailBlob = null;
+        }
+      } catch {
+        // keep thumbnailBlob — fall back to the inline BLOB
+      }
+    }
+
+    const id = insertUpload(req.user!.id, {
+      provider: resolved.driverId,
+      url: mainUrl,
+      filename: originalName || null,
+      mime: outMime,
+      byte_size: outByteSize,
+      width: outWidth,
+      height: outHeight,
+      thumbnail: thumbnailBlob,
+      thumbnail_url: thumbnailUrl,
+      uploader_config_id: resolved.configId,
+      ref: (result.ref as string | undefined) ?? null,
+    });
+
+    // Report the upload to the control plane's moderation index. Self-gates to
+    // a no-op in standalone (no control plane configured), so it's called
+    // unconditionally; fire-and-forget, never blocks the response.
+    reportUploadSoon({
+      cell_upload_id: id,
+      cell_user_id: req.user!.id,
+      url: mainUrl,
+      thumb_url: thumbnailUrl,
+      mime: outMime,
+      byte_size: outByteSize,
+      width: outWidth,
+      height: outHeight,
+    });
+
+    // Deletability is decided at capture time (decision 8): the driver returned
+    // a ref only if this specific upload's bytes can be destroyed later.
+    const canDelete = Boolean(result.ref) && deletableWith(resolved.driver, resolved.driverConfig);
+    res.json({
+      id,
+      url: mainUrl,
+      // The REAL mime, derived from the bytes — the client builds its optimistic
+      // history row from this rather than from what the browser guessed, so the
+      // row's type icon isn't a lie until the next refetch.
+      mime: outMime,
+      can_delete: canDelete,
+      ...(thumbnailUrl ? { thumbnail_url: thumbnailUrl } : {}),
+    });
+  } catch (err) {
+    next(err);
+  } finally {
+    // Every exit takes the temp file with it: success, 4xx/5xx, driver failure,
+    // or a throw. (A client abort never reaches the handler — multer unlinks its
+    // own partial file — and sweepTempUploads() catches anything a crash left.)
+    await discardTemp(req.file);
+  }
+});
 
 // Can rows produced by this configured uploader have their bytes destroyed?
 // Same resolution the DELETE gate uses (loadDriverForRef → deletableWith), so
@@ -557,6 +529,10 @@ router.get('/', (req: Request, res: Response) => {
       return { ...rest, can_delete, ...(thumb ? { thumbnail_url: thumb } : {}) };
     }),
     providers: driverIds,
+    // The same number the snapshot advertises (#627), repeated here so a
+    // REST-only client browsing its uploads doesn't need the WebSocket to learn
+    // what it may send. Single source of truth, so the two can't drift.
+    maxUploadBytes: effectiveUploadCapBytes(req.user!.id, req.user!.role === 'admin'),
   });
 });
 
@@ -581,37 +557,34 @@ router.get('/:id/thumb', (req: Request, res: Response) => {
 // tombstone) are refused — the client never offered a button for them, so a
 // request for one is forged or stale. Bytes go first so a driver failure keeps
 // the row and the user can retry; drivers treat "already gone" as success.
-router.delete(
-  '/:id',
-  asyncHandler(async (req: Request, res: Response) => {
-    const id = Number(req.params.id);
-    // Ownership is enforced by the user-scoped lookup — a caller can only
-    // delete their own upload.
-    const row = getUploadForReap(req.user!.id, id);
-    if (!row) {
-      res.status(404).json({ error: 'not found' });
-      return;
-    }
-    const loaded =
-      row.ref && !row.removed && row.uploader_config_id != null
-        ? loadDriverForRef(row.uploader_config_id)
-        : null;
-    if (!loaded || !deletableWith(loaded.driver, loaded.driverConfig)) {
-      res.status(409).json({ error: 'this upload cannot be deleted' });
-      return;
-    }
-    try {
-      await loaded.driver.delete!(row.ref!, loaded.driverConfig);
-    } catch (err) {
-      const e = err as { code?: string; message?: string };
-      res
-        .status(providerErrorStatus(e))
-        .json({ error: e.message || 'delete failed', provider: row.provider });
-      return;
-    }
-    deleteUpload(req.user!.id, id);
-    res.json({ ok: true });
-  }),
-);
+router.delete('/:id', async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  // Ownership is enforced by the user-scoped lookup — a caller can only
+  // delete their own upload.
+  const row = getUploadForReap(req.user!.id, id);
+  if (!row) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const loaded =
+    row.ref && !row.removed && row.uploader_config_id != null
+      ? loadDriverForRef(row.uploader_config_id)
+      : null;
+  if (!loaded || !deletableWith(loaded.driver, loaded.driverConfig)) {
+    res.status(409).json({ error: 'this upload cannot be deleted' });
+    return;
+  }
+  try {
+    await loaded.driver.delete!(row.ref!, loaded.driverConfig);
+  } catch (err) {
+    const e = err as { code?: string; message?: string };
+    res
+      .status(providerErrorStatus(e))
+      .json({ error: e.message || 'delete failed', provider: row.provider });
+    return;
+  }
+  deleteUpload(req.user!.id, id);
+  res.json({ ok: true });
+});
 
 export default router;

@@ -7,6 +7,8 @@
 // alphabetically). Used by keyboard navigation so prev/next-channel and the
 // quick switcher walk the same order the user sees in the sidebar.
 
+import { isChannelTarget, stripChannelPrefix } from '../../../shared/channels.js';
+
 interface BufferEntry {
   target: string;
 }
@@ -24,40 +26,40 @@ interface BuffersStore {
   byKey(key: string): { unread: number } | null | undefined;
 }
 
-// The FRIENDS pseudo-network (a feed header + each friend's primary DM) is
-// injected at the top so keyboard nav / quick-switch walk the same order the
-// sidebar renders. `excludeKeys` drops those primary DMs from their real
-// network so they aren't visited twice.
-interface FriendsOrder {
-  dms: Array<{ networkId: string | number; target: string }>;
-  excludeKeys?: Set<string>;
-  feedKey?: string;
+// The FRIENDS/FAVORITES sections (two kind-filtered views of the one global
+// favorites list) are injected at the top so keyboard nav / quick-switch walk
+// the same order the sidebar renders. `excludeKeys` drops those buffers from
+// their real network group so they aren't visited twice.
+export interface FavoritesOrder {
+  friends: Array<{ networkId: string | number; target: string }>;
+  channels: Array<{ networkId: string | number; target: string }>;
+  // `${networkId}::${lowercased target}` keys of every favorite.
+  excludeKeys: Set<string>;
 }
 
 interface BufferOrderArgs {
   networks: Network[];
   buffers: BuffersStore;
   pins: PinsStore;
-  friends?: FriendsOrder;
+  favorites?: FavoritesOrder;
 }
 
-// Sentinel group id for the FRIENDS group — its members carry their real
-// networkId for activation but group together, apart from that network. A
-// non-numeric string so it can never alias a real network id (which are
-// positive integers), even though groupId shares the `string | number` space.
+// Sentinel group ids for the two favorites sections — their members carry
+// their real networkId for activation but group together, apart from that
+// network. Non-numeric strings so they can never alias a real network id.
 export const FRIENDS_GROUP_ID = 'group:friends';
+export const FAVORITES_GROUP_ID = 'group:favorites';
 
 interface BufferOrderEntry {
   networkId: string | number;
   target: string;
-  // The activeKey for this entry — `${networkId}::${target}` for real buffers,
-  // a flat sentinel (e.g. ':friends:') for virtual ones. Callers match the
-  // active buffer and re-activate against this rather than recomputing.
+  // The activeKey for this entry — `${networkId}::${target}` for real buffers.
+  // Callers match the active buffer and re-activate against this rather than
+  // recomputing.
   key: string;
-  // Logical group this entry belongs to: networkId for real buffers,
-  // FRIENDS_GROUP_ID for the feed + friend DMs (so they group apart from their
-  // underlying network). Kept distinct from networkId so consumers can tell a
-  // friend's DM from a plain network buffer.
+  // Logical group this entry belongs to: the networkId for real buffers, a
+  // section sentinel for favorites (so they group apart from their
+  // underlying network).
   groupId: string | number;
 }
 
@@ -65,15 +67,14 @@ function isServerTarget(target: string): boolean {
   return typeof target === 'string' && target.startsWith(':server:');
 }
 
-function isChannelTarget(target: string): boolean {
-  return typeof target === 'string' && target.startsWith('#');
-}
-
 // Alphabetical sort key for a buffer: leading channel sigils stripped, ASCII-
 // lowercased (matching the house case-folding style). Exported so the quick
 // switcher's smart sort (#393) alphabetises identically to the sidebar.
+//
+// ⚠ All four sigils, not just `#` (#724) — the comment always said "channel sigils", but the
+// pattern stripped only one of them, so `&local` sorted under `&` instead of alongside `#local`.
 export function bufferSortKey(target: string): string {
-  return target.replace(/^#+/, '').toLowerCase();
+  return stripChannelPrefix(target).toLowerCase();
 }
 
 function bufferOrder(target: string): number {
@@ -85,29 +86,28 @@ export function flattenBufferOrder({
   networks,
   buffers,
   pins,
-  friends,
+  favorites,
 }: BufferOrderArgs): BufferOrderEntry[] {
   const out: BufferOrderEntry[] = [];
-  const exclude = friends?.excludeKeys;
+  const exclude = favorites?.excludeKeys;
   const isExcluded = (networkId: string | number, target: string): boolean =>
     !!exclude && exclude.has(`${networkId}::${target.toLowerCase()}`);
 
-  // FRIENDS group first (matches the sidebar): feed header, then friend DMs.
-  // All carry FRIENDS_GROUP_ID so per-network nav treats them as one group.
-  if (friends?.feedKey) {
-    out.push({
-      networkId: FRIENDS_GROUP_ID,
-      target: friends.feedKey,
-      key: friends.feedKey,
-      groupId: FRIENDS_GROUP_ID,
-    });
-  }
-  for (const dm of friends?.dms || []) {
+  // Favorites sections first (matches the sidebar): FRIENDS then FAVORITES.
+  for (const dm of favorites?.friends || []) {
     out.push({
       networkId: dm.networkId,
       target: dm.target,
       key: `${dm.networkId}::${dm.target}`,
       groupId: FRIENDS_GROUP_ID,
+    });
+  }
+  for (const ch of favorites?.channels || []) {
+    out.push({
+      networkId: ch.networkId,
+      target: ch.target,
+      key: `${ch.networkId}::${ch.target}`,
+      groupId: FAVORITES_GROUP_ID,
     });
   }
 
@@ -154,8 +154,7 @@ export function flattenBufferOrder({
 }
 
 // Same shape as flattenBufferOrder but only entries with unread > 0. Server
-// pseudo-buffers participate (network-level notices land there); the virtual
-// FRIENDS feed never has unread, so it drops out here naturally.
+// pseudo-buffers participate (network-level notices land there).
 export function flattenUnreadOrder(args: BufferOrderArgs): BufferOrderEntry[] {
   const { buffers } = args;
   return flattenBufferOrder(args).filter((entry) => {

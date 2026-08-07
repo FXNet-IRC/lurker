@@ -3,6 +3,7 @@
 
 import { defineStore } from 'pinia';
 import { socketSend } from '../composables/useSocket.js';
+import { idFor } from './buffers.js';
 
 // Per-channel override for the desktop nicklist collapsed state. The server is
 // the source of truth: a toggle sends a WS message and the `nicklist-collapsed
@@ -35,7 +36,27 @@ export const useNicklistCollapseStore = defineStore('nicklistCollapse', {
       this.byNetwork[networkId][target] = collapsed;
     },
     setCollapsed(networkId: number | string, target: string, collapsed: boolean) {
-      socketSend({ type: 'set-nicklist-collapsed', networkId, target, collapsed });
+      socketSend({
+        type: 'set-nicklist-collapsed',
+        networkId,
+        target,
+        collapsed,
+        bufferId: idFor(networkId, target),
+      });
+    },
+    // Lifecycle hooks (lib/bufferLifecycle.ts).
+    dropBuffer(networkId: number | string | null, target: string) {
+      if (networkId == null) return;
+      const map = this.byNetwork[networkId];
+      if (map && target in map) delete map[target];
+    },
+    rekeyBuffer(networkId: number | string | null, from: string, to: string) {
+      if (networkId == null) return;
+      const map = this.byNetwork[networkId];
+      if (!map || !(from in map)) return;
+      // Destination wins on a merge collision.
+      if (!(to in map)) map[to] = map[from];
+      delete map[from];
     },
   },
 });

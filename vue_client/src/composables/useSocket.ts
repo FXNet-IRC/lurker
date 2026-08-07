@@ -2,23 +2,29 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import type { Ref } from 'vue';
-import { ref, onMounted, onBeforeUnmount } from 'vue';
+import { ref, onMounted, watch, effectScope } from 'vue';
 import { useNetworksStore } from '../stores/networks.js';
 import { useBuffersStore } from '../stores/buffers.js';
 import { useAuthStore } from '../stores/auth.js';
 import { useSettingsStore } from '../stores/settings.js';
+import { useThemesStore } from '../stores/themes.js';
+import { THEME_POINTER_KEYS } from '../../../shared/themePresets.js';
+import { primePreviews } from './useLinkPreview.js';
+import { previewableEventTexts } from '../utils/previewEvents.js';
+import { useConfigStore } from '../stores/config.js';
 import { useHighlightRulesStore } from '../stores/highlightRules.js';
 import { useInputHistoryStore } from '../stores/inputHistory.js';
+import { bufferClosed, applyBufferRenamed } from '../lib/bufferLifecycle.js';
 import { useDraftStore } from '../stores/drafts.js';
 import { useChanlistStore } from '../stores/chanlist.js';
 import { useSearchStore } from '../stores/search.js';
 import { usePinsStore } from '../stores/pins.js';
+import { useFavoritesStore, type FavoriteEntry } from '../stores/favorites.js';
 import { useNicklistCollapseStore } from '../stores/nicklistCollapse.js';
 import { useChannelNotifyStore } from '../stores/channelNotify.js';
 import { useIgnoresStore } from '../stores/ignores.js';
 import { useNickNotesStore } from '../stores/nickNotes.js';
 import { useRelayBotsStore } from '../stores/relayBots.js';
-import { useFriendsStore } from '../stores/friends.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useBookmarksStore } from '../stores/bookmarks.js';
 import { useDataExportStore } from '../stores/dataExport.js';
@@ -28,6 +34,7 @@ import { makeClientId } from '../utils/clientId.js';
 import { useToastsStore } from '../stores/toasts.js';
 import { downloadTextFile } from '../utils/download.js';
 import { notifyForEvent, playSound } from './useHighlightNotifier.js';
+import { isChannelTarget } from '../../../shared/channels.js';
 
 export interface AckResult {
   ok: boolean;
@@ -48,10 +55,52 @@ let socket: WebSocket | null = null;
 // 'close' reconnect arm can't fire.
 let socketListeners: AbortController | null = null;
 // Module-level singleton: the live WS link to the lurker service. Exported so
-// read-only consumers (e.g. the FRIENDS status dot) can reflect it without
+// read-only consumers (e.g. the sidebar status dot) can reflect it without
 // calling useSocket() (which would re-register the connect lifecycle).
 export const connected = ref(false);
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+// Consecutive failed reconnect attempts, driving the backoff below. Deliberately
+// NOT reset when a socket opens — only once one has survived RECONNECT_STABLE_MS,
+// which the close handler decides. See that constant for why opening is too early
+// to count as success.
+let reconnectAttempts = 0;
+// When the current socket opened, or null when there isn't one. Used to decide
+// whether a connection lasted long enough to count as healthy.
+let socketOpenedAt: number | null = null;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30_000;
+// How long a socket must stay open before we treat it as a *successful*
+// connection and reset the backoff.
+//
+// Resetting on `open` instead is the obvious version and it's wrong: it clears
+// the backoff the instant the upgrade succeeds, before the connection has
+// proved it can survive. Any accept-then-close pattern then retries forever at
+// the base delay with no backoff at all — and the server's backpressure reaper
+// is exactly such a pattern (accept → snapshot → drop → repeat), where each
+// iteration costs the server a full synchronous snapshot.
+//
+// **This must exceed the server's `BACKPRESSURE_GRACE_MS` (30s), or it doesn't
+// defend against the case it's named for.** That reaper can only fire after a
+// full grace period of no progress, i.e. at least 30s after the socket opened —
+// so a threshold below 30s classifies every backpressure drop as a healthy
+// connection, resets the counter, and retries in ~1s. Which is the unthrottled
+// loop. 60s keeps a comfortable margin; a normal session lasts hours, so the
+// only connections this denies a fast retry to are ones that died young.
+const RECONNECT_STABLE_MS = 60_000;
+// How long to wait before the next reconnect: exponential 1s→30s with ±25%
+// jitter, matching the iOS client's policy.
+//
+// The jitter is the load-bearing half. A flat interval (this was a hard 2s)
+// means every tab the user has open — and on a hosted cell, every tab of every
+// user on it — reconnects inside the same window after a restart, and each
+// reconnect costs the server a full synchronous snapshot burst. That's a
+// thundering herd aimed at a process that has just started and is least able to
+// absorb it. Spreading the retries is what stops a routine deploy from looking
+// like an outage.
+function nextReconnectDelay(): number {
+  const capped = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempts, RECONNECT_MAX_MS);
+  return Math.round(capped * (0.75 + Math.random() * 0.5));
+}
 const openHandlers = new Set<() => void>();
 // Outstanding send/action ACKs keyed by clientId. Resolver is called with
 // { ok, error } when the server returns a send-result, on socket close, or on
@@ -76,6 +125,49 @@ export function onSocketOpen(handler: () => void): () => void {
 const HIDDEN_RESNAPSHOT_MS = 30_000;
 let hiddenSince: number | null = null;
 let visibilityWired = false;
+
+// Zombie-socket liveness probe. Mobile OSes routinely kill a backgrounded (or
+// flaky-network) WebSocket's TCP connection without telling the page —
+// readyState still claims OPEN, so sends go into the void and the user sits on
+// stale or wedged-loading buffers until the OS TCP timeout errors the socket,
+// minutes later. Any request with a guaranteed reply (the resume snapshot,
+// every 'history' fetch) doubles as a probe: a live server always produces
+// SOME inbound traffic after it, so total silence for the whole window means
+// the link is dead — force-close it, which trips the normal 'close' arm (fail
+// pending ACKs + in-flight history, schedule reconnect, and the hydration
+// reconciler refetches on the reconnect edge).
+//
+// 10s, not lower: the probe fires only on TOTAL inbound silence since the
+// send (any frame counts), so the window's only job is to out-wait worst-case
+// link latency on a quiet connection. A false positive costs one spurious
+// reconnect cycle (self-healing — the reconnect path arms no probe and the
+// server re-sends a snapshot on connect), but there's no reason to shave
+// seconds off a detector whose true-positive alternative is a minutes-long
+// TCP timeout.
+const LIVENESS_PROBE_TIMEOUT_MS = 10_000;
+let livenessProbeTimer: ReturnType<typeof setTimeout> | null = null;
+let lastMessageAt = 0;
+
+// Arm (or re-arm) the probe against the CURRENT socket. The callback captures
+// the socket instance it measured and re-checks identity before acting: a
+// probe armed against socket A must never close A's healthy replacement B
+// when A dies mid-window and the reconnect brings B up before the timer fires
+// (B can be OPEN with its first snapshot frame still in flight — and with
+// backoff the first retry can land in well under a second). The
+// close handler also clears the timer outright, so identity is a second
+// fence, not the only one.
+function armLivenessProbe(): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  const probed = socket;
+  const sentAt = Date.now();
+  if (livenessProbeTimer) clearTimeout(livenessProbeTimer);
+  livenessProbeTimer = setTimeout(() => {
+    livenessProbeTimer = null;
+    if (socket === probed && socket.readyState === WebSocket.OPEN && lastMessageAt < sentAt) {
+      socket.close();
+    }
+  }, LIVENESS_PROBE_TIMEOUT_MS);
+}
 
 function wsUrl(): string {
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
@@ -105,6 +197,10 @@ function applyEvent(event: any): void {
       // server's read-state broadcast (fired after every countable event),
       // so we don't increment them here.
       if (!buffers.pushMessage(event)) break;
+      // A live message is the one case where growth is expected and harmless: it lands at the
+      // bottom, where the list's existing stick-to-bottom logic follows it down. Primed after
+      // the dedupe check so a replayed event doesn't re-queue.
+      primeEventPreviews([event]);
       // Speakers feeds tab-complete and the nick-picker. Our own messages
       // would just clutter our own suggestions, so they don't count as
       // "people who recently spoke here."
@@ -214,7 +310,7 @@ function applyEvent(event: any): void {
       // toast with a one-click Join. The durable record for the latter lives in
       // the system buffer (logged server-side), so the long TTL is just a
       // convenience window, not the only chance to act.
-      if (typeof event.target === 'string' && event.target.startsWith('#')) {
+      if (isChannelTarget(event.target as string)) {
         buffers.pushMessage(event);
         break;
       }
@@ -268,38 +364,35 @@ function applyEvent(event: any): void {
         stateAt: event.stateAt,
         awayMessage: event.awayMessage,
       });
-      const friends = useFriendsStore();
-      // Came-online notification: only on a real offline→online transition. The
-      // server also reports current state on the MONITOR seed and whenever a nick
-      // is freshly added to the watch (RPL_MONONLINE with no prior presence row),
+      // Came-online notification for FRIENDS (favorited DMs): only on a real
+      // offline→online transition. The server also reports current state on
+      // the MONITOR seed and whenever a nick is freshly added to the watch,
       // so keying purely off `state === 'online'` would fire when you add an
-      // already-online friend or on a first connect. Gate on the prior client
-      // state being 'offline' so only genuine transitions notify.
+      // already-online friend or on a first connect.
       //
       // In-app toast + sound only when the tab is visible — the hidden case is
-      // the server-side push's job (wsHub.maybePushFriendOnline), gated on the
-      // same Page Visibility signal, so exactly one of the two fires.
+      // the server-side push's job (wsHub.maybePushFavoriteOnline), gated on
+      // the same Page Visibility signal, so exactly one of the two fires.
       if (
         event.state === 'online' &&
         prevPeerState === 'offline' &&
         typeof document !== 'undefined' &&
         !document.hidden
       ) {
-        const contact = friends.notifyContactFor(event.networkId, event.nick);
+        const nick = String(event.nick);
         const settings = useSettingsStore();
-        if (contact && settings.effective('notifications.friend_online.enabled')) {
-          // Name the nick that actually signed on when it differs from the
-          // display name — for a friend watched under several nicks/alts, "(as
-          // nostimo)" says which identity, and matches the dot in the breakdown.
-          const nick = String(event.nick);
-          const asNick =
-            nick && nick.toLowerCase() !== contact.displayName.toLowerCase() ? ` (as ${nick})` : '';
+        if (
+          useFavoritesStore().isFavorite(event.networkId, nick) &&
+          settings.effective('notifications.friend_online.enabled')
+        ) {
           useToastsStore().push({
             kind: 'notify',
-            title: `${contact.displayName} came online${asNick}`,
+            title: `${nick} came online`,
             body: '',
             networkId: event.networkId,
-            target: event.nick,
+            // The normalized string, not the raw payload field — click-routing
+            // downstream shouldn't meet whatever type the wire happened to carry.
+            target: nick,
           });
           // Optional sound, same enable/choice/volume model as the DM/highlight/
           // always-notify toasts (shared playSound helper).
@@ -370,6 +463,104 @@ function applyEvent(event: any): void {
   }
 }
 
+// Kick off preview resolution for a batch of incoming events.
+//
+// ⚠ This is the ONLY place previews are requested. Rendering a row never triggers a fetch —
+// see the header of composables/useLinkPreview. Priming here is what gives scrollback the
+// Slack/Discord property: by the time a history page's rows are rendered their previews are
+// usually already known, so the rows are laid out correctly on first paint instead of growing
+// under the reader a moment later.
+//
+// Fire-and-forget by design. A history page must not wait on the internet before it can be
+// read, and nothing here can fail in a way a reader should hear about.
+function primeEventPreviews(
+  events: unknown,
+  fallbackNetworkId?: number | string | null,
+  fallbackTarget?: string | null,
+): void {
+  if (!Array.isArray(events) || events.length === 0) return;
+  // ANDed with the instance feature flag, matching MessageAttachments — priming a URL the
+  // server has no route for would be a guaranteed 404 per batch.
+  const config = useConfigStore();
+  if (!config.linkPreviews) return;
+  const settings = useSettingsStore();
+  const toggles = {
+    inlineMedia: settings.effective('chat.inline_media.enabled') === true,
+    linkPreviews: settings.effective('chat.link_previews.enabled') === true,
+  };
+  if (!toggles.inlineMedia && !toggles.linkPreviews) return;
+  primePreviews(previewableEventTexts(events, fallbackNetworkId, fallbackTarget), toggles);
+}
+
+let previewTogglesWired = false;
+
+/**
+ * Owns the preview-toggle watcher, so no component does.
+ *
+ * ⚠⚠ DETACHED, and that is the entire point (#693). `watch` registers with whatever effect scope
+ * is ACTIVE when it runs — and `wirePreviewToggles` is called from `useSocket`'s `onMounted`,
+ * which runs with the calling component's instance current. So the watcher was adopted by
+ * whichever route mounted first, and stopped when that route unmounted; the `previewTogglesWired`
+ * latch below then guaranteed it was never rebuilt. Declaring the watcher at module level did NOT
+ * fix that, because declaration site is not ownership.
+ *
+ * Created here rather than inside the function so it exists before any component does, and
+ * detached so it is never collected into a parent scope even if that changes.
+ */
+let previewToggleScope = effectScope(true);
+
+/**
+ * Re-prime what is ALREADY in the store when a preview setting is switched on.
+ *
+ * ⚠⚠ Wired once and owned by a module-level scope, deliberately — this lived in `MessageList` and
+ * could not fire for the path almost everyone uses. Settings is a separate route with no
+ * `KeepAlive`, so opening it destroys the chat view; a watcher owned by that view goes with it,
+ * and coming back mounts a fresh one with no `immediate`, which therefore never observes the
+ * flip. Nor does the remount re-ingest anything, because the buffer already has messages. The net
+ * effect was that turning the setting on in the settings UI left every existing message without a
+ * preview, forever — the exact outcome the watcher was written to prevent. It only ever worked
+ * via `/set` and cross-device sync, which is why it survived QA.
+ *
+ * Every loaded buffer, not just the active one: `MessageList` is not keyed per buffer, so
+ * priming only what happens to be on screen left every other buffer blank for the session.
+ *
+ * Still called lazily rather than at module load: it reads Pinia stores, which do not exist until
+ * the app has installed Pinia.
+ */
+function wirePreviewToggles(): void {
+  if (previewTogglesWired) return;
+  previewTogglesWired = true;
+  previewToggleScope.run(() => {
+    const config = useConfigStore();
+    const settings = useSettingsStore();
+    watch(
+      () => [
+        config.linkPreviews && settings.effective('chat.inline_media.enabled') === true,
+        config.linkPreviews && settings.effective('chat.link_previews.enabled') === true,
+      ],
+      ([inlineMedia, linkPreviews], previous) => {
+        // Only on a flip TO enabled. Turning one off needs no work: the rows stop rendering.
+        const gained = (inlineMedia && !previous?.[0]) || (linkPreviews && !previous?.[1]);
+        if (!gained) return;
+        const buffers = useBuffersStore();
+        for (const buf of Object.values(buffers.buffers)) {
+          primeEventPreviews(buf.messages, buf.networkId, buf.target);
+        }
+      },
+    );
+  });
+}
+
+/**
+ * Test-only: tear the watcher down so a suite can re-wire it from a known state.
+ * A stopped scope cannot be re-run, so this mints a fresh one rather than reusing it.
+ */
+export function resetPreviewToggleWiring(): void {
+  previewToggleScope.stop();
+  previewToggleScope = effectScope(true);
+  previewTogglesWired = false;
+}
+
 function applySnapshot(snapshot: any[], globalIgnores: any[] = []): void {
   const networks = useNetworksStore();
   const buffers = useBuffersStore();
@@ -393,6 +584,14 @@ function applySnapshot(snapshot: any[], globalIgnores: any[] = []): void {
     .fetchAll()
     .catch(() => {
       /* ignore — server stamp (m.matched) still drives highlighting */
+    });
+  // Saved themes: the only live refresh is the themes-changed frame, which a
+  // disconnected device never received. Refetch on every (re)connect so a
+  // theme edited elsewhere while this device slept doesn't render stale.
+  useThemesStore()
+    .fetchAll()
+    .catch(() => {
+      /* ignore — the bootstrap list (or the last successful fetch) keeps rendering */
     });
   for (const net of snapshot) {
     for (const ch of net.channels) {
@@ -428,7 +627,9 @@ function applyBacklog(payload: any): void {
     payload.joined,
     // reset: the resume gap overflowed the server cap, so `events` is a fresh
     // latest slice meant to replace the buffer rather than gap-fill onto it.
-    { reset: !!payload.reset, hasMoreOlder: payload.hasMoreOlder },
+    // bufferId: the burst doubles as the id directory (§5.2) — this is where
+    // the client learns each buffer's stable id.
+    { reset: !!payload.reset, hasMoreOlder: payload.hasMoreOlder, bufferId: payload.bufferId },
   );
   if (payload.inputHistory) {
     const inputHistory = useInputHistoryStore();
@@ -452,6 +653,12 @@ function handleMessage(raw: string): void {
     // ?since pulls only genuinely-new events rather than re-gap-filling history
     // the shells intentionally omitted. Present on fresh connects only.
     if (typeof payload.cursor === 'number') trackSeenId(payload.cursor);
+    // Saves made elsewhere while we were away are replayed by no frame — the
+    // backlogs that follow reconcile the id set row by row, but the loaded
+    // bookmarks LIST would stay as it was before the gap. Re-arm it so the next
+    // modal open refetches. This is what the departed `bookmark-ids-snapshot`
+    // used to do as a side effect of overwriting the store.
+    useBookmarksStore().markListStale();
     return;
   }
   if (payload.kind === 'backlog') {
@@ -461,6 +668,8 @@ function handleMessage(raw: string): void {
     if (payload.networkId != null && Array.isArray(payload.events)) {
       for (const e of payload.events) trackSeenId(e?.id);
     }
+    useBookmarksStore().noteFromEvents(payload.events, payload.networkId);
+    primeEventPreviews(payload.events, payload.networkId, payload.target);
     applyBacklog(payload);
     return;
   }
@@ -471,6 +680,10 @@ function handleMessage(raw: string): void {
     // 'history' kind — disambiguated by `mode`.
     const buffers = useBuffersStore();
     const mode = payload.mode || 'before';
+    // Every mode carries `events`; reconcile before the mode-specific dispatch so
+    // one call covers around/latest/after/before alike.
+    useBookmarksStore().noteFromEvents(payload.events, payload.networkId);
+    primeEventPreviews(payload.events, payload.networkId, payload.target);
     if (mode === 'around') {
       buffers.applyAroundSlice(payload.networkId, payload.target, payload);
     } else if (mode === 'latest') {
@@ -522,6 +735,25 @@ function handleMessage(raw: string): void {
   if (payload.kind === 'settings') {
     const settings = useSettingsStore();
     settings.applyRemote(payload);
+    // A cross-device theme APPLY lands here (pointer write + themed resets) and
+    // races the themes-changed refetch, which is an async GET — a pointer at a
+    // theme this tab hasn't fetched yet resolves as built-in Dark meanwhile.
+    // When a pointer moved to an id we don't know, refetch right away; this
+    // also heals a list left stale by an earlier fetch failing silently.
+    const changed = payload.changes || {};
+    const themes = useThemesStore();
+    if (THEME_POINTER_KEYS.some((k) => k in changed && !themes.byId(String(changed[k])))) {
+      themes.fetchAll().catch(() => {});
+    }
+    return;
+  }
+  if (payload.kind === 'themes-changed') {
+    // Saved theme list changed somewhere (this device's own writes included —
+    // harmless double-fetch). Refetch like highlight rules: small list, no
+    // payload contract to keep in sync.
+    useThemesStore()
+      .fetchAll()
+      .catch(() => {});
     return;
   }
   if (payload.kind === 'highlight-rules-changed') {
@@ -549,21 +781,19 @@ function handleMessage(raw: string): void {
     });
     return;
   }
+  if (payload.kind === 'buffer-renamed') {
+    // A buffer kept its identity and changed names (a DM following a peer's
+    // /nick; later, channel renames). One call moves every store.
+    applyBufferRenamed(payload);
+    return;
+  }
   if (payload.kind === 'buffer-closed') {
-    const networks = useNetworksStore();
-    const buffers = useBuffersStore();
-    const inputHistory = useInputHistoryStore();
-    const drafts = useDraftStore();
-    const closedKey = `${payload.networkId}::${payload.target}`;
-    if (networks.activeKey === closedKey) networks.activeKey = null;
-    buffers.drop(payload.networkId, payload.target);
-    // History rows survive on the server (re-seeded if the buffer reopens);
-    // we just drop the in-memory mirror so it doesn't go stale.
-    inputHistory.drop(payload.networkId, payload.target);
-    // Drafts for a closed buffer are cleared server-side too (wsHub's
-    // close-buffer handler). Mirror that locally so a future reopen starts
-    // empty rather than restoring the pre-close draft.
-    drafts.drop(payload.networkId, payload.target);
+    // ONE sweep over every store holding per-buffer state (the registry in
+    // lib/bufferLifecycle.ts). The old inline version cleaned exactly four
+    // stores and leaked the rest — pins, nicklist toggles, notify flags,
+    // nav/recent trails all kept entries for a buffer nothing would reference
+    // again.
+    bufferClosed(payload.networkId, payload.target);
     return;
   }
   if (payload.kind === 'input-history-added') {
@@ -642,6 +872,12 @@ function handleMessage(raw: string): void {
     pins.setNetwork(payload.networkId, payload.pinned || []);
     return;
   }
+  if (payload.kind === 'favorites-changed') {
+    // Full ordered global list, replace wholesale — the same frame seeds the
+    // connect burst, so this one handler covers seed and every correction.
+    useFavoritesStore().apply((payload.favorites as FavoriteEntry[]) || []);
+    return;
+  }
   if (payload.kind === 'nicklist-collapsed-changed') {
     const nicklistCollapse = useNicklistCollapseStore();
     nicklistCollapse.applyChange(payload.networkId, payload.target, !!payload.collapsed);
@@ -676,36 +912,27 @@ function handleMessage(raw: string): void {
     useDccStore().applyTransfer(payload.transfer);
     return;
   }
-  if (payload.kind === 'contacts-snapshot') {
-    useFriendsStore().applySnapshot(payload.contacts || []);
-    return;
-  }
-  if (payload.kind === 'contact-updated') {
-    useFriendsStore().applyContactUpdated(payload.contact);
-    return;
-  }
-  if (payload.kind === 'contact-deleted') {
-    useFriendsStore().applyContactDeleted(payload.contactId);
-    return;
-  }
-  if (payload.kind === 'bookmark-ids-snapshot') {
-    const bookmarks = useBookmarksStore();
-    bookmarks.applySnapshot(payload.ids || []);
-    return;
-  }
   if (payload.kind === 'bookmark-updated') {
     const bookmarks = useBookmarksStore();
     bookmarks.applyUpdate({ messageId: payload.messageId, saved: !!payload.saved });
     return;
   }
   if (payload.kind === 'buffer-opened') {
-    // Reply to our own `open-buffer` request: the server resolved the
-    // canonical target — reopened a since-closed buffer, or joined a new
-    // channel. Focus it now. For a reopen the `backlog` frame sent just
-    // before this already recreated the buffer; for a join the channel-joined
-    // flow will. activate() ensures the buffer exists either way.
     const buffers = useBuffersStore();
-    buffers.activate(payload.networkId, payload.target);
+    // Two meanings, one frame — tell them apart by whether WE asked.
+    //
+    // Our own reply: the server resolved the canonical target — reopened a
+    // since-closed buffer, or joined a new channel. Focus it. For a reopen the
+    // `backlog` frame sent just before already recreated the buffer; for a join
+    // the channel-joined flow will. activate() ensures it exists either way.
+    //
+    // Otherwise it's a fan-out: another of the user's devices opened this
+    // buffer. The shell that travelled with this frame has already put the row
+    // in the sidebar, and that's the whole job — activating here would drag this
+    // tab to a buffer someone opened on their phone.
+    if (buffers.claimPendingOpen(payload.networkId, payload.target)) {
+      buffers.activate(payload.networkId, payload.target);
+    }
     return;
   }
   if (payload.kind === 'buffer-reopened') {
@@ -749,6 +976,9 @@ function open() {
     'open',
     () => {
       connected.value = true;
+      // Stamped, not reset — the backoff clears on a connection that PROVED
+      // itself, which is decided in the close handler. See RECONNECT_STABLE_MS.
+      socketOpenedAt = Date.now();
       // Detached buffers won't survive a reconnect cleanly — the incoming
       // snapshot/backlog would otherwise be short-circuited by replaceBacklog's
       // detached guard, leaving the slice stale and the buffer cut off from
@@ -776,19 +1006,50 @@ function open() {
     },
     opts,
   );
-  socket.addEventListener('message', (ev) => handleMessage(ev.data), opts);
+  socket.addEventListener(
+    'message',
+    (ev) => {
+      lastMessageAt = Date.now();
+      handleMessage(ev.data);
+    },
+    opts,
+  );
   socket.addEventListener(
     'close',
     () => {
       connected.value = false;
       socket = null;
+      // A probe armed against the socket that just died must not survive into
+      // the replacement's lifetime (its identity check would make firing a
+      // no-op, but a dead timer serves nobody).
+      if (livenessProbeTimer) {
+        clearTimeout(livenessProbeTimer);
+        livenessProbeTimer = null;
+      }
       // Anything we were waiting on is gone with the socket. Settle every
       // pending ACK as a disconnect so callers can surface the failure now
       // instead of waiting out the timeout.
       failAllPendingAcks('disconnected');
+      // Same for in-flight history fetches: their responses died with the
+      // socket, and the per-buffer loadingHistory guards would otherwise wedge
+      // every future fetch for those buffers (a permanently blank,
+      // un-refetchable message list). Clearing here also makes the buffers
+      // eligible again for the hydration reconciler's reconnect refetch.
+      try {
+        useBuffersStore().failInFlightHistory();
+      } catch (_) {
+        /* store not yet initialized; nothing in flight */
+      }
       const auth = useAuthStore();
       if (auth.user) {
-        reconnectTimer = setTimeout(open, 2000);
+        // A socket that lived a while proves the server is healthy and this was
+        // an ordinary drop — start over at the base delay. One that died young
+        // counts as a failed attempt and escalates. Decided BEFORE scheduling,
+        // since the delay is computed from the count.
+        const livedMs = socketOpenedAt === null ? 0 : Date.now() - socketOpenedAt;
+        socketOpenedAt = null;
+        reconnectAttempts = livedMs >= RECONNECT_STABLE_MS ? 0 : reconnectAttempts + 1;
+        reconnectTimer = setTimeout(open, nextReconnectDelay());
       }
     },
     opts,
@@ -860,6 +1121,10 @@ export function resetSocket(): void {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  if (livenessProbeTimer) {
+    clearTimeout(livenessProbeTimer);
+    livenessProbeTimer = null;
+  }
   if (socket) {
     // Detach every listener at once so the 'close' reconnect arm can't fire.
     socketListeners?.abort();
@@ -872,6 +1137,11 @@ export function resetSocket(): void {
     socket = null;
   }
   connected.value = false;
+  // A teardown ends the session (sign-out, or an explicit reset) — whatever
+  // backoff the last outage had built up shouldn't be inherited by the next
+  // sign-in's first reconnect.
+  reconnectAttempts = 0;
+  socketOpenedAt = null;
   hiddenSince = null;
   lastSeenEventId = 0;
   failAllPendingAcks('disconnected');
@@ -880,11 +1150,18 @@ export function resetSocket(): void {
 function refreshSnapshot() {
   if (socket && socket.readyState === WebSocket.OPEN) {
     send({ type: 'snapshot' });
+    // The socket may be a zombie after a long background stint — the snapshot
+    // reply is guaranteed traffic, so treat the request as a liveness probe.
+    armLivenessProbe();
     return;
   }
-  // Socket isn't open — pull the reconnect forward instead of waiting on the
-  // 2s backoff timer. The fresh connection will trigger the server-side
-  // sendSnapshot path on its own.
+  // Socket isn't open — pull the reconnect forward instead of waiting out the
+  // backoff timer. The user is looking at the tab right now, so the wait that
+  // protects a restarting server from a herd is the wrong trade here. The
+  // attempt counter is deliberately NOT reset: if the server really is down,
+  // the retries that follow this one should resume backing off rather than
+  // restart at 1s. The fresh connection triggers the server-side sendSnapshot
+  // path on its own.
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -909,14 +1186,30 @@ function wireVisibility() {
 export function useSocket(): SocketAPI {
   onMounted(() => {
     wireVisibility();
+    wirePreviewToggles();
     open();
   });
-  onBeforeUnmount(() => {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-  });
+  // Deliberately no teardown. The socket, and the reconnect timer that revives
+  // it, are module-level singletons shared by every view that calls this
+  // (DesktopChat, MobileChat, Settings, Admin) — so cancelling the timer when
+  // any ONE of them unmounts kills a reconnect the others still depend on. It
+  // only ever looked harmless because the incoming route's onMounted → open()
+  // papered over it, which also meant every route change during an outage fired
+  // an immediate un-backed-off connect, defeating the backoff above. The
+  // lifecycle that matters is the session's, and resetSocket() owns that.
   return { connected, send, reconnect: open };
 }
 
 export function socketSend(payload: Record<string, unknown>): boolean {
-  return send(payload);
+  const sent = send(payload);
+  // Every 'history' request has a guaranteed reply, so each successful send is
+  // also a liveness expectation. Without this, a fetch swallowed by a
+  // half-open socket while the tab stays FOREGROUNDED wedges that buffer's
+  // loadingHistory until the OS TCP timeout finally fires 'close' (minutes):
+  // the close-handler sweep can't run without a close, and the resume-path
+  // probe only arms after a ≥30s-hidden visibilitychange. Arming here closes
+  // that gap — silence for the probe window forces the close, the sweep
+  // clears the flags, and the hydration reconciler refetches on reconnect.
+  if (sent && payload.type === 'history') armLivenessProbe();
+  return sent;
 }

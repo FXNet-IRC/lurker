@@ -35,6 +35,7 @@ interface ExportTableDefWithScope {
   encryptedColumns?: string[];
   rekeyOnImport?: boolean;
   fkRekey?: Record<string, string>;
+  rowWhere?: string;
 }
 
 /** Called periodically as messages stream out so the job row + WS can report progress. */
@@ -70,10 +71,20 @@ function scopeFilter(scope: string, userId: number): { where: string; params: nu
   }
 }
 
-function countRows(db: Database, table: string, scope: string, userId: number): number {
+function countRows(
+  db: Database,
+  table: string,
+  scope: string,
+  userId: number,
+  rowWhere?: string,
+): number {
   const { where, params } = scopeFilter(scope, userId);
-  return (db.prepare(`SELECT COUNT(*) AS n FROM ${table} ${where}`).get(...params) as { n: number })
-    .n;
+  const extra = rowWhere ? ` AND (${rowWhere})` : '';
+  return (
+    db.prepare(`SELECT COUNT(*) AS n FROM ${table} ${where}${extra}`).get(...params) as {
+      n: number;
+    }
+  ).n;
 }
 
 // Project a row into the shape that lands in the export. Strips BLOB columns
@@ -148,12 +159,12 @@ function selectAll(
   userId: number,
 ): Record<string, unknown>[] {
   const { where, params } = scopeFilter(def.scope, userId);
+  const rowWhere = def.rowWhere ? ` AND (${def.rowWhere})` : '';
   const cols = def.columns.join(', ');
   const order = def.pk ? `ORDER BY ${def.pk} ASC` : '';
-  return db.prepare(`SELECT ${cols} FROM ${table} ${where} ${order}`).all(...params) as Record<
-    string,
-    unknown
-  >[];
+  return db
+    .prepare(`SELECT ${cols} FROM ${table} ${where}${rowWhere} ${order}`)
+    .all(...params) as Record<string, unknown>[];
 }
 
 export function computeExportPreview(
@@ -173,7 +184,7 @@ export function computeExportPreview(
       counts[table] = 0;
       continue;
     }
-    counts[table] = countRows(db, table, d.scope, userId);
+    counts[table] = countRows(db, table, d.scope, userId, d.rowWhere);
   }
   return counts;
 }

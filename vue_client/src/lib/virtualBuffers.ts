@@ -3,34 +3,26 @@
 
 // Virtual buffers are sidebar-selectable "buffers" that aren't tied to an IRC
 // network. They use a flat sentinel key (no `::`) so the usual
-// `${networkId}::${target}` parsers ignore them. Today there are two:
+// `${networkId}::${target}` parsers ignore them. Today there is one:
 //
-//   :system:  — the system buffer (issue #355). renderMode 'buffer': a real,
-//               app-scoped Buffer in the buffers store (networkId null),
-//               rendered by MessageList with a slash-command input and no
-//               nicklist. It's the home for the server lifecycle log plus
-//               command output / errors that have no other buffer.
-//   :friends: — the cross-network Friends buffer. renderMode 'overview': a
-//               bespoke FriendsOverview component (a management pane, not a
-//               message feed), no nicklist or input.
+//   :system:  — the system buffer (issue #355). A real, app-scoped Buffer in
+//               the buffers store (networkId null), rendered by MessageList
+//               with a slash-command input and no nicklist. It's the home for
+//               the server lifecycle log plus command output / errors that
+//               have no other buffer.
 //
-// renderMode/hasInput/hasNicklist are load-bearing: useActiveBuffer surfaces
-// them and the views dispatch the body component + input + member list off
-// them, so a future :highlights: buffer is one registry entry plus (if it needs
-// a new body) one renderMode branch — not another round of scattered
-// `=== ':system:'` checks.
+// hasInput/hasNicklist are load-bearing: useActiveBuffer surfaces them and the
+// views dispatch the input row + member list off them, so a future
+// :highlights: buffer is one registry entry — not another round of scattered
+// `=== ':system:'` checks. (A virtual pane rendered by a bespoke component
+// instead of MessageList would need a renderMode field again — the removed
+// Friends overview was the model.)
 
 export const SYSTEM_KEY = ':system:';
-export const FRIENDS_KEY = ':friends:';
-
-// 'buffer'  — a real Buffer in the buffers store, rendered by MessageList.
-// 'overview'— a bespoke component in the message-pane slot (Friends overview).
-export type VirtualRenderMode = 'buffer' | 'overview';
 
 export interface VirtualBufferConfig {
   key: string;
   label: string;
-  renderMode: VirtualRenderMode;
   hasNicklist: boolean;
   hasInput: boolean;
 }
@@ -39,16 +31,8 @@ export const VIRTUAL_BUFFERS: Readonly<Record<string, VirtualBufferConfig>> = Ob
   [SYSTEM_KEY]: {
     key: SYSTEM_KEY,
     label: 'Lurker',
-    renderMode: 'buffer',
     hasNicklist: false,
     hasInput: true,
-  },
-  [FRIENDS_KEY]: {
-    key: FRIENDS_KEY,
-    label: 'Friends',
-    renderMode: 'overview',
-    hasNicklist: false,
-    hasInput: false,
   },
 });
 

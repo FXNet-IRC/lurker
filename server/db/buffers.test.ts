@@ -195,11 +195,21 @@ describe('importRow closed_at merging', () => {
 
 describe('app-scoped rows (NULL network_id)', () => {
   it('dedupe via the coalesced unique index', () => {
+    // The `:system:` row is minted with the account (schema 17) — ensureOpen
+    // routes ':'-prefixed targets to the sentinel path, which always resolves
+    // to that one row rather than inserting under the coalesced index.
     const a = buffers.ensureOpen(user.id, null, ':system:', { kind: 'system' });
     const b = buffers.ensureOpen(user.id, null, ':system:', { kind: 'system' });
-    expect(a.created).toBe(true);
+    expect(a.created).toBe(false);
     expect(b.created).toBe(false);
     expect(a.record.id).toBe(b.record.id);
+    expect(a.record.kind).toBe('system');
+  });
+
+  it('sentinel rows are uncloseable and undeletable', () => {
+    expect(buffers.close(user.id, null, ':system:')).toBe(false);
+    expect(buffers.deleteBuffer(user.id, null, ':system:')).toBe(false);
+    expect(buffers.getBuffer(user.id, null, ':system:')?.state).toBe('open');
   });
 });
 

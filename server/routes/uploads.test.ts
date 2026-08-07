@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import type { LurkerTestAgent } from '../test-utils/testApp.js';
 import type { Express } from 'express';
 import sharp from 'sharp';
@@ -475,6 +475,66 @@ describe('GET /api/uploads — search params', () => {
   });
 });
 
+// #627: clients hardcoded a cap because nothing advertised one — lurker-ios shipped
+// a Cloudflare-safe 90 MiB guess that is simply wrong for a self-hoster.
+describe('GET /api/uploads — advertised size cap', () => {
+  // DELETE rather than restore-to-a-number: this user had no row for the key
+  // before, so the registry default applied for the rest of the file. Writing a
+  // value here would silently re-cap every later test in the file.
+  afterEach(async () => {
+    delete process.env.LURKER_MAX_UPLOAD_MB;
+    const { deleteUserSetting } = await import('../db/settings.js');
+    deleteUserSetting(user.id, 'uploads.image.max_upload_mb');
+  });
+
+  it("advertises the user's effective cap in bytes", async () => {
+    const { setUserSetting } = await import('../db/settings.js');
+    setUserSetting(user.id, 'uploads.image.max_upload_mb', 25);
+    const res = await agent.get('/api/uploads');
+    expect(res.status).toBe(200);
+    expect(res.body.maxUploadBytes).toBe(25 * 1024 * 1024);
+  });
+
+  // The whole point of the feature: what the client is told has to account for the
+  // proxy in front of us, not just the cap this process knows how to enforce. Note
+  // the number is NOT 100 MiB — decimal MB, minus the multipart envelope, because
+  // the proxy's limit is on the whole body while this describes the file part.
+  it('reports the transport ceiling when it is lower than the user cap', async () => {
+    const { setUserSetting } = await import('../db/settings.js');
+    setUserSetting(user.id, 'uploads.image.max_upload_mb', 200);
+    process.env.LURKER_MAX_UPLOAD_MB = '100';
+    const res = await agent.get('/api/uploads');
+    expect(res.body.maxUploadBytes).toBe(100 * 1_000_000 - 64 * 1024);
+    // A client that compressed to exactly this and added an envelope still fits.
+    expect(res.body.maxUploadBytes).toBeLessThan(100 * 1_000_000);
+  });
+});
+
+describe('POST /api/uploads — transport ceiling (#627)', () => {
+  afterEach(async () => {
+    delete process.env.LURKER_MAX_UPLOAD_MB;
+    const { deleteUserSetting } = await import('../db/settings.js');
+    deleteUserSetting(user.id, 'uploads.image.max_upload_mb');
+  });
+
+  // An over-ceiling body would be killed at the edge with a connection reset the
+  // client can't interpret. Enforcing the operator's declared limit here turns that
+  // into a 413 naming the real number.
+  it('refuses a body over the declared proxy limit with a 413, even under the user cap', async () => {
+    const { setUserSetting } = await import('../db/settings.js');
+    setUserSetting(user.id, 'uploads.image.max_upload_mb', 200);
+    process.env.LURKER_MAX_UPLOAD_MB = '5';
+    const big = Buffer.alloc(6 * 1024 * 1024, 0x7a);
+    const res = await agent
+      .post('/api/uploads')
+      .attach('image', big, { filename: 'big.bin', contentType: 'text/plain' });
+    expect(res.status).toBe(413);
+    // 4.7, not 5: the 413 has to name the number the user can actually hit, or
+    // they come back with another file that fails the same way.
+    expect(res.body.error).toBe('file exceeds 4.7 MB');
+  });
+});
+
 describe('GET /api/uploads/:id/thumb', () => {
   it('serves thumbnail bytes', async () => {
     const upload = await agent
@@ -816,6 +876,44 @@ describe('media uploads (#515)', () => {
     expect(sent.includes(Buffer.from('udta'))).toBe(false);
     // Size-preserving, so the recorded byte_size is still right.
     expect(sent.length).toBe(original.length);
+    await waitForNoTemps();
+  });
+
+  // The real-world shape of the case 3GPP support was added for. A Samsung voice memo
+  // arrives NAMED `.m4a` and CLAIMED as audio/x-m4a, but its bytes are a `3gp4`-brand
+  // container — so the claim decides nothing and the sniff picks the class, the served
+  // extension, and the scrub. Before #685 this 415'd.
+  it('accepts a Samsung voice memo whose name and claim both say m4a', async () => {
+    stub.shouldThrow = null;
+    const FINGERPRINT = 'com.sec.android.app.voicenote.common.util.VoiceRecorderData';
+    const ftyp = box(
+      'ftyp',
+      Buffer.concat([
+        Buffer.from('3gp4'),
+        Buffer.alloc(4),
+        Buffer.from('isom'),
+        Buffer.from('3gp4'),
+      ]),
+    );
+    const udta = box('udta', box('vrdt', Buffer.from(FINGERPRINT)));
+    const moov = box('moov', Buffer.concat([box('mvhd', Buffer.alloc(100)), udta]));
+    // mdat BEFORE moov, the way the recorder writes it.
+    const memo = Buffer.concat([ftyp, box('mdat', Buffer.alloc(1024, 0xcd)), moov]);
+    expect(memo.includes(Buffer.from(FINGERPRINT))).toBe(true);
+
+    const res = await agent.post('/api/uploads').attach('image', memo, {
+      filename: 'Voice 260804_013303.m4a',
+      contentType: 'audio/x-m4a',
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.mime).toBe('video/3gpp');
+    // The honest container extension, NOT the `.m4a` the recorder and the client
+    // both claimed.
+    expect(stub.capturedMeta!.filename).toMatch(/\.3gp$/);
+    // And the recorder's fingerprint never left the machine.
+    expect(stub.capturedBytes!.includes(Buffer.from(FINGERPRINT))).toBe(false);
+    expect(stub.capturedBytes!.length).toBe(memo.length);
     await waitForNoTemps();
   });
 

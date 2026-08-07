@@ -313,7 +313,7 @@ const NOTIFICATION_SIGNALS = [
   {
     key: 'friend_online',
     title: 'Friend online',
-    help: 'When a friend you have flagged "notify when online" comes online. The per-friend toggle in the Configure Friend dialog is the opt-in.',
+    help: 'When the peer of a DM in your FRIENDS section comes online.',
   },
 ];
 

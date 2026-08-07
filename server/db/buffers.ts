@@ -3,6 +3,9 @@
 
 import db from './index.js';
 import { encryptSecret, decryptSecret } from '../utils/secretCrypto.js';
+import { foldTargetWith, normalizeCasemapping } from './casemapping.js';
+import { isChannelTarget } from '../../shared/channels.js';
+import type { Casemapping } from './casemapping.js';
 
 // The buffer registry — the single owner of "does this buffer exist" and "is it
 // in the sidebar". A buffer exists because a row exists here, not because
@@ -12,11 +15,13 @@ import { encryptSecret, decryptSecret } from '../utils/secretCrypto.js';
 // IrcConnection.channels Map and is never persisted as truth.
 //
 // Casing: `target` keeps the canonical display casing (first writer wins; the
-// live paths fold forward to it). `target_folded` (ASCII toLowerCase, house
-// rule — see #268/#289/#327) is the ONLY lookup key, so a server relaying
-// `#Chan` for a buffer stored as `#chan` can neither fork a second row nor slip
-// past a closed check. That single folding rule is what retires the
-// exact-write/folded-read split that closed_buffers had.
+// live paths fold forward to it). `target_folded` is the ONLY lookup key, so a
+// server relaying `#Chan` for a buffer stored as `#chan` can neither fork a
+// second row nor slip past a closed check (#268/#289/#327). The folding rule
+// is per-network since #707 — the server-declared ISUPPORT CASEMAPPING, via
+// `foldTargetFor` — with the legacy Unicode-lowercase fold for undeclared
+// networks and the system buffer. Stored folds are rewritten (and collisions
+// merged) by db/refoldBuffers when a network's declared mapping changes.
 //
 // Write discipline (the whole reducer):
 //   - join ECHO            → ensureOpen(autojoin: true, key) — the only
@@ -45,17 +50,61 @@ export interface BufferRecord {
   closedAt: string | null;
 }
 
-/** The one folding rule for buffer targets (ASCII, matching the client). */
+/** The LEGACY folding rule — Unicode lowercase, what every pre-#707 row's
+ *  target_folded was built with. Still the rule for the system buffer (no
+ *  network to declare a mapping) and for any network that hasn't declared
+ *  one. Everything network-scoped should fold through `foldTargetFor`. */
 export function foldTarget(target: string): string {
   return target.toLowerCase();
 }
 
-const CHANNEL_PREFIXES = new Set(['#', '&', '+', '!']);
+const casemappingStmt = db.prepare(`SELECT casemapping FROM networks WHERE id = ?`);
+
+// networkId → declared mapping, lazily filled. Cached — unlike name→id
+// resolution, which stays uncached on principle — because the invalidation
+// story is the opposite of a name's: exactly two writers exist (the refold
+// pass that stores a newly-declared mapping, and network deletion, whose ids
+// SQLite may reuse), both call invalidateCasemappingCache below, and the
+// value is read on every buffer-keyed lookup — several times per inbound
+// message — where an uncached PK seek would double the statement count of
+// the whole hot path for a value that changes at most once per network life.
+const casemappingCache = new Map<number, Casemapping | null>();
+
+/** Drop a network's cached CASEMAPPING — or, with no argument, all of them.
+ *  Callers are the paths that can make an entry lie: the refold pass (after
+ *  its transaction stores a new mapping), network deletion (SQLite can reuse
+ *  the id for a future network), and an import ROLLBACK (whole-cache clear:
+ *  the buffers import folds through the cache mid-transaction, and a
+ *  rollback reverts sqlite_sequence, so the rolled-back ids — cached with
+ *  the rolled-back mappings — are exactly the ids the retry will mint). */
+export function invalidateCasemappingCache(networkId?: number): void {
+  if (networkId === undefined) casemappingCache.clear();
+  else casemappingCache.delete(networkId);
+}
+
+/** The network's declared ISUPPORT CASEMAPPING, as last captured on connect
+ *  (#707) — null until the network first declares one. */
+export function networkCasemapping(networkId: number): Casemapping | null {
+  const cached = casemappingCache.get(networkId);
+  if (cached !== undefined) return cached;
+  const raw = (casemappingStmt.get(networkId) as { casemapping: string | null } | undefined)
+    ?.casemapping;
+  const mapping = normalizeCasemapping(raw) ?? null;
+  casemappingCache.set(networkId, mapping);
+  return mapping;
+}
+
+/** Per-network target folding (#707): the server-declared CASEMAPPING rule,
+ *  falling back to the legacy fold until the network declares one. */
+export function foldTargetFor(networkId: number | null, raw: string): string {
+  if (networkId == null) return foldTarget(raw);
+  return foldTargetWith(networkCasemapping(networkId), raw);
+}
 
 /** channel/dm classification by target shape (server/system rows are minted
  *  explicitly by their owners, never inferred). */
 export function kindForTarget(target: string): BufferKind {
-  return CHANNEL_PREFIXES.has(target[0] ?? '') ? 'channel' : 'dm';
+  return isChannelTarget(target) ? 'channel' : 'dm';
 }
 
 interface BufferRow {
@@ -107,10 +156,13 @@ const reopenStmt = db.prepare(`
     AND state = 'closed'
 `);
 
+// server/system rows are permanent fixtures (the server console and the app
+// console always exist); the kind guard makes closing one structurally
+// impossible rather than a code-path promise.
 const closeStmt = db.prepare(`
   UPDATE buffers SET state = 'closed', closed_at = datetime('now')
   WHERE user_id = ? AND IFNULL(network_id, 0) = IFNULL(?, 0) AND target_folded = ?
-    AND state = 'open'
+    AND state = 'open' AND kind NOT IN ('server', 'system')
 `);
 
 const setAutojoinStmt = db.prepare(`
@@ -123,9 +175,13 @@ const setKeyStmt = db.prepare(`
   WHERE user_id = ? AND IFNULL(network_id, 0) = IFNULL(?, 0) AND target_folded = ?
 `);
 
+// Same kind guard as closeStmt — and doubly load-bearing now that satellite
+// rows cascade from buffers(id): deleting a sentinel row would take its read
+// pointer (and, post-v17, its messages) with it.
 const deleteStmt = db.prepare(`
   DELETE FROM buffers
   WHERE user_id = ? AND IFNULL(network_id, 0) = IFNULL(?, 0) AND target_folded = ?
+    AND kind NOT IN ('server', 'system')
 `);
 
 // Import-path only: close (or stamp) with an archive-supplied closed_at rather
@@ -168,7 +224,9 @@ export function getBuffer(
   networkId: number | null,
   target: string,
 ): BufferRecord | undefined {
-  return toRecord(getStmt.get(userId, networkId, foldTarget(target)) as BufferRow | undefined);
+  return toRecord(
+    getStmt.get(userId, networkId, foldTargetFor(networkId, target)) as BufferRow | undefined,
+  );
 }
 
 // Decrypt-free projections for the hot paths. The live event filter runs one
@@ -183,7 +241,7 @@ const stateStmt = db.prepare(`
 `);
 
 const listStatesForUserStmt = db.prepare(`
-  SELECT network_id, target, target_folded, state FROM buffers
+  SELECT id, network_id, target, target_folded, state FROM buffers
   WHERE user_id = ? ORDER BY network_id, target_folded
 `);
 
@@ -199,12 +257,15 @@ export function getState(
   target: string,
 ): BufferState | undefined {
   return (
-    stateStmt.get(userId, networkId, foldTarget(target)) as { state: BufferState } | undefined
+    stateStmt.get(userId, networkId, foldTargetFor(networkId, target)) as
+      | { state: BufferState }
+      | undefined
   )?.state;
 }
 
 /** One sidebar-shaped row per buffer (no key, no decryption) — the walk's fuel. */
 export interface BufferStateRow {
+  id: number;
   networkId: number | null;
   target: string;
   targetFolded: string;
@@ -214,12 +275,14 @@ export interface BufferStateRow {
 export function listStatesForUser(userId: number): BufferStateRow[] {
   return (
     listStatesForUserStmt.all(userId) as Array<{
+      id: number;
       network_id: number | null;
       target: string;
       target_folded: string;
       state: BufferState;
     }>
   ).map((r) => ({
+    id: r.id,
     networkId: r.network_id,
     target: r.target,
     targetFolded: r.target_folded,
@@ -251,6 +314,58 @@ export interface EnsureResult {
   reopened: boolean;
 }
 
+// --- Sentinel buffers -------------------------------------------------------
+//
+// `:server:<netId>` and `:system:` are real rows as of schema 17 (kinds
+// 'server'/'system', reserved since the registry landed). They are minted at
+// network/user creation, by the v17 migration for existing data, and
+// defensively below — never by the channel/dm reducer paths, whose
+// kindForTarget would misclassify a ':'-prefixed name as a DM.
+
+const networkOwnerStmt = db.prepare(`SELECT user_id FROM networks WHERE id = ?`);
+
+const sentinelInsertStmt = db.prepare(`
+  INSERT INTO buffers (user_id, network_id, target, target_folded, kind, state, autojoin, key)
+  VALUES (?, ?, ?, ?, ?, 'open', 0, NULL)
+  ON CONFLICT(user_id, IFNULL(network_id, 0), target_folded) DO NOTHING
+`);
+
+/** Make the network's `:server:` row exist; returns it. Undefined only for an
+ *  unknown networkId. */
+export function ensureServerBuffer(networkId: number): BufferRecord | undefined {
+  const owner = networkOwnerStmt.get(networkId) as { user_id: number } | undefined;
+  if (!owner) return undefined;
+  const target = `:server:${networkId}`;
+  sentinelInsertStmt.run(owner.user_id, networkId, target, target, 'server');
+  return toRecord(getStmt.get(owner.user_id, networkId, target) as BufferRow | undefined);
+}
+
+/** Make the user's app-scoped `:system:` row exist; returns it. */
+export function ensureSystemBuffer(userId: number): BufferRecord {
+  sentinelInsertStmt.run(userId, null, ':system:', ':system:', 'system');
+  return toRecord(getStmt.get(userId, null, ':system:') as BufferRow);
+}
+
+/** Route a ':'-prefixed target to its sentinel mint. Returns undefined for
+ *  non-sentinel targets (the ordinary reducer path applies). */
+function ensureSentinel(
+  userId: number,
+  networkId: number | null,
+  target: string,
+): EnsureResult | undefined {
+  if (!target.startsWith(':')) return undefined;
+  const record =
+    target === ':system:' || networkId == null
+      ? ensureSystemBuffer(userId)
+      : ensureServerBuffer(networkId);
+  if (!record) {
+    // Unknown network for a ':server:' target — surface it as a programming
+    // error; nothing legitimate constructs this.
+    throw new Error(`ensureSentinel: no network ${networkId} for target ${target}`);
+  }
+  return { record, created: false, reopened: false };
+}
+
 /** The reducer workhorse: make (user, network, target) exist and be open.
  *  Creates the row when absent (canonical casing = the caller's casing),
  *  reopens it when closed. `autojoin` set only when passed (the join echo
@@ -265,7 +380,9 @@ export const ensureOpen = db.transaction(
     target: string,
     opts: { kind?: BufferKind; autojoin?: boolean; key?: string | null } = {},
   ): EnsureResult => {
-    const folded = foldTarget(target);
+    const sentinel = ensureSentinel(userId, networkId, target);
+    if (sentinel) return sentinel;
+    const folded = foldTargetFor(networkId, target);
     const existing = getStmt.get(userId, networkId, folded) as BufferRow | undefined;
     if (!existing) {
       insertStmt.run({
@@ -310,7 +427,9 @@ export const ensureExists = db.transaction(
     target: string,
     opts: { kind?: BufferKind } = {},
   ): { record: BufferRecord; created: boolean } => {
-    const folded = foldTarget(target);
+    const sentinel = ensureSentinel(userId, networkId, target);
+    if (sentinel) return { record: sentinel.record, created: sentinel.created };
+    const folded = foldTargetFor(networkId, target);
     const existing = getStmt.get(userId, networkId, folded) as BufferRow | undefined;
     if (existing) return { record: toRecord(existing), created: false };
     insertStmt.run({
@@ -334,14 +453,14 @@ export const ensureExists = db.transaction(
  *  the buffer-reopened fanout keys off this, same contract as the old
  *  reopenBuffer's rows-deleted. */
 export function reopen(userId: number, networkId: number | null, target: string): boolean {
-  return reopenStmt.run(userId, networkId, foldTarget(target)).changes > 0;
+  return reopenStmt.run(userId, networkId, foldTargetFor(networkId, target)).changes > 0;
 }
 
 /** Update-only open→closed flip. A no-op when the row doesn't exist — closing
  *  can never conjure a buffer (the phantom-row class the old
  *  upsertChannel-on-close path had). */
 export function close(userId: number, networkId: number | null, target: string): boolean {
-  return closeStmt.run(userId, networkId, foldTarget(target)).changes > 0;
+  return closeStmt.run(userId, networkId, foldTargetFor(networkId, target)).changes > 0;
 }
 
 /** Update-only; absent row = no-op. Lowered on part/kick/470/442 so a failed
@@ -352,7 +471,7 @@ export function setAutojoin(
   target: string,
   autojoin: boolean,
 ): void {
-  setAutojoinStmt.run(autojoin ? 1 : 0, userId, networkId, foldTarget(target));
+  setAutojoinStmt.run(autojoin ? 1 : 0, userId, networkId, foldTargetFor(networkId, target));
 }
 
 /** Update-only; null clears (MODE -k). Encrypted at rest via secretCrypto. */
@@ -362,7 +481,7 @@ export function setChannelKey(
   target: string,
   key: string | null,
 ): void {
-  setKeyStmt.run(encryptSecret(key), userId, networkId, foldTarget(target));
+  setKeyStmt.run(encryptSecret(key), userId, networkId, foldTargetFor(networkId, target));
 }
 
 /** Config-time channel seed (network create's default_channels): the buffer
@@ -372,7 +491,7 @@ export function setChannelKey(
  *  empty parted buffer. An existing row just gains autojoin (+key). */
 export const seedAutojoinChannel = db.transaction(
   (userId: number, networkId: number, target: string, key?: string | null): void => {
-    const folded = foldTarget(target);
+    const folded = foldTargetFor(networkId, target);
     const existing = getStmt.get(userId, networkId, folded) as BufferRow | undefined;
     if (!existing) {
       insertStmt.run({
@@ -407,7 +526,7 @@ export const importRow = db.transaction(
     key?: string | null;
     closedAt?: string | null;
   }): void => {
-    const folded = foldTarget(row.target);
+    const folded = foldTargetFor(row.networkId, row.target);
     const existing = getStmt.get(row.userId, row.networkId, folded) as BufferRow | undefined;
     if (!existing) {
       insertStmt.run({
@@ -445,7 +564,7 @@ export const importRow = db.transaction(
  *  to show. Callers with history use setAutojoin(false) instead so the buffer
  *  (and its messages) survive. */
 export function deleteBuffer(userId: number, networkId: number | null, target: string): boolean {
-  return deleteStmt.run(userId, networkId, foldTarget(target)).changes > 0;
+  return deleteStmt.run(userId, networkId, foldTargetFor(networkId, target)).changes > 0;
 }
 
 export function listForUser(userId: number): BufferRecord[] {

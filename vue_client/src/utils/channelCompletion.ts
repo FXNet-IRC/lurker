@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
+import { isChannelTarget } from '../../../shared/channels.js';
+
 // Shared candidate builder for channel completion — used by both Tab-completion
 // in MessageInput and the `#`-triggered ChannelPicker. Returns the targets of
 // joined channels matching `prefix` (case-insensitive), most-recently-visited
@@ -50,7 +52,11 @@ export function buildChannelCandidates(
   return (
     buffers
       .map((b) => b.target ?? '')
-      .filter((t) => t.startsWith('#') && t.toLowerCase().startsWith(lower))
+      // The classification half widens with everything else (#724); the TRIGGER that produced
+      // `prefix` is still `#`-only (see MessageInput), so today `lower` always starts with `#`
+      // and this can't actually surface an `&`/`+`/`!` channel. It asks the right question
+      // anyway, so a future trigger change doesn't have to remember to come back here.
+      .filter((t) => isChannelTarget(t) && t.toLowerCase().startsWith(lower))
       // Rank each candidate once up front rather than inside the comparator: a
       // rank lookup is a linear scan of the MRU trail, and a comparator would
       // repeat it twice per comparison — on every keystroke, since the picker's

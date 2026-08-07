@@ -65,8 +65,16 @@
     <!-- Screen: buffer -->
     <section v-else-if="screen === 'buffer'" class="screen buffer">
       <header class="bar">
-        <button class="icon back" title="Back" @click="goList">
+        <!-- Leaving this screen is the only way back to the buffer list, so its
+             per-row highlight badges collapse onto this button while it's the
+             only thing standing in for them (#636). Inline rather than a corner
+             badge: .icon is already a flex row and the bar has the width, so
+             "← 3" stays legible where an overlay on a 36px target would not. -->
+        <button class="icon back" :title="backTitle" :aria-label="backTitle" @click="goList">
           <i class="fa-solid fa-arrow-left"></i>
+          <span v-if="hlChip.show.value" class="hl-chip" aria-hidden="true">{{
+            hlChip.label.value
+          }}</span>
         </button>
         <!-- Channels and DMs drop the name here — the compact status bar
              carries net/#chan on mobile, so a header copy is just redundant
@@ -79,22 +87,6 @@
              search / highlights / saved / uploads live on the list top bar. -->
         <span v-if="isServerBuffer || isVirtual" class="title">{{ bufferLabel }}</span>
         <span class="spacer"></span>
-        <template v-if="isFriendsBuffer">
-          <button
-            class="icon"
-            title="Add friend"
-            aria-label="Add friend"
-            @click="friends.openEditorNew()"
-          >
-            <i class="fa-solid fa-person-circle-plus"></i>
-          </button>
-          <span
-            class="friend-count"
-            :title="`${friendCount} ${friendCount === 1 ? 'friend' : 'friends'}`"
-          >
-            <i class="fa-solid fa-users"></i> {{ friendCount }}
-          </span>
-        </template>
         <button
           v-if="!isVirtual && !isServerBuffer"
           class="icon"
@@ -135,7 +127,7 @@
           class="icon"
           title="Members"
           aria-label="Members"
-          @click="screen = 'members'"
+          @click="goMembers"
         >
           <i class="fa-solid fa-users"></i>
         </button>
@@ -150,8 +142,7 @@
           <i class="fa-solid fa-ellipsis-vertical"></i>
         </button>
       </header>
-      <FriendsOverview v-if="renderMode === 'overview'" @view-activity="onViewActivity" />
-      <MessageList v-else :pending-scroll-id="pendingScrollId" />
+      <MessageList :pending-scroll-id="pendingScrollId" />
       <StatusBar compact />
       <div
         v-if="hasInput"
@@ -165,7 +156,7 @@
     <!-- Screen: members -->
     <section v-else-if="screen === 'members'" class="screen members-screen">
       <header class="bar">
-        <button class="icon back" title="Back" @click="screen = 'buffer'">
+        <button class="icon back" title="Back" @click="goBufferFromMembers">
           <i class="fa-solid fa-arrow-left"></i>
         </button>
         <span class="title">{{ bufferLabel }} — members</span>
@@ -212,6 +203,7 @@
     <MediaViewerModal
       v-if="viewer.isOpen && viewer.url !== null"
       :url="viewer.url"
+      :share-url="viewer.shareUrl"
       :filename="viewer.current?.filename ?? null"
       :index="viewer.index"
       :count="viewer.count"
@@ -234,18 +226,19 @@
       :nick="nickNotes.editor.nick"
       :network-id="nickNotes.editor.networkId"
     />
-    <ConfigureFriendModal v-if="friends.editor.open" />
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import type { Network } from '../stores/networks.js';
 import type { BufferLike } from '../composables/useBufferActions.js';
 import { useNetworksStore } from '../stores/networks.js';
 import { useConfigStore } from '../stores/config.js';
 import { useSocket } from '../composables/useSocket.js';
 import { useChatBootstrap } from '../composables/useChatBootstrap.js';
+import { pushBuffer } from '../composables/useBufferRoute.js';
 import { useActiveBuffer } from '../composables/useActiveBuffer.js';
 import { useBufferSearchScope } from '../composables/useBufferSearchScope.js';
 import { useBufferActions } from '../composables/useBufferActions.js';
@@ -253,7 +246,6 @@ import { useContextMenu } from '../composables/useContextMenu.js';
 import type { ContextMenuItem } from '../composables/useContextMenu.js';
 import BufferList from '../components/BufferList.vue';
 import MessageList from '../components/MessageList.vue';
-import FriendsOverview from '../components/FriendsOverview.vue';
 import MessageInput from '../components/MessageInput.vue';
 import MemberList from '../components/MemberList.vue';
 import StatusBar from '../components/StatusBar.vue';
@@ -267,11 +259,12 @@ import RecentUploadsModal from '../components/RecentUploadsModal.vue';
 import TransfersModal from '../components/TransfersModal.vue';
 import SearchModal from '../components/SearchModal.vue';
 import NickNoteModal from '../components/NickNoteModal.vue';
-import ConfigureFriendModal from '../components/ConfigureFriendModal.vue';
 import UserProfileModal from '../components/UserProfileModal.vue';
 import MediaViewerModal from '../components/MediaViewerModal.vue';
+import { screenForRoute } from '../utils/mobileScreen.js';
+import { backOrPush } from '../utils/routerBack.js';
+import { shouldLeaveMembers } from '../utils/bufferNav.js';
 import { useNickNotesStore } from '../stores/nickNotes.js';
-import { useFriendsStore } from '../stores/friends.js';
 import { useDccStore } from '../stores/dcc.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useChannelListModal } from '../composables/useChannelListModal.js';
@@ -280,6 +273,7 @@ import { useMediaViewer } from '../composables/useMediaViewer.js';
 import { useNetworkEditor } from '../composables/useNetworkEditor.js';
 import { useJumpToMessage } from '../composables/useJumpToMessage.js';
 import { useVisualViewport } from '../composables/useVisualViewport.js';
+import { useHighlightChip } from '../composables/useHighlightChip.js';
 import { useBuffersStore } from '../stores/buffers.js';
 import { useAuthStore } from '../stores/auth.js';
 import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
@@ -287,10 +281,21 @@ import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
 const networks = useNetworksStore();
 const config = useConfigStore();
 const buffers = useBuffersStore();
+const router = useRouter();
+const route = useRoute();
 const auth = useAuthStore();
 
 // Admin panel entry in the mobile top bar.
 const showAdminEntry = computed(() => auth.isAdmin);
+
+const hlChip = useHighlightChip();
+// The chip is aria-hidden in the markup — screen readers get the count here as
+// words instead, so "Back" doesn't turn into "Back 3".
+const backTitle = computed(() =>
+  hlChip.show.value
+    ? `Back — ${hlChip.label.value} highlight${hlChip.count.value === 1 ? '' : 's'}`
+    : 'Back',
+);
 const { connected } = useSocket();
 const { keyboardOpen } = useVisualViewport();
 const {
@@ -303,15 +308,11 @@ const {
   topic,
   isSystemBuffer,
   isVirtual,
-  isFriendsBuffer,
-  renderMode,
   hasInput,
 } = useActiveBuffer();
 const bufferActions = useBufferActions();
 const menu = useContextMenu();
 const nickNotes = useNickNotesStore();
-const friends = useFriendsStore();
-const friendCount = computed(() => friends.contacts.length);
 const dcc = useDccStore();
 const dccTitle = computed(() =>
   dcc.pendingCount > 0 ? `DCC transfers — ${dcc.pendingCount} awaiting approval` : 'DCC transfers',
@@ -322,22 +323,47 @@ function openSystemConsole() {
   // Route through activate() (not networks.activateSystem) so the system buffer
   // gets the full read-state lifecycle: divider snapshot + mark-read on entry.
   buffers.activate(null, SYSTEM_KEY);
-  // The activeKey watcher only fires on value change. If the user is
-  // already on `:system:` (e.g. they hit Back to the list, then re-tap
-  // the logo), the watcher won't advance them — drive the screen
-  // directly so the second tap behaves like the first.
-  screen.value = 'buffer';
+  // By NAME, not id: this is the one buffer that has to open before the server
+  // has answered — which is exactly when its connection log is worth reading.
+  void router.push('/system');
 }
 
-// `list` (default) → tap a buffer → `buffer` → tap members icon → `members`.
-// Back arrows walk the stack backwards. We don't sync this to the URL — the
-// flow is short and stateful, and a URL would expose us to bookmarks that
-// land on the buffer screen with no active buffer.
 const channelListModal = reactive(useChannelListModal());
 const joinChannelModal = reactive(useJoinChannelModal());
 const viewer = reactive(useMediaViewer());
 const networkEditor = reactive(useNetworkEditor());
-const screen = ref('list');
+
+// `/` → list, `/buffer/<id>` → buffer, `/buffer/<id>/members` → members.
+//
+// DERIVED, never assigned (#744/#200). It used to be a ref nudged from four
+// places, which is what made the mobile shell and the URL able to disagree: the
+// list screen had no history entry of its own, so a back gesture from it popped
+// to a BUFFER url and the auto-advance watcher dutifully hauled the user into
+// that buffer, on top of the list they'd just asked for. With the route as the
+// single source, "which screen" and "which URL" cannot come apart, and the
+// platform back gesture walks members → buffer → list for free.
+//
+// The activeKey clause keeps a cold launch honest: `/buffer/7` is a real screen
+// the instant it's routed, but the buffer behind it arrives over the WS a beat
+// later, and rendering an empty buffer shell in the meantime looks broken. Wait
+// on the list, exactly as the old auto-advance did. useBufferRoute owns the
+// other end of that wait — it drops the URL back to `/` if the id never lands.
+// True while the active buffer is a real IRC buffer the server hasn't given a
+// row id yet — an optimistically opened DM. Nothing can route to it.
+const activeLacksId = computed(() => {
+  const buf = activeBuf.value as { id?: number; networkId?: number | null } | null;
+  return !!buf && buf.networkId != null && buf.id == null;
+});
+
+const screen = computed(() =>
+  screenForRoute(
+    route.params.id,
+    route.name === 'buffer-members',
+    !!activeKey.value,
+    route.name === 'system',
+    activeLacksId.value,
+  ),
+);
 const showBookmarks = ref(false);
 const showTopic = ref(false);
 const showUploads = ref(false);
@@ -347,15 +373,8 @@ const bufferCogBtn = ref<HTMLElement | null>(null);
 
 // Search & Highlights modal state + per-buffer `in:/on:` scoping, shared with
 // DesktopChat (#496).
-const {
-  showSearch,
-  showHighlights,
-  searchScope,
-  highlightScope,
-  openSearch,
-  openHighlights,
-  onViewActivity,
-} = useBufferSearchScope();
+const { showSearch, showHighlights, searchScope, highlightScope, openSearch, openHighlights } =
+  useBufferSearchScope();
 
 // Mobile folds the remaining buffer/topic/server actions behind one kebab menu
 // to keep the header uncluttered (Members is an inline header button — see
@@ -369,7 +388,9 @@ function openBufferActions() {
   const el = bufferCogBtn.value;
   if (!a || !el) return;
   const items: ContextMenuItem[] = [];
-  if (topic.value) {
+  // Channels only: a DM's pseudo-topic (the peer's ident@host) is a header
+  // identity, not prose worth a modal.
+  if (isChannel.value && topic.value) {
     items.push({
       label: 'View topic',
       icon: 'fa-solid fa-circle-info',
@@ -441,51 +462,93 @@ function closeNetworkForm() {
   networkEditor.close();
 }
 
-// BufferList calls buffers.activate() directly on click; we react to the
-// activeKey flip rather than intercepting the click so the same store state
-// drives both layouts. Auto-advance from list (the natural buffer-open
-// flow) AND from members (Send DM out of the nick menu flips activeKey to a
-// new DM buffer — the members screen for the old channel would otherwise be
-// stranded). The buffer screen itself doesn't auto-advance — we let in-
-// buffer activations (e.g. a user explicitly switching) drop the user
-// straight into the new buffer without re-triggering the watcher's screen
-// change since they're already on that screen.
-watch(activeKey, (next) => {
-  if (next && (screen.value === 'list' || screen.value === 'members')) {
-    screen.value = 'buffer';
-  } else if (next === null && screen.value !== 'list') {
-    // The active buffer went away (closed it, or its network was removed) while
-    // we were viewing it — activeKey only nulls in those "no buffer" cases, so
-    // fall back to the list instead of stranding the user on an empty buffer or
-    // members screen (#137). Buffer-to-buffer switches set activeKey directly
-    // (no null transition), so this never flickers mid-switch.
-    screen.value = 'list';
-  }
+// Send DM out of a nick menu flips activeKey to a new DM buffer while the user
+// is on the members screen; the route has to follow or they'd be left looking
+// at the old channel's member list. Every other activation path already
+// navigates (useBufferRoute's binding, or openActiveBuffer above).
+//
+// Guarded by shouldLeaveMembers: a cold refresh of /buffer/:id/members also
+// lands here — the snapshot resolves and useBufferRoute activates the buffer
+// this route already names — and navigating for THAT bounced the user to the
+// chat screen before the members screen ever rendered.
+watch(activeKey, () => {
+  if (route.name !== 'buffer-members') return;
+  const buf = activeBuf.value as { id?: number } | null;
+  if (shouldLeaveMembers(buf?.id, route.params.id)) openActiveBuffer();
 });
 
-// Re-tapping the *same* buffer the user was last in doesn't change activeKey
-// so the watcher above doesn't fire. Catch the bubbled click here as a
-// belt-and-suspenders advance: if a row was hit and a buffer is active, go
-// to the buffer screen. Vue event bubbling runs BufferList's @click first,
-// so by the time we read activeKey it's already up to date.
+// Navigate to whichever buffer is active NOW.
+//
+// Needed wherever an activation might not CHANGE activeKey, because
+// useBufferRoute's activeKey → URL binding is a watcher and correctly does
+// nothing when there's no change: re-tapping the buffer you were last in, or
+// re-tapping the Lurker logo while already on `:system:`. Both are a
+// navigation from the user's point of view even though no state moved.
+function openActiveBuffer() {
+  const buf = activeBuf.value as { id?: number; networkId?: number | null } | null;
+  if (!buf) return;
+  // App-scoped (the system console) routes by name — it may have no row id yet.
+  if (buf.networkId == null) {
+    void router.push('/system');
+    return;
+  }
+  if (buf.id != null) {
+    pushBuffer(router, buf.id);
+    return;
+  }
+  // Active but not addressable yet — a DM opened optimistically has no row id
+  // until the server answers. Deliberately does NOT navigate: pushing `/` here
+  // dropped the user on the buffer list with a DM they could not reach from it
+  // (no id to route to, and the server only mints the row once a message is
+  // sent — which needs the composer). `screen` shows it via activeLacksId
+  // instead, until the id lands and the URL binding routes to it properly.
+}
+
 function onBufferListClick(e: MouseEvent) {
-  const hit = (e.target as Element).closest('.channels li, .net-head');
+  // :not(.section-head): the FRIENDS/FAVORITES headers are inert labels — a
+  // tap on one must not teleport into whatever buffer was last active.
+  const hit = (e.target as Element).closest('.channels li, .net-head:not(.section-head)');
   if (!hit) return;
-  if (activeKey.value) screen.value = 'buffer';
+  // BufferList's own @click ran first (Vue event bubbling), so activeKey is
+  // already up to date by the time we read it.
+  openActiveBuffer();
 }
 
 function goList() {
-  screen.value = 'list';
+  // Backing out of an optimistically opened buffer can't be a navigation: it
+  // has no URL, so the route may already BE `/` (Send DM from the list), where
+  // a push is a no-op and the screen would stay locked on the DM. Clear the
+  // active pointer instead — the buffer keeps its place in the list, and the
+  // URL binding normalizes whatever route we're on.
+  if (activeLacksId.value) {
+    networks.clearActive();
+    return;
+  }
+  void router.push('/');
+}
+
+// The members screen has its own URL now, so it can be the FIRST entry of a
+// document (refresh, or a shared link) — in which case back() either does
+// nothing or leaves Lurker. Fall back to the buffer it belongs to.
+function goBufferFromMembers() {
+  backOrPush(router, route.params.id ? `/buffer/${route.params.id}` : '/');
+}
+
+function goMembers() {
+  // The ACTIVE buffer's id, not route.params.id: the button belongs to the
+  // buffer on screen, and the two can disagree — a channel shown via
+  // activeLacksId before its row id lands leaves the route naming the PREVIOUS
+  // buffer, so the route form opened the wrong channel's member list. While
+  // the id is missing there is nothing to route to; the button no-ops.
+  const buf = activeBuf.value as { id?: number } | null;
+  if (buf?.id != null) void router.push(`/buffer/${buf.id}/members`);
 }
 
 const onJumpToMessage = useJumpToMessage({
   pendingScrollId,
-  // Mobile shell stacks list → buffer → members. Tapping a search result or
-  // notification needs to forward us onto the buffer screen so the message
-  // we just jumped to is actually visible.
-  afterActivate: () => {
-    screen.value = 'buffer';
-  },
+  // A search hit or notification for the buffer the user is ALREADY in doesn't
+  // move activeKey, so nothing would carry them off the list to see it.
+  afterActivate: openActiveBuffer,
 });
 
 useChatBootstrap({ onJump: onJumpToMessage });
@@ -495,10 +558,16 @@ useChatBootstrap({ onJump: onJumpToMessage });
 /* Single-column flex stack sized to 100dvh. On current iOS Safari the
    dynamic-viewport unit shrinks with the soft keyboard, so the shell
    contracts and the input bar (last flex child) rides up flush against
-   the keyboard with no extra plumbing. We deliberately do NOT use
-   position: fixed or a JS-tracked --kb-bottom here — those approaches
-   fight iOS auto-scroll, env() shifts, and a known iOS 26 visualViewport
-   regression (returns phantom positive values after keyboard dismiss).
+   the keyboard with no extra plumbing. Chrome Android needs one assist
+   to follow the same model: interactive-widget=resizes-content in the
+   viewport meta (index.html, #581) — without it Chrome overlays the
+   keyboard instead of shrinking the layout viewport, and its focused-
+   input reveal scrolls the document our shell forbids from scrolling,
+   stranding the input bar off-screen after dismiss. We deliberately do
+   NOT use position: fixed or a JS-tracked --kb-bottom here — those
+   approaches fight iOS auto-scroll, env() shifts, and a known iOS 26
+   visualViewport regression (returns phantom positive values after
+   keyboard dismiss).
    The body-level `touch-action: none` (see main.css) is what stops iOS
    from drag-scrolling the document despite overflow:hidden. Safe-area
    home-indicator clearance lives on .composer-host (below) — wrapping
@@ -546,12 +615,6 @@ useChatBootstrap({ onJump: onJumpToMessage });
   text-overflow: ellipsis;
   min-width: 0;
 }
-.friend-count {
-  color: var(--fg-muted);
-  font-variant-numeric: tabular-nums;
-  padding: 0 var(--space-2);
-  white-space: nowrap;
-}
 .spacer {
   flex: 1;
 }
@@ -589,6 +652,21 @@ useChatBootstrap({ onJump: onJumpToMessage });
 }
 .icon.back {
   margin-left: -4px;
+  gap: var(--space-2);
+}
+/* Highlight total for the buffer list this button returns to. Colored text on a
+   tint of the same var rather than a solid fill: --buffer-highlight is
+   user-themeable (look.color.buffer.highlight), so a fixed label color could
+   land on an unreadable pairing — the tint tracks their choice and the text
+   keeps its contrast against it. Mixed against --bg (not transparent) so the
+   pill is opaque: a see-through wash let the back arrow ghost through where the
+   two overlap at larger font sizes. Matches DesktopChat's rail chip. */
+.icon.back .hl-chip {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  font-size: 0.85em;
+  color: var(--buffer-highlight);
+  background: color-mix(in srgb, var(--buffer-highlight) 24%, var(--bg));
 }
 /* The buffer screen's MessageList + StatusBar + MessageInput chain mirrors
    the desktop rows but in a vertical flex. min-height: 0 on the screen +

@@ -114,4 +114,31 @@ describe('formatSettingValue', () => {
     expect(formatSettingValue(strOpt, '')).toBe('(empty)');
     expect(formatSettingValue(intOpt, 14)).toBe('14');
   });
+
+  // A labelled enum reads as its id with the label in parens — the REVERSE of the
+  // Settings pane, on purpose. The id is what you type back to `/set`, so it has
+  // to stay the value; the label is only there to connect this line to what the
+  // GUI calls the same setting.
+  it('shows a labelled enum as id (Label), keeping the id typeable', () => {
+    const labelled = {
+      ...enumOpt,
+      key: 'a.labelled',
+      choices: ['all', 'none'],
+      choiceLabels: { all: 'No filter', none: 'Hide all' },
+    } satisfies SettingOption;
+    expect(formatSettingValue(labelled, 'all')).toBe('all (No filter)');
+    expect(formatSettingValue(labelled, 'none')).toBe('none (Hide all)');
+  });
+
+  it('leaves an unlabelled enum choice as the bare value', () => {
+    // Both the no-choiceLabels case (every enum before this existed) and a
+    // partial map, which the registry explicitly allows.
+    expect(formatSettingValue(enumOpt, 'left')).toBe('left');
+    const partial = {
+      ...enumOpt,
+      key: 'a.partial',
+      choiceLabels: { left: 'Left' },
+    } satisfies SettingOption;
+    expect(formatSettingValue(partial, 'right')).toBe('right');
+  });
 });

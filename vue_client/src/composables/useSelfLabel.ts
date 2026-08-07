@@ -6,6 +6,7 @@ import { computed } from 'vue';
 import { useNetworksStore } from '../stores/networks.js';
 import { useBuffersStore } from '../stores/buffers.js';
 import { prefixOf } from '../utils/memberPrefix.js';
+import { isChannelTarget } from '../../../shared/channels.js';
 
 export interface SelfLabelState {
   promptLabelNoModes: ComputedRef<string>;
@@ -32,7 +33,7 @@ export function useSelfLabel(): SelfLabelState {
 
   const channelPrefix = computed(() => {
     const buf = buffer.value;
-    if (!buf || buf.networkId == null || !buf.target.startsWith('#')) return '';
+    if (!buf || buf.networkId == null || !isChannelTarget(buf.target)) return '';
     const nick = networks.states[buf.networkId]?.nick;
     if (!nick) return '';
     const lc = nick.toLowerCase();

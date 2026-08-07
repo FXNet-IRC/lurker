@@ -24,7 +24,6 @@ import fs from 'fs';
 import { fileTypeFromBuffer } from 'file-type';
 import { isUtf8, trimPartialUtf8 } from '../utils/utf8.js';
 import { resolveDiskPath } from '../services/uploadProviders/local.js';
-import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = Router();
 
@@ -58,6 +57,13 @@ const INLINE_MIME = new Set<string>([
   'video/x-m4v',
   'audio/x-m4a',
   'audio/mp4',
+  // 3GPP is the same ISO-BMFF box structure under a different `ftyp` brand, and the
+  // files that reach us are Samsung voice memos holding ordinary AAC — verified
+  // playing in Chrome from a real recording. Leaving them out of this set would have
+  // accepted the upload and then forced it to Downloads, which is a worse answer than
+  // the 415 was.
+  'video/3gpp',
+  'video/3gpp2',
 ]);
 
 // file-type recommends >= 4100 bytes to recognize every supported signature.
@@ -77,68 +83,65 @@ async function sniffHead(fullPath: string): Promise<Buffer> {
   }
 }
 
-router.get(
-  '/:key',
-  asyncHandler(async (req: Request, res: Response) => {
-    const key = String(req.params.key);
-    if (!KEY_RE.test(key)) {
-      res.status(404).json({ error: 'not found' });
-      return;
-    }
+router.get('/:key', async (req: Request, res: Response) => {
+  const key = String(req.params.key);
+  if (!KEY_RE.test(key)) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
 
-    let fullPath: string;
-    try {
-      fullPath = resolveDiskPath(key);
-    } catch {
-      res.status(404).json({ error: 'not found' });
-      return;
-    }
+  let fullPath: string;
+  try {
+    fullPath = resolveDiskPath(key);
+  } catch {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
 
-    // Sniff the served type from the file's own bytes — never a stored or claimed
-    // content-type. A missing file (raced delete, bad key) throws here → 404.
-    let head: Buffer;
-    try {
-      head = await sniffHead(fullPath);
-    } catch {
-      res.status(404).json({ error: 'not found' });
-      return;
-    }
+  // Sniff the served type from the file's own bytes — never a stored or claimed
+  // content-type. A missing file (raced delete, bad key) throws here → 404.
+  let head: Buffer;
+  try {
+    head = await sniffHead(fullPath);
+  } catch {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
 
-    // Recognized-and-inline → inline; recognized-but-not-inline (pdf/zip/svg/...)
-    // → download; unrecognized-but-textual → text/plain; else opaque → download.
-    const ft = await fileTypeFromBuffer(head);
-    let mime: string;
-    let inline: boolean;
-    if (ft && INLINE_MIME.has(ft.mime)) {
-      mime = ft.mime;
-      inline = true;
-    } else if (ft) {
-      mime = ft.mime;
-      inline = false;
-    } else if (isUtf8(trimPartialUtf8(head))) {
-      mime = 'text/plain; charset=utf-8';
-      inline = true;
-    } else {
-      mime = 'application/octet-stream';
-      inline = false;
-    }
+  // Recognized-and-inline → inline; recognized-but-not-inline (pdf/zip/svg/...)
+  // → download; unrecognized-but-textual → text/plain; else opaque → download.
+  const ft = await fileTypeFromBuffer(head);
+  let mime: string;
+  let inline: boolean;
+  if (ft && INLINE_MIME.has(ft.mime)) {
+    mime = ft.mime;
+    inline = true;
+  } else if (ft) {
+    mime = ft.mime;
+    inline = false;
+  } else if (isUtf8(trimPartialUtf8(head))) {
+    mime = 'text/plain; charset=utf-8';
+    inline = true;
+  } else {
+    mime = 'application/octet-stream';
+    inline = false;
+  }
 
-    // Security headers are set HERE, in the handler (not via middleware ordering
-    // that a wiring change could silently drop). Byte delivery then goes to
-    // res.sendFile, which adds Range/ETag/Last-Modified + conditional 304s and
-    // honors our pre-set Content-Type (send skips its extension guess when a
-    // Content-Type is already present — so the sniffed type always wins).
-    res.setHeader('Content-Type', mime);
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
-    // The random key already carries a safe extension; use it as the download name.
-    res.setHeader('Content-Disposition', inline ? 'inline' : `attachment; filename="${key}"`);
+  // Security headers are set HERE, in the handler (not via middleware ordering
+  // that a wiring change could silently drop). Byte delivery then goes to
+  // res.sendFile, which adds Range/ETag/Last-Modified + conditional 304s and
+  // honors our pre-set Content-Type (send skips its extension guess when a
+  // Content-Type is already present — so the sniffed type always wins).
+  res.setHeader('Content-Type', mime);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+  // The random key already carries a safe extension; use it as the download name.
+  res.setHeader('Content-Disposition', inline ? 'inline' : `attachment; filename="${key}"`);
 
-    res.sendFile(fullPath, { maxAge: '365d', immutable: true }, (err) => {
-      // A read error before the response is flushed → 404; after, nothing to do.
-      if (err && !res.headersSent) res.status(404).json({ error: 'not found' });
-    });
-  }),
-);
+  res.sendFile(fullPath, { maxAge: '365d', immutable: true }, (err) => {
+    // A read error before the response is flushed → 404; after, nothing to do.
+    if (err && !res.headersSent) res.status(404).json({ error: 'not found' });
+  });
+});
 
 export default router;

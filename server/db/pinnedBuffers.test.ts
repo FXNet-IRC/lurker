@@ -11,20 +11,30 @@ process.env.DATABASE_PATH = path.join(tmpDir, 'test.db');
 
 let createUser: typeof import('./users.js').createUser;
 let createNetwork: typeof import('./networks.js').createNetwork;
+let ensureBuffer: typeof import('./buffers.js').ensureExists;
 let pinned: typeof import('./pinnedBuffers.js');
 let db: typeof import('./index.js').default;
 let user: ReturnType<typeof import('./users.js').createUser>;
 let net: ReturnType<typeof import('./networks.js').createNetwork>;
 let net2: ReturnType<typeof import('./networks.js').createNetwork>;
 
+function mkNet(userId: number, name: string) {
+  return createNetwork(userId, { name, host: 'h', port: 6697, tls: true, nick: name });
+}
+
 beforeAll(async () => {
   ({ createUser } = await import('./users.js'));
   ({ createNetwork } = await import('./networks.js'));
+  ({ ensureExists: ensureBuffer } = await import('./buffers.js'));
   pinned = await import('./pinnedBuffers.js');
   db = (await import('./index.js')).default;
   user = createUser('pin-alice');
-  net = createNetwork(user.id, { name: 'libera', host: 'h', port: 6697, tls: true, nick: 'a' });
-  net2 = createNetwork(user.id, { name: 'oftc', host: 'h2', port: 6697, tls: true, nick: 'a' });
+  net = mkNet(user.id, 'libera');
+  net2 = mkNet(user.id, 'oftc');
+  // Pins are keyed by buffer_id (schema 18): a pin only exists for a buffer
+  // the registry knows, so the fixtures mint every target used.
+  for (const t of ['#a', '#b', '#c', '#d']) ensureBuffer(user.id, net!.id, t);
+  ensureBuffer(user.id, net2!.id, '#meta');
 });
 
 afterAll(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
@@ -40,6 +50,10 @@ describe('pinBuffer / listPinnedForUserNetwork', () => {
   it('is idempotent — pinning twice does not duplicate or move the entry', () => {
     pinned.pinBuffer(user.id, net!.id, '#a');
     expect(pinned.listPinnedForUserNetwork(user.id, net!.id)).toEqual(['#a', '#b', '#c']);
+  });
+
+  it('pinning an unknown target is a no-op', () => {
+    expect(pinned.pinBuffer(user.id, net!.id, '#never-existed')).toEqual(['#a', '#b', '#c']);
   });
 });
 
@@ -70,6 +84,13 @@ describe('reorderPins', () => {
     expect(pinned.reorderPins(user.id, net!.id, ['#d', '#d'])).toBeNull();
   });
 
+  it('returns null on two casings of the same pin (they resolve to one buffer)', () => {
+    // Pre-normalization these were distinct raw strings and failed the
+    // membership check by luck of exact matching; now they resolve to the
+    // same buffer_id and fail the duplicate check deliberately.
+    expect(pinned.reorderPins(user.id, net!.id, ['#d', '#D'])).toBeNull();
+  });
+
   // The client drops pins it can't render (closed/parted buffers, friend
   // primary DMs), so a drag legitimately reorders only a subset of the pinned
   // set. The reorder must still apply, keeping the unmentioned ("hidden") pins
@@ -77,13 +98,8 @@ describe('reorderPins', () => {
   it('accepts a subset, reordering the supplied targets and keeping hidden pins after them', () => {
     // Fresh user/network so the suite-wide ordering above stays intact.
     const carol = createUser('pin-carol');
-    const netC = createNetwork(carol.id, {
-      name: 'c',
-      host: 'h',
-      port: 6697,
-      tls: true,
-      nick: 'c',
-    });
+    const netC = mkNet(carol.id, 'c');
+    for (const t of ['#visibleA', 'hiddenDM', '#visibleB']) ensureBuffer(carol.id, netC!.id, t);
     pinned.pinBuffer(carol.id, netC!.id, '#visibleA'); // pos 0
     pinned.pinBuffer(carol.id, netC!.id, 'hiddenDM'); // pos 1 (invisible to the client)
     pinned.pinBuffer(carol.id, netC!.id, '#visibleB'); // pos 2
@@ -102,14 +118,10 @@ describe('reorderPins', () => {
 describe('unpinBufferCaseInsensitive', () => {
   it('removes a pin whose stored casing differs from the requested target', () => {
     const dave = createUser('pin-dave');
-    const netD = createNetwork(dave.id, {
-      name: 'd',
-      host: 'h',
-      port: 6697,
-      tls: true,
-      nick: 'd',
-    });
-    pinned.pinBuffer(dave.id, netD!.id, '#Channel'); // stored with a capital C
+    const netD = mkNet(dave.id, 'd');
+    ensureBuffer(dave.id, netD!.id, '#Channel'); // canonical casing: capital C
+    ensureBuffer(dave.id, netD!.id, '#other');
+    pinned.pinBuffer(dave.id, netD!.id, '#Channel');
     pinned.pinBuffer(dave.id, netD!.id, '#other');
 
     // close-buffer arrives with the server's lowercased casing.
@@ -118,41 +130,41 @@ describe('unpinBufferCaseInsensitive', () => {
     expect(pinned.listPinnedForUserNetwork(dave.id, netD!.id)).toEqual(['#other']);
   });
 
-  it('removes every case-variant in one pass (PRIMARY KEY is case-sensitive)', () => {
+  it('case variants resolve to ONE pin — a twin row is unrepresentable', () => {
+    // Pre-normalization the raw-string PRIMARY KEY let '#Channel' and
+    // '#channel' coexist as separate pin rows, and this function existed to
+    // sweep all of them. Under (user_id, buffer_id) keying the second pin is
+    // the same buffer, so it's an idempotent no-op, and one unpin (any
+    // casing) clears it with positions staying dense.
     const frank = createUser('pin-frank');
-    const netF = createNetwork(frank.id, {
-      name: 'f',
-      host: 'h',
-      port: 6697,
-      tls: true,
-      nick: 'f',
-    });
-    // The schema allows both rows since the target column has no NOCASE.
+    const netF = mkNet(frank.id, 'f');
+    ensureBuffer(frank.id, netF!.id, '#Channel');
+    ensureBuffer(frank.id, netF!.id, '#kept');
     pinned.pinBuffer(frank.id, netF!.id, '#Channel');
-    pinned.pinBuffer(frank.id, netF!.id, '#channel');
+    pinned.pinBuffer(frank.id, netF!.id, '#channel'); // same buffer — no-op
     pinned.pinBuffer(frank.id, netF!.id, '#kept');
+    expect(pinned.listPinnedForUserNetwork(frank.id, netF!.id)).toEqual(['#Channel', '#kept']);
 
     const next = pinned.unpinBufferCaseInsensitive(frank.id, netF!.id, '#CHANNEL');
     expect(next).toEqual(['#kept']);
-    expect(pinned.listPinnedForUserNetwork(frank.id, netF!.id)).toEqual(['#kept']);
-    // Positions stay dense after pulling two rows out of the middle/front.
     const rows = db
-      .prepare(`SELECT target, position FROM pinned_buffers WHERE user_id = ? AND network_id = ?`)
+      .prepare(
+        `SELECT b.target AS target, p.position AS position
+         FROM pinned_buffers p JOIN buffers b ON b.id = p.buffer_id
+         WHERE p.user_id = ? AND p.network_id = ?`,
+      )
       .all(frank.id, netF!.id) as Array<{ target: string; position: number }>;
     expect(rows).toEqual([{ target: '#kept', position: 0 }]);
   });
 
   it('returns null when nothing matches so the caller can skip the broadcast', () => {
     const erin = createUser('pin-erin');
-    const netE = createNetwork(erin.id, {
-      name: 'e',
-      host: 'h',
-      port: 6697,
-      tls: true,
-      nick: 'e',
-    });
+    const netE = mkNet(erin.id, 'e');
+    ensureBuffer(erin.id, netE!.id, '#kept');
+    ensureBuffer(erin.id, netE!.id, '#nope'); // exists but isn't pinned
     pinned.pinBuffer(erin.id, netE!.id, '#kept');
     expect(pinned.unpinBufferCaseInsensitive(erin.id, netE!.id, '#nope')).toBeNull();
+    expect(pinned.unpinBufferCaseInsensitive(erin.id, netE!.id, '#gone')).toBeNull();
     expect(pinned.listPinnedForUserNetwork(erin.id, netE!.id)).toEqual(['#kept']);
   });
 });
@@ -166,107 +178,61 @@ describe('listPinnedForUser', () => {
   });
 });
 
-// Mirrors the schemaVersion < 7 cleanup in db/index.ts. Kept here as a string
-// so the test can replay it against orphan rows that the public API can no
-// longer create (close-buffer now implies unpin).
-// The v7 migration repair ran against the legacy closed_buffers table (the
-// registry didn't exist yet), and is now gated on that table existing. Its
-// replay here recreates the legacy world: fixture table + fixture close.
-function ensureLegacyClosedBuffers(): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS closed_buffers (
-      user_id INTEGER NOT NULL,
-      network_id INTEGER NOT NULL,
-      target TEXT NOT NULL,
-      closed_at TEXT NOT NULL DEFAULT (datetime('now')),
-      PRIMARY KEY (user_id, network_id, target)
-    )
-  `);
-}
-function closeBuffer(userId: number, networkId: number, target: string): void {
-  ensureLegacyClosedBuffers();
-  db.prepare(
-    `INSERT INTO closed_buffers (user_id, network_id, target) VALUES (?, ?, ?)
-     ON CONFLICT(user_id, network_id, target) DO UPDATE SET closed_at = datetime('now')`,
-  ).run(userId, networkId, target);
-}
+// The schemaVersion < 7 orphan-cleanup replay that used to live here is gone
+// with the name-keyed schema: that repair runs only on legacy databases (gated
+// on the retired closed_buffers table existing, always before the v18 rebuild
+// reshapes pinned_buffers), and its SQL cannot execute against the buffer_id
+// schema. The migration path itself is covered by the v15-fixture migration
+// tests.
 
-const PURGE_ORPHANS_SQL = `
-  DELETE FROM pinned_buffers
-  WHERE EXISTS (
-    SELECT 1 FROM closed_buffers c
-    WHERE c.user_id = pinned_buffers.user_id
-      AND c.network_id = pinned_buffers.network_id
-      AND c.target = pinned_buffers.target
-  )
-`;
-const RENUMBER_PINS_SQL = `
-  WITH renum AS (
-    SELECT user_id, network_id, target,
-           ROW_NUMBER() OVER (
-             PARTITION BY user_id, network_id
-             ORDER BY position ASC, target ASC
-           ) - 1 AS new_pos
-    FROM pinned_buffers
-  )
-  UPDATE pinned_buffers
-  SET position = (
-    SELECT new_pos FROM renum
-    WHERE renum.user_id = pinned_buffers.user_id
-      AND renum.network_id = pinned_buffers.network_id
-      AND renum.target = pinned_buffers.target
-  )
-`;
+describe('listPinnedWithIds — the pins-changed dual payload', () => {
+  it('stays parallel-indexed with the name list across pin/unpin/reorder', async () => {
+    const grace = createUser('pin-grace');
+    const netG = mkNet(grace.id, 'g');
+    for (const t of ['#one', '#two', '#three']) ensureBuffer(grace.id, netG!.id, t);
+    pinned.pinBuffer(grace.id, netG!.id, '#one');
+    pinned.pinBuffer(grace.id, netG!.id, '#two');
+    pinned.pinBuffer(grace.id, netG!.id, '#three');
 
-describe('schemaVersion < 7 orphan cleanup (issue #112)', () => {
-  it('drops pinned rows whose target is also closed, then renumbers positions per (user, network)', () => {
-    // Fresh user/networks so we don't entangle with the suite-wide state above.
-    const bob = createUser('pin-bob');
-    const netA = createNetwork(bob.id, {
-      name: 'a',
-      host: 'h',
-      port: 6697,
-      tls: true,
-      nick: 'b',
-    });
-    const netB = createNetwork(bob.id, {
-      name: 'b',
-      host: 'h',
-      port: 6697,
-      tls: true,
-      nick: 'b',
-    });
+    const buffers = await import('./buffers.js');
+    const check = () => {
+      // The two wire arrays are one read: names in position order, and each
+      // row's id must be the id of the SAME-INDEX name — the property the
+      // pins-changed frame's parallel-indexing contract rests on.
+      const rows = pinned.listPinnedWithIds(grace.id, netG!.id);
+      expect(rows.map((r) => r.target)).toEqual(
+        pinned.listPinnedForUserNetwork(grace.id, netG!.id),
+      );
+      for (const row of rows) {
+        expect(buffers.getBuffer(grace.id, netG!.id, row.target)!.id).toBe(row.bufferId);
+      }
+    };
 
-    pinned.pinBuffer(bob.id, netA!.id, '#x');
-    pinned.pinBuffer(bob.id, netA!.id, '#y');
-    pinned.pinBuffer(bob.id, netA!.id, '#z');
-    pinned.pinBuffer(bob.id, netB!.id, '#solo');
+    check();
+    pinned.reorderPins(grace.id, netG!.id, ['#three', '#one', '#two']);
+    check();
+    pinned.unpinBuffer(grace.id, netG!.id, '#one');
+    check();
+    expect(pinned.listPinnedForUserNetwork(grace.id, netG!.id)).toEqual(['#three', '#two']);
+  });
+});
 
-    // Simulate the pre-fix bug: close a pinned buffer without unpinning it,
-    // leaving an orphan pinned_buffers row pointing at a closed buffer.
-    closeBuffer(bob.id, netA!.id, '#y');
-    closeBuffer(bob.id, netB!.id, '#solo');
+describe('pinsChangedFrame (wsHub)', () => {
+  it('ships pinned[] and pinnedIds[] parallel-indexed from one read', async () => {
+    const henry = createUser('pin-henry');
+    const netH = mkNet(henry.id, 'h');
+    for (const t of ['#a', '#b']) ensureBuffer(henry.id, netH!.id, t);
+    pinned.pinBuffer(henry.id, netH!.id, '#a');
+    pinned.pinBuffer(henry.id, netH!.id, '#b');
 
-    db.exec(PURGE_ORPHANS_SQL);
-    db.exec(RENUMBER_PINS_SQL);
-
-    expect(pinned.listPinnedForUserNetwork(bob.id, netA!.id)).toEqual(['#x', '#z']);
-    expect(pinned.listPinnedForUserNetwork(bob.id, netB!.id)).toEqual([]);
-
-    // Positions must be dense (0..n-1) so a subsequent pin appends at the
-    // correct slot — listPinnedForUserNetwork already orders by position,
-    // but reorderPins relies on the underlying numbering being gap-free.
-    const rows = db
-      .prepare(`SELECT target, position FROM pinned_buffers WHERE user_id = ? AND network_id = ?`)
-      .all(bob.id, netA!.id) as Array<{ target: string; position: number }>;
-    expect(rows.toSorted((a, b) => a.position - b.position)).toEqual([
-      { target: '#x', position: 0 },
-      { target: '#z', position: 1 },
+    const { pinsChangedFrame } = await import('../services/wsHub.js');
+    const buffers = await import('./buffers.js');
+    const frame = pinsChangedFrame(henry.id, netH!.id);
+    expect(frame.kind).toBe('pins-changed');
+    expect(frame.pinned).toEqual(['#a', '#b']);
+    expect(frame.pinnedIds).toEqual([
+      buffers.getBuffer(henry.id, netH!.id, '#a')!.id,
+      buffers.getBuffer(henry.id, netH!.id, '#b')!.id,
     ]);
-
-    // Pinning a new buffer after the cleanup lands at position 2, not 3
-    // (which is what would happen if renumber missed a gap).
-    pinned.pinBuffer(bob.id, netA!.id, '#w');
-    expect(pinned.listPinnedForUserNetwork(bob.id, netA!.id)).toEqual(['#x', '#z', '#w']);
   });
 });

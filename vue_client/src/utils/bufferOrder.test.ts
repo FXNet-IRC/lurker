@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import { describe, it, expect } from 'vitest';
-import { flattenBufferOrder, flattenUnreadOrder, FRIENDS_GROUP_ID } from './bufferOrder.js';
+import {
+  flattenBufferOrder,
+  flattenUnreadOrder,
+  FRIENDS_GROUP_ID,
+  FAVORITES_GROUP_ID,
+} from './bufferOrder.js';
 
 // Lightweight duck-typed fakes matching the store interfaces bufferOrder reads.
 function makeBuffers(byNetwork: Record<string, string[]>, unread: Record<string, number> = {}) {
@@ -54,44 +59,92 @@ describe('flattenBufferOrder', () => {
     expect(order.map((e) => e.target)).toEqual([':server:1', '#real']);
   });
 
-  it('injects the FRIENDS group first (feed header + friend DMs) under FRIENDS_GROUP_ID', () => {
+  it('injects the FRIENDS then FAVORITES sections first, under their group ids', () => {
     const order = flattenBufferOrder({
       networks: [{ id: 1 }],
-      buffers: makeBuffers({ '1': ['#chan', 'bob'] }),
+      buffers: makeBuffers({ '1': ['#chan', '#fav', 'bob'] }),
       pins: makePins({}),
-      friends: {
-        feedKey: ':friends:',
-        dms: [{ networkId: 1, target: 'bob' }],
-        excludeKeys: new Set(['1::bob']),
+      favorites: {
+        friends: [{ networkId: 1, target: 'bob' }],
+        channels: [{ networkId: 1, target: '#fav' }],
+        excludeKeys: new Set(['1::bob', '1::#fav']),
       },
     });
     expect(order.slice(0, 2)).toEqual([
-      {
-        networkId: FRIENDS_GROUP_ID,
-        target: ':friends:',
-        key: ':friends:',
-        groupId: FRIENDS_GROUP_ID,
-      },
       { networkId: 1, target: 'bob', key: '1::bob', groupId: FRIENDS_GROUP_ID },
+      { networkId: 1, target: '#fav', key: '1::#fav', groupId: FAVORITES_GROUP_ID },
     ]);
-    // bob is excluded from its real network so it isn't walked twice.
-    const realNetKeys = order.filter((e) => e.groupId === 1).map((e) => e.target);
-    expect(realNetKeys).toEqual([':server:1', '#chan']);
+    // Favorited buffers are excluded from their real network so they aren't
+    // walked twice.
+    expect(order.filter((e) => e.groupId === 1).map((e) => e.target)).toEqual([
+      ':server:1',
+      '#chan',
+    ]);
   });
 
-  it('excludeKeys matching is case-insensitive on the nick', () => {
+  it('excludeKeys matching is case-insensitive on the target', () => {
     const order = flattenBufferOrder({
       networks: [{ id: 1 }],
       buffers: makeBuffers({ '1': ['Bob'] }), // server-cased nick
       pins: makePins({}),
-      friends: {
-        feedKey: ':friends:',
-        dms: [{ networkId: 1, target: 'Bob' }],
+      favorites: {
+        friends: [{ networkId: 1, target: 'Bob' }],
+        channels: [],
         excludeKeys: new Set(['1::bob']),
       },
     });
-    // Only the friends-group Bob remains; the real-network one is excluded.
+    // Only the friends-section Bob remains; the real-network one is excluded.
     expect(order.filter((e) => e.groupId === 1).map((e) => e.target)).toEqual([':server:1']);
+  });
+
+  it('excludes favorited pins from the pinned walk too', () => {
+    const order = flattenBufferOrder({
+      networks: [{ id: 1 }],
+      buffers: makeBuffers({ '1': ['#fav', '#pinned'] }),
+      pins: makePins({ '1': ['#fav', '#pinned'] }),
+      favorites: {
+        friends: [],
+        channels: [{ networkId: 1, target: '#fav' }],
+        excludeKeys: new Set(['1::#fav']),
+      },
+    });
+    expect(order.map((e) => e.key)).toEqual(['1::#fav', srvKey(1), '1::#pinned']);
+  });
+});
+
+// #724: the sidebar sorted channels before DMs using a bare `#` test, so an `&`/`+`/`!` channel
+// filed among the DMs — and its sort key kept the sigil, so it sorted under punctuation instead
+// of by name.
+describe('non-# channels sort as channels', () => {
+  it('puts &, + and ! channels in the channel block, before DMs', () => {
+    const order = flattenBufferOrder({
+      networks: [{ id: 1 }],
+      buffers: makeBuffers({ '1': ['bob', '&local', '#zeta', '+nomodes', 'amy', '!ABCDEsafe'] }),
+      pins: makePins({}),
+    });
+    expect(order.map((e) => e.key)).toEqual([
+      srvKey(1),
+      // Channels, alphabetical by name with the sigil stripped:
+      // ABCDEsafe, local, nomodes, zeta
+      '1::!ABCDEsafe',
+      '1::&local',
+      '1::+nomodes',
+      '1::#zeta',
+      // …then the DMs.
+      '1::amy',
+      '1::bob',
+    ]);
+  });
+
+  it('sorts &local by its name, adjacent to #local', () => {
+    const order = flattenBufferOrder({
+      networks: [{ id: 1 }],
+      buffers: makeBuffers({ '1': ['#apple', '&banana', '#cherry'] }),
+      pins: makePins({}),
+    });
+    // Sigil-blind alphabetical: apple, banana, cherry. With the old `/^#+/` strip, `&banana`
+    // sorted on the literal `&` and led the list.
+    expect(order.map((e) => e.key)).toEqual([srvKey(1), '1::#apple', '1::&banana', '1::#cherry']);
   });
 });
 
@@ -106,17 +159,5 @@ describe('flattenUnreadOrder', () => {
       pins: makePins({}),
     };
     expect(flattenUnreadOrder(args).map((e) => e.key)).toEqual([srvKey(1), '1::#busy']);
-  });
-
-  it('drops the virtual FRIENDS feed (no backing buffer / never unread)', () => {
-    const args = {
-      networks: [{ id: 1 }],
-      buffers: makeBuffers({ '1': ['#busy'] }, { '1::#busy': 2 }),
-      pins: makePins({}),
-      friends: { feedKey: ':friends:', dms: [] as Array<{ networkId: number; target: string }> },
-    };
-    const keys = flattenUnreadOrder(args).map((e) => e.key);
-    expect(keys).not.toContain(':friends:');
-    expect(keys).toEqual(['1::#busy']);
   });
 });

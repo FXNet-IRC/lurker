@@ -133,10 +133,13 @@ export function buildApnsRequest(
         'thread-id': content.tag,
       },
       // Custom keys live beside `aps`, and are what tap-to-open reads to know
-      // which buffer to jump to.
+      // which buffer to jump to. bufferId rides along for the same reason it
+      // rides the web push payload (#744): a cold tap can address the buffer
+      // by row id. Shipped iOS builds read networkId/target and ignore it.
       networkId: payload.networkId,
       target: payload.target,
       messageId: payload.messageId,
+      bufferId: payload.bufferId,
       kind: payload.kind,
     }),
   };

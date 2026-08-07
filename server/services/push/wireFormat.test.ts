@@ -93,10 +93,10 @@ describe('buildApnsRequest', () => {
   });
 
   it('omits the badge rather than sending 0 when there is none', () => {
-    // A friend-online push carries no badge on purpose (#451): the total can't
-    // have changed. Sending `badge: 0` would CLEAR the user's app icon instead
-    // of leaving it alone — worse than not sending it.
-    const p = payload({ kind: 'friend_online', displayName: 'Amiantos', badge: undefined });
+    // A badge-less push means "the total can't have changed" (#451). Sending
+    // `badge: 0` would CLEAR the user's app icon instead of leaving it alone —
+    // worse than not sending it.
+    const p = payload({ badge: undefined });
     const body = JSON.parse(build(p).body);
     expect('badge' in body.aps).toBe(false);
   });

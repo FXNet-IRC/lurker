@@ -161,10 +161,14 @@ describe('schemaVersion 16 — buffers backfill', () => {
       )
       .all() as Array<{ target: string }>;
     expect(msgTargets.map((r) => r.target)).toEqual(['#Chatty']);
-    // …and moved the stray-cased read pointer with it, so the exact-target
-    // read-state lookup still resolves against the registry's canonical name.
+    // …and moved the stray-cased read pointer with it — post-v18 the pointer
+    // is id-keyed, so it resolves through the registry row the fold chose.
     const reads = db
-      .prepare(`SELECT target, last_read_message_id AS lr FROM buffer_reads WHERE network_id = 10`)
+      .prepare(
+        `SELECT b.target AS target, r.last_read_message_id AS lr
+         FROM buffer_reads r JOIN buffers b ON b.id = r.buffer_id
+         WHERE b.network_id = 10`,
+      )
       .all() as Array<{ target: string; lr: number }>;
     expect(reads).toEqual([{ target: '#Chatty', lr: 2 }]);
   });
@@ -210,14 +214,24 @@ describe('schemaVersion 16 — buffers backfill', () => {
     expect(tomb.closedAt).toBe('2026-02-02T00:00:00Z');
   });
 
-  it('never creates rows for :server: virtual targets', () => {
-    expect(buffers.getBuffer(1, 10, ':server:10')).toBeUndefined();
+  it('the v16 pass itself skips :server:, whose row arrives kinded from v17', () => {
+    // v16 derived channel/dm rows from history and deliberately never minted
+    // virtual targets; the schema-17 sentinel mint (which runs after it on
+    // the same boot) is what makes the row real — kinded 'server', open,
+    // never a history-derived channel/dm misclassification.
+    const server = buffers.getBuffer(1, 10, ':server:10');
+    expect(server?.kind).toBe('server');
+    expect(server?.state).toBe('open');
   });
 
   it('scopes rows to each network owner', () => {
     const other = buffers.getBuffer(2, 20, '#other')!;
     expect(other.userId).toBe(2);
     expect(buffers.getBuffer(1, 20, '#other')).toBeUndefined();
-    expect(buffers.listForUser(1).every((b) => b.networkId === 10)).toBe(true);
+    // The app-scoped :system: sentinel (networkId null, schema 17) rides
+    // alongside user 1's network-10 rows.
+    expect(buffers.listForUser(1).every((b) => b.networkId === 10 || b.kind === 'system')).toBe(
+      true,
+    );
   });
 });

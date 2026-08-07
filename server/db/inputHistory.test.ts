@@ -21,6 +21,9 @@ beforeAll(async () => {
   inputHistory = await import('./inputHistory.js');
   user = createUser('ih-alice');
   net = createNetwork(user.id, { name: 'libera', host: 'h', port: 6697, tls: true, nick: 'a' });
+  // buffer_id-keyed since schema 18 — mint the targets the tests write to.
+  const { ensureExists } = await import('./buffers.js');
+  for (const t of ['#a', '#b', '#chat', '#wall']) ensureExists(user.id, net!.id, t);
 });
 
 afterAll(() => fs.rmSync(tmpDir, { recursive: true, force: true }));

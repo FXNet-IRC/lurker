@@ -16,11 +16,15 @@
 import { reactive } from 'vue';
 import { useViewport } from '../composables/useViewport.js';
 import { useOnboarding } from '../composables/useOnboarding.js';
+import { useBufferRoute } from '../composables/useBufferRoute.js';
 import DesktopChat from './DesktopChat.vue';
 import MobileChat from './MobileChat.vue';
 import OnboardingFlow from '../components/OnboardingFlow.vue';
 
 const { isMobile } = useViewport();
+// Bound here, not in either shell: the URL <-> active-buffer binding has to
+// survive the Desktop<->Mobile swap below, exactly like OnboardingFlow above.
+useBufferRoute();
 // reactive() so the composable's refs unwrap in the template, matching how the
 // shells consume useNetworkEditor.
 const onboarding = reactive(useOnboarding());

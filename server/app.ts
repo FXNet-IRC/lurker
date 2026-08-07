@@ -20,6 +20,7 @@ import settingsRouter from './routes/settings.js';
 import highlightRulesRouter from './routes/highlightRules.js';
 import highlightsRouter from './routes/highlights.js';
 import bookmarksRouter from './routes/bookmarks.js';
+import themesRouter from './routes/themes.js';
 import pushRouter from './routes/push.js';
 import adminRouter from './routes/admin.js';
 import uploadsRouter from './routes/uploads.js';
@@ -30,6 +31,7 @@ import draftsRouter from './routes/drafts.js';
 import { exportsRouter, importRouter } from './routes/exports.js';
 import apiTokensRouter from './routes/apiTokens.js';
 import configRouter from './routes/config.js';
+import linkPreviewRouter from './routes/linkPreview.js';
 import nodeRouter from './routes/node.js';
 import provisionRouter from './routes/provision.js';
 import guestRouter from './routes/guest.js';
@@ -38,6 +40,7 @@ import { requireApiAuth } from './middleware/apiAuth.js';
 import { isNodeMode } from './utils/edition.js';
 import { isPublicModeEnabled } from './utils/publicMode.js';
 import { trustProxyConfig } from './utils/clientIp.js';
+import { previewsEnabled } from './utils/previews.js';
 import { allowedBrowserOrigins } from './utils/corsOrigins.js';
 
 const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
@@ -85,6 +88,7 @@ export function buildApp(sessionSecret: string): Express {
   app.use('/api/highlight-rules', highlightRulesRouter);
   app.use('/api/highlights', highlightsRouter);
   app.use('/api/bookmarks', bookmarksRouter);
+  app.use('/api/themes', themesRouter);
   app.use('/api/push', pushRouter);
   app.use('/api/admin', adminRouter);
   app.use('/api/uploads', uploadsRouter);
@@ -109,6 +113,12 @@ export function buildApp(sessionSecret: string): Express {
   app.use('/api/exports', exportsRouter);
   app.use('/api/imports', importRouter);
   app.use('/api/config', configRouter);
+  // ⚠ Not mounted at all when the feature is off, so both endpoints 404 rather than existing
+  // and refusing. The in-route and resolver guards stay as defence in depth — this is the outer
+  // one, and it's what makes "off" mean the surface isn't there.
+  if (previewsEnabled()) {
+    app.use('/api/link-preview', linkPreviewRouter);
+  }
 
   // FXNet account provisioning. Mounted unconditionally — the route's middleware
   // fails closed (503) until LURKER_PROVISION_SECRET is set, so an instance that

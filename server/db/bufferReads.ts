@@ -2,54 +2,51 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import db from './index.js';
+import { resolveBuffer } from './bufferResolve.js';
 
-/** A row from `buffer_reads`. network_id is null for the app-scoped system
- * buffer (#355). */
-export interface BufferRead {
-  user_id: number;
-  network_id: number | null;
-  target: string;
-  last_read_message_id: number;
-  updated_at: string;
-  cleared_before_message_id: number | null;
-  cleared_at: string | null;
-}
+// buffer_reads is keyed (user_id, buffer_id) since schema 18 — the name lives
+// in `buffers` alone. Exported signatures still take (networkId, target)
+// because that's what callers hold; each entry point resolves the name once
+// through bufferResolve. A resolution miss means "no such buffer": reads
+// return the zero state, writes are a no-op — state for a buffer that doesn't
+// exist is meaningless, and the old path's implicit row-for-any-string was
+// exactly the detached-pointer bug class (#355's ms-blowup incident).
+//
+// The list functions join back through `buffers` so their wire shape —
+// `${networkId}::${target}` map keys — is byte-identical to the name-keyed
+// era (a NULL networkId stringifies to "null", matching the system buffer's
+// old key).
 
 export interface ClearedState {
   clearedBeforeId: number;
   clearedAt: string | null;
 }
 
-// ON CONFLICT targets the coalesced unique index (user_id, IFNULL(network_id,0),
-// target) so the app-scoped system buffer (NULL network_id) dedupes — a plain
-// (user_id, network_id, target) conflict target treats NULL as distinct.
 const upsertStmt = db.prepare(`
-  INSERT INTO buffer_reads (user_id, network_id, target, last_read_message_id, updated_at)
-  VALUES (?, ?, ?, ?, datetime('now'))
-  ON CONFLICT(user_id, IFNULL(network_id, 0), target) DO UPDATE SET
+  INSERT INTO buffer_reads (user_id, buffer_id, last_read_message_id, updated_at)
+  VALUES (?, ?, ?, datetime('now'))
+  ON CONFLICT(user_id, buffer_id) DO UPDATE SET
     last_read_message_id = MAX(last_read_message_id, excluded.last_read_message_id),
     updated_at = excluded.updated_at
 `);
 
-// IFNULL on both sides so a NULL network_id (system buffer) matches its own row;
-// for real network ids it's an identity, so network-buffer lookups are unchanged.
 const getOneStmt = db.prepare(`
   SELECT last_read_message_id AS lastReadId
   FROM buffer_reads
-  WHERE user_id = ? AND IFNULL(network_id, 0) = IFNULL(?, 0) AND target = ?
+  WHERE user_id = ? AND buffer_id = ?
 `);
 
 const listForUserStmt = db.prepare(`
-  SELECT network_id AS networkId, target, last_read_message_id AS lastReadId
-  FROM buffer_reads
-  WHERE user_id = ?
+  SELECT b.network_id AS networkId, b.target AS target, r.last_read_message_id AS lastReadId
+  FROM buffer_reads r JOIN buffers b ON b.id = r.buffer_id
+  WHERE r.user_id = ?
 `);
 
 // Returns map keyed by `${networkId}::${target}` → lastReadId.
 export function listReadStateForUser(userId: number): Record<string, number> {
   const out: Record<string, number> = {};
   for (const row of listForUserStmt.all(userId) as Array<{
-    networkId: number;
+    networkId: number | null;
     target: string;
     lastReadId: number;
   }>) {
@@ -59,7 +56,9 @@ export function listReadStateForUser(userId: number): Record<string, number> {
 }
 
 export function getReadState(userId: number, networkId: number | null, target: string): number {
-  const row = getOneStmt.get(userId, networkId, target) as { lastReadId: number } | undefined;
+  const buffer = resolveBuffer(userId, networkId, target);
+  if (!buffer) return 0;
+  const row = getOneStmt.get(userId, buffer.id) as { lastReadId: number } | undefined;
   return row ? row.lastReadId : 0;
 }
 
@@ -72,10 +71,13 @@ export function setReadState(
   target: string,
   messageId: number,
 ): number {
+  const buffer = resolveBuffer(userId, networkId, target);
+  if (!buffer) return 0;
   const id = Number(messageId);
   if (!Number.isFinite(id) || id <= 0) return getReadState(userId, networkId, target);
-  upsertStmt.run(userId, networkId, target, id);
-  return getReadState(userId, networkId, target);
+  upsertStmt.run(userId, buffer.id, id);
+  const row = getOneStmt.get(userId, buffer.id) as { lastReadId: number } | undefined;
+  return row ? row.lastReadId : 0;
 }
 
 // --- /clear marker state ---------------------------------------------------
@@ -87,10 +89,9 @@ export function setReadState(
 
 const upsertClearedStmt = db.prepare(`
   INSERT INTO buffer_reads
-    (user_id, network_id, target, last_read_message_id,
-     cleared_before_message_id, cleared_at, updated_at)
-  VALUES (?, ?, ?, 0, ?, ?, datetime('now'))
-  ON CONFLICT(user_id, IFNULL(network_id, 0), target) DO UPDATE SET
+    (user_id, buffer_id, last_read_message_id, cleared_before_message_id, cleared_at, updated_at)
+  VALUES (?, ?, 0, ?, ?, datetime('now'))
+  ON CONFLICT(user_id, buffer_id) DO UPDATE SET
     cleared_before_message_id = excluded.cleared_before_message_id,
     cleared_at = excluded.cleared_at,
     updated_at = excluded.updated_at
@@ -101,17 +102,17 @@ const getClearedStmt = db.prepare(`
     cleared_before_message_id AS clearedBeforeId,
     cleared_at AS clearedAt
   FROM buffer_reads
-  WHERE user_id = ? AND IFNULL(network_id, 0) = IFNULL(?, 0) AND target = ?
+  WHERE user_id = ? AND buffer_id = ?
 `);
 
 const listClearedStmt = db.prepare(`
-  SELECT network_id AS networkId, target,
-         cleared_before_message_id AS clearedBeforeId,
-         cleared_at AS clearedAt
-  FROM buffer_reads
-  WHERE user_id = ?
-    AND cleared_before_message_id IS NOT NULL
-    AND cleared_before_message_id > 0
+  SELECT b.network_id AS networkId, b.target AS target,
+         r.cleared_before_message_id AS clearedBeforeId,
+         r.cleared_at AS clearedAt
+  FROM buffer_reads r JOIN buffers b ON b.id = r.buffer_id
+  WHERE r.user_id = ?
+    AND r.cleared_before_message_id IS NOT NULL
+    AND r.cleared_before_message_id > 0
 `);
 
 export function getClearedState(
@@ -119,9 +120,12 @@ export function getClearedState(
   networkId: number | null,
   target: string,
 ): ClearedState {
-  const row = getClearedStmt.get(userId, networkId, target) as
-    | { clearedBeforeId: number | null; clearedAt: string | null }
-    | undefined;
+  const buffer = resolveBuffer(userId, networkId, target);
+  const row = buffer
+    ? (getClearedStmt.get(userId, buffer.id) as
+        | { clearedBeforeId: number | null; clearedAt: string | null }
+        | undefined)
+    : undefined;
   if (!row || !row.clearedBeforeId) return { clearedBeforeId: 0, clearedAt: null };
   return { clearedBeforeId: row.clearedBeforeId, clearedAt: row.clearedAt };
 }
@@ -137,12 +141,14 @@ export function setClearedState(
   boundaryId: number,
   clearedAt: string | null,
 ): ClearedState {
+  const buffer = resolveBuffer(userId, networkId, target);
+  if (!buffer) return { clearedBeforeId: 0, clearedAt: null };
   const id = Number(boundaryId);
   if (!Number.isFinite(id) || id <= 0) {
-    upsertClearedStmt.run(userId, networkId, target, null, null);
+    upsertClearedStmt.run(userId, buffer.id, null, null);
     return { clearedBeforeId: 0, clearedAt: null };
   }
-  upsertClearedStmt.run(userId, networkId, target, id, clearedAt);
+  upsertClearedStmt.run(userId, buffer.id, id, clearedAt);
   return getClearedState(userId, networkId, target);
 }
 
@@ -152,7 +158,7 @@ export function setClearedState(
 export function listClearedStateForUser(userId: number): Record<string, ClearedState> {
   const out: Record<string, ClearedState> = {};
   for (const row of listClearedStmt.all(userId) as Array<{
-    networkId: number;
+    networkId: number | null;
     target: string;
     clearedBeforeId: number;
     clearedAt: string | null;

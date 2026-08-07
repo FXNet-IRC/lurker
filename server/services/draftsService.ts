@@ -25,13 +25,15 @@ class DraftsService extends EventEmitter {
       this.clear(userId, networkId, target, originWs);
       return;
     }
-    upsertDraft(userId, networkId, target, text);
-    this.emit('change', { userId, networkId, target, body: text, originWs });
+    const bufferId = upsertDraft(userId, networkId, target, text);
+    if (bufferId === undefined) return; // unknown buffer — nothing stored, nothing to announce
+    this.emit('change', { userId, networkId, target, bufferId, body: text, originWs });
   }
 
   clear(userId: number, networkId: number, target: string, originWs: unknown = null): void {
-    clearDraft(userId, networkId, target);
-    this.emit('change', { userId, networkId, target, body: '', originWs });
+    const bufferId = clearDraft(userId, networkId, target);
+    if (bufferId === undefined) return;
+    this.emit('change', { userId, networkId, target, bufferId, body: '', originWs });
   }
 
   snapshotForUser(userId: number): unknown[] {

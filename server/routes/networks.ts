@@ -16,7 +16,8 @@ import {
 import { listChannelsForNetwork, seedAutojoinChannel } from '../db/buffers.js';
 import ircManager from '../services/ircManager.js';
 import { isNetworkHostAllowed, hostAllowedChecker } from '../services/networkPolicy.js';
-import { fanOutToUser } from '../services/wsHub.js';
+import { fanOutToUser, favoritesChangedFrame } from '../services/wsHub.js';
+import { renumberFavorites } from '../db/favoriteBuffers.js';
 import { isNetworkLockEnabled } from '../utils/forcedNetwork.js';
 
 // Fields a locked account may never set or change — the lock binds everyone to
@@ -231,14 +232,12 @@ router.delete('/:id', (req: Request, res: Response) => {
   }
   ircManager.disposeNetwork(req.user!.id, id, 'network removed');
   deleteNetwork(id, req.user!.id);
-  // Deleting the network cascades away its contact_targets, so re-publish the
-  // contact list to every open tab — otherwise the Friends UI keeps stale
-  // targets (and a possibly-dead primary DM) pointing at the gone network until
-  // the next reconnect re-snapshots.
-  fanOutToUser(req.user!.id, {
-    kind: 'contacts-snapshot',
-    contacts: ircManager.listContacts(req.user!.id),
-  });
+  // The network's buffers cascaded away and took their favorite rows with
+  // them, leaving holes mid-sequence in the user's global favorites order.
+  // Re-densify and re-publish so open tabs drop the dead entries instead of
+  // keeping them until the next reconnect re-seeds.
+  renumberFavorites(req.user!.id);
+  fanOutToUser(req.user!.id, favoritesChangedFrame(req.user!.id));
   res.json({ ok: true });
 });
 

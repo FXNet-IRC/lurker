@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MPL-2.0
 
 # Stage 1: Build Vue client
-FROM node:22-slim AS vue-builder
+FROM node:24-slim@sha256:cd84903a12dbd26b46f1f3b8144a2568c41c5d37ddd0c7a80a34c7a19786b35f AS vue-builder
 
 WORKDIR /app/vue_client
 
@@ -27,10 +27,17 @@ RUN npm run build
 # multi-arch building on a single-arch GHA runner is glacial (or hangs
 # outright), and the prebuild path sidesteps it entirely.
 #
-# Pinned to node:22 specifically (rather than lts) because better-sqlite3
-# 11.x ships prebuilds for Node 22 but not Node 24 (which the lts tag
-# currently resolves to). Bump when better-sqlite3 catches up.
-FROM node:22-slim AS server-deps
+# Track the current LTS line explicitly (24, EOL 2028-04-30) rather than the
+# `lts` tag or the newest tag. Odd-numbered majors (23, 25, ...) never become
+# LTS and go EOL in months, so "newest" is actively wrong here.
+#
+# Both native modules stay on the prebuild path at 24: better-sqlite3 12.x
+# publishes ABI-137 builds for linux-x64 and linux-arm64, and sharp 0.35 uses
+# N-API platform packages, which are ABI-independent.
+#
+# The digest is refreshed by dependabot; see .github/dependabot.yml, which
+# also explains why tag bumps here are deliberately not automated.
+FROM node:24-slim@sha256:cd84903a12dbd26b46f1f3b8144a2568c41c5d37ddd0c7a80a34c7a19786b35f AS server-deps
 
 WORKDIR /app
 
@@ -38,7 +45,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 # Stage 3: Runtime image
-FROM node:22-slim
+FROM node:24-slim@sha256:cd84903a12dbd26b46f1f3b8144a2568c41c5d37ddd0c7a80a34c7a19786b35f
 
 WORKDIR /app
 

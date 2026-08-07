@@ -21,6 +21,15 @@ export type SettingType = 'string' | 'color' | 'secret' | 'int' | 'bool' | 'enum
 /** A stored setting value, in its decoded (non-string) form. */
 export type SettingValue = string | number | boolean | string[];
 
+/**
+ * One "this setting is live when …" clause. `key` must name another registry
+ * option; the clause holds when that option's effective value is one of `in`.
+ */
+export interface SettingDependency {
+  key: string;
+  in: readonly SettingValue[];
+}
+
 interface BaseOption {
   key: string;
   label: string;
@@ -40,6 +49,40 @@ interface BaseOption {
   // trivially bypassable. The upload pipeline limits (uploads.image.*) are the
   // reference pattern: hidden here, enforced in the cell's upload route.
   selfHostedOnly?: boolean;
+
+  // This option only exists when the named instance feature is enabled. Unlike `selfHostedOnly`
+  // (a cosmetic gate on a knob that still works), a flagged-off feature has no server behind it
+  // at all — the routes aren't even mounted — so the option is HIDDEN rather than shown and
+  // ignored. Offering a switch that silently does nothing is worse than offering none.
+  requiresFeature?: 'linkPreviews';
+
+  // Conditions under which this setting actually does anything, ORed together:
+  // the option is live if ANY clause holds. Resolution is TRANSITIVE — an
+  // option whose dependency is itself inactive is inactive too, so a chain like
+  // `consolidate_max_names → consolidate_joins → chat.events` only needs each
+  // link stated once.
+  //
+  // Presentation only, and deliberately so: an inactive setting still stores and
+  // returns its value, because the condition can flip back (switching a phone
+  // off `none` must restore exactly the modifiers that were set before, not a
+  // pile of defaults). Clients render these greyed out; nothing enforces them.
+  //
+  // The tier keys (chat.events / chat.events.mobile) are why this exists as
+  // registry data rather than a hardcoded map per client — the iOS settings
+  // screen was already carrying one of these by hand for consolidate_max_names,
+  // and the tier adds eight more.
+  dependsOn?: readonly SettingDependency[];
+
+  // Part of a theme preset's snapshot (#TBD): the fonts group plus every
+  // color-typed appearance setting. A theme stores a value for each themed key;
+  // the client resolves a themed key as override → active theme → registry
+  // default (stores/settings.ts). Two server behaviors hang off this flag:
+  // settingsService KEEPS a themed row whose value equals the registry default
+  // (on a non-default theme, "set it to the default color" is a statement, not
+  // an absence), and /api/themes validates snapshot keys against it. The
+  // look.theme.* pointer keys themselves must NEVER be themed — the resolver
+  // reads them to pick the active theme, so a themed pointer would recurse.
+  themed?: boolean;
 }
 
 /** Free-text settings: plain strings, CSS colors, and write-only secrets. */
@@ -67,6 +110,16 @@ export interface EnumOption extends BaseOption {
   type: 'enum';
   choices: readonly string[];
   default: string;
+  // Display text per choice, for enums whose stored values read as identifiers
+  // rather than as English. Omit and clients render the raw value, which is the
+  // right answer for a choice like `auto` / `standard` / `compact`.
+  //
+  // The values stay the ids — see the note on `chat.image_modal.enabled` about
+  // keys aging. Renaming a stored enum value is a MIGRATION, and doing one to
+  // improve wording would be paying in orphaned rows for something a label
+  // fixes for free. A choice with no entry here falls back to its raw value, so
+  // a partial map is safe.
+  choiceLabels?: Readonly<Record<string, string>>;
 }
 
 /** Multi-value settings: an ordered list of strings. */
@@ -94,6 +147,24 @@ export interface SettingCategory {
   hideInPublicMode?: boolean;
 }
 
+// ─── Shared dependency clauses ─────────────────────────────────────────────
+// Everything else in the Events category hangs off the event filter, which is
+// two keys (desktop + mobile). A setting is live if EITHER device class can
+// still see the thing it modifies — a phone set to "Hide all" must not grey out
+// the consolidation knobs a desktop is actively using, and vice versa.
+
+/** Live when at least one device class renders event rows at all. */
+const EVENTS_VISIBLE: readonly SettingDependency[] = Object.freeze([
+  { key: 'chat.events', in: ['all', 'smart'] },
+  { key: 'chat.events.mobile', in: ['all', 'smart'] },
+]);
+
+/** Live when at least one device class is on the smart tier. */
+const EVENTS_SMART: readonly SettingDependency[] = Object.freeze([
+  { key: 'chat.events', in: ['smart'] },
+  { key: 'chat.events.mobile', in: ['smart'] },
+]);
+
 export const REGISTRY: readonly SettingOption[] = Object.freeze([
   // ─── Fonts ─────────────────────────────────────────────────────────────
   {
@@ -101,6 +172,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Font family',
     category: 'appearance',
     group: 'fonts',
+    themed: true,
     type: 'string',
     default: "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
     description:
@@ -113,6 +185,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Font size',
     category: 'appearance',
     group: 'fonts',
+    themed: true,
     type: 'int',
     min: 9,
     max: 32,
@@ -126,6 +199,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Font size (mobile)',
     category: 'appearance',
     group: 'fonts',
+    themed: true,
     type: 'int',
     min: 9,
     max: 32,
@@ -140,6 +214,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Font weight',
     category: 'appearance',
     group: 'fonts',
+    themed: true,
     type: 'int',
     min: 100,
     max: 900,
@@ -155,6 +230,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Terminal-style font smoothing (macOS)',
     category: 'appearance',
     group: 'fonts',
+    themed: true,
     type: 'bool',
     default: false,
     description:
@@ -169,6 +245,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Background',
     category: 'appearance',
     group: 'palette',
+    themed: true,
     type: 'color',
     default: '#191a1b',
     description: 'Window background (every region uses this, like a CLI app).',
@@ -178,6 +255,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Soft background (hover / active)',
     category: 'appearance',
     group: 'palette',
+    themed: true,
     type: 'color',
     default: '#242526',
     description: 'Slightly raised background used for hover and active-buffer highlight.',
@@ -187,6 +265,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Foreground (text)',
     category: 'appearance',
     group: 'palette',
+    themed: true,
     type: 'color',
     default: '#e7eae0',
     description: 'Default foreground / text color.',
@@ -196,6 +275,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Muted text',
     category: 'appearance',
     group: 'palette',
+    themed: true,
     type: 'color',
     default: '#797b75',
     description: 'Muted text (timestamps, system events, secondary labels).',
@@ -205,6 +285,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Accent',
     category: 'appearance',
     group: 'palette',
+    themed: true,
     type: 'color',
     default: '#79a617',
     description: 'Primary accent (logo, active-buffer indicator, focused borders).',
@@ -214,6 +295,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Link color',
     category: 'appearance',
     group: 'palette',
+    themed: true,
     type: 'color',
     default: 'var(--accent)',
     description:
@@ -225,6 +307,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Good / connected',
     category: 'appearance',
     group: 'palette',
+    themed: true,
     type: 'color',
     default: '#79a617',
     description: 'Positive / connected state.',
@@ -234,6 +317,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Warning',
     category: 'appearance',
     group: 'palette',
+    themed: true,
     type: 'color',
     default: '#c9a227',
     description: 'Warning / in-progress state (connecting, modified setting marker).',
@@ -243,6 +327,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Error / disconnected',
     category: 'appearance',
     group: 'palette',
+    themed: true,
     type: 'color',
     default: '#a61717',
     description: 'Error / disconnected / destructive state.',
@@ -252,6 +337,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Borders',
     category: 'appearance',
     group: 'palette',
+    themed: true,
     type: 'color',
     default: '#2f3031',
     description: 'Subtle horizontal/vertical separators between regions.',
@@ -261,14 +347,21 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'mIRC color palette',
     category: 'appearance',
     group: 'palette',
+    themed: true,
     type: 'string-list',
     // 16 entries, one per mIRC color code 0..15. The chromatic slots default
     // to the closest hue from look.nick.colors so coloured chat text harmonises
-    // with the rest of the theme; the four mono-ish slots (white, black, gray,
-    // light gray) use theme variables so they stay legible on any background.
+    // with the rest of the theme; the mono-ish slots track the theme so they
+    // stay legible when the user changes look.color.bg / look.color.fg.
+    //
+    // ⚠ A slot must never resolve to the SURFACE it's drawn on. Slot 1 was
+    // var(--bg) — the background by definition — so black text rendered in
+    // exactly the colour behind it and disappeared. Anything derived from
+    // var(--fg) is safe; var(--bg) never is. Keep in sync with
+    // MIRC_PALETTE_FALLBACK in vue_client/src/utils/nickColor.ts.
     default: [
       'var(--fg)', //                                       0  white
-      'var(--bg)', //                                       1  black
+      '#000000', //                                         1  black — NOT var(--bg)
       '#6799f3', //                                         2  navy
       '#a9dc76', //                                         3  green
       '#ff6188', //                                         4  red
@@ -289,7 +382,9 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'in order: white, black, navy, green, red, maroon, purple, orange, yellow, ' +
       'lime, teal, cyan, blue, magenta, gray, light gray. Defaults pick the ' +
       'closest hue from your nick palette so coloured text matches the rest of ' +
-      'the theme. Any CSS color value works (hex, rgb(), var(--name), color-mix()).',
+      'the theme. Any CSS color value works (hex, rgb(), var(--name), color-mix()) — ' +
+      'except var(--bg), which is the chat background itself, so text set to it is ' +
+      'invisible.',
   },
 
   // ─── Alternating message rows ─────────────────────────────────────────
@@ -298,6 +393,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Alternating row background',
     category: 'appearance',
     group: 'messages',
+    themed: true,
     type: 'color',
     default: 'var(--bg)',
     description:
@@ -309,6 +405,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Alternating row text',
     category: 'appearance',
     group: 'messages',
+    themed: true,
     type: 'color',
     default: '#c4c4c4',
     description:
@@ -384,6 +481,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Owner prefix (~)',
     category: 'appearance',
     group: 'members',
+    themed: true,
     type: 'color',
     default: '#ed6c89',
     description: 'Color for the ~ prefix (channel owner mode +q).',
@@ -393,6 +491,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Admin prefix (&)',
     category: 'appearance',
     group: 'members',
+    themed: true,
     type: 'color',
     default: '#fc9867',
     description: 'Color for the & prefix (channel admin mode +a).',
@@ -402,6 +501,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Op prefix (@)',
     category: 'appearance',
     group: 'members',
+    themed: true,
     type: 'color',
     default: '#a99dec',
     description: 'Color for the @ prefix (channel operator mode +o).',
@@ -411,6 +511,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Half-op prefix (%)',
     category: 'appearance',
     group: 'members',
+    themed: true,
     type: 'color',
     default: '#78dce8',
     description: 'Color for the % prefix (half-op mode +h).',
@@ -420,6 +521,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Voiced prefix (+)',
     category: 'appearance',
     group: 'members',
+    themed: true,
     type: 'color',
     default: '#b3db82',
     description: 'Color for the + prefix (voiced mode +v).',
@@ -435,6 +537,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Unread row color',
     category: 'appearance',
     group: 'buffer-list',
+    themed: true,
     type: 'color',
     default: 'var(--accent)',
     description:
@@ -448,6 +551,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Highlighted row color',
     category: 'appearance',
     group: 'buffer-list',
+    themed: true,
     type: 'color',
     default: 'var(--warn)',
     description:
@@ -488,6 +592,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Nick color palette',
     category: 'appearance',
     group: 'nicks',
+    themed: true,
     type: 'string-list',
     default: [
       '#ff6188',
@@ -519,6 +624,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     label: 'Your own nick color',
     category: 'appearance',
     group: 'nicks',
+    themed: true,
     type: 'color',
     default: 'var(--fg)',
     description:
@@ -702,29 +808,74 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'overrides this per channel and is remembered. Has no effect on mobile.',
   },
 
+  // ─── Events: the filter (#666) ────────────────────────────────────────
+  // The primary "how much presence churn do I want to see" choice, and the
+  // reason this category exists. Everything in the two groups below is a
+  // modifier on whatever this leaves standing — see shared/eventFilter.ts for
+  // the tier semantics and the noise set. Registry ORDER decides the order the
+  // pane renders its groups in, so keep these three adjacent and in this
+  // sequence: filter, then consolidation, then smart-filter tuning.
+  {
+    key: 'chat.events',
+    label: 'Event filter',
+    category: 'events',
+    group: 'event-filter',
+    type: 'enum',
+    choices: ['all', 'smart', 'none'],
+    choiceLabels: { all: 'No filter', smart: 'Smart filter', none: 'Hide all' },
+    default: 'all',
+    description:
+      'How much join/part/quit/nick/host-change/mode noise reaches the message list. ' +
+      '"No filter" (the default) shows every event, folded into summary lines when ' +
+      'consolidation is on. "Smart filter" shows events only for nicks who have recently ' +
+      'spoken, so silent lurkers cycling on and off stay invisible. "Hide all" removes ' +
+      'event rows entirely, leaving conversation only. Kicks, topic changes and ' +
+      'invites are never hidden — they are things that happened, not churn.',
+  },
+  {
+    key: 'chat.events.mobile',
+    label: 'Event filter (mobile)',
+    category: 'events',
+    group: 'event-filter',
+    type: 'enum',
+    choices: ['all', 'smart', 'none'],
+    choiceLabels: { all: 'No filter', smart: 'Smart filter', none: 'Hide all' },
+    default: 'all',
+    description:
+      'The same choice for phone-sized viewports (≤768px) and the native mobile ' +
+      'apps, which read this key unconditionally. A phone screen holds a fraction ' +
+      'of the lines a desktop one does, so "Hide all" is a common pick here even for ' +
+      'people who want everything at their desk. Only the filter is split by device — ' +
+      'the settings below are shared.',
+  },
+
   // ─── Join/part consolidation (IRCCloud-style summary line) ────────────
   {
     key: 'chat.consolidate_joins',
     label: 'Consolidate join/part/quit/nick/host-change events',
-    category: 'chat',
+    category: 'events',
     group: 'consolidate',
     type: 'bool',
     default: true,
+    dependsOn: EVENTS_VISIBLE,
     description:
       'Merge consecutive join/part/quit/nick/host-change events into a single summary line ' +
       'per nick (e.g. "Alice and Bob joined; Dave left; Eve → Eve_afk"). ' +
-      'Off shows every event individually. Composes with smart filter — events ' +
-      'the smart filter hides are excluded from the summary.',
+      'Off shows every event individually. Composes with the "smart" tier — events ' +
+      'it hides are excluded from the summary.',
   },
   {
     key: 'chat.consolidate_max_names',
     label: 'Max nicks per summary category',
-    category: 'chat',
+    category: 'events',
     group: 'consolidate',
     type: 'int',
     min: 1,
     max: 50,
     default: 5,
+    // Only names the switch directly above it: the tier condition arrives
+    // transitively through chat.consolidate_joins.
+    dependsOn: [{ key: 'chat.consolidate_joins', in: [true] }],
     description:
       'In each category (joined / left / reconnected / renamed / changed host) of a summary ' +
       'line, show at most this many nicks before collapsing the rest into ' +
@@ -734,10 +885,13 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
   {
     key: 'chat.show_event_host',
     label: 'Show user@host on join/part/quit/nick',
-    category: 'chat',
+    category: 'events',
     group: 'consolidate',
     type: 'bool',
     default: false,
+    // Hangs off the tier, not off consolidation: this decorates the individual
+    // lines, which is exactly what survives when consolidation is OFF.
+    dependsOn: EVENTS_VISIBLE,
     description:
       'Show the affected user’s user@host next to their nick on JOIN, PART, ' +
       'QUIT, and nick-change lines (e.g. "alice (~alice@host.example.net) ' +
@@ -748,10 +902,11 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
   {
     key: 'chat.show_join_account',
     label: 'Show services account on join lines',
-    category: 'chat',
+    category: 'events',
     group: 'consolidate',
     type: 'bool',
     default: false,
+    dependsOn: EVENTS_VISIBLE,
     description:
       'Show the joining user’s services (NickServ) account next to their nick ' +
       'on JOIN lines (e.g. "alice [aliceacct] joined") — useful for channel ops ' +
@@ -759,6 +914,73 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'extended-join extension; nothing is shown for users who are not logged ' +
       'in, or on networks without it. Applies to individual lines only; events ' +
       'that collapse into the consolidation summary above stay account-less.',
+  },
+
+  // ─── Smart filter tuning (join/part/quit/nick noise) ──────────────────
+  // Last of the three Events groups, and the narrowest — it only does anything
+  // on one rung of the filter.
+  //
+  // The master switch used to live here as `chat.smart_filter`; it is now the
+  // middle rung of `chat.events` (#666), and a boot migration carries anyone who
+  // had it on across to the tier. What remains is the tuning it always had.
+  {
+    key: 'chat.smart_filter_delay',
+    label: '"Recently spoke" window (minutes)',
+    category: 'events',
+    group: 'smart-filter',
+    type: 'int',
+    min: 0,
+    max: 1440,
+    default: 5,
+    dependsOn: EVENTS_SMART,
+    description:
+      'Window in minutes for "recently spoke". A join/part/quit/nick event is hidden ' +
+      'if the affected nick has not posted a message within this many minutes before ' +
+      'the event.',
+  },
+  {
+    key: 'chat.smart_filter_join',
+    label: 'Filter joins',
+    category: 'events',
+    group: 'smart-filter',
+    type: 'bool',
+    default: true,
+    dependsOn: EVENTS_SMART,
+    description: 'Apply smart filter to JOIN events.',
+  },
+  {
+    key: 'chat.smart_filter_quit',
+    label: 'Filter parts and quits',
+    category: 'events',
+    group: 'smart-filter',
+    type: 'bool',
+    default: true,
+    dependsOn: EVENTS_SMART,
+    description: 'Apply smart filter to PART and QUIT events.',
+  },
+  {
+    key: 'chat.smart_filter_nick',
+    label: 'Filter nick changes',
+    category: 'events',
+    group: 'smart-filter',
+    type: 'bool',
+    default: true,
+    dependsOn: EVENTS_SMART,
+    description: 'Apply smart filter to NICK change events.',
+  },
+  {
+    key: 'chat.smart_filter_join_unmask',
+    label: 'Reveal join when user speaks (minutes)',
+    category: 'events',
+    group: 'smart-filter',
+    type: 'int',
+    min: 0,
+    max: 1440,
+    default: 30,
+    dependsOn: EVENTS_SMART,
+    description:
+      'If a smart-filtered nick speaks within this many minutes after their JOIN, ' +
+      'the JOIN line is revealed. 0 disables unmasking.',
   },
 
   // ─── Composing (outgoing message guardrails) ─────────────────────────
@@ -793,74 +1015,22 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'this client from sending typing/paused/done notifications while you compose ' +
       "a message. Doesn't affect seeing other people's typing indicators.",
   },
-
-  // ─── Smart filter (join/part/quit/nick noise) ─────────────────────────
   {
-    key: 'chat.smart_filter',
-    label: 'Smart filter (hide noise from quiet users)',
+    key: 'chat.keep_position_on_send',
+    label: 'Stay where you are when you send',
     category: 'chat',
-    group: 'smart-filter',
+    group: 'composing',
     type: 'bool',
     default: false,
     description:
-      'Master switch for smart filtering of join/part/quit/nick noise. When enabled, ' +
-      'these events are hidden for nicks that have not recently spoken in the channel. ' +
-      'Off by default — the consolidation summary line above is usually a better fit, ' +
-      'but turn this on to also hide events for nicks who never chat.',
-  },
-  {
-    key: 'chat.smart_filter_delay',
-    label: '"Recently spoke" window (minutes)',
-    category: 'chat',
-    group: 'smart-filter',
-    type: 'int',
-    min: 0,
-    max: 1440,
-    default: 5,
-    description:
-      'Window in minutes for "recently spoke". A join/part/quit/nick event is hidden ' +
-      'if the affected nick has not posted a message within this many minutes before ' +
-      'the event.',
-  },
-  {
-    key: 'chat.smart_filter_join',
-    label: 'Filter joins',
-    category: 'chat',
-    group: 'smart-filter',
-    type: 'bool',
-    default: true,
-    description: 'Apply smart filter to JOIN events.',
-  },
-  {
-    key: 'chat.smart_filter_quit',
-    label: 'Filter parts and quits',
-    category: 'chat',
-    group: 'smart-filter',
-    type: 'bool',
-    default: true,
-    description: 'Apply smart filter to PART and QUIT events.',
-  },
-  {
-    key: 'chat.smart_filter_nick',
-    label: 'Filter nick changes',
-    category: 'chat',
-    group: 'smart-filter',
-    type: 'bool',
-    default: true,
-    description: 'Apply smart filter to NICK change events.',
-  },
-  {
-    key: 'chat.smart_filter_join_unmask',
-    label: 'Reveal join when user speaks (minutes)',
-    category: 'chat',
-    group: 'smart-filter',
-    type: 'int',
-    min: 0,
-    max: 1440,
-    default: 30,
-    description:
-      'If a smart-filtered nick speaks within this many minutes after their JOIN, ' +
-      'the JOIN line is revealed. 0 disables unmasking.',
+      'Keep your scroll position when you send a message, instead of jumping to ' +
+      'the newest message. For reading back through a busy channel while still ' +
+      'replying — your own line lands at the bottom and the "Return ↓" button ' +
+      'counts it, so you can drop back down when you are ready. Off (the default) ' +
+      'jumps to the bottom on every send. Sending while you are viewing a ' +
+      'jumped-to point in history returns you to the live conversation either ' +
+      'way, since that view holds live messages back and there is nowhere in it ' +
+      'for your own message to appear.',
   },
 
   // ─── Inline media viewer ──────────────────────────────────────────────
@@ -880,6 +1050,44 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'When enabled, clicking a link to an image, video, audio file, or .txt opens it ' +
       'in an in-app viewer instead of a new browser tab. Cmd/Ctrl-click always opens ' +
       'in a new tab.',
+  },
+
+  // ─── Inline media & link previews ─────────────────────────────────────
+  //
+  // Two keys rather than one, because wanting one does not imply wanting the
+  // other. Seeing the screenshots your friends paste is a different appetite
+  // from having every news article sprout a card, and plenty of people want
+  // exactly one of them.
+  //
+  // Both default OFF. Neither is device-split: if you want images inline you
+  // want them inline everywhere. (Contrast `chat.events`, which IS device-split
+  // because screen size genuinely changes the right answer.)
+  {
+    key: 'chat.inline_media.enabled',
+    requiresFeature: 'linkPreviews',
+    label: 'Inline media',
+    category: 'chat',
+    group: 'viewing',
+    type: 'bool',
+    default: false,
+    description:
+      'When enabled, a link that points straight at an image, video, or audio file ' +
+      'renders under the message instead of showing only as a link. The file is fetched ' +
+      'and served by your Lurker server, so the site hosting it never sees your device.',
+  },
+  {
+    key: 'chat.link_previews.enabled',
+    requiresFeature: 'linkPreviews',
+    label: 'Link previews',
+    category: 'chat',
+    group: 'viewing',
+    type: 'bool',
+    default: false,
+    description:
+      'When enabled, a link to a web page renders a small card with its title, ' +
+      'description, and thumbnail. Your Lurker server fetches the page — your device ' +
+      'never contacts the site. Video links get a play button, and nothing is sent to ' +
+      'the video host until you press it.',
   },
 
   // ─── Connection ───────────────────────────────────────────────────────
@@ -1210,6 +1418,9 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
   },
 
   {
+    // Same key names the contacts-era friend-online settings used: stored
+    // user_settings rows were orphaned (never purged) when the friends system
+    // left, so re-registering the names revives every preference untouched.
     key: 'notifications.friend_online.enabled',
     label: 'Friend online notifications',
     category: 'notifications',
@@ -1217,9 +1428,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     type: 'bool',
     default: true,
     description:
-      'Toast me when a friend I have flagged "notify when online" comes online. ' +
-      'The per-friend toggle (in the Configure Friend dialog) is the opt-in; this ' +
-      'is the global master.',
+      'Toast me when a friend — the peer of a DM in your FRIENDS section — comes online.',
   },
   {
     key: 'notifications.friend_online.sound.enabled',
@@ -1433,6 +1642,74 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'work either way.',
   },
 
+  // ─── Theme presets (pointer keys) ─────────────────────────────────────
+  // Which theme preset drives the `themed` appearance keys. Category `theme`
+  // is deliberately absent from CATEGORIES (like `system`): these render in
+  // the bespoke Themes section of the Appearance pane, not as raw rows. The
+  // stored value of the three pointer keys is a theme id — 'dark' / 'light'
+  // for the built-ins, or the decimal row id of a saved /api/themes theme. A
+  // pointer at a theme that no longer exists resolves as the built-in Dark
+  // theme (the client resolver falls back; the themes DELETE route also
+  // resets any pointer it dangles). None of these are `themed` — see the
+  // BaseOption note; a themed pointer would make resolution recursive.
+  {
+    key: 'look.theme.mode',
+    label: 'Theme selection mode',
+    category: 'theme',
+    group: 'presets',
+    type: 'enum',
+    choices: ['single', 'system'],
+    // Ascribed because TS unions every literal in REGISTRY: a second distinct
+    // choiceLabels key-set makes each other's keys optional-undefined, which the
+    // Record<string, string> index signature rejects.
+    choiceLabels: {
+      single: 'One theme everywhere',
+      system: 'Follow system light/dark',
+    } as Readonly<Record<string, string>>,
+    default: 'single',
+    description:
+      'How the active theme preset is chosen. "single" uses the one theme set ' +
+      'in look.theme.active everywhere. "system" follows this device\'s ' +
+      'light/dark preference: look.theme.light applies when the OS is in ' +
+      'light mode, look.theme.dark when it is in dark mode. The preference is ' +
+      'read per device, so a phone in light mode and a desktop in dark mode ' +
+      'each get their assigned theme from the same synced settings.',
+  },
+  {
+    key: 'look.theme.active',
+    label: 'Active theme',
+    category: 'theme',
+    group: 'presets',
+    type: 'string',
+    default: 'dark',
+    description:
+      'The theme preset in effect when look.theme.mode is "single": "dark", ' +
+      '"light", or the id of a saved theme. Applying a theme sets this and ' +
+      'clears any per-setting overrides so the theme shows unmodified.',
+  },
+  {
+    key: 'look.theme.light',
+    label: 'Light-mode theme',
+    category: 'theme',
+    group: 'presets',
+    type: 'string',
+    default: 'light',
+    description:
+      'The theme preset used while this device reports a light color scheme, ' +
+      'when look.theme.mode is "system". "dark", "light", or a saved theme id.',
+  },
+  {
+    key: 'look.theme.dark',
+    label: 'Dark-mode theme',
+    category: 'theme',
+    group: 'presets',
+    type: 'string',
+    default: 'dark',
+    description:
+      'The theme preset used while this device reports a dark color scheme, ' +
+      'when look.theme.mode is "system". "dark", "light", or a saved theme id.',
+  },
+
   // ─── System / locale ──────────────────────────────────────────────────
   {
     key: 'system.timezone',
@@ -1475,6 +1752,24 @@ export function defaultsAsObject(): Record<string, SettingValue> {
   return out;
 }
 
+/** The keys a theme preset snapshots, in registry order. */
+export const THEMED_KEYS: readonly string[] = Object.freeze(
+  REGISTRY.filter((opt) => opt.themed).map((opt) => opt.key),
+);
+
+/**
+ * Registry defaults for just the themed keys — the built-in Dark theme's
+ * values. Arrays are copied: REGISTRY's freeze is shallow, so handing out the
+ * live default arrays would let any consumer mutate the registry in place.
+ */
+export function themedDefaults(): Record<string, SettingValue> {
+  const out: Record<string, SettingValue> = {};
+  for (const opt of REGISTRY) {
+    if (opt.themed) out[opt.key] = Array.isArray(opt.default) ? [...opt.default] : opt.default;
+  }
+  return out;
+}
+
 // ─── Sidebar taxonomy ─────────────────────────────────────────────────────
 //
 // Ordered list of categories shown in the Settings sidebar. `kind: 'registry'`
@@ -1490,8 +1785,16 @@ export function defaultsAsObject(): Record<string, SettingValue> {
 // personal → meta. Sidebar renders top-to-bottom; the first category is also
 // the redirect target when navigating to bare /settings.
 export const CATEGORIES: readonly SettingCategory[] = Object.freeze([
-  { id: 'appearance', label: 'Appearance', kind: 'registry' },
+  // Bespoke only for the leading Themes section (AppearancePane.vue); the
+  // registry rows still render beneath it via the embedded RegistryPane.
+  { id: 'appearance', label: 'Appearance', kind: 'bespoke' },
   { id: 'chat', label: 'Chat', kind: 'registry' },
+  // Everything about join/part/quit/nick/host-change/mode lines: whether you see
+  // them at all, how they're folded, and how much detail each carries. Split out
+  // of Chat (#666) because the tier turned three loosely-related groups into one
+  // subject with a single primary control, and that subject is big enough to
+  // stop being a tail on a category about composing and reading messages.
+  { id: 'events', label: 'Events', kind: 'registry' },
   { id: 'input', label: 'Input bar', kind: 'registry' },
   // Bespoke: the pane leads with the configured-uploader list + picker (which is
   // table-backed, not registry-backed) and renders the surviving registry rows
@@ -1529,9 +1832,10 @@ export const GROUPS: Readonly<Record<string, string>> = Object.freeze({
   nicks: 'Nick coloring',
   layout: 'Layout',
   misc: 'Misc',
-  consolidate: 'Join/part consolidation',
+  'event-filter': 'Filter',
+  consolidate: 'Consolidation',
   composing: 'Composing',
-  'smart-filter': 'Smart filter',
+  'smart-filter': 'Smart filter tuning',
   connection: 'Connection',
   ctcp: 'CTCP replies',
   'auto-away': 'Auto-away',

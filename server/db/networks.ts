@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import db from './index.js';
+import { ensureServerBuffer, invalidateCasemappingCache } from './buffers.js';
 import { encryptSecret, decryptSecret } from '../utils/secretCrypto.js';
 import { ENCRYPTED_NETWORK_COLUMNS } from './exportSchema.js';
 
@@ -37,6 +38,19 @@ export interface Network {
   sasl_password: string | null;
   connect_commands: string | null;
   position: number;
+  /** ISUPPORT CASEMAPPING as last declared by the server (#707); null until
+   *  the network first connects to one that declares it. Server-captured
+   *  (stored by db/refoldBuffers inside the refold transaction), deliberately
+   *  not part of NetworkFields — a PATCH body must not be able to plant a
+   *  fold rule the registry wasn't rewritten under.
+   *
+   *  Typed `string | null`, NOT the Casemapping union, on purpose: this
+   *  mirrors the raw column, which archive import writes verbatim — so an
+   *  archive from a newer Lurker could legally hold a value this build
+   *  doesn't know. The union lives at the read boundary
+   *  (buffers.networkCasemapping normalizes, unknown → null = legacy fold)
+   *  and at the sole writer (refoldNetworkBuffers takes Casemapping). */
+  casemapping: string | null;
   created_at: string;
   // Most recent browser IP that established/holds this connection (FXNet WEBIRC).
   // NULL until a client IP is observed; then forwarded via WEBIRC on connect.
@@ -125,6 +139,10 @@ export function createNetwork(userId: number, fields: NetworkFields): Network | 
       encryptSecret(connect_commands || null),
       next,
     );
+  // The network's `:server:` buffer is a real registry row (kind 'server',
+  // schema 17) — minted with the network so its console history and read
+  // pointer have an id from the first event.
+  ensureServerBuffer(Number(result.lastInsertRowid));
   return getNetwork(result.lastInsertRowid, userId);
 }
 
@@ -172,6 +190,10 @@ export function updateNetwork(
 
 export function deleteNetwork(id: number, userId: number): void {
   db.prepare('DELETE FROM networks WHERE id = ? AND user_id = ?').run(id, userId);
+  // SQLite may hand a future network this id (rowid reuse); a cached
+  // CASEMAPPING surviving the row would fold the newcomer's targets with the
+  // dead network's rule.
+  invalidateCasemappingCache(id);
 }
 
 // Record the latest browser IP for a network so the next connect can forward it

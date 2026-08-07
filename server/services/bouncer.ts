@@ -49,7 +49,7 @@ import { verifyPassword, hashPassword } from './password.js';
 import { hashToken, findActiveByHash, touchLastUsed } from '../db/apiTokens.js';
 import { listNetworksForUser } from '../db/networks.js';
 import type { Network } from '../db/networks.js';
-import { closedFoldedSetForNetwork } from '../db/buffers.js';
+import { closedFoldedSetForNetwork, foldTargetFor } from '../db/buffers.js';
 import {
   listMessages,
   listBuffersForNetwork,
@@ -66,6 +66,7 @@ import {
   certFingerprint,
   keyMatchesCert,
 } from '../utils/bouncerCert.js';
+import { isChannelTarget } from '../../shared/channels.js';
 
 const SERVER_NAME = 'lurker.bouncer';
 
@@ -461,7 +462,7 @@ export function isValidServerTime(s: string): boolean {
 type ChatBound = { star: true } | { iso: string };
 
 function isChannelName(target: string): boolean {
-  return target.startsWith('#') || target.startsWith('&');
+  return isChannelTarget(target);
 }
 
 // Network-services pseudo-users (NickServ/ChanServ/…). Playback replays their
@@ -1061,7 +1062,10 @@ class BouncerSession {
   }
 
   private verifyUser(username: string, secret: string): User | null {
-    const user = findUserByUsername(username) ?? findUserByUsername(username.toLowerCase());
+    // findUserByUsername folds case itself now, so the old explicit
+    // lowercase retry (IRC clients routinely lowercase the SASL username) is
+    // no longer needed.
+    const user = findUserByUsername(username);
     const storedHash = user ? getPasswordHash(user.id) : null;
     // Always run exactly one scrypt (against a dummy hash when the user is
     // unknown or has no password) so login latency can't reveal whether the
@@ -1300,11 +1304,17 @@ class BouncerSession {
     const isBetween = sub === 'BETWEEN';
     const limit = this.parseChatHistoryLimit(sub, msg.params[isBetween ? 4 : 3] ?? '');
     if (limit === null) return;
-    const bound0 = this.parseChatHistoryBound(sub, msg.params[2] || '', sub === 'LATEST', 'first');
+    const bound0 = this.parseChatHistoryBound(
+      sub,
+      target,
+      msg.params[2] || '',
+      sub === 'LATEST',
+      'first',
+    );
     if (!bound0) return;
     let bound1: ChatBound | null = null;
     if (isBetween) {
-      bound1 = this.parseChatHistoryBound(sub, msg.params[3] || '', false, 'second');
+      bound1 = this.parseChatHistoryBound(sub, target, msg.params[3] || '', false, 'second');
       if (!bound1) return;
     }
     const rows = this.loadChatHistory(sub, target, bound0, bound1, limit);
@@ -1323,8 +1333,11 @@ class BouncerSession {
     // buffers registry this path enumerated straight from messages and offered
     // conversations the user had closed everywhere else.
     const closed = closedFoldedSetForNetwork(this.networkId);
+    // The set holds target_folded values — per-network folds since #707, so
+    // the probe must fold the same way or a closed 'foo[m]' (stored 'foo{m}'
+    // on an rfc1459 network) slips past and gets re-offered.
     const targets = listActiveTargetsInWindow(this.networkId, isoA, isoB, limit).filter(
-      (t) => !closed.has(t.target.toLowerCase()),
+      (t) => !closed.has(foldTargetFor(this.networkId, t.target)),
     );
     this.withBatch('draft/chathistory-targets', [], (ref) => {
       const tag = ref ? `@batch=${ref} ` : '';
@@ -1393,17 +1406,42 @@ class BouncerSession {
   // Parse a CHATHISTORY selector — `*` (LATEST only) or `timestamp=<iso>`. msgid
   // selectors are deliberately rejected (see the ChatBound type). Writes a FAIL
   // and returns null on error.
+  //
+  // The spec separates two failure modes and we honor the distinction, because a
+  // client probing for msgid support reads the code to decide what to do next:
+  //   INVALID_MSGREFTYPE — a well-formed `<reftype>=<value>` we don't implement.
+  //     Retrying with different syntax will never help; use timestamp instead.
+  //   INVALID_PARAMS — the selector is malformed (unparseable timestamp value, or
+  //     not a `key=value` selector at all). A syntax error the client can fix.
+  // Reporting the first as the second is a lie that hides the real reason, and
+  // it's the kind of thing a conformance-minded onlooker checks.
+  //
+  // The two codes also take DIFFERENT parameter layouts, which is easy to get
+  // wrong: INVALID_MSGREFTYPE is `<command> <target> [context]` while
+  // INVALID_PARAMS is `<command> [timestamp]` with NO target. So `target` is
+  // only ever emitted on the msgreftype path. TARGETS has no target argument at
+  // all and passes '*', keeping the parameter count stable so a client reading
+  // positionally can't mistake the bound for a buffer name.
   private parseChatHistoryBound(
     sub: string,
+    target: string,
     boundStr: string,
     allowStar: boolean,
     which: 'first' | 'second',
   ): ChatBound | null {
     if (allowStar && boundStr === '*') return { star: true };
     const eq = boundStr.indexOf('=');
-    if (eq !== -1 && boundStr.slice(0, eq) === 'timestamp') {
-      const val = boundStr.slice(eq + 1);
-      if (isValidServerTime(val)) return { iso: val };
+    const reftype = eq === -1 ? '' : boundStr.slice(0, eq);
+    if (reftype && reftype !== 'timestamp') {
+      // Known-shaped selector, unsupported type — `msgid=` today. We advertise
+      // MSGREFTYPES=timestamp; see the ChatBound notes for why msgid isn't there.
+      this.write(
+        `:${SERVER_NAME} FAIL CHATHISTORY INVALID_MSGREFTYPE ${sub} ${target || '*'} ${boundStr} :Unsupported message reference type`,
+      );
+      return null;
+    }
+    if (reftype === 'timestamp' && isValidServerTime(boundStr.slice(eq + 1))) {
+      return { iso: boundStr.slice(eq + 1) };
     }
     this.write(
       `:${SERVER_NAME} FAIL CHATHISTORY INVALID_PARAMS ${sub} ${boundStr} :Invalid ${which} bound`,
@@ -1412,7 +1450,8 @@ class BouncerSession {
   }
 
   private parseTimestampBound(boundStr: string, which: 'first' | 'second'): string | null {
-    const bound = this.parseChatHistoryBound('TARGETS', boundStr, false, which);
+    // TARGETS takes no target argument — '*' holds the slot (see parseChatHistoryBound).
+    const bound = this.parseChatHistoryBound('TARGETS', '*', boundStr, false, which);
     return bound && 'iso' in bound ? bound.iso : null;
   }
 
@@ -1475,7 +1514,10 @@ class BouncerSession {
     const dms = listBuffersForNetwork(this.networkId)
       .filter((b) => !isChannelName(b.target) && !b.target.startsWith(':server:'))
       .filter((b) => !joined.has(b.target.toLowerCase()))
-      .filter((b) => !closed.has(b.target.toLowerCase()))
+      // Fold like the set was built (per-network target_folded, #707) — the
+      // legacy lowercase probe replays closed DMs on every attach once the
+      // folds diverge, the exact pre-registry regression this filter stops.
+      .filter((b) => !closed.has(foldTargetFor(this.networkId, b.target)))
       .slice(0, PLAYBACK_MAX_DM_BUFFERS);
     for (const b of dms) targets.push({ target: b.target, isChannel: false });
 

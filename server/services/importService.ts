@@ -30,9 +30,21 @@ import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { Statement, RunResult } from 'better-sqlite3';
 import db from '../db/index.js';
 import { EXPORT_TABLES, EXPORT_FORMAT_VERSION, IMPORT_ORDER } from '../db/exportSchema.js';
+import { isBuiltinThemeId, THEME_POINTER_KEYS } from '../../shared/themePresets.js';
+import themesService from './themesService.js';
 import { encryptSecret } from '../utils/secretCrypto.js';
-import { importRow as importBufferRow } from '../db/buffers.js';
+import {
+  importRow as importBufferRow,
+  reopen as reopenBuffer,
+  ensureServerBuffer,
+  ensureSystemBuffer,
+  foldTargetFor,
+  invalidateCasemappingCache,
+} from '../db/buffers.js';
+import { resolveBuffer } from '../db/bufferResolve.js';
 import { listBufferTargets, hasMessageForTarget } from '../db/messages.js';
+import { resolveOrMintForInsert } from '../db/bufferResolve.js';
+import { migrateSmartFilterToEventMode } from '../db/migrateEventMode.js';
 import ignoreRulesService from './ignoreRulesService.js';
 import type { IgnorePatternKind } from '../db/ignoredMasks.js';
 
@@ -178,6 +190,34 @@ function dependsOnMessages(def: ExportTableDefFull): boolean {
   return !!(def.fkRekey && Object.values(def.fkRekey).includes('messages'));
 }
 
+// The buffer_id-keyed view-state tables (schema 18). Only these get the
+// v1-archive name→id derivation below.
+const SATELLITE_BUFFER_TABLES = new Set([
+  'buffer_reads',
+  'input_history',
+  'pinned_buffers',
+  'nicklist_collapsed',
+  'channel_notify_settings',
+  'user_drafts',
+]);
+
+/** Resolve an archive row's (networkId, target) — already mapped to THIS
+ *  install's network id — to a buffer id. Sentinel targets mint/attach to
+ *  this install's own consoles. */
+function resolveArchiveBufferId(
+  userId: number,
+  networkId: number | null,
+  target: string,
+): number | undefined {
+  if (!target) return undefined;
+  if (target.startsWith(':')) {
+    if (networkId == null || target === ':system:') return ensureSystemBuffer(userId).id;
+    return ensureServerBuffer(networkId)?.id;
+  }
+  if (networkId == null) return undefined;
+  return resolveBuffer(userId, networkId, target)?.id;
+}
+
 // Insert all rows of one data.json table, building its id map for FK rekeying.
 // Caller runs this inside a transaction.
 function insertTable(
@@ -204,9 +244,45 @@ function insertTable(
 
     // target_folded is derived state (the registry's one folded lookup key);
     // recompute rather than trusting the archive so a hand-edited or corrupted
-    // file can't plant a row the folded lookups will never find.
+    // file can't plant a row the folded lookups will never find. Folded
+    // per-network (#707): network_id is already rekeyed and networks import
+    // before buffers, so the just-imported casemapping governs — a legacy
+    // toLowerCase here would write folds the message import's own resolver
+    // then misses, minting duplicate buffers mid-restore (and colliding
+    // outright on ascii-network case-twins), while the healing refold never
+    // runs because the imported mapping makes the next connect a no-op.
     if (table === 'buffers') {
-      row.target_folded = String(row.target ?? '').toLowerCase();
+      row.target_folded = foldTargetFor(
+        (row.network_id as number | null) ?? null,
+        String(row.target ?? ''),
+      );
+      // Sentinel rows (:system:, :server:<id>) are install-local: the target
+      // account already owns its :system: row (minted at account creation —
+      // inserting the archive's copy violates idx_buffers_key), and an
+      // archived ':server:<oldNetId>' target embeds the SOURCE install's
+      // network id, which nothing on this install will ever ask for. The
+      // target install mints its own sentinels on first use.
+      if (String(row.target ?? '').startsWith(':')) continue;
+    }
+
+    // v1-archive fallback for the buffer_id-keyed view-state tables: pre-v2
+    // rows carry (network_id, target) instead of buffer_id. Derive it against
+    // the already-imported registry (Phase A puts `buffers` before all of
+    // these) — the old network id maps through idMaps.networks explicitly,
+    // since most of these tables no longer declare network_id as a column.
+    // ':'-prefixed targets route to this install's own sentinels, which is
+    // strictly better than v1-era behavior: an archived server-console read
+    // pointer used to strand under ':server:<oldNetId>'; now it lands on the
+    // network's real console. Unresolvable rows drop, same as any unmapped FK.
+    if (SATELLITE_BUFFER_TABLES.has(table) && row.buffer_id === undefined) {
+      const target = typeof original.target === 'string' ? original.target : '';
+      const oldNet = original.network_id;
+      const mappedNet =
+        oldNet == null ? null : (idMaps.networks?.get(oldNet) as number | undefined);
+      if (oldNet != null && mappedNet === undefined) continue; // network wasn't imported
+      row.buffer_id = resolveArchiveBufferId(targetUserId, mappedNet ?? null, target);
+      if (row.buffer_id === undefined) continue;
+      if (table === 'pinned_buffers' && row.network_id == null) row.network_id = mappedNet;
     }
 
     // Export carries at-rest secrets (network passwords, +k channel keys) as
@@ -248,6 +324,56 @@ function insertTable(
       const mapped = idMaps.uploader_config?.get(oldId);
       if (mapped === undefined) continue;
       row.value = JSON.stringify(mapped);
+    }
+
+    // Same in-VALUE rewrite for the theme pointers: their value is a user_themes
+    // row id as a decimal STRING (or a built-in id, which travels as-is). A
+    // pointer whose theme didn't survive the trip drops and falls back to its
+    // registry default — the resolver treats that as the built-in Dark theme.
+    if (
+      table === 'user_settings' &&
+      typeof row.key === 'string' &&
+      THEME_POINTER_KEYS.includes(row.key)
+    ) {
+      let oldId: unknown;
+      try {
+        oldId = JSON.parse(String(row.value));
+      } catch {
+        continue;
+      }
+      if (typeof oldId !== 'string') continue;
+      if (!isBuiltinThemeId(oldId)) {
+        // Only a canonical decimal string is a pointer. '012' or '2e0' never
+        // resolved on any client (exact-string byId), so rewriting them through
+        // Number() would turn a dead value into a live pointer.
+        const n = Number(oldId);
+        if (!Number.isInteger(n) || String(n) !== oldId) continue;
+        const mapped = idMaps.user_themes?.get(n);
+        if (mapped === undefined) continue;
+        row.value = JSON.stringify(String(mapped));
+      }
+    }
+
+    // Saved themes route through the service (same reasoning as ignored_masks
+    // below): a crafted/edited archive must not plant what POST /api/themes
+    // would 400 — non-themed keys, type-invalid values, reserved/over-long
+    // names, rows past the cap, or case-twin names that would abort the whole
+    // import on the NOCASE UNIQUE constraint. An invalid theme drops alone;
+    // its pointer rewrite above then misses and the pointer falls back to the
+    // built-in Dark theme.
+    if (table === 'user_themes') {
+      let values: unknown;
+      try {
+        values = JSON.parse(String(row.values_json));
+      } catch {
+        continue;
+      }
+      const result = themesService.create(row.user_id as number, { name: row.name, values });
+      if (!result.ok) continue;
+      idMaps.user_themes ??= new Map();
+      idMaps.user_themes.set(original.id, result.theme.id);
+      inserted += 1;
+      continue;
     }
 
     // Route ignore rules through the service rather than a raw INSERT, so a
@@ -308,16 +434,22 @@ function convertLegacyBuffers(
   if (!networkMap || (!legacyChannels.length && !legacyClosed.length && !networkMap.size)) return;
 
   let converted = 0;
-  // A: every imported message target becomes an open row.
+  // A: every imported message target becomes an open row. The message stream
+  // already minted these rows (insertMessage's defensive mint materializes
+  // unknown targets CLOSED so it can never conjure a surfaced buffer), and
+  // importRow's conflict policy deliberately never flips closed→open — so the
+  // "message targets are open" rule is applied with an explicit reopen. The
+  // closed_buffers pass below still wins last, exactly as before.
   for (const newNetworkId of networkMap.values()) {
     for (const target of listBufferTargets(newNetworkId as number)) {
-      if (target.startsWith(':')) continue; // virtual buffers are never rows
+      if (target.startsWith(':')) continue; // sentinel rows keep their own state
       importBufferRow({
         userId: targetUserId,
         networkId: newNetworkId as number,
         target,
         state: 'open',
       });
+      reopenBuffer(targetUserId, newNetworkId as number, target);
       converted += 1;
     }
   }
@@ -363,7 +495,15 @@ async function streamMessagesInBatches(
   idMaps: Record<string, Map<unknown, unknown>>,
 ): Promise<number> {
   const def = EXPORT_TABLES.messages as ExportTableDefFull;
-  const { stmt, cols } = buildInsertStatement('messages', def);
+  // buffer_id is not an archive column (archives carry names; ids are
+  // install-local), but the live table's invariant is "never NULL" — an
+  // imported row with a NULL buffer_id would be invisible to every id-keyed
+  // read. Stamped per row below, resolved against the already-imported
+  // buffers rows (IMPORT_ORDER puts `buffers` in Phase A, before messages);
+  // anything a legacy archive fails to resolve gets the same defensive
+  // closed-mint the insert path uses.
+  const defWithBufferId = { ...def, columns: [...def.columns, 'buffer_id'] };
+  const { stmt, cols } = buildInsertStatement('messages', defWithBufferId);
   const messagesMap = idMaps.messages;
   let inserted = 0;
 
@@ -391,6 +531,7 @@ async function streamMessagesInBatches(
       // is NOT NULL. Default to 1 (notable), matching the column default: old
       // history predates the server-buffer notability model, so it all counts.
       if (row.notable === undefined) row.notable = 1;
+      row.buffer_id = resolveOrMintForInsert(row.network_id as number, String(row.target ?? ''));
       const result = insertOne(stmt, cols, row);
       messagesMap.set(original.id, result.lastInsertRowid);
       inserted += 1;
@@ -420,18 +561,21 @@ async function streamMessagesInBatches(
 // we clear them explicitly. Must cover every importable user-scoped root in
 // EXPORT_TABLES.
 function resetImportedData(userId: number): void {
+  // The buffers import folds through the casemapping cache mid-transaction,
+  // and the rollback that lands us here reverts sqlite_sequence — so the
+  // rolled-back network ids (cached with the rolled-back mappings) are
+  // exactly the ids the next createNetwork or retried import will mint.
+  // A stale hit there folds new rows under a dead network's rule AND makes
+  // the healing refold's stored===declared compare read the lie. Clear it
+  // all; the cache is lazy and refills on first use.
+  invalidateCasemappingCache();
   const wipe = db.transaction(() => {
     db.prepare('DELETE FROM networks WHERE user_id = ?').run(userId);
     db.prepare('DELETE FROM highlight_rules WHERE user_id = ?').run(userId);
     db.prepare('DELETE FROM user_settings WHERE user_id = ?').run(userId);
+    db.prepare('DELETE FROM user_themes WHERE user_id = ?').run(userId);
     db.prepare('DELETE FROM upload_history WHERE user_id = ?').run(userId);
     db.prepare('DELETE FROM user_away_state WHERE user_id = ?').run(userId);
-    // Contacts are a user-scoped import root: contact_targets cascade away with
-    // the networks above, but the contacts rows themselves only cascade on user
-    // delete, so wipe them here too. Otherwise a failed-then-retried import
-    // re-inserts every contact (accountIsEmpty only counts networks), leaving
-    // duplicated, target-less friends.
-    db.prepare('DELETE FROM contacts WHERE user_id = ?').run(userId);
     // Network-scoped buffers cascade with networks above, but an app-scoped row
     // (network_id NULL — the reserved system/server kinds) only cascades on
     // user delete; without this a failed-then-retried import of an archive
@@ -528,8 +672,12 @@ export async function importFromZipFile(
       // ---- Phase A: data.json tables that don't depend on messages (one tx). ----
       db.transaction(() => {
         // Fresh accounts usually have an auto-synced system.timezone row; wipe
-        // before insert — import replaces, doesn't merge.
+        // before insert — import replaces, doesn't merge. Same for saved
+        // themes: accountIsEmpty only checks networks, so a zero-network
+        // account can still hold themes whose names would collide with the
+        // archive's on the NOCASE UNIQUE constraint (or silently merge).
         db.prepare('DELETE FROM user_settings WHERE user_id = ?').run(targetUserId);
+        db.prepare('DELETE FROM user_themes WHERE user_id = ?').run(targetUserId);
         for (const table of IMPORT_ORDER) {
           const def = EXPORT_TABLES[table as keyof typeof EXPORT_TABLES] as
             | ExportTableDefFull
@@ -592,6 +740,14 @@ export async function importFromZipFile(
         // history. Modern archives skip this (their buffers table imported in
         // Phase A).
         convertLegacyBuffers(data, idMaps, counts, targetUserId);
+
+        // An archive taken before #666 carries a live `chat.smart_filter` row,
+        // which the boot migration has already retired everywhere else — so
+        // importing one reintroduces a key nothing reads, and the user's smart
+        // filtering silently reverts to "show everything" until the next restart
+        // happens to re-run it. Idempotent and self-terminating, so calling it
+        // here just converts whatever this import brought in.
+        migrateSmartFilterToEventMode(db);
       })();
     } catch (err) {
       resetImportedData(targetUserId);

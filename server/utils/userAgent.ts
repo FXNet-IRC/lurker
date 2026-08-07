@@ -24,6 +24,8 @@ const contact = (process.env.USER_AGENT_CONTACT || DEFAULT_CONTACT).trim();
 
 export const APP_NAME = 'Lurker';
 export const APP_VERSION: string = pkg.version;
+/** Where an operator whose logs we show up in should complain. May be blank. */
+export const USER_AGENT_CONTACT: string = contact;
 
 // Used as the HTTP User-Agent header on outbound requests to upload providers
 // and any future external service. Format follows the conventional

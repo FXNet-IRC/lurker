@@ -46,6 +46,17 @@ describe('POST /api/auth/setup/password', () => {
     expect(res.status).toBe(400);
   });
 
+  it('rejects a username with a space', async () => {
+    // The tightening: a space in a stored username makes 'bob smith', 'bobsmith'
+    // and 'Bob Smith' three lookalike accounts, and it can't survive into the
+    // identd ident either.
+    const res = await testRequest(app).post('/api/auth/setup/password').send({
+      username: 'bob smith',
+      password: 'longenoughpw',
+    });
+    expect(res.status).toBe(400);
+  });
+
   it('rejects too-short passwords', async () => {
     const res = await testRequest(app).post('/api/auth/setup/password').send({
       username: 'firstadmin',
@@ -105,6 +116,35 @@ describe('login / logout / me', () => {
       .send({ username: 'firstadmin', password: '' });
     expect(r1.status).toBe(400);
     expect(r2.status).toBe(400);
+  });
+
+  it('logs in regardless of the case typed', async () => {
+    // 'FirstAdmin' is the same account as 'firstadmin' — case is not identity.
+    const res = await testRequest(app).post('/api/auth/login/password').send({
+      username: 'FIRSTADMIN',
+      password: 'longenoughpw',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.user.username).toBe('firstadmin');
+  });
+
+  it('accepts a grandfathered username with a space at the login prompt', async () => {
+    // Such an account can no longer be CREATED, but one that already exists must
+    // still be able to authenticate — a 400 here would lock a real user out of
+    // their own instance with no recourse but SQL.
+    const db = (await import('../db/index.js')).default;
+    const { setPasswordHash, findUserByUsername } = await import('../db/users.js');
+    const { hashPassword } = await import('../services/password.js');
+    db.prepare('INSERT INTO users (username, role) VALUES (?, ?)').run('legacy user', 'user');
+    const legacy = findUserByUsername('legacy user')!;
+    setPasswordHash(legacy.id, hashPassword('longenoughpw'));
+
+    const res = await testRequest(app).post('/api/auth/login/password').send({
+      username: 'legacy user',
+      password: 'longenoughpw',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.user.username).toBe('legacy user');
   });
 
   it('valid password login issues a session cookie', async () => {

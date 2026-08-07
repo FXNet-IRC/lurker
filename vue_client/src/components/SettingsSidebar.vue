@@ -101,7 +101,8 @@
 import { ref, computed, watch, nextTick } from 'vue';
 import { useRouter } from 'vue-router';
 import type { SettingCategory } from '../../../shared/settingsRegistry.js';
-import { REGISTRY, CATEGORIES } from '../utils/settingsRegistry.js';
+import { REGISTRY, CATEGORIES, optionVisible } from '../utils/settingsRegistry.js';
+import { useConfigStore } from '../stores/config.js';
 
 const props = defineProps<{
   activeCategoryId: string;
@@ -120,17 +121,30 @@ interface SettingsSubsection {
 }
 
 const router = useRouter();
+const config = useConfigStore();
 const searchInput = ref('');
 const searchEl = ref<HTMLInputElement | null>(null);
 
 const searchActive = computed(() => searchInput.value.trim().length > 0);
 
-// Build the searchable index once: every registry entry, tagged with its
-// resolved category label for breadcrumb display. Bespoke-only state (highlight
-// rule lists, ignore masks, push subscriptions) is intentionally NOT searchable
-// — that's list data, not settings.
-const SEARCH_INDEX = REGISTRY.filter((opt) => CATEGORIES.some((c) => c.id === opt.category)).map(
-  (opt) => {
+// The searchable index: every registry entry, tagged with its resolved category label for
+// breadcrumb display. Bespoke-only state (highlight rule lists, ignore masks, push
+// subscriptions) is intentionally NOT searchable — that's list data, not settings.
+//
+// ⚠ A computed, not a module-scope const, because it has to apply the same `optionVisible`
+// rule the panes and `/set` do — and the feature flags it depends on arrive from /api/config
+// AFTER this module is evaluated. Built once at import time it both ignored the rule and
+// couldn't have honoured it: settings for a feature the instance doesn't have stayed
+// searchable, and picking one navigated to a pane where the row does not exist.
+const searchIndex = computed(() =>
+  REGISTRY.filter(
+    (opt) =>
+      CATEGORIES.some((c) => c.id === opt.category) &&
+      optionVisible(opt, {
+        isNode: config.isNode,
+        features: { linkPreviews: config.linkPreviews },
+      }),
+  ).map((opt) => {
     const cat = CATEGORIES.find((c) => c.id === opt.category);
     return {
       key: opt.key,
@@ -139,14 +153,14 @@ const SEARCH_INDEX = REGISTRY.filter((opt) => CATEGORIES.some((c) => c.id === op
       categoryId: opt.category,
       categoryLabel: cat?.label || opt.category,
     };
-  },
+  }),
 );
 
 const searchResults = computed(() => {
   const q = searchInput.value.trim().toLowerCase();
   if (!q) return [];
   const out = [];
-  for (const row of SEARCH_INDEX) {
+  for (const row of searchIndex.value) {
     let score = 0;
     if (row.label.toLowerCase().includes(q)) score = 3;
     else if (row.description.toLowerCase().includes(q)) score = 2;

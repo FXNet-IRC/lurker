@@ -53,11 +53,21 @@ function valuesEqual(a: SettingValue, b: SettingValue): boolean {
 }
 
 class SettingsService extends EventEmitter {
-  // changes: { [key]: rawValue }
-  // Returns { ok: true, values } on full success or { ok: false, error, key } on first invalid entry.
+  // changes: { [key]: rawValue }; resets: keys to delete outright (theme apply
+  // clears every themed override alongside its pointer write, atomically).
+  // Returns { ok: true, values } on full success or { ok: false, error, key } on
+  // the first invalid entry — nothing is written on a validation failure.
+  //
+  // The emitted event carries both shapes: `changes` includes a { key: default }
+  // entry for every deleted key (the pre-resets frame older clients understand),
+  // and `resets` names the deleted keys explicitly. The web client applies
+  // changes then resets, so for a themed key the two are distinguishable:
+  // "override equal to the registry default" stays an override, "reset" removes
+  // the row. Under a non-default theme those render differently.
   update(
     userId: number,
     changes: Record<string, unknown>,
+    resets: string[] = [],
   ): { ok: false; error: string; key: string } | { ok: true; values: Record<string, unknown> } {
     const validated: Record<string, SettingValue> = {};
     for (const [key, raw] of Object.entries(changes)) {
@@ -65,18 +75,34 @@ class SettingsService extends EventEmitter {
       if (!result.ok) return { ok: false, error: result.error, key };
       validated[key] = result.value;
     }
+    for (const key of resets) {
+      if (!getOption(key)) return { ok: false, error: `unknown setting: ${key}`, key };
+    }
+    const deleted = new Set<string>();
+    for (const key of resets) {
+      deleteUserSetting(userId, key);
+      deleted.add(key);
+    }
     for (const [key, value] of Object.entries(validated)) {
       const opt = getOption(key);
-      // Setting a key back to its default is semantically "no override";
-      // drop the row so isModified() reflects that everywhere.
-      if (opt && valuesEqual(value, opt.default)) {
+      // Setting a key back to its default is semantically "no override"; drop
+      // the row so isModified() reflects that everywhere. EXCEPT themed keys:
+      // their fallback is the active theme, not the registry default, so on a
+      // non-default theme "set it to the default color" is a real override —
+      // dropping it would silently re-theme the value (a default is not a
+      // statement). Themed rows only leave via an explicit reset.
+      if (opt && !opt.themed && valuesEqual(value, opt.default)) {
         deleteUserSetting(userId, key);
+        deleted.add(key);
       } else {
         setUserSetting(userId, key, value);
+        deleted.delete(key);
       }
     }
-    if (Object.keys(validated).length > 0) {
-      this.emit('event', { userId, changes: validated });
+    if (Object.keys(validated).length > 0 || deleted.size > 0) {
+      const eventChanges: Record<string, SettingValue> = { ...validated };
+      for (const key of deleted) eventChanges[key] = getOption(key)!.default;
+      this.emit('event', { userId, changes: eventChanges, resets: [...deleted] });
     }
     return { ok: true, values: getUserSettings(userId) };
   }
@@ -88,7 +114,7 @@ class SettingsService extends EventEmitter {
     const opt = getOption(key);
     if (!opt) return { ok: false, error: `unknown setting: ${key}` };
     deleteUserSetting(userId, key);
-    this.emit('event', { userId, changes: { [key]: opt.default } });
+    this.emit('event', { userId, changes: { [key]: opt.default }, resets: [key] });
     return { ok: true, values: getUserSettings(userId) };
   }
 }

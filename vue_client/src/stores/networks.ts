@@ -74,7 +74,7 @@ export const useNetworksStore = defineStore('networks', {
     // Presence row for a (network, nick), disconnected-aware: a down network's
     // cached rows are stale, so report a synthetic 'offline'. Connected with no
     // row stays null (unknown = "potentially online", the no-MONITOR case).
-    // Single source of truth for the sidebar, status bar, profile, and Friends.
+    // Single source of truth for the sidebar, status bar, and profile.
     peerFor:
       (state) =>
       (networkId: number | string, nick: string): PeerPresenceEntry | null => {
@@ -85,10 +85,10 @@ export const useNetworksStore = defineStore('networks', {
       },
     activeBuffer(state): ActiveBuffer | null {
       if (!state.activeKey) return null;
-      // Virtual buffers (:system:, :friends:) use a flat sentinel key (no `::`).
+      // Virtual buffers (:system:) use a flat sentinel key (no `::`).
       // They have no IRC send target, so report "no IRC buffer active" — the
-      // views drive their own header/rendering. Friends still renders messages
-      // via buffers.byKey(activeKey) directly, not through this getter.
+      // views drive their own header/rendering; the system buffer still renders
+      // messages via buffers.byKey(activeKey) directly, not through this getter.
       if (isVirtualKey(state.activeKey)) return null;
       if (!state.activeKey.includes('::')) return null;
       const [networkId, name] = state.activeKey.split('::');
@@ -156,12 +156,31 @@ export const useNetworksStore = defineStore('networks', {
       if (useAuthStore().isPaused) return;
       await api(`/api/networks/${id}/reconnect`, { method: 'POST' });
     },
+    // Lifecycle hooks (lib/bufferLifecycle.ts): the active pointer follows a
+    // rename and clears on a close.
+    dropBuffer(networkId: number | string | null, target: string) {
+      const k = networkId == null ? target : `${networkId}::${target}`;
+      if (this.activeKey === k) this.activeKey = null;
+    },
+    rekeyBuffer(networkId: number | string | null, from: string, to: string) {
+      const fromKey = networkId == null ? from : `${networkId}::${from}`;
+      if (this.activeKey === fromKey) {
+        this.activeKey = networkId == null ? to : `${networkId}::${to}`;
+      }
+    },
     setActive(networkId: number | string | null, target: string) {
       // The app-scoped system buffer (#355) has no network — it keys on the bare
       // sentinel target, matching the buffers store's key() helper.
       this.activeKey = networkId == null ? target : `${networkId}::${target}`;
     },
-    // Virtual buffers (system console, friends) aren't tied to an IRC network.
+    // Leave no buffer active WITHOUT closing anything — the buffer stays in the
+    // store and the list. Exists for backing out of an optimistically created
+    // buffer (#744): it has no server row id, so no URL can name it, and "back
+    // to the list" can only be expressed by clearing the active pointer.
+    clearActive() {
+      this.activeKey = null;
+    },
+    // Virtual buffers (the system console) aren't tied to an IRC network.
     // They use a flat sentinel key (no `::`) so the existing
     // `${networkId}::${target}` parsers ignore them.
     activateVirtual(key: string) {

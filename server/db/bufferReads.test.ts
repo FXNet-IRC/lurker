@@ -21,6 +21,28 @@ beforeAll(async () => {
   bufferReads = await import('./bufferReads.js');
   user = createUser('br-alice');
   net = createNetwork(user.id, { name: 'libera', host: 'h', port: 6697, tls: true, nick: 'a' });
+  // Read state is keyed by buffer_id (schema 18): a target only has state if
+  // the registry knows the buffer, so the fixtures mint every target used.
+  const { ensureExists } = await import('./buffers.js');
+  for (const t of [
+    '#a',
+    '#again',
+    '#b',
+    '#bad',
+    '#c',
+    '#empty',
+    '#has',
+    '#mixed',
+    '#mixed2',
+    '#mono',
+    '#never-cleared',
+    '#read-only',
+    '#undo',
+    '#vanish',
+    '#x',
+  ]) {
+    ensureExists(user.id, net!.id, t);
+  }
 });
 
 afterAll(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
@@ -60,27 +82,33 @@ describe('system buffer read pointer (null network_id, #355)', () => {
     expect(bufferReads.setReadState(user.id, null, ':system:', 10)).toBe(30);
   });
 
-  it('upserts a single row rather than duplicating (coalesced unique index)', async () => {
+  it('upserts a single row rather than duplicating (buffer_id primary key)', async () => {
     const u = createUser('br-sys-dedupe');
     bufferReads.setReadState(u.id, null, ':system:', 5);
     bufferReads.setReadState(u.id, null, ':system:', 9);
     const db = (await import('./index.js')).default;
     const row = db
       .prepare(
-        "SELECT COUNT(*) AS n FROM buffer_reads WHERE user_id = ? AND network_id IS NULL AND target = ':system:'",
+        `SELECT COUNT(*) AS n FROM buffer_reads r JOIN buffers b ON b.id = r.buffer_id
+         WHERE r.user_id = ? AND b.kind = 'system'`,
       )
       .get(u.id) as { n: number };
     expect(row.n).toBe(1);
     expect(bufferReads.getReadState(u.id, null, ':system:')).toBe(9);
   });
 
-  it('is independent of a network buffer with the same target name', () => {
+  it("a network-scoped ':system:' is not a buffer and stores nothing", () => {
+    // The old composite key could hold a per-network row under the ':system:'
+    // NAME — a shape nothing in production writes (wsHub always maps the
+    // system target to a null network). Under buffer_id keying that shape is
+    // unrepresentable: the write is a no-op and the app-scoped pointer is
+    // untouched.
     const u = createUser('br-sys-iso');
     const n = createNetwork(u.id, { name: 'lib', host: 'h', port: 6697, tls: true, nick: 'a' });
     bufferReads.setReadState(u.id, null, ':system:', 100);
-    bufferReads.setReadState(u.id, n!.id, ':system:', 7);
+    expect(bufferReads.setReadState(u.id, n!.id, ':system:', 7)).toBe(0);
     expect(bufferReads.getReadState(u.id, null, ':system:')).toBe(100);
-    expect(bufferReads.getReadState(u.id, n!.id, ':system:')).toBe(7);
+    expect(bufferReads.getReadState(u.id, n!.id, ':system:')).toBe(0);
   });
 });
 

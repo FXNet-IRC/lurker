@@ -35,6 +35,51 @@ describe('createUser / findUser', () => {
     users.createUser('dupe-target');
     expect(() => users.createUser('dupe-target')).toThrow(/UNIQUE constraint failed/);
   });
+
+  it('uniqueness is CASE-INSENSITIVE at the schema level too', () => {
+    // The DB index is the backstop for any path that forgets to call
+    // usernameTaken — 'Casey' and 'casey' must not be two accounts.
+    users.createUser('casey');
+    expect(() => users.createUser('CASEY')).toThrow(/UNIQUE constraint failed/);
+  });
+});
+
+describe('findUserByUsername is case-insensitive', () => {
+  it('finds an account regardless of the case typed', () => {
+    const u = users.createUser('MixedCase');
+    expect(users.findUserByUsername('mixedcase')!.id).toBe(u.id);
+    expect(users.findUserByUsername('MIXEDCASE')!.id).toBe(u.id);
+    expect(users.findUserByUsername('MixedCase')!.id).toBe(u.id);
+  });
+
+  it('returns undefined for a genuinely unknown name', () => {
+    expect(users.findUserByUsername('nobody-here')).toBeUndefined();
+  });
+});
+
+describe('usernameTaken', () => {
+  it('answers case-insensitively so signup cannot mint a case-twin', () => {
+    users.createUser('Claimed');
+    expect(users.usernameTaken('claimed')).toBe(true);
+    expect(users.usernameTaken('CLAIMED')).toBe(true);
+    expect(users.usernameTaken('unclaimed')).toBe(false);
+  });
+});
+
+describe('listGrandfatheredUsernames', () => {
+  it('names a legacy username with a space', async () => {
+    // Inserted straight past the route validation, which is exactly how such a
+    // row got there: it was legal when it was created.
+    const db = (await import('./index.js')).default;
+    db.prepare('INSERT INTO users (username, role) VALUES (?, ?)').run('legacy name', 'user');
+    const flagged = users.listGrandfatheredUsernames();
+    expect(flagged.find((f) => f.username === 'legacy name')?.why).toMatch(/space/);
+  });
+
+  it('says nothing about accounts that already conform', () => {
+    const flagged = users.listGrandfatheredUsernames();
+    expect(flagged.find((f) => f.username === 'plain-user')).toBeUndefined();
+  });
 });
 
 describe('countUsers / countAdmins', () => {

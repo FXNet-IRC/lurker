@@ -70,9 +70,37 @@ function parseDuration(s: string | undefined): number | null {
   const mult = DURATION_MULT[(m[2] || 's').toLowerCase()];
   if (mult == null) return null;
   const ms = parseInt(m[1], 10) * mult;
-  if (!Number.isFinite(ms) || ms > MAX_DURATION_MS) return null;
+  // Zero is rejected rather than taken literally: `-time 0` expires the rule at
+  // the instant it is created, so it is reported as added, never matches, and —
+  // having no index in the listing — can only be removed by mask until the
+  // sweeper notices. A permanent ignore is `-time` omitted.
+  if (ms <= 0 || !Number.isFinite(ms) || ms > MAX_DURATION_MS) return null;
   return ms;
 }
+
+// Whether a token is a bare unit word — what `-time 7 days` splits into.
+function isDurationUnit(token: string): boolean {
+  return DURATION_MULT[token.toLowerCase()] != null;
+}
+
+// The flags this grammar knows. `-pattern` refuses to take one as its value:
+// otherwise `/ignore bob -pattern -network` stores a rule matching the literal
+// text "-network" AND silently drops the scope, making global the rule the user
+// had just scoped to one connection. Only known flags are refused, so a pattern
+// may still begin with a dash.
+const FLAGS = new Set([
+  '-regexp',
+  '-regex',
+  '-full',
+  '-word',
+  '-except',
+  '-network',
+  '-net',
+  '-global',
+  '-replies',
+  '-pattern',
+  '-time',
+]);
 
 // Turn a duration string (e.g. "7 days", "30m") into an ISO expiry timestamp,
 // or null if it doesn't parse. Same grammar as the -time flag, exported so the
@@ -144,6 +172,9 @@ export function parseIgnoreArgs(argLine: string, now: number = Date.now()): Pars
   const subLevels: string[] = [];
   const channels: string[] = [];
   let mask: string | null = null;
+  // Whether an explicit `*` (or an empty token) claimed the mask slot — "anyone",
+  // said on purpose, as against never naming a subject at all.
+  let sawAnyone = false;
   let sawRegexp = false;
   let sawFull = false;
 
@@ -177,11 +208,25 @@ export function parseIgnoreArgs(argLine: string, now: number = Date.now()): Pars
     if (lower === '-pattern') {
       const val = tokens[++i];
       if (val === undefined) return fail('-pattern needs a value');
+      if (FLAGS.has(val.toLowerCase())) return fail(`-pattern needs a value (got the flag ${val})`);
       base.pattern = val;
       continue;
     }
     if (lower === '-time') {
-      const val = tokens[++i];
+      let val = tokens[++i];
+      // `7 days` typed without quotes arrives as two tokens. Taking only the
+      // first makes `/ignore -time 7 days` a SEVEN-SECOND rule whose mask is the
+      // word "days" — which then lapses and leaves no trace of what happened.
+      // The pair is unambiguous (a bare count followed by a unit word), so join
+      // it and read the line the way it was written.
+      if (
+        val !== undefined &&
+        /^\d+$/.test(val) &&
+        tokens[i + 1] &&
+        isDurationUnit(tokens[i + 1])
+      ) {
+        val = `${val} ${tokens[++i]}`;
+      }
       const ms = parseDuration(val);
       if (ms == null) return fail(`invalid -time value: ${val ?? '(missing)'}`);
       base.expiresAt = new Date(now + ms).toISOString();
@@ -192,6 +237,14 @@ export function parseIgnoreArgs(argLine: string, now: number = Date.now()): Pars
     if (t.startsWith('-') && t.length > 1) {
       const lvl = canonicalLevel(t.slice(1));
       if (lvl) {
+        // `-ALL` reads as "everything except everything", and resolving it below
+        // produces the MAXIMUM hide set: the base expands ALL to its concrete
+        // members first, so the removal loop then looks for a token that is no
+        // longer in the set and takes nothing off. Refuse it — `PUBLIC -PUBLIC`
+        // already fails with "no levels remain", and this is the same request.
+        if (lvl === 'ALL') {
+          return fail("-ALL isn't a level to subtract — name what to keep, or drop the rule");
+        }
         subLevels.push(lvl);
         continue;
       }
@@ -209,8 +262,18 @@ export function parseIgnoreArgs(argLine: string, now: number = Date.now()): Pars
       continue;
     }
 
-    if (mask === null) {
-      mask = t === '*' ? null : t;
+    if (mask === null && !sawAnyone) {
+      // `*` is "anyone", which the matcher spells as no mask at all — and so are
+      // an empty quoted token (`/ignore ""`) and a whitespace-only one
+      // (`/ignore " "`), both of which `parseIgnoreInput`'s strOrNull nulls on
+      // the way in. Normalizing all three here keeps the rule the client shows
+      // the same as the one the server stores; `" "` previously survived as a
+      // mask, was nulled server-side, and became a rule hiding everyone.
+      const trimmed = t.trim();
+      // Remembered, because "the user asked for everyone" and "the user named
+      // nobody" both leave `mask` null and only the second is a mistake.
+      if (trimmed === '*' || trimmed === '') sawAnyone = true;
+      else mask = trimmed;
       continue;
     }
     return fail(`unexpected argument: ${t}`);
@@ -219,6 +282,13 @@ export function parseIgnoreArgs(argLine: string, now: number = Date.now()): Pars
   base.patternKind = sawRegexp ? 'regex' : sawFull ? 'full' : 'substr';
   base.mask = mask;
   base.channels = channels.length ? channels : null;
+  // A whitespace-only pattern is nulled by strOrNull server-side, and a null
+  // pattern WIDENS the rule from "hide what they say about X" to "hide
+  // everything they say" — so trim here and treat empty as absent.
+  if (base.pattern != null) {
+    const trimmed = base.pattern.trim();
+    base.pattern = trimmed === '' ? null : trimmed;
+  }
 
   // Resolve the level set. Additive tokens form the base; with none given the
   // base is ALL. Subtractive tokens expand ALL to its concrete members first,
@@ -232,6 +302,34 @@ export function parseIgnoreArgs(argLine: string, now: number = Date.now()): Pars
     for (const s of subLevels) levelSet.delete(s);
   }
   if (levelSet.size === 0) return fail('no levels remain');
+
+  // A rule that names no subject — no mask, no channel, no content — hides EVERY
+  // message from everyone, on every network if it's global. That is occasionally
+  // what someone means, so the escape hatch is to say it: `/ignore * JOINS` is
+  // explicit and passes. What's refused is arriving there by accident, which
+  // several ordinary lines do: `/ignore -network` sent by a stray Return,
+  // `/ignore -time 1d`, or `/ignore Quit`, where a nick that happens to spell a
+  // level token is consumed as the level (levels are read before masks) leaving
+  // the rule with no subject at all. `ignoreRulesService.add` deliberately
+  // declines to stop this, since by then the intent is unrecoverable.
+  if (mask === null && channels.length === 0 && !base.pattern && !sawAnyone) {
+    return fail(
+      'that names nobody to ignore — try /ignore <nick>, or /ignore * <levels> for everyone',
+    );
+  }
+
+  // A `-regexp` pattern is compiled here, where the engine is the same one the
+  // matcher will use. Without it the rule reaches the server, `add` refuses it
+  // ("invalid regex"), and `wsHub`'s add-ignore drops that failure with a bare
+  // `break` and no reply — so an unclosed bracket looks like it worked and the
+  // rule simply never exists.
+  if (sawRegexp && base.pattern) {
+    try {
+      void new RegExp(base.pattern);
+    } catch (e) {
+      return fail(`invalid regex: ${(e as Error).message}`);
+    }
+  }
 
   // Canonical order + dedupe for a stable stored CSV.
   base.levels = canonicalizeLevels([...levelSet]);

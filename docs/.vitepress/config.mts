@@ -25,6 +25,14 @@ export default defineConfig({
     nav: [
       { text: 'Guide', link: '/guide/' },
       { text: 'Self-Hosting', link: '/SELF_HOSTING' },
+      {
+        text: 'Developers',
+        items: [
+          { text: 'Client Protocol & API', link: '/CLIENT_PROTOCOL' },
+          { text: 'MCP & HTTP API', link: '/MCP' },
+          { text: 'IRCv3 Support', link: '/IRCV3' },
+        ],
+      },
       { text: 'App', link: 'https://app.lurker.chat' },
     ],
     sidebar: {
@@ -47,7 +55,15 @@ export default defineConfig({
           items: [
             { text: 'Self-Hosting Lurker', link: '/SELF_HOSTING' },
             { text: 'Deploy on DigitalOcean', link: '/digitalocean' },
+          ],
+        },
+        {
+          text: 'Developers',
+          items: [
+            { text: 'Client Protocol & API', link: '/CLIENT_PROTOCOL' },
+            { text: 'Client Migration: 1.1.x → 2.0', link: '/MIGRATION_2_0' },
             { text: 'MCP & HTTP API', link: '/MCP' },
+            { text: 'IRCv3 Support', link: '/IRCV3' },
           ],
         },
       ],

@@ -26,7 +26,7 @@ import type Database from 'better-sqlite3';
 // actually used = the case you joined/opened with), ties broken by `target ASC`
 // purely for determinism. A target that never drifted (a single case) maps to
 // itself and is left untouched, so #idleRPG stays #idleRPG. The flat ':'-virtual
-// buffers (`:server:`, `:friends:`…) are never folded. Composite-PK tables merge
+// buffers (`:server:`…) are never folded. Composite-PK tables merge
 // conflict-aware (furthest read pointer + clear marker, joined flag, junk-close
 // dropped). The whole apply runs in one transaction; dryRun computes the same
 // report without mutating.
@@ -72,6 +72,14 @@ export interface FoldReport {
 // Tables keyed by a per-buffer `target` column (channels live in `channels.name`,
 // handled separately). Order matters only for readability; each fold is
 // independent.
+//
+// The fold runs against whatever SHAPE the given db actually has: it's called
+// from the schemaVersion<9 and <16 blocks (every table below still name-keyed
+// there), but the v18 rebuild moves the view-state satellites onto buffer_id
+// keys — on a migrated database only `messages.target` (an insert-time log)
+// and any lingering legacy tables remain foldable, and the per-table guards
+// below skip the rest. Case forks in the id-keyed world are two `buffers`
+// rows, which merge via the rename machinery, not this fold.
 const TARGET_TABLES = [
   'messages',
   'input_history',
@@ -111,6 +119,19 @@ export function foldBufferCase(
         WHERE c.network_id = ${t}.network_id AND c.lkey = lower(${t}.target)
           AND c.canon <> ${t}.target)`;
 
+  // A table participates only while it exists AND still carries a `target`
+  // column (a missing table's PRAGMA returns no rows, so both collapse to one
+  // check). See the TARGET_TABLES comment — the v18 rebuild retires the
+  // satellites' name columns.
+  const hasTargetColumn = (t: string): boolean =>
+    (db.prepare(`PRAGMA table_info(${t})`).all() as Array<{ name: string }>).some(
+      (c) => c.name === 'target',
+    );
+  const foldable = TARGET_TABLES.filter(hasTargetColumn);
+  const hasChannelsTable = !!db
+    .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'channels'`)
+    .get();
+
   const work = (): FoldReport => {
     // Connection-local temp table; drop defensively in case a prior run in this
     // same connection left one behind.
@@ -134,22 +155,24 @@ export function foldBufferCase(
     const rowsAffected: Record<string, number> = {};
     let forks: FoldGroup[] = [];
     if (wantReport) {
-      for (const t of TARGET_TABLES) {
+      for (const t of foldable) {
         rowsAffected[t] = (
           db.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE ${needsFold(t)}`).get() as { n: number }
         ).n;
       }
-      rowsAffected['channels'] = (
-        db
-          .prepare(
-            `SELECT COUNT(*) AS n FROM channels
+      if (hasChannelsTable) {
+        rowsAffected['channels'] = (
+          db
+            .prepare(
+              `SELECT COUNT(*) AS n FROM channels
                WHERE ${pred('name')} AND EXISTS (
                  SELECT 1 FROM _buf_canon c
                  WHERE c.network_id = channels.network_id AND c.lkey = lower(channels.name)
                    AND c.canon <> channels.name)`,
-          )
-          .get() as { n: number }
-      ).n;
+            )
+            .get() as { n: number }
+        ).n;
+      }
 
       const variantRows = db
         .prepare(
@@ -190,7 +213,9 @@ export function foldBufferCase(
     if (!dryRun) {
       // id-keyed (target not unique) — straight rewrite. messages_fts only indexes
       // text, so the AFTER UPDATE trigger reindexes identical text (harmless).
-      for (const t of ['messages', 'input_history']) {
+      for (const t of ['messages', 'input_history'].filter((t) =>
+        foldable.includes(t as (typeof TARGET_TABLES)[number]),
+      )) {
         db.exec(`UPDATE ${t} SET target = ${canonExpr(t)} WHERE ${needsFold(t)}`);
       }
 
@@ -199,7 +224,8 @@ export function foldBufferCase(
       // drop the off-case variant. Carrying `key` here is essential — without it
       // the merge would strip the channel key off a case-forked keyed channel
       // and it would fail to auto-rejoin after the next reconnect.
-      db.exec(`
+      if (hasChannelsTable) {
+        db.exec(`
         INSERT INTO channels (network_id, name, joined, created_at, key)
           SELECT ch.network_id, c.canon, ch.joined, ch.created_at, ch.key
           FROM channels ch JOIN _buf_canon c
@@ -210,16 +236,18 @@ export function foldBufferCase(
           created_at = MIN(channels.created_at, excluded.created_at),
           key = COALESCE(channels.key, excluded.key)
       `);
-      db.exec(`
+        db.exec(`
         DELETE FROM channels WHERE ${pred('name')} AND EXISTS (
           SELECT 1 FROM _buf_canon c
           WHERE c.network_id = channels.network_id AND c.lkey = lower(channels.name)
             AND c.canon <> channels.name)
       `);
+      }
 
       // buffer_reads: composite PK. Merge keeping the furthest read pointer and any
       // clear marker, then drop the variant so nothing resurfaces as unread.
-      db.exec(`
+      if (foldable.includes('buffer_reads')) {
+        db.exec(`
         INSERT INTO buffer_reads
           (user_id, network_id, target, last_read_message_id, updated_at,
            cleared_before_message_id, cleared_at)
@@ -243,11 +271,14 @@ export function foldBufferCase(
             THEN excluded.cleared_at ELSE buffer_reads.cleared_at END,
           updated_at = MAX(buffer_reads.updated_at, excluded.updated_at)
       `);
-      db.exec(`DELETE FROM buffer_reads WHERE ${needsFold('buffer_reads')}`);
+        db.exec(`DELETE FROM buffer_reads WHERE ${needsFold('buffer_reads')}`);
+      }
 
       // closed_buffers: a stray-cased row was the junk buffer the user closed; the
       // canonical buffer's own open/closed state wins, so drop the off-case rows.
-      db.exec(`DELETE FROM closed_buffers WHERE ${needsFold('closed_buffers')}`);
+      if (foldable.includes('closed_buffers')) {
+        db.exec(`DELETE FROM closed_buffers WHERE ${needsFold('closed_buffers')}`);
+      }
 
       // Remaining per-(user, network, target) state: move to canon, or drop if a
       // canon row already exists (its state wins).
@@ -256,14 +287,15 @@ export function foldBufferCase(
         'nicklist_collapsed',
         'channel_notify_settings',
         'user_drafts',
-      ]) {
+      ].filter((t) => foldable.includes(t as (typeof TARGET_TABLES)[number]))) {
         db.exec(`UPDATE OR IGNORE ${t} SET target = ${canonExpr(t)} WHERE ${needsFold(t)}`);
         db.exec(`DELETE FROM ${t} WHERE ${needsFold(t)}`);
       }
 
       // Keep pin positions dense per (user, network): a dropped duplicate pin can
       // leave a gap, and reorderPins assumes 0..n-1 (same fix as schemaVersion 7).
-      db.exec(`
+      if (foldable.includes('pinned_buffers')) {
+        db.exec(`
         WITH renum AS (
           SELECT user_id, network_id, target,
                  ROW_NUMBER() OVER (
@@ -278,6 +310,7 @@ export function foldBufferCase(
             AND renum.target = pinned_buffers.target
         )
       `);
+      }
     }
 
     db.exec(`DROP TABLE _buf_canon`);

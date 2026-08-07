@@ -64,6 +64,7 @@
       Imports replace nothing — the target account must be empty. Sign in to the new instance as a
       fresh user, then drop the .zip file here.
     </p>
+    <p v-if="tooLargeMessage" class="error inline">{{ tooLargeMessage }}</p>
     <p v-if="importError" class="error inline">{{ importError }}</p>
     <p v-if="importNotice" class="muted small">{{ importNotice }}</p>
 
@@ -76,7 +77,7 @@
         <span class="muted small">({{ formatBytes(chosenFile.size) }})</span>
       </div>
       <div class="actions">
-        <button class="link" :disabled="importing || !confirmed" @click="onImport">
+        <button class="link" :disabled="importing || !confirmed || tooLarge" @click="onImport">
           {{ importing ? `importing… ${progress}%` : 'import' }}
         </button>
         <button v-if="!importing" class="link danger" @click="onCancelFile">cancel</button>
@@ -99,6 +100,9 @@ import { useDataExportStore } from '../../stores/dataExport.js';
 interface ExportPreview {
   settingsOnly: Record<string, number>;
   withMessages: { messages: number };
+  // The largest archive this instance can actually receive — the 500 MB limit,
+  // lowered to whatever proxy sits in front of it (#649).
+  maxImportBytes?: number;
 }
 
 const router = useRouter();
@@ -140,6 +144,28 @@ const importNotice = ref('');
 const importing = ref(false);
 const progress = ref(0);
 const confirmed = ref(false);
+
+// An archive this instance can't receive (#649). Derived, not set once at pick
+// time: `preview` arrives asynchronously while the file input is already
+// interactive, so a file chosen before it lands would otherwise disable the
+// import button with no explanation of why — a dead end whose only exit is
+// cancel. As a computed, the message appears the moment the cap is known.
+//
+// A cap we never learned (the preview fetch failed) means no client-side gate,
+// which is a graceful degradation rather than a hole: the server enforces the
+// same number and now answers with a real 413 naming it (#649) instead of the
+// edge reset that made this worth pre-flighting in the first place.
+const tooLarge = computed(() => {
+  const cap = preview.value?.maxImportBytes;
+  return Boolean(cap && chosenFile.value && chosenFile.value.size > cap);
+});
+const tooLargeMessage = computed(() =>
+  tooLarge.value
+    ? `This archive is ${formatBytes(chosenFile.value!.size)}, but this instance can ` +
+      `only accept ${formatBytes(preview.value!.maxImportBytes!)}. Uploading it would ` +
+      `fail partway through.`
+    : '',
+);
 
 // `users` is always 1 (the row representing the caller); excluding it so a
 // brand-new account with no real activity reads as 0 small rows instead of 1.
@@ -188,6 +214,8 @@ function onFileChosen(e: Event) {
   importError.value = '';
   importNotice.value = '';
   confirmed.value = false;
+  // The over-limit warning is NOT set here — see tooLargeMessage. It has to
+  // survive `preview` landing after the file was picked.
 }
 
 function onCancelFile() {

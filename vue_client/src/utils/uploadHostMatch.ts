@@ -20,9 +20,16 @@ export type MediaKind = 'image' | 'video' | 'audio' | 'text';
 // links, not a gate on uploads: a .webm or .flac someone pastes from elsewhere plays
 // perfectly well in a browser, and refusing to show it because *we* can't yet scrub its
 // metadata (#553) would be enforcing our upload policy on other people's links.
+// ⚠ `.3gp`/`.3g2` sit under video even though the ones we see most are audio-only
+// (a Samsung voice memo — see contentClass.ts). Two reasons: the container sniffs as
+// `video/3gpp` and can legitimately carry a picture, and the failure modes aren't
+// symmetric — a <video> element playing audio-only content still plays it, just with a
+// black frame, while an <audio> element on a real 3gp clip would silently drop the
+// video. It also keeps them consistent with `.mp4`, which already renders through
+// <video> when it happens to be audio-only.
 const EXTENSIONS: Record<MediaKind, readonly string[]> = {
   image: ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif', '.bmp'],
-  video: ['.mp4', '.mov', '.m4v', '.webm'],
+  video: ['.mp4', '.mov', '.m4v', '.webm', '.3gp', '.3g2'],
   audio: ['.mp3', '.m4a', '.ogg', '.oga', '.wav', '.flac'],
   text: ['.txt'],
 };

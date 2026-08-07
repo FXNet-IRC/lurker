@@ -54,6 +54,7 @@ function makeConn(): IrcConnection {
       sasl_password: null,
       connect_commands: null,
       position: 0,
+      casemapping: null,
       created_at: new Date().toISOString(),
       last_client_ip: null,
     },
@@ -70,6 +71,8 @@ describe('outbound encrypt (ircManager.send)', () => {
       publish,
       client: { user: { nick: 'alice' } },
       supportsMultiline: () => false,
+      echoActive: () => false,
+      noteSentCiphertext: () => {},
       flushE2eRekeys: () => {},
     } as unknown as IrcConnection;
     vi.spyOn(ircManager, 'getConnection').mockReturnValue(fakeConn);
@@ -107,6 +110,8 @@ describe('outbound encrypt (ircManager.send)', () => {
       publish,
       client: { user: { nick: 'alice' } },
       supportsMultiline: () => false,
+      echoActive: () => false,
+      noteSentCiphertext: () => {},
       flushE2eRekeys: () => {},
     } as unknown as IrcConnection;
     vi.spyOn(ircManager, 'getConnection').mockReturnValue(fakeConn);
@@ -307,6 +312,7 @@ describe('egress refuses cleartext actions/notices on an E2E channel (#2)', () =
       notice,
       publish,
       publishEphemeral,
+      echoActive: () => false,
       client: { user: { nick: 'alice' } },
     } as unknown as IrcConnection;
     return { conn, action, notice, publishEphemeral };

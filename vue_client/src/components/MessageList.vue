@@ -16,7 +16,15 @@
          throwing off the prepend anchor math or (with browser anchoring)
          leaving scrollTop near the top so maybeRequestHistory cascades. -->
     <div v-if="!buffer?.hasMoreOlder && messages.length" class="notice">— start of history —</div>
-    <p v-if="!messages.length" class="notice empty">No messages yet.</p>
+    <!-- Exactly one of these renders when there are no message rows, so the
+         pane is never silently blank: a fetch in flight (or pending — an
+         unhydrated shell awaiting the reconciler) says so, a hydrated-but-
+         empty buffer says so, and the degenerate every-row-filtered-out case
+         (e.g. an inconsistent /clear marker) gets a fallback instead of an
+         empty scroller that looks broken. -->
+    <p v-if="initialLoading" class="notice empty">Loading messages…</p>
+    <p v-else-if="!messages.length" class="notice empty">No messages yet.</p>
+    <p v-else-if="!renderRows.length" class="notice empty">No messages to show.</p>
     <template v-for="row in renderRows" :key="row.key">
       <div v-if="row.divider === 'unread'" :ref="setUnreadDividerEl" class="notice unread-divider">
         <span class="notice-label">unread</span>
@@ -120,6 +128,11 @@
               :network-id="buffer?.networkId ?? null"
               interactive-nicks
               @nick-click="onMentionMenu"
+            />
+            <MessageAttachments
+              v-if="previewsActive && mightHaveLink(row.m?.text)"
+              :text="row.m?.text"
+              @measured="repinAfterPreviewGrowth(true)"
             />
           </span>
           <span class="time">{{ row.continuationTime ? '' : time(row.m?.time) }}</span>
@@ -254,6 +267,23 @@
             <template v-else-if="row.m?.type === 'error'"
               ><LinkedText :text="row.m.text ?? ''"
             /></template>
+            <!-- ⚠ OUTSIDE the v-if/v-else-if chain above, deliberately. Sitting between
+                 RenderSegments and the first `v-else-if` re-parented the ENTIRE event chain
+                 (join/part/quit/kick/…) onto this element's condition instead of
+                 `hasInlineText`. Output was identical only because message|action is a subset
+                 of what hasInlineText covers — so any later edit to the condition here (gating
+                 on a setting, adding `notice`, extracting the component) would have silently
+                 deleted or doubled every event row, from an edit site that gives no hint the
+                 two are connected. -->
+            <MessageAttachments
+              v-if="
+                (row.m?.type === 'message' || row.m?.type === 'action') &&
+                previewsActive &&
+                mightHaveLink(row.m?.text)
+              "
+              :text="row.m?.text"
+              @measured="repinAfterPreviewGrowth(true)"
+            />
           </span>
         </template>
         <div
@@ -317,12 +347,17 @@ import {
   formatDayLabel,
 } from '../utils/timestamp.js';
 import { consolidateRows } from '../utils/consolidate.js';
+import { historyCountBy } from '../lib/historyPaging.js';
 import type { ConsolidationGroup, NickEntry, RenameEntry } from '../../../shared/consolidate.js';
 import { collapseDisplay } from '../utils/collapseDisplay.js';
 import { parseRelayMessage } from '../../../shared/parseRelay.js';
+import { asEventMode, eventModeKey, isNoiseType } from '../../../shared/eventFilter.js';
 import NickRef from './NickRef.vue';
 import LinkedText from './LinkedText.vue';
 import RenderSegments from './RenderSegments.vue';
+import MessageAttachments from './MessageAttachments.vue';
+import { previewRevision } from '../composables/useLinkPreview.js';
+import { useConfigStore } from '../stores/config.js';
 import IgnoreModal from './IgnoreModal.vue';
 import { useMessageActions } from '../composables/useMessageActions.js';
 import type {
@@ -336,6 +371,7 @@ import { useContextMenu, type ContextMenuItem } from '../composables/useContextM
 import { useWhoisStore } from '../stores/whois.js';
 import { addressNick } from '../composables/useComposerOverlay.js';
 import { setViewedBuffer } from '../composables/useViewedBuffer.js';
+import { isChannelTarget } from '../../../shared/channels.js';
 
 // Extended BufferMessage fields accessed in the template and script
 // (beyond the core BufferMessage definition which uses [key: string]: unknown).
@@ -427,6 +463,7 @@ const props = withDefaults(
 const networks = useNetworksStore();
 const buffers = useBuffersStore();
 const settings = useSettingsStore();
+const config = useConfigStore();
 const ignores = useIgnoresStore();
 const highlights = useHighlightRulesStore();
 const relayBots = useRelayBotsStore();
@@ -554,6 +591,19 @@ function setUnreadDividerEl(el: Element | ComponentPublicInstance | null): void 
 const buffer = computed(() => (networks.activeKey ? buffers.byKey(networks.activeKey) : null));
 const messages = computed(() => buffer.value?.messages || []);
 
+// "Loading messages…" vs "No messages yet.": an empty list whose buffer is
+// unhydrated (fresh-connect shell / wiped detach slice) or mid-fetch is
+// LOADING — content exists server-side and a fetch is in flight or will fire
+// as soon as the socket allows (useBufferHydration). Only a hydrated empty
+// buffer is genuinely "no messages". Empty-list-only on purpose: loadingHistory
+// is also true during scrollback paging, where injecting a notice above the
+// viewport would shift scrollTop (see the comment atop the template).
+const initialLoading = computed(() => {
+  const b = buffer.value;
+  if (!b || b.networkId == null || messages.value.length) return false;
+  return b.loadingHistory || b.unseeded || b.pendingRefetch;
+});
+
 const selfLower = computed(() => {
   const b = buffer.value;
   // The app-scoped system buffer has no network (and no self nick).
@@ -569,7 +619,7 @@ const nickSet = computed((): Set<string> => {
     const n = typeof mem === 'string' ? mem : mem.nick;
     if (n) set.add(n);
   }
-  if (b.target && !b.target.startsWith('#') && !b.target.startsWith(':server:')) {
+  if (b.target && !isChannelTarget(b.target) && !b.target.startsWith(':server:')) {
     set.add(b.target);
   }
   const sn = b.networkId != null ? networks.states[b.networkId]?.nick : undefined;
@@ -695,7 +745,7 @@ function onMessageRowClick(e: MouseEvent, m: ChatMessage | undefined | null): vo
 // ─── Nick interactivity (#238) + mode-prefix glyph (#376) ──────────────────
 // Message-list nicks behave exactly like their nicklist entry: a tap (or
 // right-click / long-press) opens the shared member-action menu — Reply, Copy
-// Nickname, whois, DM, note, friend, ignore, and op-gated kick/ban/op/voice.
+// Nickname, whois, DM, note, ignore, and op-gated kick/ban/op/voice.
 // The menu and ignore modal are owned here, mirroring MemberList's pattern.
 const memberActions = useMemberActions();
 const contextMenu = useContextMenu();
@@ -738,7 +788,7 @@ const selfModes = computed<string[]>(() => {
 function authorModes(m: ChatMessage | undefined): string[] | undefined {
   if (!showModePrefix.value || !m?.nick) return undefined;
   const b = buffer.value;
-  if (!b || !b.target?.startsWith('#')) return undefined;
+  if (!b || !isChannelTarget(b.target)) return undefined;
   return nickMember(m.nick)?.modes;
 }
 
@@ -839,7 +889,10 @@ function onMentionMenu(nick: string, e: MouseEvent): void {
   onNickMenu(e, nick);
 }
 
-const smartFilterEnabled = computed(() => !!settings.effective('chat.smart_filter'));
+// The event-noise tier (#666). One enum answers "which presence events survive"
+// for this device class; everything below it only tunes the survivors.
+const eventMode = computed(() => asEventMode(settings.effective(eventModeKey(isMobile.value))));
+const smartFilterEnabled = computed(() => eventMode.value === 'smart');
 const smartFilterDelayMs = computed(
   () => ((settings.effective('chat.smart_filter_delay') as number) || 0) * 60_000,
 );
@@ -850,7 +903,11 @@ const smartFilterJoin = computed(() => !!settings.effective('chat.smart_filter_j
 const smartFilterQuit = computed(() => !!settings.effective('chat.smart_filter_quit'));
 const smartFilterNick = computed(() => !!settings.effective('chat.smart_filter_nick'));
 
-const consolidateEnabled = computed(() => !!settings.effective('chat.consolidate_joins'));
+// At the `none` tier there are no event rows left to fold, so the consolidation
+// pass is skipped outright rather than run over a stream it can't match.
+const consolidateEnabled = computed(
+  () => eventMode.value !== 'none' && !!settings.effective('chat.consolidate_joins'),
+);
 const consolidateMaxNames = computed(
   () => (settings.effective('chat.consolidate_max_names') as number) || 5,
 );
@@ -923,6 +980,7 @@ const renderRows = computed((): RenderRow[] => {
   const out: RenderRow[] = [];
 
   const filterOn = smartFilterEnabled.value && !!buf?.speakers;
+  const hideAllEvents = eventMode.value === 'none';
   const ownNickLc = selfLower.value;
   const delayMs = smartFilterDelayMs.value;
   const unmaskMs = smartFilterUnmaskMs.value;
@@ -987,7 +1045,7 @@ const renderRows = computed((): RenderRow[] => {
 
   const networkId = buf?.networkId;
   const bufTarget = buf?.target ?? '';
-  const bufIsDm = !bufTarget.startsWith('#') && !bufTarget.startsWith(':server:');
+  const bufIsDm = !isChannelTarget(bufTarget) && !bufTarget.startsWith(':server:');
 
   for (let i = 0; i < list.length; i++) {
     // Cast to ChatMessage so template-used properties are typed; BufferMessage
@@ -999,6 +1057,16 @@ const renderRows = computed((): RenderRow[] => {
     // /clear filter (hard hide). Comes first so the divider, when emitted
     // below, lands above every other filter's surviving rows.
     if (clearedBeforeId > 0 && m.id != null && Number(m.id) <= clearedBeforeId) continue;
+
+    // `none` tier (#666): drop every event row outright — including your own,
+    // and including mode changes. Unconditional on purpose: a reader who asked
+    // for no event noise on this device wants none of it, not
+    // none-except-mine. Kicks, topic changes and invites sit outside
+    // NOISE_TYPES and still render, because they are things that happened
+    // rather than churn. Placed with the other hard hides so the rows never
+    // reach the ignore/highlight evaluation below, and so dividers anchor to
+    // the first row the reader can actually see.
+    if (hideAllEvents && isNoiseType(m.type)) continue;
 
     // Render-time ignore filter (issue #301). Self-authored events are never
     // hidden. The matcher gets full event context so level/channel/pattern
@@ -1366,6 +1434,16 @@ function requestMoreHistory() {
   // via fan-out, defeating prependHistory's prepend semantics and creating a
   // visible duplicate. Wait until there's at least one message to anchor on.
   if (!before) return;
+  // /clear boundary: in live view every row with id <= clearedBeforeId is
+  // hidden by the render filter, so a page fetched past the boundary can
+  // never add a VISIBLE row — but ensureViewportFilled's recursion can't see
+  // that: the viewport never fills, so it vacuums the buffer's entire
+  // history into memory one invisible page at a time, and "Show earlier
+  // messages" then renders the whole pile (plus a link-preview mount per
+  // URL) in one frame. Stop at the boundary; unclearing re-enables paging
+  // through the normal scroll path. Detached views ignore the clear filter
+  // (jump-to-message must land on its row), so they page freely.
+  if (!buf.detached && buf.clearedBeforeId > 0 && Number(before) <= buf.clearedBeforeId) return;
   buffers.setLoadingHistory(buf.networkId, buf.target, true);
   socketSend({
     type: 'history',
@@ -1373,6 +1451,7 @@ function requestMoreHistory() {
     target: buf.target,
     before,
     limit: 100,
+    countBy: historyCountBy(),
   });
 }
 
@@ -1397,6 +1476,7 @@ function requestNewerHistory() {
     target: buf.target,
     afterId,
     limit: 100,
+    countBy: historyCountBy(),
   });
 }
 
@@ -1498,6 +1578,22 @@ function scrollToBottom() {
   el.scrollTop = el.scrollHeight;
 }
 
+// Unclearing resets the buffer to the latest chat (the store trims the slice
+// to the newest page) — land the viewport there too. Without this the scroll
+// stays wherever the "Show earlier messages" button was, which after the trim
+// is an arbitrary spot above the tail.
+watch(
+  () => buffer.value?.clearedBeforeId,
+  async (next, prev) => {
+    if ((prev ?? 0) > 0 && (next ?? 0) === 0 && !buffer.value?.detached) {
+      stickToBottom.value = true;
+      setStuckToBottom(true);
+      await nextTick();
+      scrollToBottom();
+    }
+  },
+);
+
 // Away/back markers are emitted from awayState, not from messages.value, so
 // the messages-array watcher below doesn't see them. When the user flips
 // state while pinned to the bottom, follow the new divider down — same
@@ -1528,7 +1624,7 @@ function maybeBumpNewBelow() {
       target: tail.target,
       text: tail.text ?? '',
       type: tail.type,
-      isDm: !tail.target.startsWith('#') && !tail.target.startsWith(':server:'),
+      isDm: !isChannelTarget(tail.target) && !tail.target.startsWith(':server:'),
     });
   if (!tailIgnored && tail?.id != null) bumpNewBelow();
 }
@@ -1558,6 +1654,150 @@ async function pinAnchorRow(el: HTMLElement, anchorId: number, useHeightFallback
   } else if (useHeightFallback) {
     el.scrollTop = el.scrollHeight - oldScrollHeight + oldScrollTop;
   }
+}
+
+// The RESIDUAL preview case, after priming moved resolution to message ingest (see
+// composables/useLinkPreview): a reader scrolling fast enough to outrun the priming request
+// renders a row before its preview is known, and the row grows when it lands.
+//
+// This used to fire on every scroll into history, because resolution was triggered BY
+// rendering — and the compensation walked every row in the buffer reading offsetTop and
+// offsetHeight, forcing a synchronous layout per row. That was QA's "the whole screen is
+// trying to redraw". Priming makes the growth rare; this makes handling it cheap.
+//
+// `overflow-anchor: none` on the scroller (see the CSS) means the browser won't compensate on
+// its own — the same deliberate choice that makes history prepends predictable.
+//
+// BOTH cases need handling, and the previous pass got this wrong. The reasoning then was that
+// growth above the viewport "belongs to the prepend paths that already pin an anchor" — but a
+// prepend's pin runs when the prepend lands, and the previews for that batch resolve a moment
+// LATER. Nothing was covering the gap, which is exactly what QA hit: scroll up, history
+// arrives, previews arrive, position lost.
+//
+// This watcher runs BEFORE the DOM updates (Vue's default 'pre' flush), which is what makes a
+// correction possible at all: `pinAnchorRow` measures the anchor now, awaits the re-render, and
+// puts it back where it was.
+//
+// The anchor is found with elementFromPoint — O(1). Scanning every row for the first visible
+// one, as an earlier version did, read offsetTop/offsetHeight per row and forced a synchronous
+// layout for each; that was QA's "the whole screen is trying to redraw".
+/**
+ * @param afterGrowth true when the growth has ALREADY happened (an image `load` event) rather
+ *   than being about to happen (the pre-flush `previewRevision` watcher).
+ *
+ * ⚠ A post-growth call can only follow the bottom. `pinAnchorRow` works by measuring the
+ * anchor, awaiting the re-render, and restoring — so if the row grew before we were told, it
+ * measures the already-grown position and restores the same scrollTop it started from: a no-op
+ * that reads like a fix. Only the pre-flush path can hold a scrolled-up reader still, which is
+ * why server-provided dimensions matter — they move the growth into that path.
+ */
+async function repinAfterPreviewGrowth(afterGrowth = false) {
+  const el = scroller.value;
+  if (!el) return;
+  if (afterGrowth && !stickToBottom.value) return;
+  if (stickToBottom.value) {
+    // A reader at the live tail wants to follow the growth down, same as a live append.
+    await nextTick();
+    scrollToBottom();
+    return;
+  }
+  const anchorId = topVisibleMessageId(el);
+  if (anchorId != null) await pinAnchorRow(el, anchorId, false);
+}
+
+/**
+ * The id of the message row at the top of the viewport, in constant time.
+ *
+ * `elementFromPoint` asks the browser what it has already laid out rather than re-measuring
+ * anything, so this costs the same whether the buffer holds ten rows or a thousand. A point
+ * just inside the top edge lands on whatever the reader's eye is on; walking up to the nearest
+ * `[data-msg-id]` turns it into the anchor `pinAnchorRow` wants.
+ */
+function topVisibleMessageId(el: HTMLElement): number | null {
+  const box = el.getBoundingClientRect();
+  const hit = document.elementFromPoint(box.left + box.width / 2, box.top + 2);
+  // ⚠ `elementFromPoint` is DOCUMENT-global and knows nothing about this scroller. The media
+  // viewer — which a filmstrip click opens — is `position: fixed; inset: 0` and a plain sibling
+  // of the list, as is every AppModal overlay (search, bookmarks, highlights). With one open the
+  // probe lands on the overlay, `closest()` finds no row, and the sibling walk below wanders
+  // through the overlay's own subtree. Scoped here so an unrelated overlay can't decide where a
+  // scrolled-up reader gets anchored.
+  if (!hit || !el.contains(hit)) return null;
+
+  const idOf = (node: Element | null): number | null => {
+    const raw = (node as HTMLElement | null)?.dataset?.msgId;
+    const id = Number(raw);
+    return raw != null && Number.isFinite(id) && id > 0 ? id : null;
+  };
+
+  // The row under the top edge is often NOT a message: date/unread/away/cleared dividers carry
+  // no `data-msg-id` at all, and a consolidated joins/parts block carries
+  // `data-cons-first-id`/`-last-id` instead. Both are routine at the top of the viewport when
+  // scrolling into history — which is precisely when this correction is needed — so returning
+  // null there silently skipped the re-pin. Walk forward to the next real message instead.
+  const direct = idOf(hit.closest('[data-msg-id]'));
+  if (direct != null) return direct;
+
+  // Walk FORWARD in document order from whatever is at the top edge, rather than measuring.
+  //
+  // ⚠ The obvious version — scanning every row for `offsetTop + offsetHeight > el.scrollTop` —
+  // is wrong here: `offsetTop` is relative to the nearest POSITIONED ancestor, and
+  // `.message-list` sets no `position`, so it carries the scroller's own document offset and the
+  // comparison mixes coordinate spaces. It came out true for row 0 at any realistic scrollTop,
+  // making the "fallback" reliably return the OLDEST row in the buffer. (The prepend code is
+  // safe from this because it only ever uses offsetTop *differences*.)
+  //
+  // Walking siblings needs no measurement at all, is correct by construction, and costs a few
+  // steps instead of a layout read per row.
+  let node: Element | null = hit.closest('.line, .notice');
+  if (!node) {
+    // ⚠ The point landed in the CONTAINER itself, not in a row — routine in compact mode, where
+    // `.line` carries a 10px top margin, so there is a real gap between rows to land in. The
+    // previous fallback (`?? hit`, then `querySelector('[data-msg-id]')`) then searched the
+    // whole list and returned its FIRST row: `pinAnchorRow` restored the identical scrollTop,
+    // which is the "reliably anchors the oldest row" outcome the note below says was designed
+    // out. Find the first row that is actually at or below the viewport top instead, comparing
+    // client rects — the one coordinate space both sides of the comparison agree on.
+    for (const child of el.children) {
+      if (child.getBoundingClientRect().bottom > box.top) {
+        node = child;
+        break;
+      }
+    }
+  }
+  while (node) {
+    const found = idOf(node.matches('[data-msg-id]') ? node : node.querySelector('[data-msg-id]'));
+    if (found != null) return found;
+    node = node.nextElementSibling;
+  }
+  return null;
+}
+
+watch(previewRevision, () => void repinAfterPreviewGrowth());
+
+// ⚠ The re-prime-on-toggle watcher used to live here and could not work: Settings is a separate
+// route, so opening it destroys this component and the watcher, and the remount never sees the
+// flip. It now lives in useSocket, which outlives navigation — see `wirePreviewToggles`.
+
+/**
+ * Whether an attachment could render at all right now.
+ *
+ * ⚠ Checked HERE, at the mount site, rather than only inside MessageAttachments. The component
+ * was mounted once per message row regardless — 500 instances, each building a computed and
+ * running the URL regex — so every user of a default-off feature paid for it on every buffer
+ * switch. Hoisting the gate up also means an unrelated settings write can't invalidate a
+ * per-row computed 500 times over.
+ */
+const previewsActive = computed(
+  () =>
+    config.linkPreviews &&
+    (settings.effective('chat.inline_media.enabled') === true ||
+      settings.effective('chat.link_previews.enabled') === true),
+);
+
+/** Cheap pre-filter: no scheme, no possible attachment. Skips the regex for most rows. */
+function mightHaveLink(text: string | null | undefined): boolean {
+  return !!text && text.includes('://');
 }
 
 // Watch the messages array shape so we can react to:
@@ -1883,6 +2123,80 @@ defineExpose({ scrollByPage });
 // the jump, which is the main reason a *delivered* jump fails to scroll on mobile.
 const SCROLL_RETRY_FRAMES = 60;
 
+// How long to keep the jump target centred after the first scroll.
+//
+// Landing on the row isn't enough. A jump renders a whole slice at once, and
+// this pane deliberately disables browser scroll anchoring (see overflow-anchor
+// below — it picks bad anchors when older history prepends). So as images and
+// wrapped text ABOVE the target finish resolving, everything below shifts down
+// while scrollTop stays put, and the row the user asked for drifts off screen.
+// Re-centre while that settles.
+//
+// Measured on device, not assumed: a jump into a 1870-event slice took 74
+// corrections before it stopped moving. A smaller slice took none — which is
+// why the drift only showed up sometimes, and why it can't be reasoned away.
+const SCROLL_HOLD_MS = 1200;
+// Don't fight sub-pixel noise, do fix a row that has moved meaningfully.
+const SCROLL_DRIFT_PX = 8;
+
+function holdCentred(el: HTMLElement, target: HTMLElement, id: number | string): void {
+  const until = performance.now() + SCROLL_HOLD_MS;
+  let released = false;
+  // The moment the user takes over, stop — being dragged back to a row you're
+  // scrolling away from is worse than the drift. Keyboard and pointer count as
+  // taking over too: this same component binds PageUp/PageDown to scroll, and a
+  // scrollbar drag is a mousedown, so listening for touch and wheel alone would
+  // fight all of them for over a second.
+  const release = () => {
+    released = true;
+  };
+  const RELEASE_ON = ['touchstart', 'wheel', 'pointerdown', 'keydown'] as const;
+  for (const evt of RELEASE_ON) {
+    (evt === 'keydown' ? window : el).addEventListener(evt, release, {
+      passive: true,
+      once: true,
+    });
+  }
+
+  // Cached across frames: rows are keyed, so the node only changes when a
+  // re-render actually replaces it — which isConnected detects. Without the
+  // cache every frame of the hold pays an attribute-selector scan over the
+  // whole slice even when nothing is drifting (the common case).
+  let node: HTMLElement | null = target;
+  const tick = () => {
+    // el.isConnected: the scroller can be unmounted mid-hold (buffer switch,
+    // screen change) — stop instead of measuring detached rects to deadline.
+    if (released || props.pendingScrollId !== id || !el.isConnected) return finish();
+    if (!node || !node.isConnected) {
+      node = el.querySelector(`[data-msg-id="${id}"]`) as HTMLElement | null;
+    }
+    if (node) {
+      const rect = node.getBoundingClientRect();
+      const box = el.getBoundingClientRect();
+      const drift = rect.top + rect.height / 2 - (box.top + box.height / 2);
+      if (Math.abs(drift) > SCROLL_DRIFT_PX) {
+        // Give up once the scroller stops moving. A target within half a
+        // viewport of either end of the slice can never BE centred — scrollTop
+        // clamps — so the drift check stays true forever and this would force a
+        // style+layout pass every frame for the full hold, on exactly the large
+        // slices that motivated it. Jumping to the oldest or newest message in
+        // a buffer hits this every time.
+        const before = el.scrollTop;
+        node.scrollIntoView({ block: 'center', behavior: 'auto' });
+        if (el.scrollTop === before) return finish();
+      }
+    }
+    if (performance.now() < until) requestAnimationFrame(tick);
+    else finish();
+  };
+  function finish(): void {
+    for (const evt of RELEASE_ON) {
+      (evt === 'keydown' ? window : el).removeEventListener(evt, release);
+    }
+  }
+  requestAnimationFrame(tick);
+}
+
 watch(
   () => props.pendingScrollId,
   async (id) => {
@@ -1900,9 +2214,13 @@ watch(
         return;
       }
       stickToBottom.value = false;
-      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      // 'auto', not 'smooth': a jump is a teleport, and an animated scroll over
+      // a slice this size is both meaningless and fragile — it races the layout
+      // settling below and loses.
+      target.scrollIntoView({ block: 'center', behavior: 'auto' });
       target.classList.add('scroll-target');
       setTimeout(() => target.classList.remove('scroll-target'), 1500);
+      holdCentred(el, target as HTMLElement, id);
     };
     tryScroll();
   },
@@ -2041,9 +2359,17 @@ watch(
    own buffer + unread badge already. */
 .line.highlight {
   background: color-mix(in srgb, var(--warn) 12%, transparent);
+  /* A link-preview card inside a highlighted row needs a WARM panel: the neutral grey one
+     reads as a foreign object dropped onto the tint. Re-tinted rather than lightened, one
+     step further into the highlight than the row itself, so it still reads as raised.
+     Custom properties inherit through scoped styles, so overriding the token here is enough
+     — MessageAttachment needs no knowledge that highlights exist. */
+  --embed-bg: color-mix(in srgb, var(--warn) 24%, var(--bg));
 }
 .message-list:not(.compact) .line.highlight.alt {
   background: color-mix(in srgb, var(--warn) 18%, transparent);
+  /* Matched the alt row's stronger tint, so the panel stays a step above it. */
+  --embed-bg: color-mix(in srgb, var(--warn) 30%, var(--bg));
 }
 .line.scroll-target {
   animation: scroll-target-pulse 1.5s ease-out;

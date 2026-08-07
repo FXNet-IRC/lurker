@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { PassThrough } from 'stream';
 import Database from 'better-sqlite3';
 import type { LurkerTestAgent } from '../test-utils/testApp.js';
@@ -105,6 +105,33 @@ describe('GET /api/exports/preview', () => {
     const wm = (Object.values(res.body.withMessages) as number[]).reduce((s, n) => s + n, 0);
     expect(wm).toBeGreaterThanOrEqual(so);
   });
+
+  // #649: the pane needs this to refuse an over-limit archive at file-pick, so
+  // the user isn't told minutes into an upload that could never finish.
+  describe('maxImportBytes', () => {
+    afterEach(() => {
+      delete process.env.LURKER_MAX_UPLOAD_MB;
+    });
+
+    it('is the full 500 MB import limit when no transport ceiling is declared', async () => {
+      const res = await aliceAgent.get('/api/exports/preview');
+      expect(res.body.maxImportBytes).toBe(500 * 1024 * 1024);
+    });
+
+    // The regression this split exists to prevent: transportCapBytes() reports an
+    // UNSET ceiling as the upload path's 200 MB hard cap, so clamping to it would
+    // have quietly cut every self-hoster's import limit from 500 MB to 200 MB.
+    it('is never lowered to the upload hard cap by an unset ceiling', async () => {
+      const res = await aliceAgent.get('/api/exports/preview');
+      expect(res.body.maxImportBytes).toBeGreaterThan(200 * 1024 * 1024);
+    });
+
+    it('drops to the declared transport ceiling when the operator sets one', async () => {
+      process.env.LURKER_MAX_UPLOAD_MB = '100';
+      const res = await aliceAgent.get('/api/exports/preview');
+      expect(res.body.maxImportBytes).toBe(100 * 1_000_000 - 64 * 1024);
+    });
+  });
 });
 
 describe('export job flow', () => {
@@ -151,6 +178,25 @@ describe('POST /api/imports', () => {
   it('requires a file', async () => {
     const res = await aliceAgent.post('/api/imports');
     expect(res.status).toBe(400);
+  });
+
+  // #649: without this the body dies at the proxy with a connection reset the
+  // client can't interpret, because Express never sees the request at all.
+  it('refuses an archive over the declared transport ceiling with a real 413', async () => {
+    process.env.LURKER_MAX_UPLOAD_MB = '1';
+    try {
+      const big = Buffer.alloc(2 * 1024 * 1024, 0x7a);
+      const res = await aliceAgent
+        .post('/api/imports')
+        .attach('archive', big, { filename: 'big.lurk' });
+      expect(res.status).toBe(413);
+      expect(res.body.code).toBe('archive_too_large');
+      // 1 decimal MB minus the multipart envelope = 934,464 bytes = 0.891 MiB,
+      // reported rounded DOWN so the number named is one the user can actually hit.
+      expect(res.body.error).toBe('archive exceeds 0.8 MB');
+    } finally {
+      delete process.env.LURKER_MAX_UPLOAD_MB;
+    }
   });
 
   it('rejects a non-zip body with code=not_a_zip', async () => {

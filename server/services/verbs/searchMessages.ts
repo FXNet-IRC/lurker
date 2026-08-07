@@ -75,6 +75,8 @@ registerVerb({
       limit: limit + 1,
     });
     const hasMore = rows.length > limit;
+    // NOT hoisted (#679): search spans buffers, so unlike every other N-row
+    // decorate site the notify-always answer genuinely varies per row.
     const messages = (hasMore ? rows.slice(0, limit) : rows).map((e) =>
       decorateMessage(ctx.userId, e),
     );

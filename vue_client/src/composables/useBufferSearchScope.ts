@@ -3,7 +3,6 @@
 
 import { computed, ref } from 'vue';
 import { useActiveBuffer } from './useActiveBuffer.js';
-import { useSearchStore } from '../stores/search.js';
 
 // Shared open-state and per-buffer scoping for the Search & Highlights modals,
 // used by both the desktop and mobile chat shells (#496). Each shell owns one
@@ -45,14 +44,6 @@ export function useBufferSearchScope() {
     showHighlights.value = true;
   }
 
-  // "View activity" from the Friends overview: open Search with the scoped query
-  // (from:<nick> on:<network>) and run it immediately.
-  function onViewActivity(query: string): void {
-    useSearchStore().runQuery(query);
-    searchScope.value = null;
-    showSearch.value = true;
-  }
-
   return {
     showSearch,
     showHighlights,
@@ -60,6 +51,5 @@ export function useBufferSearchScope() {
     highlightScope,
     openSearch,
     openHighlights,
-    onViewActivity,
   };
 }

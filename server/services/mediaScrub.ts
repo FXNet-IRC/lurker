@@ -201,7 +201,9 @@ export async function scrubMediaFile(path: string, mime: string): Promise<void> 
       await scrubId3(fh, size);
       return;
     }
-    // Everything else we accept is ISO-BMFF: mp4, mov, m4v, m4a.
+    // Everything else we accept is ISO-BMFF: mp4, mov, m4v, m4a, m4b/f4a/f4b, 3gp, 3g2.
+    // They differ only in their `ftyp` major brand — to the box walker they are one
+    // format, which is why the accepted set can grow without this function changing.
     await walkBoxes(fh, 0, size, 0);
   } catch (err) {
     if (err instanceof MediaScrubError) throw err;

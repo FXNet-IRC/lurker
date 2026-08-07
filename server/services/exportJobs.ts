@@ -13,10 +13,12 @@
 // exportService). That's what keeps it off the critical path without a worker
 // thread: no long-lived cursor is held on the shared connection (so a
 // concurrent IRC write can't crash the process — lurker#175) and the loop stays
-// responsive on a large export. We deliberately do NOT use worker_threads: tsx's
-// module resolution doesn't propagate into worker threads on Node 22 (the
-// deployed runtime), so a worker entry can't import the app's `.js`-specified
-// TS modules there.
+// responsive on a large export. We deliberately do NOT use worker_threads. The
+// original reason was that tsx's module resolution didn't propagate into worker
+// threads on Node 22 (then the deployed runtime), so a worker entry couldn't
+// import the app's `.js`-specified TS modules. That no longer reproduces on a
+// minimal case under tsx 4.23.x on either 22 or 24 — but the shared-connection
+// reason above is the load-bearing one and is unaffected, so this stays.
 
 import fs from 'node:fs';
 import path from 'node:path';

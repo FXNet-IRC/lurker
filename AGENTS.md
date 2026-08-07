@@ -59,8 +59,9 @@ Tests live **next to the code** they cover as `*.test.ts`.
 
 ## Setup & dev
 
-- **Node 22** — matches CI and the Docker runtime. better-sqlite3 + sharp are
-  native; stay on 22 to avoid ABI surprises.
+- **Node 24** (current LTS) — matches CI and the Docker runtime. `better-sqlite3`
+  and `sharp` are native, so stay on 24 to avoid ABI surprises. Track the LTS
+  line: odd-numbered majors never become LTS and go EOL within months.
 - `npm run install:all` — installs root **and** `vue_client/` deps.
 - `cp .env.example .env` — defaults are documented inline.
 - `npm run dev` — runs server + client concurrently.
@@ -141,10 +142,15 @@ These are the non-obvious constraints that have bitten changes before:
   throws `database connection is busy` and crashes the process. Read large sets
   with keyset pagination — `WHERE id > ? ORDER BY id LIMIT N`, a discrete
   `.all()` per page, yielding with `setImmediate` between pages.
-- **No `worker_threads`.** Under `tsx` on Node 22 (the deploy runtime) the
-  `.js`→`.ts` loader does not propagate into worker threads, so a TS worker
-  entry fails with `Cannot find module` at runtime even though it type-checks
-  and runs on newer Node. Use in-process `setImmediate` chunking for heavy work.
+- **No `worker_threads`.** Historically, under `tsx` the `.js`→`.ts` loader did
+  not propagate into worker threads on Node 22 (then the deploy runtime), so a
+  TS worker entry failed with `Cannot find module` at runtime even though it
+  type-checked. ⚠ A minimal repro no longer reproduces this on **either** Node
+  22 or 24 with tsx 4.23.x, so treat the version framing as unverified and
+  re-establish the failure before relying on this note in either direction. The
+  guidance stands regardless: use in-process `setImmediate` chunking for heavy
+  work, which also avoids holding a long-lived cursor on the shared SQLite
+  connection (lurker#175).
 - **Fold IRC target case when matching buffers.** Servers send channel and nick
   names with inconsistent casing. Never look a buffer up by exact key — match
   case-insensitively (client: the buffers store's `findByTarget`/`findDm`;

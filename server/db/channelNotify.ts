@@ -2,46 +2,48 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import db from './index.js';
+import { resolveBuffer } from './bufferResolve.js';
 
 /** Per-target settings shape returned to callers. */
 export interface ChannelNotifyShape {
   notifyAlways: boolean;
 }
 
-// Per-(user, network, channel) override. One flag lives here now:
+// Per-(user, buffer) override, keyed (user_id, buffer_id) since schema 18.
+// One flag lives here:
 //   notify_always — treat every message in the channel like a notification
 //                   trigger for push/toast (no visual highlight).
 // The old display-only `muted` flag was folded into the ignore engine as a
-// NOUNREAD/NONOTIFY rule (issue #359, so mute now also silences notifications).
-// The `muted` column remains in the table (always written 0) for backward-compat
-// with older images, but is no longer read or written meaningfully — the boot
-// migration in index.ts converts any lingering muted=1 rows into ignore rules.
+// NOUNREAD/NONOTIFY rule (issue #359) and its dead column died in the v18
+// rebuild.
 
 const getStmt = db.prepare(`
   SELECT notify_always FROM channel_notify_settings
-  WHERE user_id = ? AND network_id = ? AND target = ?
+  WHERE user_id = ? AND buffer_id = ?
 `);
 
 const listForUserStmt = db.prepare(`
-  SELECT network_id AS networkId, target, notify_always AS notifyAlways
-  FROM channel_notify_settings
-  WHERE user_id = ? AND notify_always = 1
+  SELECT b.network_id AS networkId, b.target AS target, c.notify_always AS notifyAlways
+  FROM channel_notify_settings c JOIN buffers b ON b.id = c.buffer_id
+  WHERE c.user_id = ? AND c.notify_always = 1
 `);
 
 const upsertStmt = db.prepare(`
-  INSERT INTO channel_notify_settings (user_id, network_id, target, notify_always, muted, updated_at)
-  VALUES (?, ?, ?, 1, 0, datetime('now'))
-  ON CONFLICT(user_id, network_id, target)
+  INSERT INTO channel_notify_settings (user_id, buffer_id, notify_always, updated_at)
+  VALUES (?, ?, 1, datetime('now'))
+  ON CONFLICT(user_id, buffer_id)
   DO UPDATE SET notify_always = 1, updated_at = excluded.updated_at
 `);
 
 const deleteStmt = db.prepare(`
   DELETE FROM channel_notify_settings
-  WHERE user_id = ? AND network_id = ? AND target = ?
+  WHERE user_id = ? AND buffer_id = ?
 `);
 
 export function getChannelNotifyAlways(userId: number, networkId: number, target: string): boolean {
-  const row = getStmt.get(userId, networkId, target) as { notify_always: number } | undefined;
+  const buffer = resolveBuffer(userId, networkId, target);
+  if (!buffer) return false;
+  const row = getStmt.get(userId, buffer.id) as { notify_always: number } | undefined;
   return !!(row && row.notify_always);
 }
 
@@ -80,9 +82,11 @@ export function setChannelNotifyAlways(
   target: string,
   notifyAlways: boolean,
 ): void {
+  const buffer = resolveBuffer(userId, networkId, target);
+  if (!buffer) return;
   if (notifyAlways) {
-    upsertStmt.run(userId, networkId, target);
+    upsertStmt.run(userId, buffer.id);
   } else {
-    deleteStmt.run(userId, networkId, target);
+    deleteStmt.run(userId, buffer.id);
   }
 }

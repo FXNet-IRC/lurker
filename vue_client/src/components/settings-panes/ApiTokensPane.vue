@@ -231,11 +231,6 @@ async function onRevoke(token: ApiToken) {
   min-width: 0;
 }
 
-.token-row .ua {
-  display: flex;
-  align-items: center;
-  gap: 1ch;
-}
 .token-row .name {
   color: var(--fg);
 }

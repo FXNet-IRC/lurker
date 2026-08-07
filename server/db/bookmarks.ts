@@ -63,12 +63,6 @@ const existsStmt = db.prepare(`
   SELECT 1 FROM user_bookmarks WHERE user_id = ? AND message_id = ?
 `);
 
-const listIdsStmt = db.prepare(`
-  SELECT message_id AS messageId FROM user_bookmarks
-  WHERE user_id = ?
-  ORDER BY message_id DESC
-`);
-
 export function addBookmark(userId: number, messageId: number): boolean {
   insertStmt.run({ userId, messageId });
   return !!existsStmt.get(userId, messageId);
@@ -82,9 +76,10 @@ export function isBookmarked(userId: number, messageId: number): boolean {
   return !!existsStmt.get(userId, messageId);
 }
 
-export function listBookmarkIdsForUser(userId: number): number[] {
-  return (listIdsStmt.all(userId) as Array<{ messageId: number }>).map((r) => r.messageId);
-}
+// There is deliberately no "every id this user saved" accessor. That query
+// existed to seed a connect-burst snapshot, which grew without bound over an
+// account's life; bookmark state now rides on the message rows (`bookmarked` in
+// db/messages.ts), so nothing needs to ask for the whole set at once.
 
 // Paginated list joined with messages + networks. Row shape matches
 // listUserHighlights so the same HistoryMessageRow component can render

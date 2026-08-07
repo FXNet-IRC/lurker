@@ -18,8 +18,10 @@ let createNetwork: typeof import('./networks.js').createNetwork;
 let upsertDraft: typeof import('./drafts.js').upsertDraft;
 let clearDraft: typeof import('./drafts.js').clearDraft;
 let listForUser: typeof import('./drafts.js').listForUser;
+let ensureBuffer: typeof import('./buffers.js').ensureExists;
 
 beforeAll(async () => {
+  ({ ensureExists: ensureBuffer } = await import('./buffers.js'));
   ({ createUser, deleteUser } = await import('./users.js'));
   ({ createNetwork } = await import('./networks.js'));
   ({ upsertDraft, clearDraft, listForUser } = await import('./drafts.js'));
@@ -30,13 +32,16 @@ afterAll(() => {
 });
 
 function mkNetwork(userId: number, name: string) {
-  return createNetwork(userId, {
+  const net = createNetwork(userId, {
     name,
     host: 'irc.libera.chat',
     port: 6697,
     tls: true,
     nick: name,
   });
+  // buffer_id-keyed since schema 18 — mint the targets this file writes to.
+  for (const t of ['#a', '#b', '#meta']) ensureBuffer(userId, net!.id, t);
+  return net;
 }
 
 describe('drafts', () => {

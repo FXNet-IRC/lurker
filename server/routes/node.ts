@@ -6,13 +6,14 @@ import type { Request, Response } from 'express';
 import { requireNodeAuth } from '../middleware/nodeAuth.js';
 import { getEdition } from '../utils/edition.js';
 import { APP_VERSION } from '../utils/userAgent.js';
-import { isValidUsername } from '../utils/username.js';
+import { isValidUsername } from '../../shared/username.js';
 import {
   countUsers,
   createUser,
   deleteUser,
   findUserById,
   findUserByUsername,
+  usernameTaken,
   setUserPaused,
 } from '../db/users.js';
 import { markUploadRemovedById } from '../db/uploadHistory.js';
@@ -53,12 +54,31 @@ router.post('/users', (req: Request, res: Response) => {
     res.status(400).json({ error: 'invalid username' });
     return;
   }
-  const existing = findUserByUsername(username);
+  // Case-insensitive: 'acct-5' and 'ACCT-5' are the same tenant, and the
+  // orchestrator retrying with different case must reconcile, not create a
+  // second row.
+  const taken = usernameTaken(username);
+  const existing = taken ? findUserByUsername(username) : undefined;
   if (existing) {
     // Surface the existing id so a retried provision can reconcile rather than
     // guess. Deliberately not an idempotent 200 — a real username clash should
     // be visible to the orchestrator.
     res.status(409).json({ error: 'username already exists', id: existing.id });
+    return;
+  }
+  if (taken) {
+    // Taken, but by MORE THAN ONE row that folds to this name — only possible on
+    // a cell carrying grandfathered case-twins, which hosted provisioning
+    // (`acct-<id>`) never creates. The cell genuinely cannot say which account to
+    // reconcile to, and guessing would bind a paying customer to the wrong row,
+    // so this fails and asks for a human. `id` is OMITTED rather than sent as
+    // null: the control plane recovers a 409 only when an id is present
+    // (cellClient.ts provisionUserOnCell), so this deliberately lands as
+    // provision_failed instead of a silent mis-reconcile.
+    res.status(409).json({
+      error:
+        'username matches more than one existing account (case-insensitive); resolve on the cell',
+    });
     return;
   }
   const user = createUser(username); // role defaults to 'user'

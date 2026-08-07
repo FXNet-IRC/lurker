@@ -165,6 +165,7 @@ import {
   type NickStripItem,
 } from '../composables/useComposerOverlay.js';
 import type { EmojiMatch } from '../utils/emojiData.js';
+import { isChannelTarget } from '../../../shared/channels.js';
 
 withDefaults(
   defineProps<{
@@ -254,7 +255,7 @@ const nickKeyFor = (item: NickStripItem): string => item.nick.toLowerCase();
 // template — same shape as the emoji strip.
 const onNickStripSelect = (item: NickStripItem): void => selectNick(item.nick);
 
-const isChannel = computed(() => !!active.value?.target?.startsWith('#'));
+const isChannel = computed(() => isChannelTarget(active.value?.target));
 
 const networkLabel = computed(() => {
   const a = active.value;
@@ -283,7 +284,7 @@ const modeSuffix = computed(() => {
 const isDmBuffer = computed(
   () =>
     !!active.value?.target &&
-    !active.value.target.startsWith('#') &&
+    !isChannelTarget(active.value.target) &&
     !active.value.target.startsWith(':server:'),
 );
 const peerForActive = computed(() => {

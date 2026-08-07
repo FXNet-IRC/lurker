@@ -110,5 +110,14 @@ export function formatSettingValue(opt: SettingOption, value: SettingValue | und
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   if (value === undefined) return '(unset)';
   const s = String(value);
-  return s === '' ? '(empty)' : s;
+  if (s === '') return '(empty)';
+  // An enum with prose labels reads as its id here, with the label in parens —
+  // the reverse of the Settings pane, and deliberately. The id is what you have
+  // to TYPE back to `/set`, so it stays the value; the label is only there so
+  // someone who saw "Hide all" in the GUI can tell it is this same setting.
+  if (opt.type === 'enum') {
+    const label = opt.choiceLabels?.[s];
+    if (label && label !== s) return `${s} (${label})`;
+  }
+  return s;
 }

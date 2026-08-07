@@ -61,7 +61,7 @@ let callVerb: typeof import('./services/verbRegistry.js').callVerb;
 let searchMessages: typeof import('./db/messages.js').searchMessages;
 let getNetwork: typeof import('./db/networks.js').getNetwork;
 let addBookmark: typeof import('./db/bookmarks.js').addBookmark;
-let listBookmarkIdsForUser: typeof import('./db/bookmarks.js').listBookmarkIdsForUser;
+let listBookmarksForUser: typeof import('./db/bookmarks.js').listBookmarksForUser;
 let listDraftsForUser: typeof import('./db/drafts.js').listForUser;
 let listPushForUser: typeof import('./db/pushSubscriptions.js').listAllForUser;
 
@@ -112,7 +112,7 @@ beforeAll(async () => {
   searchMessages = search;
   getNetwork = networksDb.getNetwork;
   addBookmark = bookmarks.addBookmark;
-  listBookmarkIdsForUser = bookmarks.listBookmarkIdsForUser;
+  listBookmarksForUser = bookmarks.listBookmarksForUser;
   listDraftsForUser = drafts.listForUser;
   listPushForUser = push.listAllForUser;
 
@@ -455,13 +455,18 @@ describe('DB isolation primitives', () => {
     expect(getNetwork(netAId, userAId)).toBeDefined();
   });
 
+  // Read back through the paginated list, which is how production reads
+  // bookmarks now that no all-ids accessor exists.
+  const savedIds = (userId: number) =>
+    listBookmarksForUser(userId, { limit: 200 }).map((r) => r.id);
+
   it('addBookmark cannot cross tenants (the messageId IDOR is closed)', () => {
     // B tries to bookmark A's message by id — must be a silent no-op so it
     // can't then be read back through B's bookmarks list.
     expect(addBookmark(userBId, msgIdA)).toBe(false);
-    expect(listBookmarkIdsForUser(userBId)).toHaveLength(0);
+    expect(savedIds(userBId)).toHaveLength(0);
     // Positive control: A's own bookmark is present.
-    expect(listBookmarkIdsForUser(userAId)).toContain(msgIdA);
+    expect(savedIds(userAId)).toContain(msgIdA);
   });
 
   it('searchMessages is user-scoped at the SQL layer', () => {

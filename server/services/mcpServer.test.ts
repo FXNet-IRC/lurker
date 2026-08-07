@@ -112,7 +112,6 @@ describe('MCP server', () => {
       .map((t) => t.name)
       .toSorted();
     expect(names).toEqual([
-      'delete_contact',
       'get_nick_note',
       'list_buffers',
       'list_networks',
@@ -121,7 +120,6 @@ describe('MCP server', () => {
       'send_action',
       'send_message',
       'send_notice',
-      'set_contact',
       'set_nick_note',
       'set_relay_bot',
     ]);

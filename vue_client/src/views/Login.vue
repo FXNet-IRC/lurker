@@ -26,9 +26,16 @@
               autofocus
               required
               placeholder="lurker username"
+              :pattern="USERNAME_PATTERN"
+              :maxlength="MAX_USERNAME_LENGTH"
+              title="Letters, numbers, and . _ - — no spaces"
             />
           </label>
-          <p class="hint">Your Lurker account login — not the nick you'll use on IRC networks.</p>
+          <p class="hint">
+            Your Lurker account login — not the nick you'll use on IRC networks. Letters, numbers
+            and
+            <code>. _ -</code>, no spaces; it isn't case-sensitive.
+          </p>
           <label>
             <span>Password</span>
             <input
@@ -79,6 +86,7 @@ import { useRouter, useRoute } from 'vue-router';
 import type { SetupStatus } from '../stores/auth.js';
 import { useAuthStore } from '../stores/auth.js';
 import WordBackdrop from '../components/WordBackdrop.vue';
+import { USERNAME_PATTERN, MAX_USERNAME_LENGTH } from '../../../shared/username.js';
 
 interface AuthMethods {
   passkey: boolean;

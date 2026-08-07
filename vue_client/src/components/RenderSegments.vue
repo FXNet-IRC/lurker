@@ -61,7 +61,6 @@ import { useBuffersStore } from '../stores/buffers.js';
 import { useSettingsStore } from '../stores/settings.js';
 import { useMircPalette } from '../composables/useNickColors.js';
 import { useMediaViewer } from '../composables/useMediaViewer.js';
-import { socketSend } from '../composables/useSocket.js';
 import { mediaKindForUrl } from '../utils/uploadHostMatch.js';
 import SpoilerText from './SpoilerText.vue';
 
@@ -149,6 +148,6 @@ function openChannel(channel: string): void {
     buffers.activate(nid, existing.target);
     return;
   }
-  socketSend({ type: 'open-buffer', networkId: nid, target: channel });
+  buffers.openBuffer(nid, channel);
 }
 </script>

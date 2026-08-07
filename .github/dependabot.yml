@@ -49,6 +49,22 @@ updates:
           - minor
           - patch
 
+  # Docs site (vitepress + wrangler)
+  - package-ecosystem: npm
+    directory: /docs
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
   # GitHub Actions
   - package-ecosystem: github-actions
     directory: /
@@ -60,3 +76,29 @@ updates:
       actions:
         patterns:
           - '*'
+
+  # Docker base image. REQUIRED, not optional: the Dockerfile pins
+  # node:24-slim by digest for supply-chain reasons, which also freezes the
+  # Debian package set inside it. Without dependabot rewriting that digest the
+  # base image silently rots and stops receiving OS security patches — the pin
+  # would trade one risk for a worse one.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    # Digest refreshes only — never a tag bump. Left unconstrained, this
+    # ecosystem chases the highest numeric tag, which for `node` means the
+    # non-LTS line: its first run proposed node 25 (#729), a release that
+    # reached end-of-life on 2026-06-01. Moving between Node majors also has
+    # to bump node-version in test.yml/docs.yml in lockstep, so it is a
+    # deliberate change that must never arrive as an automated one-file diff.
+    # semver-patch is deliberately NOT ignored: the tag (`24-slim`) carries no
+    # patch component, so it cannot produce a tag bump, and leaving it alone
+    # keeps any risk of suppressing the digest updates this entry exists for.
+    ignore:
+      - dependency-name: node
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor

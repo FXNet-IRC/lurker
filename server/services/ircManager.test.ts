@@ -70,6 +70,54 @@ describe('ircManager pause linchpin', () => {
   });
 });
 
+// #616: the gate the auto-reconnect controller now asks before each retry. Same
+// implementation startNetwork uses, so the two can't drift apart — which is the
+// whole point, since the reconnect path used to skip both checks entirely.
+describe('ircManager.connectGate', () => {
+  let seq = 0;
+  function gateUserNet(host = 'irc.example.invalid') {
+    const user = createUser(`gate-${(seq += 1)}`);
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host,
+      port: 6697,
+      tls: true,
+      nick: 'x',
+      autoconnect: false,
+    });
+    if (!net) throw new Error('createNetwork returned undefined');
+    return { userId: user.id, networkId: net.id };
+  }
+
+  // Hands back the row it read. startNetwork consumes it instead of issuing a
+  // second getNetwork — a duplicate synchronous read on every connect, on the
+  // boot-time fan-out path #460 showed can starve the event loop.
+  it('allows an ordinary account and network, returning the row it read', () => {
+    const { userId, networkId } = gateUserNet();
+    const gate = ircManager.connectGate(userId, networkId);
+    expect(gate.ok).toBe(true);
+    expect(gate.ok === true && gate.network.id).toBe(networkId);
+    expect(gate.ok === true && gate.network.host).toBe('irc.example.invalid');
+  });
+
+  // The refusal reason is user-facing: auto-reconnect publishes it when it stops,
+  // and a connection that quits retrying without saying why reads as a bug.
+  it('refuses a paused account with a reason', () => {
+    const { userId, networkId } = gateUserNet();
+    setUserPaused(userId, true);
+    const gate = ircManager.connectGate(userId, networkId);
+    expect(gate.ok).toBe(false);
+    expect(gate.ok === false && gate.reason).toMatch(/paused/i);
+  });
+
+  it('refuses a network that has been deleted out from under a pending retry', () => {
+    const { userId, networkId } = gateUserNet();
+    const gate = ircManager.connectGate(userId, networkId + 100000);
+    expect(gate.ok).toBe(false);
+    expect(gate.ok === false && gate.reason).toMatch(/no longer exists/i);
+  });
+});
+
 describe('ircManager.acceptDccTransfer result codes', () => {
   let seq = 0;
   function dccUserNet() {
@@ -260,121 +308,6 @@ describe('ircManager deferrable connect (issue #236 throttle seam)', () => {
   });
 });
 
-// Contact CRUD goes through ircManager so it can diff watch-targets onto the
-// live MONITOR set. With no live connection the diff is a no-op, so these
-// assertions exercise the db orchestration, ownership scoping, and the
-// per-(network,nick) uniqueness filter without opening a socket.
-describe('ircManager contacts', () => {
-  it('creates, edits, and lists contacts; enforces ownership + uniqueness', () => {
-    const user = createUser('irc-contacts');
-    const other = createUser('irc-contacts-other');
-    const net = createNetwork(user.id, { name: 'n', host: 'h', port: 6697, tls: true, nick: 'a' })!;
-
-    const a = ircManager.setContact(user.id, {
-      displayName: 'Darc',
-      notifyOnline: true,
-      targets: [{ networkId: net.id, nick: 'darc' }],
-    });
-    expect(a).toMatchObject({ displayName: 'Darc', notifyOnline: true });
-    // A lone target is the primary by default.
-    expect(a!.targets).toEqual([{ networkId: net.id, nick: 'darc', isPrimary: true }]);
-
-    // A target on a network the caller doesn't own is filtered out.
-    const otherNet = createNetwork(other.id, {
-      name: 'x',
-      host: 'h',
-      port: 6697,
-      tls: true,
-      nick: 'a',
-    })!;
-    const b = ircManager.setContact(user.id, {
-      displayName: 'Sneaky',
-      notifyOnline: false,
-      targets: [
-        { networkId: net.id, nick: 'sneaky' },
-        { networkId: otherNet.id, nick: 'pwn' },
-      ],
-    });
-    expect(b!.targets).toEqual([{ networkId: net.id, nick: 'sneaky', isPrimary: true }]);
-
-    // (network, nick) already owned by contact `a` can't be claimed by another.
-    const c = ircManager.setContact(user.id, {
-      displayName: 'Thief',
-      notifyOnline: false,
-      targets: [{ networkId: net.id, nick: 'DARC' }],
-    });
-    expect(c!.targets).toEqual([]);
-
-    expect(
-      ircManager
-        .listContacts(user.id)
-        .map((x) => x.displayName)
-        .toSorted(),
-    ).toEqual(['Darc', 'Sneaky', 'Thief']);
-    expect(ircManager.listContacts(other.id)).toEqual([]);
-  });
-
-  it('honors the flagged primary target, falling back to the first', () => {
-    const user = createUser('irc-contacts-primary');
-    const n1 = createNetwork(user.id, { name: 'n1', host: 'h', port: 6697, tls: true, nick: 'a' })!;
-    const n2 = createNetwork(user.id, { name: 'n2', host: 'h', port: 6697, tls: true, nick: 'a' })!;
-
-    const chosen = ircManager.setContact(user.id, {
-      displayName: 'Multi',
-      notifyOnline: false,
-      targets: [
-        { networkId: n1.id, nick: 'm1' },
-        { networkId: n2.id, nick: 'm2', isPrimary: true },
-      ],
-    })!;
-    expect(chosen.targets.find((t) => t.nick === 'm2')!.isPrimary).toBe(true);
-    expect(chosen.targets.find((t) => t.nick === 'm1')!.isPrimary).toBe(false);
-
-    // No target flagged → first becomes primary.
-    const fallback = ircManager.setContact(user.id, {
-      contactId: chosen.id,
-      displayName: 'Multi',
-      notifyOnline: false,
-      targets: [
-        { networkId: n1.id, nick: 'm1' },
-        { networkId: n2.id, nick: 'm2' },
-      ],
-    })!;
-    expect(fallback.targets.find((t) => t.nick === 'm1')!.isPrimary).toBe(true);
-  });
-
-  it('allows multiple nicks on the same network', () => {
-    const user = createUser('irc-contacts-alts');
-    const net = createNetwork(user.id, { name: 'n', host: 'h', port: 6697, tls: true, nick: 'a' })!;
-    const saved = ircManager.setContact(user.id, {
-      displayName: 'Alts',
-      notifyOnline: false,
-      targets: [
-        { networkId: net.id, nick: 'eren' },
-        { networkId: net.id, nick: 'nostimo' },
-        { networkId: net.id, nick: 'twomoon', isPrimary: true },
-        { networkId: net.id, nick: 'eren' }, // exact dupe dropped
-      ],
-    })!;
-    expect(saved.targets.map((t) => t.nick).toSorted()).toEqual(['eren', 'nostimo', 'twomoon']);
-    expect(saved.targets.filter((t) => t.isPrimary).map((t) => t.nick)).toEqual(['twomoon']);
-  });
-
-  it('deletes a contact only for its owner', () => {
-    const user = createUser('irc-contacts-del');
-    const other = createUser('irc-contacts-del-other');
-    const net = createNetwork(user.id, { name: 'n', host: 'h', port: 6697, tls: true, nick: 'a' })!;
-    const made = ircManager.setContact(user.id, {
-      displayName: 'Gone',
-      notifyOnline: false,
-      targets: [{ networkId: net.id, nick: 'gone' }],
-    })!;
-    expect(ircManager.deleteContact(other.id, made.id)).toBe(false);
-    expect(ircManager.deleteContact(user.id, made.id)).toBe(true);
-    expect(ircManager.listContacts(user.id)).toEqual([]);
-  });
-});
-
 describe('planChannelRejoins', () => {
   it('batches keyed channels (with an aligned key list) separately from keyless ones', () => {
     const ops = planChannelRejoins([
@@ -472,7 +405,9 @@ describe('planChannelRejoins', () => {
 
     ircManager.partChannel(user.id, net.id, '#never-heard-of');
 
-    expect(buffers.listForNetwork(net.id)).toHaveLength(0);
+    // The network's `:server:` sentinel row (minted at network creation,
+    // schema 17) is the only row — no channel was conjured.
+    expect(buffers.listForNetwork(net.id).filter((b) => b.kind !== 'server')).toHaveLength(0);
     expect(conn.client.part).toHaveBeenCalledWith('#never-heard-of', undefined);
   });
 

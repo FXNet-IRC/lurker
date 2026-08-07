@@ -10,7 +10,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { requireProvisionAuth } from '../middleware/provisionAuth.js';
-import { isValidUsername } from '../utils/username.js';
+import { isValidUsername } from '../../shared/username.js';
 import {
   isValidPassword,
   passwordRequirementsMessage,

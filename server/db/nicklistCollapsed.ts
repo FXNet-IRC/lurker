@@ -2,33 +2,29 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import db from './index.js';
+import { resolveBuffer } from './bufferResolve.js';
 
-// Per-(user, network, channel) override for the desktop nicklist collapsed
-// state. Only explicitly-toggled channels have a row; everything else falls
-// back to the global look.layout.show_member_list default on the client.
-
-/** A row from the `nicklist_collapsed` table. */
-export interface NicklistCollapsed {
-  user_id: number;
-  network_id: number;
-  target: string;
-  collapsed: number;
-}
+// Per-(user, buffer) override for the desktop nicklist collapsed state,
+// keyed (user_id, buffer_id) since schema 18. Only explicitly-toggled
+// channels have a row; everything else falls back to the global
+// look.layout.show_member_list default on the client.
 
 const listForUserStmt = db.prepare(`
-  SELECT network_id AS networkId, target, collapsed FROM nicklist_collapsed
-  WHERE user_id = ?
+  SELECT b.network_id AS networkId, b.target AS target, n.collapsed AS collapsed
+  FROM nicklist_collapsed n JOIN buffers b ON b.id = n.buffer_id
+  WHERE n.user_id = ?
 `);
 
 const listForUserNetworkStmt = db.prepare(`
-  SELECT target, collapsed FROM nicklist_collapsed
-  WHERE user_id = ? AND network_id = ?
+  SELECT b.target AS target, n.collapsed AS collapsed
+  FROM nicklist_collapsed n JOIN buffers b ON b.id = n.buffer_id
+  WHERE n.user_id = ? AND b.network_id = ?
 `);
 
 const upsertStmt = db.prepare(`
-  INSERT INTO nicklist_collapsed (user_id, network_id, target, collapsed)
-  VALUES (?, ?, ?, ?)
-  ON CONFLICT(user_id, network_id, target)
+  INSERT INTO nicklist_collapsed (user_id, buffer_id, collapsed)
+  VALUES (?, ?, ?)
+  ON CONFLICT(user_id, buffer_id)
   DO UPDATE SET collapsed = excluded.collapsed
 `);
 
@@ -68,5 +64,7 @@ export function setNicklistCollapsed(
   target: string,
   collapsed: boolean | number,
 ): void {
-  upsertStmt.run(userId, networkId, target, collapsed ? 1 : 0);
+  const buffer = resolveBuffer(userId, networkId, target);
+  if (!buffer) return;
+  upsertStmt.run(userId, buffer.id, collapsed ? 1 : 0);
 }

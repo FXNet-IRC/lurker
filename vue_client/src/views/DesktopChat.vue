@@ -18,8 +18,21 @@
            (#355); the collapse control lives there too. When collapsed the list
            is unmounted, so the expand control returns to the top of the rail. -->
       <BufferList v-if="showChannels" />
-      <button v-else class="link rail-toggle" title="Show channel list" @click="toggleChannels">
+      <!-- Collapsing the list takes its per-row highlight badges with it, so the
+           control that brings it back carries their total (#636). Unlike the
+           Transfers button below this one IS a count badge: the number is the
+           information here, not a state the glyph could stand in for. -->
+      <button
+        v-else
+        class="link rail-toggle"
+        :title="railToggleTitle"
+        :aria-label="railToggleTitle"
+        @click="toggleChannels"
+      >
         <i class="fa-solid fa-angles-right"></i>
+        <span v-if="hlChip.show.value" class="hl-chip" aria-hidden="true">{{
+          hlChip.label.value
+        }}</span>
       </button>
       <div ref="footEl" class="sidebar-foot" :class="{ 'foot-wrapped': footWrapped }">
         <!-- Settings and Add-network normally live in the LURKER header (#411),
@@ -107,7 +120,12 @@
       <div class="topic-meta">
         <span v-if="isVirtual || active" class="buffer">{{ bufferLabel }}</span>
         <template v-if="active && topic">
+          <!-- A channel topic is user prose: auto-link it and open the full
+               view on click. A DM's pseudo-topic is the peer's ident@host —
+               an identity string, not prose; auto-linking turns the host into
+               a bogus email/URL link, so it renders as plain static text. -->
           <button
+            v-if="isChannel"
             type="button"
             class="topic-text"
             title="View full topic"
@@ -115,29 +133,11 @@
           >
             <LinkedText :text="topic" />
           </button>
+          <span v-else class="topic-text">{{ topic }}</span>
         </template>
       </div>
       <div class="topic-actions">
-        <template v-if="isVirtual">
-          <template v-if="isFriendsBuffer">
-            <button
-              type="button"
-              class="link"
-              title="Add friend"
-              aria-label="Add friend"
-              @click="friends.openEditorNew()"
-            >
-              <i class="fa-solid fa-person-circle-plus"></i>
-            </button>
-            <span
-              class="member-count"
-              :title="`${friendCount} ${friendCount === 1 ? 'friend' : 'friends'}`"
-            >
-              <i class="fa-solid fa-users"></i> {{ friendCount }}
-            </span>
-          </template>
-        </template>
-        <template v-else-if="active">
+        <template v-if="active && !isVirtual">
           <!-- Search & highlights scoped to this buffer (channels/DMs only) —
                parity with the mobile topic bar. The server buffer has no
                per-buffer scope, so it's excluded. -->
@@ -235,8 +235,7 @@
     </header>
     <div class="topic-divider"></div>
 
-    <FriendsOverview v-if="renderMode === 'overview'" @view-activity="onViewActivity" />
-    <MessageList v-else ref="messageListRef" :pending-scroll-id="pendingScrollId" />
+    <MessageList ref="messageListRef" :pending-scroll-id="pendingScrollId" />
     <MemberList v-if="showMembers && hasNicklist" />
     <StatusBar />
     <MessageInput v-if="hasInput" ref="messageInputRef" />
@@ -282,6 +281,7 @@
     <MediaViewerModal
       v-if="viewer.isOpen && viewer.url !== null"
       :url="viewer.url"
+      :share-url="viewer.shareUrl"
       :filename="viewer.current?.filename ?? null"
       :index="viewer.index"
       :count="viewer.count"
@@ -304,13 +304,12 @@
       :nick="nickNotes.editor.nick"
       :network-id="nickNotes.editor.networkId"
     />
-    <ConfigureFriendModal v-if="friends.editor.open" />
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import type { Network } from '../stores/networks.js';
 import { useBuffersStore, type Buffer } from '../stores/buffers.js';
 import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
@@ -320,11 +319,11 @@ import { useConfigStore } from '../stores/config.js';
 import { useChatBootstrap } from '../composables/useChatBootstrap.js';
 import { useActiveBuffer } from '../composables/useActiveBuffer.js';
 import { useBufferSearchScope } from '../composables/useBufferSearchScope.js';
+import { useHighlightChip } from '../composables/useHighlightChip.js';
 import { useSettingsStore } from '../stores/settings.js';
 import { useAuthStore } from '../stores/auth.js';
 import BufferList from '../components/BufferList.vue';
 import MessageList from '../components/MessageList.vue';
-import FriendsOverview from '../components/FriendsOverview.vue';
 import MessageInput from '../components/MessageInput.vue';
 import MemberList from '../components/MemberList.vue';
 import StatusBar from '../components/StatusBar.vue';
@@ -341,13 +340,12 @@ import QuickSwitcher from '../components/QuickSwitcher.vue';
 import SearchModal from '../components/SearchModal.vue';
 import KeyboardHelpModal from '../components/KeyboardHelpModal.vue';
 import NickNoteModal from '../components/NickNoteModal.vue';
-import ConfigureFriendModal from '../components/ConfigureFriendModal.vue';
 import UserProfileModal from '../components/UserProfileModal.vue';
 import MediaViewerModal from '../components/MediaViewerModal.vue';
 import { useKeyboardShortcuts } from '../composables/useKeyboardShortcuts.js';
 import { useNicklistCollapseStore } from '../stores/nicklistCollapse.js';
+import { shouldOpenSystemBufferOnLoad } from '../utils/defaultBuffer.js';
 import { useNickNotesStore } from '../stores/nickNotes.js';
-import { useFriendsStore } from '../stores/friends.js';
 import { useDccStore } from '../stores/dcc.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useChannelListModal } from '../composables/useChannelListModal.js';
@@ -366,14 +364,6 @@ const buffers = useBuffersStore();
 // the socket never opens: red status light + no buffers (#355 regression).
 useSocket();
 
-// Land on the system buffer instead of a blank "No messages yet." pane when
-// nothing else is active on load (#355). The last-active buffer isn't persisted,
-// so activeKey is null on every fresh load; the system buffer always exists in
-// the store, so this is always a valid target. Guarded on null so a deep-link /
-// push-jump that set a buffer first still wins.
-onMounted(() => {
-  if (networks.activeKey == null) buffers.activate(null, SYSTEM_KEY);
-});
 const {
   active,
   activeBuf,
@@ -383,8 +373,6 @@ const {
   bufferLabel,
   isSystemBuffer,
   isVirtual,
-  isFriendsBuffer,
-  renderMode,
   hasInput,
   hasNicklist,
 } = useActiveBuffer();
@@ -393,13 +381,22 @@ const settings = useSettingsStore();
 const auth = useAuthStore();
 const nicklistCollapse = useNicklistCollapseStore();
 const nickNotes = useNickNotesStore();
-const friends = useFriendsStore();
-const friendCount = computed(() => friends.contacts.length);
 const dcc = useDccStore();
 const dccTitle = computed(() =>
   dcc.pendingCount > 0 ? `DCC transfers — ${dcc.pendingCount} awaiting approval` : 'DCC transfers',
 );
 const whois = useWhoisStore();
+
+// Not reactive()-wrapped: the chip's fields stay refs so the template can read
+// them as `hlChip.show.value`, which keeps this identical to MobileChat's use.
+const hlChip = useHighlightChip();
+// The count is aria-hidden in the markup — screen readers get it here instead,
+// as words rather than a bare number floating beside "Show channel list".
+const railToggleTitle = computed(() =>
+  hlChip.show.value
+    ? `Show channel list — ${hlChip.label.value} highlight${hlChip.count.value === 1 ? '' : 's'}`
+    : 'Show channel list',
+);
 
 const channelListModal = reactive(useChannelListModal());
 const joinChannelModal = reactive(useJoinChannelModal());
@@ -415,15 +412,8 @@ const pendingScrollId = ref<number | null>(null);
 
 // Search & Highlights modal state + per-buffer `in:/on:` scoping, shared with
 // MobileChat (#496).
-const {
-  showSearch,
-  showHighlights,
-  searchScope,
-  highlightScope,
-  openSearch,
-  openHighlights,
-  onViewActivity,
-} = useBufferSearchScope();
+const { showSearch, showHighlights, searchScope, highlightScope, openSearch, openHighlights } =
+  useBufferSearchScope();
 const messageInputRef = ref<{ focus: () => void } | null>(null);
 const messageListRef = ref<{ scrollByPage: (dir: number) => void } | null>(null);
 
@@ -589,6 +579,34 @@ function onChatClick(e: MouseEvent) {
 const onJumpToMessage = useJumpToMessage({ pendingScrollId });
 
 const router = useRouter();
+const route = useRoute();
+
+// Land on the system buffer instead of a blank "No messages yet." pane when
+// nothing else is active (#355) — but not over the top of a deep link that
+// hasn't resolved yet. See shouldOpenSystemBufferOnLoad for why the route half
+// of that test is load-bearing.
+//
+// A watcher rather than a one-shot onMounted, because the interesting case
+// arrives LATE: a stale bookmark declines this rule at mount (the URL names a
+// buffer), then fails to resolve and drops the route back to `/` ten seconds
+// later with nothing active. A one-shot never sees that, and desktop is left on
+// the blank pane this rule exists to prevent.
+//
+// MUST stay below `route` above. `immediate: true` evaluates the getter
+// synchronously inside watch(), and <script setup> preserves statement order —
+// declared any earlier this throws a temporal-dead-zone ReferenceError during
+// setup and the desktop shell never mounts at all. Neither vue-tsc (it cannot
+// see through the closure) nor the suite (nothing mounts this component) catches
+// it, so the ordering is load-bearing and invisible.
+watch(
+  () => [networks.activeKey, route.params.id] as const,
+  () => {
+    if (shouldOpenSystemBufferOnLoad(networks.activeKey, route.params.id)) {
+      buffers.activate(null, SYSTEM_KEY);
+    }
+  },
+  { immediate: true },
+);
 // Collapsed-only footer affordance: the settings cog normally lives on the
 // LURKER sidebar row, but that whole list is unmounted when the sidebar is
 // collapsed (BufferList v-if), so the rail offers the cog here instead (#355).
@@ -803,6 +821,30 @@ useChatBootstrap({ onJump: onJumpToMessage });
   text-align: center;
   padding: var(--space-4) 0;
   border-bottom: 1px solid var(--border);
+  /* Anchors .hl-chip only — the chip is positioned so it stays OUT of the line
+     box, which is what keeps the rule below aligned with the topic divider. */
+  position: relative;
+}
+/* Highlight total for the list this button reveals. Colored text on a tint of
+   the same var rather than a solid fill: --buffer-highlight is user-themeable
+   (look.color.buffer.highlight), so any fixed label color could land on an
+   unreadable pairing. The tint tracks whatever they picked and the text keeps
+   its own contrast against it.
+
+   Mixed against --bg, not transparent: the chip sits over the chevron, and a
+   see-through wash let the glyph ghost through the pill where they overlap at
+   larger font sizes. An opaque tint covers it cleanly while staying light
+   enough to keep the colored text legible. */
+.rail-toggle .hl-chip {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  font-size: 0.75em;
+  line-height: 1.5;
+  color: var(--buffer-highlight);
+  background: color-mix(in srgb, var(--buffer-highlight) 24%, var(--bg));
 }
 /* The global `button:hover` repaints border-color to --accent, which would
    recolor the bottom rule on hover. Pin it back to --border — and keep it a
@@ -858,14 +900,18 @@ useChatBootstrap({ onJump: onJumpToMessage });
   margin: 0;
   font: inherit;
   text-align: left;
-  cursor: pointer;
   white-space: nowrap;
   min-width: 0;
 }
-.topic .topic-text:hover {
+/* Hover/click affordances belong to the clickable channel-topic BUTTON only;
+   the DM identity renders as a static span sharing the layout styles above. */
+button.topic-text {
+  cursor: pointer;
+}
+button.topic-text:hover {
   color: var(--fg);
 }
-.topic .topic-text:focus-visible {
+button.topic-text:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 2px;
 }

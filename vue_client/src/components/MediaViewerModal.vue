@@ -208,6 +208,8 @@ const DOUBLE_TAP_SLOP_PX = 32;
 const props = withDefaults(
   defineProps<{
     url: string;
+    /** What "copy link" should yield, when it differs from what we render. See GalleryItem. */
+    shareUrl?: string | null;
     // Gallery context (#547). All optional: a lone image opened from a message is a
     // gallery of one, and every one of these falls away to its single-image default.
     filename?: string | null;
@@ -403,7 +405,16 @@ function openInBrowser(): void {
 // something you do while still looking at the picture, and often while walking a
 // gallery. Closing would make copying two images in a row a chore.
 function onCopyLink(): void {
-  void clipboard.copy(props.url);
+  // ⚠ Absolute, and the share address rather than the rendered one. A relative path is not a
+  // link anyone can use — pasting it into a chat gives the reader a 404 at best.
+  const target = props.shareUrl || props.url;
+  let absolute = target;
+  try {
+    absolute = new URL(target, window.location.href).href;
+  } catch {
+    // A value URL couldn't parse is one we shouldn't rewrite; copy it as-is.
+  }
+  void clipboard.copy(absolute);
 }
 
 function toggleZoomFromCenter(): void {

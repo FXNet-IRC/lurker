@@ -2,40 +2,25 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import { describe, it, expect } from 'vitest';
-import {
-  SYSTEM_KEY,
-  FRIENDS_KEY,
-  VIRTUAL_BUFFERS,
-  isVirtualKey,
-  virtualConfig,
-} from './virtualBuffers.js';
+import { SYSTEM_KEY, VIRTUAL_BUFFERS, isVirtualKey, virtualConfig } from './virtualBuffers.js';
 
 describe('virtualBuffers', () => {
-  it('registers the system buffer as a real input buffer, friends as an overview', () => {
-    // #355: system is a first-class buffer (renderMode 'buffer') with a
-    // slash-command input and no nicklist.
+  it('registers the system buffer as a real input buffer', () => {
+    // #355: system is a first-class buffer with a slash-command input and no
+    // nicklist.
     expect(VIRTUAL_BUFFERS[SYSTEM_KEY]).toMatchObject({
       key: SYSTEM_KEY,
-      renderMode: 'buffer',
       hasNicklist: false,
       hasInput: true,
-    });
-    expect(VIRTUAL_BUFFERS[FRIENDS_KEY]).toMatchObject({
-      key: FRIENDS_KEY,
-      renderMode: 'overview',
-      hasNicklist: false,
-      hasInput: false,
     });
   });
 
   it('uses flat sentinel keys so the `${networkId}::${target}` parsers ignore them', () => {
     expect(SYSTEM_KEY.includes('::')).toBe(false);
-    expect(FRIENDS_KEY.includes('::')).toBe(false);
   });
 
   it('isVirtualKey recognizes registered keys and rejects everything else', () => {
     expect(isVirtualKey(SYSTEM_KEY)).toBe(true);
-    expect(isVirtualKey(FRIENDS_KEY)).toBe(true);
     expect(isVirtualKey('1::#chan')).toBe(false);
     expect(isVirtualKey(':highlights:')).toBe(false); // not registered yet
     expect(isVirtualKey('')).toBe(false);
@@ -50,7 +35,7 @@ describe('virtualBuffers', () => {
   });
 
   it('virtualConfig returns the frozen config for a virtual key, null otherwise', () => {
-    expect(virtualConfig(FRIENDS_KEY)).toBe(VIRTUAL_BUFFERS[FRIENDS_KEY]);
+    expect(virtualConfig(SYSTEM_KEY)).toBe(VIRTUAL_BUFFERS[SYSTEM_KEY]);
     expect(virtualConfig('1::#chan')).toBeNull();
     expect(virtualConfig(null)).toBeNull();
     expect(virtualConfig(undefined)).toBeNull();

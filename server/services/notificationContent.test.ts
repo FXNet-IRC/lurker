@@ -46,37 +46,61 @@ describe('composeNotification', () => {
     );
   });
 
-  it('names the identity a friend signed on as when it differs', () => {
+  it('titles a friend-online transition with the nick (displayName == target now)', () => {
+    // Under buffer favorites the display name IS the nick, so the vestigial
+    // "(as nick)" branch never fires on real payloads.
     expect(
       composeNotification(
-        payload({ kind: 'friend_online', target: 'nostimo', displayName: 'Amiantos', text: null }),
+        payload({ kind: 'friend_online', target: 'nostimo', displayName: 'nostimo', text: null }),
       ),
     ).toMatchObject({
-      title: 'Amiantos came online (as nostimo · Libera)',
+      title: 'nostimo came online (Libera)',
       // No text on a presence transition — the title carries it.
       body: '',
     });
   });
 
-  it('omits the nick when a friend signed on under their display name', () => {
-    // Case-insensitively: 'Amiantos' vs 'amiantos' is the same identity, and
-    // saying "Amiantos came online (as amiantos)" would be noise.
+  it('keeps the legacy displayName branch byte-compatible (crafted/stale payloads)', () => {
+    // The composition must keep matching sw.js's cached copy even for shapes
+    // the server no longer emits — the parity suite below runs the real worker.
     expect(
       composeNotification(
-        payload({ kind: 'friend_online', target: 'amiantos', displayName: 'Amiantos' }),
+        payload({ kind: 'friend_online', target: 'nostimo', displayName: 'Amiantos' }),
       ).title,
-    ).toBe('Amiantos came online (Libera)');
+    ).toBe('Amiantos came online (as nostimo · Libera)');
+    expect(
+      composeNotification(payload({ kind: 'friend_online', displayName: null, target: '' })).title,
+    ).toBe('A friend came online (Libera)');
   });
 
-  it('falls back when a nick or display name is missing', () => {
+  it('falls back when a nick is missing', () => {
     expect(composeNotification(payload({ nick: null })).title).toBe('someone (Libera)');
     // The same fallback on the channel branch, which is a separate expression.
     expect(
       composeNotification(payload({ kind: 'highlight', target: '#lurker', nick: null })).title,
     ).toBe('someone in #lurker');
+  });
+
+  it('strips mIRC formatting codes from the body (#606)', () => {
+    // A native alert renders body as plain text, so \x03 colors and \x02 bold
+    // would otherwise land as literal control chars on the lock screen.
+    const out = composeNotification(payload({ text: '\x0304red\x03 and \x02bold\x02 text' }));
+    expect(out.body).toBe('red and bold text');
+  });
+
+  it('presence pushes never share a collapse tag with the peer’s messages', () => {
+    // Same buffer, different tag namespace: a connection flap must not
+    // replace an unread DM alert with "came online".
+    const dm = composeNotification(payload({ kind: 'dm', target: 'bob', nick: 'bob' }));
+    const presence = composeNotification(
+      payload({ kind: 'friend_online', target: 'bob', displayName: 'bob' }),
+    );
+    expect(presence.tag).not.toBe(dm.tag);
+    // ...but repeated flaps from the same peer DO collapse among themselves.
     expect(
-      composeNotification(payload({ kind: 'friend_online', displayName: null, target: '' })).title,
-    ).toBe('A friend came online (Libera)');
+      composeNotification(payload({ kind: 'friend_online', target: 'bob', displayName: 'bob' }))
+        .tag,
+    ).toBe(presence.tag);
   });
 
   it('tags by buffer so a burst in one channel collapses', () => {
@@ -131,12 +155,12 @@ describe('parity with the service worker fallback', () => {
       payload({ kind: 'always_notify', target: '#lurker', nick: null }),
     ],
     [
-      'friend_online under a different nick',
-      payload({ kind: 'friend_online', target: 'nostimo', displayName: 'Amiantos' }),
+      'friend_online (displayName == target, the only live shape)',
+      payload({ kind: 'friend_online', target: 'nostimo', displayName: 'nostimo' }),
     ],
     [
-      'friend_online under the same nick',
-      payload({ kind: 'friend_online', target: 'amiantos', displayName: 'Amiantos' }),
+      'friend_online under a legacy distinct display name',
+      payload({ kind: 'friend_online', target: 'nostimo', displayName: 'Amiantos' }),
     ],
     [
       'friend_online with no display name',
@@ -147,7 +171,7 @@ describe('parity with the service worker fallback', () => {
       payload({
         kind: 'friend_online',
         target: 'nostimo',
-        displayName: 'Amiantos',
+        displayName: 'nostimo',
         networkName: '',
       }),
     ],

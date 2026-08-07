@@ -5,12 +5,11 @@ import { onBeforeUnmount, onMounted, watch } from 'vue';
 import { useNetworksStore } from '../stores/networks.js';
 import { useBuffersStore } from '../stores/buffers.js';
 import { usePinsStore } from '../stores/pins.js';
-import { useFriendsStore } from '../stores/friends.js';
+import { useFavoritesStore } from '../stores/favorites.js';
 import { useNavHistoryStore } from '../stores/navHistory.js';
 import { useRecentBuffersStore } from '../stores/recentBuffers.js';
 import { socketSend } from './useSocket.js';
 import { flattenBufferOrder, flattenUnreadOrder } from '../utils/bufferOrder.js';
-import { FRIENDS_KEY } from '../lib/virtualBuffers.js';
 
 export interface KeyboardShortcutsOptions {
   onOpenSwitcher?: () => void;
@@ -29,10 +28,10 @@ function isCmd(e: KeyboardEvent): boolean {
 }
 
 // Entries keyboard nav can land on: real channels and DMs. The per-network
-// server consoles (`:server:<id>`) and the virtual FRIENDS feed header are
-// walked past, not landed on — you reach those by clicking.
+// server consoles (`:server:<id>`) are walked past, not landed on — you reach
+// those by clicking.
 function isNavTarget(entry: { key: string; target: string }): boolean {
-  return !entry.target.startsWith(':server:') && entry.key !== FRIENDS_KEY;
+  return !entry.target.startsWith(':server:');
 }
 
 // IRCCloud-style global shortcuts. Wired at the document level so they fire
@@ -53,14 +52,14 @@ export function useKeyboardShortcuts({
   const networks = useNetworksStore();
   const buffers = useBuffersStore();
   const pins = usePinsStore();
-  const friends = useFriendsStore();
+  const favorites = useFavoritesStore();
   const navHistory = useNavHistoryStore();
   const recentBuffers = useRecentBuffersStore();
 
   // Feed the back/forward history (#309) and the quick switcher's MRU recency
   // list (#393) from one seam. networks.activeKey is the single place every
   // navigation path converges (sidebar click, quick switcher, slash commands,
-  // deep links, the Friends pane), so recording there captures them all.
+  // deep links), so recording there captures them all.
   // `flush: 'sync'` keeps navHistory's re-entrancy guard exact — the echo from
   // its own back()/forward() fires the instant activeKey mutates, before the
   // guard clears (recentBuffers has no such guard: a back/forward hop is a
@@ -82,23 +81,15 @@ export function useKeyboardShortcuts({
     recentBuffers.record(networks.activeKey);
   }
 
-  // The FRIENDS group as the sidebar shows it: a feed header (only when there
-  // are contacts) + each friend's primary DM, with those DMs excluded from
-  // their real network so nav doesn't visit them twice.
-  function friendsOrder() {
-    return {
-      dms: friends.primaryDmEntries,
-      excludeKeys: friends.primaryDmKeys,
-      feedKey: friends.contacts.length ? FRIENDS_KEY : undefined,
-    };
-  }
-
   function order() {
     return flattenBufferOrder({
       networks: networks.networks,
       buffers,
       pins,
-      friends: friendsOrder(),
+      // The FRIENDS/FAVORITES sections as the sidebar shows them, with those
+      // buffers excluded from their real network group so nav doesn't visit
+      // them twice.
+      favorites: favorites.orderInjection,
     });
   }
 
@@ -107,24 +98,21 @@ export function useKeyboardShortcuts({
       networks: networks.networks,
       buffers,
       pins,
-      friends: friendsOrder(),
+      favorites: favorites.orderInjection,
     });
   }
 
-  // Activate the right way for the entry: the virtual FRIENDS feed goes through
-  // the friends store (select + lazy-load); everything else is a real buffer.
   function activateEntry(entry: { networkId: string | number; target: string; key: string }): void {
-    if (entry.key === FRIENDS_KEY) friends.open();
-    else buffers.activate(entry.networkId, entry.target);
+    buffers.activate(entry.networkId, entry.target);
   }
 
   function step(delta: number, scope: 'all' | 'unread'): void {
     // Both Alt+Arrow (all buffers) and Shift+Alt+Arrow (unread only) walk the
     // full sidebar order across every network — neither is scoped to the
-    // current network. We index against the *full* list (server consoles and
-    // FRIENDS feed header included) so stepping off one of those skip-only
-    // entries flows within its own section in sidebar order rather than jumping
-    // to the top of the list; isNavTarget then walks past them to a real buffer.
+    // current network. We index against the *full* list (server consoles
+    // included) so stepping off one of those skip-only entries flows within its
+    // own section in sidebar order rather than jumping to the top of the list;
+    // isNavTarget then walks past them to a real buffer.
     const list = scope === 'unread' ? unreadOrder() : order();
     if (!list.some(isNavTarget)) return;
     const activeKey = networks.activeKey;
@@ -136,7 +124,7 @@ export function useKeyboardShortcuts({
       idx = delta > 0 ? -1 : list.length;
     }
     // Advance to the next landable buffer in the requested direction, skipping
-    // server consoles and the FRIENDS feed header and wrapping around.
+    // server consoles and wrapping around.
     for (let i = 0; i < list.length; i++) {
       idx = (idx + delta + list.length) % list.length;
       if (isNavTarget(list[idx])) {

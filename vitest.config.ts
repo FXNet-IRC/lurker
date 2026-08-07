@@ -23,7 +23,10 @@ export default defineConfig({
           // never collects it, and the run still reports all-green. Everything
           // that isn't the client's belongs to this project.
           include: ['**/*.{test,spec}.ts'],
-          exclude: ['**/node_modules/**', 'vue_client/**'],
+          // .claude/ can hold agent-harness git WORKTREES (full checkouts,
+          // including their own copies of every test); collecting those runs
+          // another branch's suite inside this one's report.
+          exclude: ['**/node_modules/**', 'vue_client/**', '.claude/**'],
           environment: 'node',
         },
       },

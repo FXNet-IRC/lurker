@@ -28,16 +28,23 @@
         >&gt;</span
       ><template v-else>&gt;</template></span
     >
+    <!-- `:value` + `@input` rather than `v-model`, with compositionend/change
+         as backstop copies of the same handler — the full rationale lives in
+         the "IME composition" note in the script block. -->
     <textarea
       ref="inputEl"
-      v-model="text"
       rows="1"
+      :value="text"
       :placeholder="placeholder"
       :disabled="(!active && !isSystemBuffer) || isPaused"
       :spellcheck="systemFeatures.spellcheck"
       :autocorrect="systemFeatures.autocorrect"
       :autocapitalize="systemFeatures.autocapitalize"
       @keydown="onKeydown"
+      @input="syncModelFromDom"
+      @compositionstart="onCompositionStart"
+      @compositionend="onCompositionEnd"
+      @change="syncModelFromDom"
       @paste="onPaste"
       @blur="onBlur"
     ></textarea>
@@ -143,6 +150,10 @@ import { parseNetworkCommand } from '../lib/commands/network.js';
 import { splitSetArgs, coerceSettingValue, formatSettingValue } from '../lib/commands/settings.js';
 import { parseRelayCommand } from '../lib/commands/relay.js';
 import { parseDccCommand } from '../lib/commands/dcc.js';
+import { parseThemeCommand } from '../lib/commands/theme.js';
+import { useThemesStore } from '../stores/themes.js';
+import { foldThemeName, themeNameError } from '../../../shared/themePresets.js';
+import type { ThemePreset } from '../../../shared/themePresets.js';
 import { formatColumns } from '../lib/commands/output.js';
 import { REGISTRY, getOption, optionVisible, CATEGORIES } from '../utils/settingsRegistry.js';
 import type { SettingOption } from '../../../shared/settingsRegistry.js';
@@ -159,6 +170,7 @@ import { useToastsStore } from '../stores/toasts.js';
 import { useIgnoresStore, type IgnoreEntry } from '../stores/ignores.js';
 import { useRelayBotsStore } from '../stores/relayBots.js';
 import { useHighlightRulesStore, type HighlightRule } from '../stores/highlightRules.js';
+import { isChannelTarget } from '../../../shared/channels.js';
 import { parseIgnoreArgs } from '../../../shared/parseIgnore.js';
 import { parseHighlightArgs } from '../../../shared/parseHighlight.js';
 import { highlightRuleDetailParts } from '../utils/highlightFormat.js';
@@ -177,6 +189,7 @@ import {
   splitGateFor,
   type MultilineLimits,
 } from '../utils/messageSplit.js';
+import { shouldRepinOnSend } from '../utils/sendScroll.js';
 import { applySpoilerMarkup } from '../utils/spoilerMarkup.js';
 import { buildNickCandidates } from '../utils/nickCompletion.js';
 import { buildChannelCandidates } from '../utils/channelCompletion.js';
@@ -319,8 +332,8 @@ const isSystemBuffer = computed(() => networks.activeKey === SYSTEM_KEY);
 const systemText = ref('');
 
 // Input contents are server-side per-buffer drafts — switching channels swaps
-// the input bar's body to that buffer's draft (or empty). v-model writes go
-// through the setter, which records the optimistic local update and schedules
+// the input bar's body to that buffer's draft (or empty). Keystrokes reach the
+// setter via syncModelFromDom, which records the optimistic local update and schedules
 // a debounced WS flush; the typing-state side effects in onInput run here
 // (not in a watch(text)) so remote `draft-updated` echoes from other tabs
 // don't fire fake "active" typing notifications. The system buffer routes to
@@ -362,7 +375,7 @@ if (!supportsFieldSizing) {
     el.style.height = 'auto';
     el.style.height = `${el.scrollHeight}px`;
   };
-  // Re-measure whenever the visible text changes — typing (the v-model setter),
+  // Re-measure whenever the visible text changes — typing (via the `text` setter),
   // programmatic edits (history recall, send-clear), and buffer switches that
   // swap in a different draft (the getter changes without firing the setter).
   watch(text, () => nextTick(autosizeInput));
@@ -472,6 +485,39 @@ const longMessageChunks = ref(0);
 const longMessageMultiline = ref(false);
 const longMessageUploading = ref(false);
 
+// The /shrug payload (#532). The backslash is literal — Lurker's inline
+// formatting is IRC control codes (\x02, \x1D…), not markdown, so nothing tries
+// to read `\_` as an escape. Shared by the send path and the split estimator so
+// the "will split into N lines" count is measured against the exact bytes that
+// go on the wire.
+const SHRUG = '¯\\_(ツ)_/¯';
+function shrugBody(text: string): string {
+  const trimmed = text.trim();
+  return trimmed ? `${trimmed} ${SHRUG}` : SHRUG;
+}
+
+/**
+ * A slash command's user-authored body, on its way to a channel or DM (#652).
+ *
+ * `||spoiler||` used to be rewritten on the plain-send path only, so the same input produced a
+ * click-to-reveal box when typed and literal pipes when sent through `/me`, `/msg`, `/notice` or
+ * `/shrug`. Silent and non-recoverable: the spoiler is already on the wire before the user sees
+ * it didn't work.
+ *
+ * ⚠⚠ Opt-in PER COMMAND, deliberately — never folded into `ackedSend`/`sendOrToast`. `/ns` and
+ * `/cs` route a raw PRIVMSG to NickServ/ChanServ whose body is usually `identify <password>`;
+ * rewriting bytes headed for an auth handshake is a bug, not a feature. Routing each chat command
+ * through this helper is what keeps those untouched by construction rather than by a guard
+ * somebody has to remember.
+ *
+ * ⚠ Only the PAYLOAD is rewritten. Every caller still hands the TYPED text to `toastSendFailure`
+ * and to input history, so a failed send shows something the user can read and copy, and up-arrow
+ * recalls `||…||` rather than raw control codes — the same split the plain path makes.
+ */
+function chatBody(text: string): string {
+  return applySpoilerMarkup(text);
+}
+
 // Strip a leading slash command (/me, /msg <who>) so chunk counting reflects
 // what irc-framework actually has to encode. For /me the relevant bytes are
 // the action body, not the slash-command prefix. For /msg the body goes to
@@ -489,12 +535,32 @@ function bodyForSplit(raw: string): { body: string; isAction: boolean } {
   const m = raw.match(/^\/(\w+)\s*(.*)$/s);
   if (!m) return { body: '', isAction: false };
   const cmd = m[1].toLowerCase();
-  if (cmd === 'me') return { body: m[2], isAction: true };
+  // ⚠ Every branch below counts the POST-rewrite bytes, for the same reason the plain path above
+  // does: the spoiler rewrite ADDS bytes (`\x0301,01` … `\x03`), so a message that fits before it
+  // may not after, and counting the typed form drifts the estimate LOW.
+  //
+  // ⚠ …and each branch reproduces its command's own whitespace handling, because `computeChunks`
+  // drives the outgoing-flood GATE, not just the indicator: bytes counted here that the send path
+  // never puts on the wire can hard-block a message that would have gone out fine. /me needs
+  // nothing for that — `\s*` above eats the leading run, and `chunksForLine` parks a TRAILING run
+  // in `pendingWs` and never charges for it — so m[2] is counted as-is.
+  if (cmd === 'me') return { body: chatBody(m[2]), isAction: true };
+  // /shrug produces a real PRIVMSG body, so it carries the same split/flood risk
+  // a plain message does — count the kaomoji too, since it's part of what goes on
+  // the wire. Built by the same helper the send path uses so the estimate and the
+  // payload can't drift.
+  if (cmd === 'shrug') return { body: chatBody(shrugBody(m[2])), isAction: false };
   if (cmd === 'msg' || cmd === 'query') {
-    // /msg <who> <body...> — drop the recipient nick from the body.
-    const rest = m[2];
-    const sp = rest.indexOf(' ');
-    return { body: sp >= 0 ? rest.slice(sp + 1) : '', isAction: false };
+    // /msg <who> <body...> — drop the recipient nick from the body. Split-and-rejoin rather than
+    // slicing at the first space, because that is exactly what the send path does:
+    // `const [cmd, ...rest] = line.slice(1).split(/\s+/)`, then `msgParts.join(' ')`. That
+    // collapses internal whitespace runs, so slicing counted bytes that never reach the wire.
+    //
+    // ⚠ NOT trimmed, unlike /me above. The send path doesn't trim either, and `split(/\s+/)` on
+    // a trailing-space string yields a final empty element — so `/msg bob hi ` really does put
+    // `hi ` on the wire. The estimator's job is to match the payload, not to tidy it.
+    const words = m[2].split(/\s+/);
+    return { body: chatBody(words.slice(1).join(' ')), isAction: false };
   }
   return { body: '', isAction: false };
 }
@@ -589,6 +655,56 @@ interface CompletionState {
 }
 let completion: CompletionState | null = null;
 let cycling = false; // true while we're programmatically rewriting `text`
+
+// ─── IME composition ────────────────────────────────────────────────────────
+//
+// The composer binds `:value` + `@input` instead of `v-model`, which is worth
+// the explanation because v-model is otherwise the obvious choice.
+//
+// vModelText carries a `composing` flag, set between compositionstart and
+// compositionend, and refuses to do anything while it is up: its input
+// listener opens with `if (e.target.composing) return`, and its beforeUpdate
+// hook bails the same way before it would write. On a desktop CJK IME that
+// covers a candidate session; on an Android soft keyboard with suggestions on
+// it covers *every word*, first letter to space. Firefox on Android composes
+// the most aggressively of the mobile engines, which is where this surfaced —
+// a user's `@ami` suggester sat frozen on the unfiltered list until they
+// dismissed the keyboard, which committed the composition and delivered the
+// whole word at once.
+//
+// The composer cannot live with either half of that. `text` is not merely
+// what's on screen: the Send button's enabled state, what submit() puts on
+// the wire, the SPLIT/FLOOD estimate, the typing indicator, the cross-device
+// draft sync and the textarea's own auto-grow all hang off it. And the write
+// half is worse than it looks — a draft cleared after a send, or swapped by a
+// buffer switch, would not reach the textarea, leaving stale text on screen
+// that the next keystroke would then adopt as the new draft.
+//
+// A plain `:value` binding has no such flag. patchDOMProp writes el.value
+// whenever the model differs and skips when it doesn't, so normal typing
+// leaves the caret alone while a genuine divergence (send-clear, buffer
+// switch, a completion splice) still repaints. Paired with syncModelFromDom below,
+// which assigns unconditionally, the model and the DOM track each other in
+// both directions no matter what the IME is doing.
+//
+// The WRITE half of v-model's guard is re-established where the dangerous
+// writes originate, not at the binding: while a composition is live the
+// drafts store (composingKey, stores/drafts.ts) drops remote draft
+// updates/seeds for that buffer and defers the debounce flush, so another
+// device can't repaint the textarea under a live preedit and a mid-word
+// pause can't persist raw preedit as the durable cross-device draft.
+//
+// Known tradeoff: a CJK IME's preedit now reaches the typing indicator, and
+// clicking Send mid-composition ships the visible text, preedit included
+// (the button's mousedown.prevent keeps focus, so no blur-commit runs
+// first). Gating Send on the composition flag was considered and rejected:
+// on an Android keyboard a composition is open for every word, so a
+// refusing Send button would go dead for any message not ending in a space
+// — the exact shape of #623, on the branch's own target platform. Desktop
+// CJK users confirm with Enter (which IS gated) before reaching for the
+// mouse; what-you-see-is-what-sends matches Discord/Slack. It self-corrects
+// on commit and is much the lesser evil next to a Send button that stays
+// disabled and a submit() that ships pre-composition text.
 
 // Input history walking state. `historyIndex` is null when we're not in a
 // recall walk; otherwise it points into the per-buffer history slice.
@@ -723,7 +839,7 @@ function applyCompletion() {
   cycling = false;
   // Move caret to just after the inserted nick + suffix.
   const caret = completion.prefix.length + pick.length + suffix.length;
-  // Set on the next tick so v-model has propagated.
+  // Set on the next tick so the `:value` patch has propagated.
   queueMicrotask(() => {
     const el = inputEl.value;
     if (!el) return;
@@ -789,6 +905,9 @@ function onBlur() {
   // races a selection.
   closeEmojiStrip();
   closeEmojiPicker();
+  // Losing focus ends any IME composition (the engine commits or cancels) —
+  // release the drafts store's composition write-guard before flushing.
+  drafts.endComposition();
   // Force the active buffer's draft to the server now rather than waiting on
   // the debounce timer — covers refocus into a different tab or mobile
   // app-switch without losing the in-progress text.
@@ -885,6 +1004,24 @@ const isMac =
   /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent || '');
 
 function onKeydown(e: KeyboardEvent): void {
+  // ONE composition gate for the whole handler, where ten scattered per-branch
+  // `!e.isComposing` checks used to live (and two branches — Cmd+B/I/U and
+  // Escape-closes-color-picker — had predictably been missed). While an IME
+  // composition is live, every key belongs to the IME: arrows/Tab/Enter drive
+  // its candidate window, Escape cancels its preedit — nothing here should
+  // act. keyCode 229 is gated too: Safari fires the Enter that confirms a CJK
+  // composition AFTER compositionend, with isComposing already false but
+  // keyCode still 229 — without this, committing a word would send the message
+  // (the standard ProseMirror/Slate guard).
+  //
+  // Tab still preventDefaults on the way out: the IME has already consumed the
+  // key, and letting the default through would walk focus out of the composer
+  // onto Send — which on Firefox/Gboard Android, where a composition is open
+  // for every word, would be the *only* thing Tab ever did.
+  if (e.isComposing || e.keyCode === 229) {
+    if (e.key === 'Tab') e.preventDefault();
+    return;
+  }
   // Formatting shortcuts (Cmd/Ctrl + B/I/U). preventDefault stops the browser
   // from owning Cmd+B for "bookmarks bar"; stopPropagation keeps the global
   // shortcut handler in useKeyboardShortcuts.js from seeing keys that map to
@@ -918,7 +1055,7 @@ function onKeydown(e: KeyboardEvent): void {
   // to send / word completion. Skipped entirely during an IME composition so
   // the same arrows/Tab/Enter stay free to drive the IME's candidate window.
   // The picker is desktop-only — the mobile suggestion strip never opens it.
-  if (pickerOpen.value && !e.isComposing && nickPickerEl.value?.hasCandidates()) {
+  if (pickerOpen.value && nickPickerEl.value?.hasCandidates()) {
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
       if (!e.altKey && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
@@ -938,7 +1075,7 @@ function onKeydown(e: KeyboardEvent): void {
   // Gated on hasCandidates() so a no-match `#zzz` lets Enter/Tab fall through to
   // send / in-place completion below. refreshPicker keeps this and the nick
   // picker from being open at once, so the two blocks can't both fire.
-  if (channelPickerOpen.value && !e.isComposing && channelPickerEl.value?.hasCandidates()) {
+  if (channelPickerOpen.value && channelPickerEl.value?.hasCandidates()) {
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
       if (!e.altKey && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
@@ -964,7 +1101,7 @@ function onKeydown(e: KeyboardEvent): void {
   // This strip is prefix-less: it pops up on any plain word that matches a
   // nick while you type an ordinary message, so a key that means "send" must
   // not quietly mean "complete" (issue #221).
-  if (overlay.nickOpen && !e.isComposing && hasNickCandidates()) {
+  if (overlay.nickOpen && hasNickCandidates()) {
     if (e.key === 'Escape') {
       e.preventDefault();
       closeStrip();
@@ -1002,7 +1139,7 @@ function onKeydown(e: KeyboardEvent): void {
   // during an IME composition. The emoji strip and the nick picker are never
   // open at once (refreshPicker closes one before opening the other), so the
   // two blocks can't both fire.
-  if (overlay.emojiOpen && !e.isComposing && hasEmojiCandidates()) {
+  if (overlay.emojiOpen && hasEmojiCandidates()) {
     if (e.key === 'Escape') {
       e.preventDefault();
       closeEmojiStrip();
@@ -1030,7 +1167,7 @@ function onKeydown(e: KeyboardEvent): void {
   // nav keys — arrows move the highlight, Tab/Enter confirm; Escape is left to
   // the popover's own document listener. Mobile uses the emoji-strip block
   // above instead (the two are never open at once). Shift+Enter still newlines.
-  if (emojiPickerOpen.value && !e.isComposing && emojiPickerEl.value?.hasCandidates()) {
+  if (emojiPickerOpen.value && emojiPickerEl.value?.hasCandidates()) {
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
       if (!e.altKey && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
@@ -1050,7 +1187,7 @@ function onKeydown(e: KeyboardEvent): void {
   // submit below, so an open menu takes precedence over walking history in
   // place. Gated on hasCandidates() like the nick/channel pickers; skipped
   // mid-IME. Shift+Enter still newlines.
-  if (historyPickerOpen.value && !e.isComposing && historyPickerEl.value?.hasCandidates()) {
+  if (historyPickerOpen.value && historyPickerEl.value?.hasCandidates()) {
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
       if (!e.altKey && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
@@ -1065,11 +1202,10 @@ function onKeydown(e: KeyboardEvent): void {
   }
   if (e.key === 'Enter') {
     // Textareas don't submit forms on Enter, so we trigger submission here.
-    // Shift+Enter falls through to the default newline insert. e.isComposing
-    // guards against IME users — pressing Enter to confirm a composition
-    // shouldn't fire a send. The fire-and-forget on submit() is intentional;
-    // it owns its own error handling and the sync handler shouldn't await.
-    if (e.isComposing) return;
+    // Shift+Enter falls through to the default newline insert; the top-of-
+    // handler composition gate keeps an IME-confirming Enter from sending.
+    // The fire-and-forget on submit() is intentional; it owns its own error
+    // handling and the sync handler shouldn't await.
     if (e.shiftKey) return;
     e.preventDefault();
     submit();
@@ -1079,8 +1215,6 @@ function onKeydown(e: KeyboardEvent): void {
     // Bare arrows only — Alt+Arrow is buffer navigation (useKeyboardShortcuts),
     // and Shift+Arrow extends the selection; neither should hijack history.
     if (e.altKey || e.metaKey || e.ctrlKey || e.shiftKey) return;
-    // Leave the arrows to an active IME — they navigate its candidate window.
-    if (e.isComposing) return;
     const el = inputEl.value;
     // Only consider history with a collapsed caret (no selection). Don't
     // preventDefault — let the browser move the caret natively first. That
@@ -1117,7 +1251,7 @@ function onKeydown(e: KeyboardEvent): void {
     !e.altKey &&
     !e.ctrlKey &&
     (e.key === 'ArrowLeft' || e.key === 'ArrowRight');
-  if (!e.isComposing && (bareHomeEnd || macCmdArrow)) {
+  if (bareHomeEnd || macCmdArrow) {
     const el = inputEl.value;
     if (el) {
       e.preventDefault();
@@ -1184,6 +1318,9 @@ function onKeydown(e: KeyboardEvent): void {
   if (!buf || !active.value) return;
   const networkId = active.value.networkId;
 
+  // ⚠ `#`-only on purpose (#724): this asks what SIGIL the user typed, not whether a target is
+  // a channel. Tab after `&loc` completes nicks, which is the lesser evil — widening it would
+  // make a leading `+` or `!` in ordinary prose start completing channel names.
   const isChannel = token.startsWith('#');
   // Strip the sigil off both forms. '#' is part of a channel name so it stays in
   // the *result*, but neither sigil belongs in the *prefix* we match on: asking
@@ -1386,6 +1523,8 @@ function refreshPicker() {
   // typed so you get the full joined-channel list; the picker self-hides when
   // nothing matches (its v-if gates on candidate count), so a stray `#5` or a
   // channel you're not in just shows no popover.
+  // ⚠ `#`-only on purpose (#724): the picker trigger is a typed character, not a classification.
+  // Opening it on `+` or `!` would pop a channel popover mid-sentence.
   if (token.startsWith('#')) {
     closePicker();
     closeStrip();
@@ -1509,10 +1648,11 @@ function onStripSelect(nick: string): void {
   // A nick at the start of a line is being addressed → ': '; mid-sentence
   // gets a bare space (what the old @-menu was missing — task #198). Shares
   // isAtLineStart() with Tab-completion and the desktop picker.
-  const suffix = isAtLineStart(text.value.slice(0, stripTokenStart)) ? ': ' : ' ';
+  const draft = text.value;
+  const suffix = isAtLineStart(draft.slice(0, stripTokenStart)) ? ': ' : ' ';
   // The strip is prefix-less: its token is the bare word under the cursor, which
   // is already the prefix buildNickMatches wants (no '@' to strip).
-  const token = text.value.slice(stripTokenStart, stripTokenEnd);
+  const token = draft.slice(stripTokenStart, stripTokenEnd);
   commitCompletion({
     start: stripTokenStart,
     end: stripTokenEnd,
@@ -1577,6 +1717,33 @@ function onHistorySelect(entry: string): void {
   resetHistoryNav();
   setInputAndCaretEnd(entry);
   queueMicrotask(() => inputEl.value?.focus());
+}
+
+// The DOM→model half of the binding (see the IME composition note further up
+// for why this replaces v-model, and why compositionend/change re-run it as
+// backstops). The equality check is a redundancy skip, not a correctness gate:
+// an event reporting the value the model already holds has nothing to update,
+// and running the pipeline for it would fire a typing notification and a draft
+// flush for a no-op edit.
+function syncModelFromDom() {
+  const el = inputEl.value;
+  if (!el || el.value === text.value) return;
+  text.value = el.value;
+}
+
+// Composition lifecycle → the drafts store's write-guard (see the IME note):
+// while a composition is live in a real buffer, the store drops remote draft
+// updates/seeds for it and defers the debounce flush. endComposition clears
+// whichever buffer was marked, so blur and buffer-switch calling it too means
+// a missed compositionend can never suppress remote updates indefinitely.
+function onCompositionStart() {
+  const a = active.value;
+  if (a && !isSystemBuffer.value) drafts.beginComposition(a.networkId, a.target);
+}
+
+function onCompositionEnd() {
+  drafts.endComposition();
+  syncModelFromDom();
 }
 
 function onInput() {
@@ -1657,6 +1824,10 @@ watch(active, (newActive, oldActive) => {
   // but any unused split-confirm token doesn't transfer — a fresh buffer is
   // a fresh consent decision.
   pendingSplitConfirm = false;
+  // A composition can't meaningfully survive the draft swap — release the
+  // store's write-guard for the buffer we're leaving so its remote updates
+  // aren't suppressed by a stale composing mark.
+  drafts.endComposition();
   // Drain any pending debounced flush for the buffer we're leaving so the
   // server's row reflects the latest body before the next tab sees us
   // switching away. flushBuffer is a no-op if nothing is pending.
@@ -1862,7 +2033,12 @@ function toastSendFailure(error: string, body: string): void {
 // Optimistically clear, but only AFTER we've confirmed the send actually
 // hit the wire. Anything we'd otherwise have lost (the typed text, the
 // history slot) is still recoverable via up-arrow if delivery later fails.
-function commitInput(raw: string, networkId: number, target: string): void {
+function commitInput(
+  raw: string,
+  networkId: number,
+  target: string,
+  opts: { isChatMessage: boolean },
+): void {
   inputHistory.add(networkId, target, raw);
   socketSend({ type: 'input-history-add', networkId, target, text: raw });
   // Clear the draft for the buffer the send came FROM, addressed explicitly
@@ -1878,10 +2054,54 @@ function commitInput(raw: string, networkId: number, target: string): void {
   pendingSplitConfirm = false;
   setComposingState({ chunks: 0, isAction: false });
   resetHistoryNav();
+  // A command always re-pins, whatever the setting says, and never reattaches.
+  // Its output lands in this buffer through localInfo — /commands, /ignore
+  // list, every usage and error line — and those rows are deliberately id-less,
+  // which is precisely what maybeBumpNewBelow skips. So keeping your place
+  // would drop the answer below the fold with no "Return (N new) ↓" to say it
+  // exists, and the command would look like it did nothing. That's the same
+  // reasoning the system buffer applies to everything it prints. Sends wearing
+  // a command's clothes (/me, /slap, /shrug, /jitsi, …) are messages, not
+  // commands; the caller tells them apart by whether the command actually put
+  // something on the wire, not by the verb.
+  if (!opts.isChatMessage) {
+    requestScrollToBottom();
+    return;
+  }
+
   // Re-pin to the bottom so a user who was scrolled up reading history sees
   // their own send land — and the live-append watcher in MessageList keeps
-  // following once stickToBottom flips back on.
-  requestScrollToBottom();
+  // following once stickToBottom flips back on. chat.keep_position_on_send
+  // opts out of the yank (#628); see shouldRepinOnSend for why a detached
+  // buffer overrides it.
+  //
+  // The buffer tested is the ACTIVE one, not the one the send was addressed to:
+  // this decides what happens to the list on screen, and a `/msg nick text` has
+  // already activated the DM by the time we get here. That new buffer is never
+  // detached, so switching to it still lands at the bottom.
+  const onScreen = networks.activeKey ? buffers.byKey(networks.activeKey) : null;
+  const detached = !!onScreen?.detached;
+  if (detached) {
+    // Sending from a detached slice returns to live, the same way the status
+    // bar's "Return ↓" does. The message went to the live tail, and a detached
+    // buffer holds that tail out of the log — so a plain scroll would land at
+    // the end of a stretch of history the message can never appear in, which
+    // reads as a failed send. Fetching the tail is the only way to show it.
+    const rejoined =
+      onScreen?.networkId != null && buffers.reattachToLive(onScreen.networkId, onScreen.target);
+    // The request doesn't go out while another history page is already in
+    // flight (the downward pager, mid-slice). The buffer is then still
+    // detached and the message still isn't loaded, so scrolling would claim an
+    // arrival that hasn't happened. Leaving the reader where they are keeps
+    // "Return ↓" and its count in front of them — one tap fetches the tail,
+    // this message included.
+    if (!rejoined) return;
+  }
+  const repin = shouldRepinOnSend({
+    keepPosition: settings.effective('chat.keep_position_on_send') === true,
+    detached,
+  });
+  if (repin) requestScrollToBottom();
 }
 
 async function submit() {
@@ -1910,6 +2130,10 @@ async function submit() {
     }
     systemText.value = '';
     resetHistoryNav();
+    // Unconditional, unlike the chat path above: chat.keep_position_on_send is
+    // for reading a conversation while replying to it, and this buffer isn't a
+    // conversation — you type a command to read what it prints back, so keeping
+    // your place would hide the only thing the send produced.
     requestScrollToBottom();
     return;
   }
@@ -1980,9 +2204,10 @@ async function submit() {
     // as a chat message; the rest stay best-effort but at least bail out
     // synchronously if the socket is closed so we don't silently swallow
     // them either.
+    const said = chatMessagesSent;
     const handled = await handleCommand(raw, networkId, target);
     if (!handled) return;
-    commitInput(raw, networkId, target);
+    commitInput(raw, networkId, target, { isChatMessage: chatMessagesSent > said });
     return;
   }
 
@@ -2002,7 +2227,7 @@ async function submit() {
   typingState = null;
   typingTarget = null;
   clearInactivityTimer();
-  commitInput(raw, networkId, target);
+  commitInput(raw, networkId, target, { isChatMessage: true });
   const result = await pending;
   if (!result.ok) toastSendFailure(result.error ?? 'unknown', raw);
 }
@@ -2092,12 +2317,13 @@ const COMMANDS_LINES = [
   'commands:',
   '  /me <text>             — emote in the current buffer',
   '  /slap <nick>           — slap someone around a bit with a large trout',
+  '  /shrug [text]          — say your text followed by ¯\\_(ツ)_/¯',
   '  /msg <nick> <text>     — open a DM and send (alias: /query)',
   '  /notice <tgt> <text>   — send a NOTICE to a channel or nick',
   '  /ns <text>             — message NickServ (e.g. identify <pass>)',
   '  /cs <text>             — message ChanServ',
-  '  /join <#chan>          — join a channel',
-  '  /part [#chan] [reason] — leave channel (keeps buffer; alias: /leave)',
+  '  /join <#chan>          — join a channel (alias: /j)',
+  '  /part [#chan] [reason] — leave channel (keeps buffer; aliases: /leave, /p)',
   '  /close                 — close current buffer (parts if channel)',
   '  /clear [off]           — hide buffer up to now (off = undo, show again)',
   '  /away [message]        — set away across every network (no arg clears)',
@@ -2142,6 +2368,9 @@ const COMMANDS_LINES = [
   '      e.g. /dcc   ·   /dcc accept 3   ·   /dcc reject 3   ·   /dcc cancel 3',
   '  /set <key> <value…>    — change a setting; /set (or /set ?) lists all keys',
   '  /get <key>             — read a setting back (output in the system buffer)',
+  '  /theme [list]          — theme presets: apply/save/delete <name>, mode [single|system]',
+  '      e.g. /theme apply light   ·   /theme save My Theme   ·   /theme use dark Ocean',
+  '      built-ins: Monokai Plus + Monokai Plus Light (dark/light work as shorthands)',
   '  /raw <line>            — send a raw IRC line (alias: /quote)',
   '  /e2e <sub>             — end-to-end encryption for a channel (experimental; /e2e help)',
   '      on [#chan] [auto|normal|quiet]   ·   off [#chan]   ·   mode <auto|normal|quiet>',
@@ -2153,8 +2382,38 @@ const COMMANDS_LINES = [
   '  //text                 — send literal "/text" as a message (escape)',
 ];
 
-function isChannelTarget(t: string): boolean {
-  return typeof t === 'string' && t.startsWith('#');
+/**
+ * Whether a COMMAND ARGUMENT names a channel — `/part &local`, `/kick &local bob`.
+ *
+ * ⚠ Distinct from the completion sigil tests further up this file, which stay `#`-only on
+ * purpose: those ask "did the user type a `#`" about text being edited, and widening them would
+ * pop a channel picker on any `+` in ordinary prose. This one asks "is this token a channel
+ * name", which is the shared question.
+ */
+function isChannelArg(t: string | undefined): boolean {
+  return isChannelTarget(t);
+}
+
+/**
+ * The same question for commands whose first argument may instead be FREE TEXT — `/part [reason]`,
+ * `/topic [text]`.
+ *
+ * ⚠⚠ These cannot use the plain prefix test, and the reason is the mirror of why widening was
+ * right everywhere else. `#` is effectively never how a sentence starts, so reading a leading `#`
+ * as "this is a channel" is safe; `+` and `!` absolutely are — `/part +brb` would part a channel
+ * named `+brb` instead of leaving the current one with reason "+brb", and `/topic !!! maintenance
+ * !!!` would set the topic of a channel called `!!!`. Both fail silently and do the wrong thing.
+ *
+ * So: `#` always addresses a channel (unambiguous, and the long-standing behaviour), and the
+ * other three prefixes only do so when they name a channel this network actually has open. That
+ * keeps `/part &local` working where `&local` exists, without letting punctuation-led prose
+ * hijack the argument.
+ */
+function isChannelArgAmbiguous(t: string | undefined, networkId: number | null): boolean {
+  if (!t) return false;
+  if (t.startsWith('#')) return true;
+  if (!isChannelTarget(t)) return false;
+  return !!buffers.findByTarget(networkId, t);
 }
 
 // Shared builder for the op/voice/ban-family MODE shortcuts (/op, /voice, /ban,
@@ -2173,7 +2432,7 @@ function modeShortcut(
 ): boolean {
   let channel = isChannelTarget(target) ? target : null;
   let args = rest;
-  if (rest[0] && rest[0].startsWith('#')) {
+  if (isChannelArg(rest[0])) {
     channel = rest[0];
     args = rest.slice(1);
   }
@@ -2211,12 +2470,29 @@ function sendOrToast(payload: Record<string, unknown>, body: string): boolean {
 // channel/DM (/me, /msg <body>, /jitsi). Same shape as the main submit path:
 // returns false synchronously if the socket is closed; otherwise kicks off
 // the await and toasts asynchronously on a non-ok ACK.
+// How many chat messages slash commands have put on the wire this session.
+// Read as a before/after pair around handleCommand (see submit) to answer "did
+// that command actually say something?", which decides whether the scroll rule
+// treats it as a send or as a command (#628).
+//
+// Counted here, at the one seam every message-shaped command goes through,
+// rather than by re-reading the verb: /me, /slap, /shrug, /jitsi, /talk, /msg
+// and /query all say something, and a list of them maintained anywhere else is
+// a list that goes stale the first time somebody adds the eighth. A counter
+// rather than a flag so the reader owns the whole question — take a reading,
+// run the command, compare — with no reset for a future call site to forget or
+// to sequence wrongly against the read.
+let chatMessagesSent = 0;
+
 function ackedSend(payload: Record<string, unknown>, body: string): boolean {
   const pending = socketSendWithAck(payload);
   if (!pending) {
     toastSendFailure('disconnected', body);
     return false;
   }
+  // 'notice' is deliberately not counted: it's addressed to someone else and
+  // puts nothing in the buffer the command was run from.
+  if (payload.type === 'send' || payload.type === 'action') chatMessagesSent += 1;
   pending.then((result) => {
     if (!result.ok) toastSendFailure(result.error ?? 'unknown', body);
     return result;
@@ -2311,6 +2587,106 @@ async function runDcc(argLine: string, networkId: number | null, target: string)
 function dccListRow(t: DccTransfer): string[] {
   const pct = t.advertised_size > 0 ? `${percentReceived(t)}%` : '';
   return [`#${t.id}`, t.filename, t.state, t.peer_nick, pct];
+}
+
+// /theme — theme presets over the themes store (slash-command-first; the
+// Themes section in Settings > Appearance is a GUI over the same operations).
+// User-wide like /set, so it runs from anywhere including the system buffer.
+// REST-backed + async → fire-and-forget from handleCommand, reports when
+// settled.
+async function runTheme(argLine: string, networkId: number | null, target: string): Promise<void> {
+  const cmd = parseThemeCommand(argLine);
+  const reply = (msg: string) => localInfo(networkId, target, msg);
+  if (cmd.kind === 'error') return reply(`/theme: ${cmd.message}`);
+  const themes = useThemesStore();
+  // foldThemeName, not toLowerCase(): the server's uniqueness domain is SQLite
+  // NOCASE (ASCII-only), and a wider Unicode fold here would silently take the
+  // destructive overwrite branch in `save` for a name the server considers new.
+  // Built-in ids double as aliases (`/theme apply dark`) — 'dark'/'light' are
+  // reserved names, so the shorthand can never collide with a saved theme.
+  const findByName = (name: string): ThemePreset | null =>
+    themes.all.find(
+      (t) =>
+        foldThemeName(t.name) === foldThemeName(name) ||
+        (t.builtin && t.id === foldThemeName(name)),
+    ) || null;
+
+  if (cmd.kind === 'list') {
+    const drift = settings.themeDriftKeys.length;
+    reply(`themes (${themes.all.length}):`);
+    for (const t of themes.all) {
+      const active = t.id === themes.activeThemeId;
+      const marks = [
+        t.builtin ? 'built-in' : '',
+        active ? (drift ? 'active, modified' : 'active') : '',
+      ]
+        .filter(Boolean)
+        .join(' — ');
+      reply(`  ${active ? '*' : ' '} ${t.name}${marks ? `  (${marks})` : ''}`);
+    }
+    const mode = settings.effective('look.theme.mode');
+    if (mode === 'system') {
+      const slotName = (key: string) =>
+        themes.byId(String(settings.effective(key) ?? ''))?.name || themes.byId('dark')!.name;
+      reply(
+        `  mode: system (light → ${slotName('look.theme.light')}, dark → ${slotName('look.theme.dark')})`,
+      );
+    } else {
+      reply('  mode: single (/theme mode system follows the OS light/dark setting)');
+    }
+    return;
+  }
+
+  try {
+    if (cmd.kind === 'apply') {
+      const t = findByName(cmd.name);
+      if (!t) return reply(`/theme: no theme named "${cmd.name}" — /theme lists them`);
+      await themes.applyTheme(t.id);
+      return reply(`applied theme ${t.name}.`);
+    }
+    if (cmd.kind === 'save') {
+      const err = themeNameError(cmd.name);
+      if (err) return reply(`/theme save: ${err}`);
+      const existing = findByName(cmd.name);
+      if (existing) {
+        await themes.saveCurrentInto(Number(existing.id));
+        return reply(`updated theme ${existing.name} with the current look.`);
+      }
+      const created = await themes.saveCurrentAs(cmd.name);
+      return reply(`saved current look as theme ${created.name}.`);
+    }
+    if (cmd.kind === 'delete') {
+      const t = findByName(cmd.name);
+      if (!t) return reply(`/theme: no theme named "${cmd.name}" — /theme lists them`);
+      if (t.builtin) return reply(`/theme: ${t.name} is built-in and can't be deleted`);
+      const wasActive = t.id === themes.activeThemeId;
+      // The dangling pointer resets to ITS default — per-slot, so a system-mode
+      // device in light scheme reverts to the light built-in, not the dark one.
+      const revertsTo = themes.byId(
+        themes.activePointerKey === 'look.theme.light' ? 'light' : 'dark',
+      )!.name;
+      await themes.remove(Number(t.id));
+      return reply(`deleted theme ${t.name}.${wasActive ? ` Reverted to ${revertsTo}.` : ''}`);
+    }
+    if (cmd.kind === 'mode') {
+      if (cmd.mode === null) {
+        return reply(`look.theme.mode = ${settings.effective('look.theme.mode')}`);
+      }
+      await settings.setValue('look.theme.mode', cmd.mode);
+      return reply(`theme mode set to ${cmd.mode}.`);
+    }
+    // use <light|dark> <name>
+    const t = findByName(cmd.name);
+    if (!t) return reply(`/theme: no theme named "${cmd.name}" — /theme lists them`);
+    await settings.setValue(`look.theme.${cmd.slot}`, t.id);
+    const hint =
+      settings.effective('look.theme.mode') === 'single'
+        ? ' (takes effect in system mode — /theme mode system)'
+        : '';
+    return reply(`${cmd.slot}-mode theme set to ${t.name}.${hint}`);
+  } catch (e: any) {
+    reply(`/theme: ${e?.message || 'failed'}`);
+  }
 }
 
 function runIgnore(argLine: string, networkId: number | null, target: string): boolean {
@@ -2607,7 +2983,14 @@ async function runNetwork(
 // Notifications still own registry-backed keys, which belong in the surface.
 function settingExposed(opt: SettingOption): boolean {
   return (
-    CATEGORIES.some((c) => c.id === opt.category) && optionVisible(opt, { isNode: config.isNode })
+    CATEGORIES.some((c) => c.id === opt.category) &&
+    // ⚠ Same visibility rule as the settings pane, deliberately. `/set` is a first-class way to
+    // operate every setting, so a key hidden in one surface and offered in the other is a
+    // half-hidden feature — and `requiresFeature` keys have no server behind them at all.
+    optionVisible(opt, {
+      isNode: config.isNode,
+      features: { linkPreviews: config.linkPreviews },
+    })
   );
 }
 
@@ -2663,7 +3046,9 @@ function runGet(argLine: string, networkId: number | null, target: string): void
   if (!opt) return reply(`/get: unknown setting "${parts[0]}" — /set lists available keys`);
   reply(`${opt.key} = ${formatSettingValue(opt, settings.effective(opt.key))}`);
   if (settings.isModified(opt.key)) {
-    reply(`  default: ${formatSettingValue(opt, opt.default)}`);
+    // Baseline, not opt.default: a themed key under a non-default theme resets
+    // to the THEME's value, and this line advertises what reset restores.
+    reply(`  default: ${formatSettingValue(opt, settings.baseline(opt.key))}`);
   }
 }
 
@@ -2718,6 +3103,10 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       // the buffer when it settles.
       void runDcc(argLine, networkId, target);
       return true;
+    case 'theme':
+      // Theme presets. App-scoped like /set; async like /dcc.
+      void runTheme(argLine, networkId, target);
+      return true;
   }
 
   // Everything else acts on a specific network/buffer.
@@ -2750,7 +3139,7 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       // relay mark is per-(network, nick), so it needs an active network.
       return runRelay(argLine, networkId, target);
     case 'me':
-      return ackedSend({ type: 'action', networkId, target, text: argLine }, argLine);
+      return ackedSend({ type: 'action', networkId, target, text: chatBody(argLine) }, argLine);
     case 'ctcp': {
       // /ctcp <nick> <type> [args] — send a CTCP query (#263). The cell frames
       // and sends it, echoes locally, and routes the reply back to this buffer.
@@ -2795,7 +3184,8 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       if (!who) return true;
       const body = msgParts.join(' ');
       if (body) {
-        if (!ackedSend({ type: 'send', networkId, target: who, text: body }, body)) return false;
+        if (!ackedSend({ type: 'send', networkId, target: who, text: chatBody(body) }, body))
+          return false;
       }
       buffers.activate(networkId, who);
       return true;
@@ -2814,6 +3204,7 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       return sendOrToast({ type: 'raw', networkId, line: `PRIVMSG ${service} :${argLine}` }, line);
     }
     case 'join':
+    case 'j':
       if (rest[0]) {
         const ch = ensureChannelPrefix(rest[0]);
         // A channel key is a single whitespace-free token — take just the next
@@ -2828,12 +3219,34 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       }
       return true;
     case 'part':
-    case 'leave': {
+    case 'leave':
+    case 'p': {
       // /part leaves the channel but KEEPS the buffer so the user can scroll
       // history and rejoin later. The buffer just renders dimmed in the
       // sidebar. Use /close to actually drop a buffer.
-      const channel = rest[0] || target;
-      const reason = rest.slice(1).join(' ');
+      //
+      // /part [reason]        — leave the CURRENT channel with that reason
+      // /part <#chan> [reason] — leave a named channel (same shape as /kick,
+      // /topic). Reading the first word as a channel unconditionally meant
+      // `/part heading out` tried to part a channel named "heading" and
+      // silently stayed put; a leading # now distinguishes the two.
+      let channel;
+      let reason;
+      if (isChannelArgAmbiguous(rest[0], networkId)) {
+        channel = rest[0];
+        reason = line
+          .slice(1 + cmd.length)
+          .trim()
+          .slice(channel.length)
+          .trim();
+      } else {
+        channel = isChannelTarget(target) ? target : null;
+        reason = argLine;
+      }
+      if (!channel) {
+        localInfo(networkId, target, 'usage: /part [#chan] [reason] — no channel context');
+        return true;
+      }
       return sendOrToast({ type: 'part', networkId, channel, reason }, line);
     }
     case 'close':
@@ -2872,7 +3285,7 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       let channel;
       let nick;
       let reason;
-      if (rest[0] && rest[0].startsWith('#')) {
+      if (isChannelArg(rest[0])) {
         channel = rest[0];
         nick = rest[1];
         reason = rest.slice(2).join(' ');
@@ -2901,13 +3314,12 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       // /invite <#chan> <nick>     (channel-first, mirroring /kick)
       let channel;
       let nick;
-      if (rest[0] && rest[0].startsWith('#')) {
+      if (isChannelArg(rest[0])) {
         channel = rest[0];
         nick = rest[1];
       } else {
         nick = rest[0];
-        channel =
-          rest[1] && rest[1].startsWith('#') ? rest[1] : isChannelTarget(target) ? target : null;
+        channel = isChannelArg(rest[1]) ? rest[1] : isChannelTarget(target) ? target : null;
       }
       if (!nick) {
         localInfo(networkId, target, 'usage: /invite <nick> [#channel]');
@@ -2927,7 +3339,7 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       // /topic <#chan> [text]         — set/get on another channel
       let channel;
       let body;
-      if (rest[0] && rest[0].startsWith('#')) {
+      if (isChannelArgAmbiguous(rest[0], networkId)) {
         channel = rest[0];
         body = line
           .slice(1 + cmd.length)
@@ -2960,7 +3372,12 @@ function handleCommand(line: string, networkId: number | null, target: string): 
         localInfo(networkId, target, 'usage: /mode [target] <flags> [args]');
         return true;
       }
-      const looksLikeFlagsOnly = /^[+-]/.test(rest[0]);
+      // ⚠ `+local` is both a valid flag string and a valid channel name, so the leading-sign
+      // heuristic alone sent `/mode +local +m` as flags against the CURRENT buffer (#724). Same
+      // disambiguation /part and /topic use: a channel wins only when one by that name is open,
+      // so real flags (`+m`, `-nt`) are untouched — no buffer is ever called that.
+      const looksLikeFlagsOnly =
+        /^[+-]/.test(rest[0]) && !isChannelArgAmbiguous(rest[0], networkId);
       if (looksLikeFlagsOnly && isChannelTarget(target)) {
         return sendOrToast(
           { type: 'raw', networkId, line: `MODE ${target} ${rest.join(' ')}` },
@@ -3082,7 +3499,7 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       // is optional; otherwise the current channel is used.
       let channel = isChannelTarget(target) ? target : null;
       let args = rest;
-      if (rest[0] && rest[0].startsWith('#')) {
+      if (isChannelArg(rest[0])) {
         channel = rest[0];
         args = rest.slice(1);
       }
@@ -3146,7 +3563,7 @@ function handleCommand(line: string, networkId: number | null, target: string): 
         localInfo(networkId, target, 'usage: /notice <target> <text>');
         return true;
       }
-      return ackedSend({ type: 'notice', networkId, target: who, text: body }, body);
+      return ackedSend({ type: 'notice', networkId, target: who, text: chatBody(body) }, body);
     }
     case 'slap': {
       // mIRC's classic: a CTCP ACTION with the canonical trout line, so it rides
@@ -3162,6 +3579,17 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       }
       const slapText = `slaps ${who} around a bit with a large trout`;
       return ackedSend({ type: 'action', networkId, target, text: slapText }, slapText);
+    }
+    case 'shrug': {
+      // A plain message, not an ACTION: everywhere this convention comes from
+      // (Slack, Discord, mIRC scripts) /shrug SAYS the kaomoji, optionally after
+      // your own text — "/shrug no idea" reads as "no idea ¯\_(ツ)_/¯".
+      if (isServer.value) {
+        localInfo(networkId, target, 'usage: /shrug [text] — run inside a channel or DM');
+        return true;
+      }
+      const shrugText = shrugBody(argLine);
+      return ackedSend({ type: 'send', networkId, target, text: chatBody(shrugText) }, shrugText);
     }
     // Info/query commands. These already function via the raw fallback now that
     // unhandled server numerics surface in the server buffer (#269) — listing

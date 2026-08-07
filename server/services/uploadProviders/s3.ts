@@ -112,7 +112,7 @@ function hmac(key: Buffer | string, data: string): Buffer {
 // '/' separators), so neither the canonical request nor the public URL ever
 // needs percent-encoding — that sidesteps the classic SigV4 encoding-mismatch
 // bugs. User-supplied prefixes are sanitized to the same alphabet.
-function sanitizeSegment(s: string): string {
+export function sanitizeSegment(s: string): string {
   return s.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64);
 }
 
@@ -142,10 +142,14 @@ export interface SignedRequest {
   headers: Record<string, string>;
 }
 
+/** What an UPLOAD's objects advertise. Safe here because `buildObjectKey` mints a
+ *  random id per object, so a key never denotes different bytes. */
+const UPLOAD_CACHE_CONTROL = 'public, max-age=31536000, immutable';
+
 /** Build a SigV4-signed request for one object. Pure given `now`, so tests can
  *  pin the clock and assert determinism. PUT carries the payload plus the
- *  cache/content headers a store may validate; DELETE signs an empty payload
- *  and only the mandatory host/x-amz headers. */
+ *  cache/content headers a store may validate; GET and DELETE sign an empty
+ *  payload and only the mandatory host/x-amz headers. */
 export function signObjectRequest(
   {
     method,
@@ -155,11 +159,13 @@ export function signObjectRequest(
     payload = Buffer.alloc(0),
     payloadHash: precomputedHash,
     contentType,
+    cacheControl = UPLOAD_CACHE_CONTROL,
+    contentDisposition,
     region,
     accessKeyId,
     secretAccessKey,
   }: {
-    method: 'PUT' | 'DELETE';
+    method: 'GET' | 'PUT' | 'DELETE';
     endpoint: string;
     bucket: string;
     key: string;
@@ -170,6 +176,23 @@ export function signObjectRequest(
     // (source.hashOf) and passes the digest here instead of the bytes.
     payloadHash?: string;
     contentType?: string;
+    // What the STORED object will advertise to whoever reads it. Defaulted to the
+    // uploader's value so every existing caller signs byte-identical requests.
+    //
+    // ⚠ A parameter rather than a constant because the two callers have opposite
+    // needs. An upload's key is random per object, so its bytes never change and a
+    // year of `immutable` is right. The preview byte cache keys by URL, where one
+    // key legitimately points at different bytes over time — and since a cached
+    // object is read DIRECTLY by browsers, whatever is signed here is what they
+    // honour. A year would pin a third party's picture at the edge long past the
+    // bucket lifecycle rule that deletes it, so deleting the object would stop
+    // being able to un-serve it.
+    cacheControl?: string;
+    // Stored on the object and replayed by S3 on every GET. Only a handful of
+    // headers work this way — Content-Type, Content-Disposition, Cache-Control —
+    // which is why the preview cache can harden a public object this far and no
+    // further. See the note in previewCache/s3.ts.
+    contentDisposition?: string;
     region: string;
     accessKeyId: string;
     secretAccessKey: string;
@@ -198,8 +221,9 @@ export function signObjectRequest(
     'x-amz-date': amzDate,
   };
   if (method === 'PUT') {
-    headers['cache-control'] = 'public, max-age=31536000, immutable';
+    headers['cache-control'] = cacheControl;
     headers['content-type'] = contentType || 'application/octet-stream';
+    if (contentDisposition) headers['content-disposition'] = contentDisposition;
   }
   const signedHeaderNames = Object.keys(headers).sort();
   const canonicalHeaders = signedHeaderNames.map((h) => `${h}:${headers[h].trim()}\n`).join('');

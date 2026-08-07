@@ -418,4 +418,4 @@ npm run client:build
 npm start
 ```
 
-The server listens on port 8010 by default. Configure with the same envvars described above (set them in a `.env` file next to `package.json`, or export them in your shell). Use a process supervisor (`systemd`, `pm2`, etc.) to keep it running.
+The server listens on port 8010 by default. Configure with the same envvars described above (set them in a `.env` file next to `package.json`, or export them in your shell). Use a process supervisor (`systemd`, `pm2`, etc.) to keep it running: it restarts the server after a crash, which nothing else on this page does. Backgrounding with `disown` and logging out also works — the server survives its terminal going away — but console output is gone for good at that point (the in-app system log keeps recording), and a crash stays down until you notice.

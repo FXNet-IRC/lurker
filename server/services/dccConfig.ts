@@ -13,16 +13,15 @@
 // unit-tested); the per-user gate reads the DB.
 
 import { CAPABILITY_DCC, userHasCapability } from '../db/userCapabilities.js';
+import { parseTruthyEnv } from '../utils/truthyEnv.js';
 import { isPublicModeEnabled } from '../utils/publicMode.js';
-
-// Conventional truthy env values — trimmed + case-insensitive.
-const TRUTHY = new Set(['1', 'true', 'yes', 'on']);
 
 /** Parse a raw LURKER_DCC_ENABLED value to a boolean. Pure (no env access) so
  *  the rule is unit-testable. Unset / empty / anything-else is OFF — DCC must be
- *  an explicit opt-in, never accidentally on. */
+ *  an explicit opt-in, never accidentally on. Kept as a named export because it is
+ *  the documented DCC rule; the convention itself is shared (utils/truthyEnv). */
 export function parseDccEnabled(raw: string | undefined): boolean {
-  return TRUTHY.has((raw ?? '').trim().toLowerCase());
+  return parseTruthyEnv(raw);
 }
 
 /** The cell-wide DCC master switch. Read live (not cached) so an operator flip

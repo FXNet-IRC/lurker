@@ -118,6 +118,53 @@ describe('node control API — provision', () => {
     expect(second.status).toBe(409);
     expect(second.body.id).toBe(first.body.id);
   });
+
+  it('reconciles a retry that differs only by case, rather than creating a second row', async () => {
+    const first = await createAnonAgent(app)
+      .post('/api/node/users')
+      .set('Authorization', AUTH)
+      .send({ username: 'acct-4242' });
+    expect(first.status).toBe(201);
+    const retry = await createAnonAgent(app)
+      .post('/api/node/users')
+      .set('Authorization', AUTH)
+      .send({ username: 'ACCT-4242' });
+    // 409 WITH the existing id is what the control plane recovers from
+    // (cellClient.provisionUserOnCell treats it as success) — an id-less 409
+    // would surface as provision_failed for what is really the same tenant.
+    expect(retry.status).toBe(409);
+    expect(retry.body.id).toBe(first.body.id);
+  });
+
+  it('refuses WITHOUT an id when the name folds to two grandfathered rows', async () => {
+    // Only reachable on a cell carrying case-twins, which hosted provisioning
+    // never creates. The cell can't say which account is meant, and guessing
+    // would bind a customer to the wrong row — so `id` is omitted, which the
+    // control plane treats as a failure needing a human rather than recovering.
+    const db = (await import('../db/index.js')).default;
+    // The twins can only be inserted with the NOCASE index absent — which is
+    // precisely the state this branch exists for: the index is skipped at boot
+    // exactly when such a pair already exists (db/index.ts). Dropping it here
+    // reproduces that DB rather than a state production could never reach.
+    db.exec('DROP INDEX IF EXISTS idx_users_username_nocase');
+    const insert = db.prepare('INSERT INTO users (username, role) VALUES (?, ?)');
+    insert.run('Twinned', 'user');
+    insert.run('twinned', 'user');
+    const res = await createAnonAgent(app)
+      .post('/api/node/users')
+      .set('Authorization', AUTH)
+      .send({ username: 'TWINNED' });
+    expect(res.status).toBe(409);
+    expect(res.body.id).toBeUndefined();
+    expect(res.body.error).toMatch(/more than one/);
+
+    // Put the schema back so no later test silently runs without the backstop.
+    db.prepare('DELETE FROM users WHERE username IN (?, ?)').run('Twinned', 'twinned');
+    db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase
+         ON users(username COLLATE NOCASE)`,
+    );
+  });
 });
 
 describe('node control API — deprovision', () => {

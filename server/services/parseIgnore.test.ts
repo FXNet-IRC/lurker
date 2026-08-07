@@ -116,6 +116,27 @@ describe('parseIgnoreArgs — flags & errors', () => {
     expect(p('-time 300 mike').expiresAt).toBe('2026-06-18T00:05:00.000Z');
   });
 
+  it('-time joins a count and a unit typed as two tokens', () => {
+    // Reading only the first token made `/ignore -time 7 days` a seven-SECOND
+    // rule whose mask was the word "days" — which then lapsed, leaving no trace
+    // of what had happened.
+    expect(p('-time 7 days bob')).toMatchObject({
+      mask: 'bob',
+      expiresAt: '2026-06-25T00:00:00.000Z',
+    });
+    expect(p('-time "7 days" bob').expiresAt).toBe('2026-06-25T00:00:00.000Z');
+    // Only a bare count followed by a unit word joins; a mask stays a mask.
+    expect(p('-time 30 bob').mask).toBe('bob');
+  });
+
+  it('rejects a zero duration rather than creating a rule born expired', () => {
+    // It would be reported as added, never match, never appear in the listing,
+    // and — having no index — be removable only by mask until the sweeper ran.
+    for (const line of ['-time 0 bob', '-time 0m bob', '-time 000 bob']) {
+      expect(p(line).error).toMatch(/time/);
+    }
+  });
+
   it('rejects an absurd -time instead of overflowing Date (no RangeError)', () => {
     expect(p('-time 99999999999999999999 bob').error).toMatch(/time/);
   });
@@ -127,6 +148,50 @@ describe('parseIgnoreArgs — flags & errors', () => {
   it('rejects an unknown flag and a missing -pattern value', () => {
     expect(p('-bogus bob').error).toMatch(/unknown flag/);
     expect(p('bob -pattern').error).toMatch(/pattern/);
+  });
+
+  it('-pattern refuses to swallow a flag as its value', () => {
+    // Taking the next token whatever it was stored a rule matching the literal
+    // text "-network" AND dropped the scope, silently making global the rule the
+    // user had just scoped to one connection.
+    expect(p('bob -pattern -network').error).toMatch(/got the flag/);
+    expect(p('-pattern -regexp foo').error).toMatch(/got the flag/);
+    // Only the known flags are refused — a pattern may still start with a dash.
+    expect(p('bob -pattern -_-').pattern).toBe('-_-');
+  });
+
+  it('refuses -ALL rather than resolving it to the maximal hide set', () => {
+    // Expanding ALL first meant the removal found no ALL left to take off, so
+    // `-ALL` produced every concrete level instead of none.
+    expect(p('bob -ALL').error).toMatch(/-ALL/);
+    expect(p('bob -all').error).toMatch(/-ALL/);
+  });
+
+  it('refuses a rule that names nobody unless * is explicit', () => {
+    // Each of these used to parse into "hide every message from everyone".
+    for (const line of ['-network', '-global', '-time 1d', '', '   ', 'Quit', 'all']) {
+      expect(p(line).error, `expected a refusal from: ${line}`).toMatch(/names nobody/);
+    }
+    // Saying it out loud still works, and so does any other dimension.
+    expect(p('* JOINS')).toMatchObject({ mask: null, levels: ['JOINS'] });
+    expect(p('#idlerpg NOUNREAD').channels).toEqual(['#idlerpg']);
+    expect(p('-pattern spam').pattern).toBe('spam');
+  });
+
+  it('normalizes a blank mask and a blank pattern to absent', () => {
+    // strOrNull nulls both server-side; a null mask is "anyone" and a null
+    // pattern widens the rule from "what they say about X" to "everything".
+    expect(p('"" JOINS').mask).toBeNull();
+    expect(p('" " JOINS').mask).toBeNull();
+    expect(p('bob -pattern " "').pattern).toBeNull();
+  });
+
+  it('compiles a -regexp pattern rather than letting the server refuse it silently', () => {
+    // wsHub's add-ignore drops a failed validation with a bare `break` and sends
+    // no reply, so an unclosed bracket looked like it worked and never existed.
+    expect(p('-regexp -pattern [ bob').error).toMatch(/invalid regex/);
+    // A pattern that isn't a regex isn't compiled — `[` is a fine substring.
+    expect(p('-pattern [ bob').pattern).toBe('[');
   });
 });
 

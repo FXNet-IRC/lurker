@@ -3,12 +3,14 @@
 
 import type { ContextMenuItem } from './useContextMenu.js';
 import { useBuffersStore } from '../stores/buffers.js';
+import { useFavoritesStore } from '../stores/favorites.js';
 import { useNickNotesStore } from '../stores/nickNotes.js';
-import { useFriendsStore } from '../stores/friends.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useContextMenu } from './useContextMenu.js';
 import { socketSend } from './useSocket.js';
+import { historyCountBy } from '../lib/historyPaging.js';
 import { addressNick } from './useComposerOverlay.js';
+import { isChannelTarget } from '../../../shared/channels.js';
 
 export interface MemberLike {
   nick: string;
@@ -97,8 +99,8 @@ function kickLine(channel: string, nick: string, reason: string): string {
 //   { networkId, isSelf(member), onIgnore(member) }
 export function useMemberActions(): MemberActionsAPI {
   const buffers = useBuffersStore();
+  const favorites = useFavoritesStore();
   const nickNotes = useNickNotesStore();
-  const friends = useFriendsStore();
   const whois = useWhoisStore();
   const menu = useContextMenu();
 
@@ -151,12 +153,36 @@ export function useMemberActions(): MemberActionsAPI {
       onClick: () => nickNotes.openEditor(ctx.networkId, nick),
     });
     if (!isSelf) {
-      const isFriend = !!friends.contactForTarget(ctx.networkId, nick);
-      items.push({
-        label: isFriend ? 'Edit Friend…' : 'Add Friend…',
-        icon: 'fa-solid fa-user-group',
-        onClick: () => friends.openEditorForNick(ctx.networkId, nick),
-      });
+      const isFriend = favorites.isFavorite(ctx.networkId, nick);
+      items.push(
+        isFriend
+          ? {
+              label: 'Remove from Friends',
+              icon: 'fa-solid fa-user-minus',
+              onClick: () => favorites.unfavorite(ctx.networkId, nick),
+            }
+          : {
+              label: 'Add to Friends',
+              icon: 'fa-solid fa-user-group',
+              // Favoriting requires an OPEN buffer (a closed one is refused —
+              // the stale-tab orphan guard), and this member may have no DM
+              // yet. open-buffer mints/reopens the row without stealing focus,
+              // and the same socket delivers it before the favorite, so the
+              // favorite always lands. No client-side ordering to get wrong.
+              onClick: () => {
+                // countBy matches the store's openBuffer seam — without it
+                // the server sizes the first backlog slice in 'event' units
+                // even for users paging by renderable lines.
+                socketSend({
+                  type: 'open-buffer',
+                  networkId: ctx.networkId,
+                  target: nick,
+                  countBy: historyCountBy(),
+                });
+                favorites.favorite(ctx.networkId, nick);
+              },
+            },
+      );
       items.push({
         label: 'Ignore…',
         icon: 'fa-solid fa-ban',
@@ -168,8 +194,12 @@ export function useMemberActions(): MemberActionsAPI {
     // channel. Each sends a raw IRC line and lets the server's MODE/KICK echo
     // update state — the same path the /kick and /mode slash commands use, so
     // no optimistic mutation here. Never offered against yourself.
+    // ⚠ `typeof` first, not a cast. `isChannelTarget` deliberately returns a plain boolean rather
+    // than a `target is string` predicate (see shared/channels.ts), so it cannot narrow
+    // `string | null | undefined` on its own — and casting to satisfy that would let a non-string
+    // through unchecked. This is the guard the pre-#724 code already had; keep it.
     const channel =
-      typeof ctx.channel === 'string' && ctx.channel.startsWith('#') ? ctx.channel : null;
+      typeof ctx.channel === 'string' && isChannelTarget(ctx.channel) ? ctx.channel : null;
     const selfModes = Array.isArray(ctx.selfModes) ? ctx.selfModes : [];
     if (!isSelf && channel && hasAny(selfModes, MODERATE_MODES)) {
       const networkId = ctx.networkId;

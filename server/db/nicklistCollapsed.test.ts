@@ -17,8 +17,10 @@ let createNetwork: typeof import('./networks.js').createNetwork;
 let listCollapsedForUser: typeof import('./nicklistCollapsed.js').listCollapsedForUser;
 let listCollapsedForUserNetwork: typeof import('./nicklistCollapsed.js').listCollapsedForUserNetwork;
 let setNicklistCollapsed: typeof import('./nicklistCollapsed.js').setNicklistCollapsed;
+let ensureBuffer: typeof import('./buffers.js').ensureExists;
 
 beforeAll(async () => {
+  ({ ensureExists: ensureBuffer } = await import('./buffers.js'));
   ({ createUser } = await import('./users.js'));
   ({ createNetwork } = await import('./networks.js'));
   ({ listCollapsedForUser, listCollapsedForUserNetwork, setNicklistCollapsed } =
@@ -30,13 +32,16 @@ afterAll(() => {
 });
 
 function mkNetwork(userId: number, name: string) {
-  return createNetwork(userId, {
+  const net = createNetwork(userId, {
     name,
     host: 'irc.libera.chat',
     port: 6697,
     tls: true,
     nick: name,
   });
+  // buffer_id-keyed since schema 18 — mint the targets this file writes to.
+  for (const t of ['#chan', '#one', '#three', '#two', '#vue']) ensureBuffer(userId, net!.id, t);
+  return net;
 }
 
 describe('nicklistCollapsed', () => {

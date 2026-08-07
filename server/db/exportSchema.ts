@@ -17,7 +17,12 @@
 // EXPORT_FORMAT_VERSION when changing the file layout in a way that older
 // importers can't tolerate.
 
-export const EXPORT_FORMAT_VERSION = 1;
+// v2 (schema 18): the per-buffer view-state tables carry `buffer_id` (rekeyed
+// through the archive's own `buffers` rows) instead of (network_id, target),
+// and channel_notify_settings dropped its dead `muted` column. v1 archives
+// still import — the importer derives buffer_id from their name columns — but
+// a v1 SERVER rejects a v2 archive as format_too_new, deliberately.
+export const EXPORT_FORMAT_VERSION = 2;
 
 // `encryptedColumns` (declared per-table below) lists columns holding secrets
 // that are encrypted at rest on hosted cells (see server/utils/secretCrypto.ts).
@@ -55,6 +60,7 @@ const USERS_SKIPPED_COLUMNS: Record<string, string> = Object.freeze({
   is_paused: 'account access state, owned by the local instance / control plane',
   is_guest:
     'ephemeral guest state, local to the public-webchat instance; an export is always a real account',
+  ident: 'admin-assigned identd name; the importing instance’s admin owns who is called what',
 });
 
 // scope values control how the exporter filters rows for a given userId.
@@ -117,6 +123,10 @@ export const EXPORT_TABLES = Object.freeze({
       'sasl_password',
       'connect_commands',
       'position',
+      // Server-declared CASEMAPPING (#707): exported so an imported network's
+      // registry folds don't churn (and case-twins don't merge) on the first
+      // reconnect after a restore.
+      'casemapping',
     ],
     skippedColumns: {
       last_client_ip:
@@ -136,6 +146,11 @@ export const EXPORT_TABLES = Object.freeze({
     section: 'data',
     pk: 'id',
     rekeyOnImport: true,
+    // Sentinel rows (:system:, :server:<id>) are install-local fixtures: the
+    // target install mints its own at account/network creation, and an
+    // archived ':server:<id>' target embeds the SOURCE install's network id.
+    // The importer independently drops any that appear (older archives).
+    rowWhere: "target NOT LIKE ':%'",
     fkRekey: { user_id: 'users', network_id: 'networks' },
     // The +k channel key gates entry to the channel — same credential class as
     // the network secrets, so same at-rest treatment.
@@ -155,26 +170,6 @@ export const EXPORT_TABLES = Object.freeze({
     ],
   },
 
-  // Friends/contacts. contacts is a rekey root (its id is referenced by
-  // contact_targets), so it imports before contact_targets.
-  contacts: {
-    mode: 'export',
-    scope: 'user_id',
-    section: 'data',
-    pk: 'id',
-    rekeyOnImport: true,
-    fkRekey: { user_id: 'users' },
-    columns: ['id', 'user_id', 'display_name', 'notify_online', 'created_at'],
-  },
-
-  contact_targets: {
-    mode: 'export',
-    scope: 'via_network',
-    section: 'data',
-    fkRekey: { contact_id: 'contacts', network_id: 'networks' },
-    columns: ['contact_id', 'network_id', 'nick', 'is_primary'],
-  },
-
   messages: {
     mode: 'export',
     scope: 'via_network',
@@ -184,6 +179,11 @@ export const EXPORT_TABLES = Object.freeze({
     fkRekey: {
       network_id: 'networks',
       matched_rule_id: 'highlight_rules',
+    },
+    skippedColumns: {
+      buffer_id:
+        'install-local buffers(id) reference; the importer re-resolves it from ' +
+        '(network_id, target) against the target install’s registry at insert time',
     },
     columns: [
       'id',
@@ -202,6 +202,7 @@ export const EXPORT_TABLES = Object.freeze({
       'from_ignored',
       'mirrored',
       'notable',
+      'msgid',
     ],
   },
 
@@ -216,7 +217,7 @@ export const EXPORT_TABLES = Object.freeze({
     // (last_read_message_id is NOT NULL — no anchor, no row).
     fkRekey: {
       user_id: 'users',
-      network_id: 'networks',
+      buffer_id: 'buffers',
       last_read_message_id: 'messages',
       cleared_before_message_id: 'messages',
     },
@@ -227,8 +228,7 @@ export const EXPORT_TABLES = Object.freeze({
     fkRekeyNullable: ['cleared_before_message_id'],
     columns: [
       'user_id',
-      'network_id',
-      'target',
+      'buffer_id',
       'last_read_message_id',
       'updated_at',
       'cleared_before_message_id',
@@ -286,8 +286,8 @@ export const EXPORT_TABLES = Object.freeze({
     scope: 'user_id',
     section: 'data',
     pk: 'id',
-    fkRekey: { user_id: 'users', network_id: 'networks' },
-    columns: ['id', 'user_id', 'network_id', 'target', 'text', 'created_at'],
+    fkRekey: { user_id: 'users', buffer_id: 'buffers' },
+    columns: ['id', 'user_id', 'buffer_id', 'text', 'created_at'],
   },
 
   upload_history: {
@@ -347,32 +347,40 @@ export const EXPORT_TABLES = Object.freeze({
     mode: 'export',
     scope: 'user_id',
     section: 'data',
-    fkRekey: { user_id: 'users', network_id: 'networks' },
-    columns: ['user_id', 'network_id', 'target', 'position', 'created_at'],
+    fkRekey: { user_id: 'users', buffer_id: 'buffers', network_id: 'networks' },
+    columns: ['user_id', 'buffer_id', 'network_id', 'position', 'created_at'],
+  },
+
+  favorite_buffers: {
+    mode: 'export',
+    scope: 'user_id',
+    section: 'data',
+    fkRekey: { user_id: 'users', buffer_id: 'buffers' },
+    columns: ['user_id', 'buffer_id', 'position', 'created_at'],
   },
 
   nicklist_collapsed: {
     mode: 'export',
     scope: 'user_id',
     section: 'data',
-    fkRekey: { user_id: 'users', network_id: 'networks' },
-    columns: ['user_id', 'network_id', 'target', 'collapsed'],
+    fkRekey: { user_id: 'users', buffer_id: 'buffers' },
+    columns: ['user_id', 'buffer_id', 'collapsed'],
   },
 
   channel_notify_settings: {
     mode: 'export',
     scope: 'user_id',
     section: 'data',
-    fkRekey: { user_id: 'users', network_id: 'networks' },
-    columns: ['user_id', 'network_id', 'target', 'notify_always', 'muted', 'updated_at'],
+    fkRekey: { user_id: 'users', buffer_id: 'buffers' },
+    columns: ['user_id', 'buffer_id', 'notify_always', 'updated_at'],
   },
 
   user_drafts: {
     mode: 'export',
     scope: 'user_id',
     section: 'data',
-    fkRekey: { user_id: 'users', network_id: 'networks' },
-    columns: ['user_id', 'network_id', 'target', 'body', 'updated_at'],
+    fkRekey: { user_id: 'users', buffer_id: 'buffers' },
+    columns: ['user_id', 'buffer_id', 'body', 'updated_at'],
   },
 
   ignored_masks: {
@@ -418,6 +426,22 @@ export const EXPORT_TABLES = Object.freeze({
     section: 'bookmarks',
     fkRekey: { user_id: 'users', message_id: 'messages' },
     columns: ['user_id', 'message_id', 'created_at'],
+  },
+
+  // Saved theme presets. The look.theme.* user_settings values reference these
+  // row ids (as decimal strings), so the id exports and rekeyOnImport builds the
+  // map the importer uses to rewrite those pointers — same hand-rewrite as
+  // uploads.uploader_id. A pointer at a built-in ('dark'/'light') needs no
+  // rewrite; one at a theme that didn't survive the trip drops and falls back
+  // to the registry default (Dark).
+  user_themes: {
+    mode: 'export',
+    scope: 'user_id',
+    section: 'data',
+    pk: 'id',
+    rekeyOnImport: true,
+    fkRekey: { user_id: 'users' },
+    columns: ['id', 'user_id', 'name', 'values_json', 'created_at', 'updated_at'],
   },
 
   // A user's OWN configured uploaders (#514). This became exportable the moment
@@ -484,6 +508,23 @@ export const EXPORT_TABLES = Object.freeze({
   sessions: {
     mode: 'skip',
     reason: 'cookie-based session tokens; new instance issues its own',
+  },
+
+  link_previews: {
+    mode: 'skip',
+    reason:
+      'a URL-keyed cache of publicly-fetched page metadata — derived data about other ' +
+      'people’s web pages, not the user’s. Exporting it would leak which links the user ' +
+      'has seen without adding anything they could not refetch',
+  },
+
+  preview_cache: {
+    mode: 'skip',
+    reason:
+      'the index for the preview BYTE cache — url hashes, sizes and content types for ' +
+      'files held on disk or in a bucket. Derived from link_previews, which is skipped ' +
+      'for the same reason, and useless on a target instance whose cache directory or ' +
+      'bucket does not contain the objects it names',
   },
 
   webauthn_credentials: {
@@ -646,20 +687,21 @@ export const IMPORT_ORDER = Object.freeze([
   // Before user_settings (whose `uploads.uploader_id` value is rewritten through
   // this table's id map) and before upload_history (which FK-rekeys against it).
   'uploader_config',
+  // Before user_settings too: the look.theme.* pointer values rewrite through
+  // this table's id map.
+  'user_themes',
   'user_settings',
   'ignored_masks',
   'user_nick_notes',
   'user_relay_bots',
   'pinned_buffers',
+  'favorite_buffers',
   'nicklist_collapsed',
   'channel_notify_settings',
   'user_drafts',
   'user_away_state',
   'input_history',
   'upload_history',
-  // contacts is referenced by contact_targets.
-  'contacts',
-  'contact_targets',
   // Messages depend on networks and highlight_rules.
   'messages',
   // Bookmarks and buffer_reads depend on messages.

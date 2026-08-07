@@ -58,6 +58,72 @@ function mp4WithGps(creation = 0xe679e672): Buffer {
   return Buffer.concat([ftyp, moov, mdat]);
 }
 
+/** A version-0 tkhd/mdhd. Both put creation/modification immediately after the
+ *  version+flags word, at the same offsets mvhd does — which is the whole reason one
+ *  zeroTimestamps() handles all three. */
+function timestamped(type: string, creation: number): Buffer {
+  const p = Buffer.alloc(32);
+  p.writeUInt8(0, 0); // version 0
+  p.writeUInt32BE(creation, 4); // creation_time
+  p.writeUInt32BE(creation, 8); // modification_time
+  p.writeUInt32BE(0x5eed, 12); // the field after them — must survive
+  return box(type, p);
+}
+
+/**
+ * What Samsung's stock voice recorder actually writes. Box layout, brand, and the
+ * metadata strings below are taken from a real Galaxy recording; the audio is filler.
+ *
+ * Two things here are NOT arbitrary. `mdat` comes BEFORE `moov`, which is how the real
+ * files are laid out and means the walker has to step over the whole payload by its
+ * declared length to reach the metadata — the other fixtures put `moov` first and
+ * never exercise that. And the metadata lives in a Java-serialized blob (`aced 0005`)
+ * inside `udta`, plus a `meta` box holding the Android version and a UTC offset.
+ *
+ * Synthesized rather than committed: the real file is somebody's voice, and a fixture
+ * whose entire point is "this container carries identifying metadata" is the last
+ * thing that belongs in a public repo.
+ */
+const SAMSUNG_METADATA = [
+  'com.sec.android.app.voicenote.common.util.VoiceRecorderData',
+  'com.sec.android.app.voicenote.common.util.MeetingData',
+  'com.android.version',
+  'com.samsung.android.utc_offset',
+  '-0400', // the recorder's timezone — the most identifying thing in the file
+];
+const SAMSUNG_MDAT_BYTES = 2048;
+
+function samsungVoiceMemo(creation = 0xe6972a18): Buffer {
+  const ftyp = box(
+    'ftyp',
+    Buffer.concat([Buffer.from('3gp4'), Buffer.alloc(4), Buffer.from('isom'), Buffer.from('3gp4')]),
+  );
+  const mdat = box('mdat', Buffer.alloc(SAMSUNG_MDAT_BYTES, 0xcd));
+  const java = Buffer.from([0xac, 0xed, 0x00, 0x05]); // Java serialization magic
+  const udta = box(
+    'udta',
+    Buffer.concat([
+      box('vrdt', Buffer.concat([java, Buffer.from(SAMSUNG_METADATA[0])])),
+      box('metd', Buffer.concat([java, Buffer.from(SAMSUNG_METADATA[1])])),
+    ]),
+  );
+  const meta = box(
+    'meta',
+    Buffer.concat([
+      Buffer.alloc(4), // FullBox version+flags
+      Buffer.from(SAMSUNG_METADATA[2]),
+      Buffer.from(SAMSUNG_METADATA[3]),
+      Buffer.from(SAMSUNG_METADATA[4]),
+    ]),
+  );
+  const trak = box(
+    'trak',
+    Buffer.concat([timestamped('tkhd', creation), box('mdia', timestamped('mdhd', creation))]),
+  );
+  const moov = box('moov', Buffer.concat([mvhd(creation), udta, meta, trak]));
+  return Buffer.concat([ftyp, mdat, moov]);
+}
+
 describe('scrubMediaFile — ISO-BMFF', () => {
   it('destroys GPS and device metadata, and never changes the file length', async () => {
     const original = mp4WithGps();
@@ -100,6 +166,64 @@ describe('scrubMediaFile — ISO-BMFF', () => {
 
     const start = original.indexOf(Buffer.from('mdat')) + 4;
     expect(after.subarray(start).equals(original.subarray(start))).toBe(true);
+  });
+
+  it('strips what a Samsung voice recorder writes into a 3GPP container', async () => {
+    // The case that made us accept 3GPP at all (see contentClass.ts). The scrubber is
+    // blind to the MIME past the mp3 branch, so this is really asking one question:
+    // does the box walker reach metadata that sits AFTER a large mdat, in a container
+    // whose only difference from mp4 is four bytes of `ftyp` brand?
+    const original = samsungVoiceMemo();
+    const p = write('samsung.3gp', original);
+    for (const s of SAMSUNG_METADATA) {
+      expect(original.includes(Buffer.from(s))).toBe(true);
+    }
+
+    await scrubMediaFile(p, 'video/3gpp');
+    const after = fs.readFileSync(p);
+
+    // The app fingerprint, the Android version, and the timezone are all gone.
+    for (const s of SAMSUNG_METADATA) {
+      expect(after.includes(Buffer.from(s))).toBe(false);
+    }
+    expect(after.includes(Buffer.from('udta'))).toBe(false);
+    expect(after.includes(Buffer.from('meta'))).toBe(false);
+    expect(after.includes(Buffer.from('free'))).toBe(true);
+
+    // Size preserved, `ftyp` untouched (it still IS a 3gp4 file), audio byte-identical.
+    expect(after.length).toBe(original.length);
+    expect(after.subarray(0, 24).equals(original.subarray(0, 24))).toBe(true);
+    const mdatFrom = original.indexOf(Buffer.from('mdat')) + 4;
+    const mdatTo = mdatFrom + SAMSUNG_MDAT_BYTES;
+    expect(after.subarray(mdatFrom, mdatTo).equals(original.subarray(mdatFrom, mdatTo))).toBe(true);
+  });
+
+  it('zeroes recording timestamps in tkhd and mdhd, not just mvhd', async () => {
+    // NEUTRALIZE gets all the attention, but TIMESTAMPED covers three box types and
+    // only mvhd was ever asserted. A real recording carries the same wall-clock in all
+    // three, so missing one would leave "when was this recorded" fully recoverable.
+    const original = samsungVoiceMemo(0xe6972a18);
+    const p = write('samsung-times.3gp', original);
+    await scrubMediaFile(p, 'video/3gpp');
+    const after = fs.readFileSync(p);
+
+    for (const type of ['mvhd', 'tkhd', 'mdhd']) {
+      const at = after.indexOf(Buffer.from(type)) + 4;
+      expect({ type, was: original.readUInt32BE(at + 4) }).toEqual({
+        type,
+        was: 0xe6972a18, // it really did carry one…
+      });
+      expect({ type, creation: after.readUInt32BE(at + 4) }).toEqual({ type, creation: 0 });
+      expect({ type, modification: after.readUInt32BE(at + 8) }).toEqual({
+        type,
+        modification: 0,
+      });
+    }
+    // …and the structural field right after them is untouched in tkhd/mdhd.
+    for (const type of ['tkhd', 'mdhd']) {
+      const at = after.indexOf(Buffer.from(type)) + 4;
+      expect({ type, kept: after.readUInt32BE(at + 12) }).toEqual({ type, kept: 0x5eed });
+    }
   });
 
   it('walks a REAL file written by a real muxer (macOS `say` → m4a)', async () => {

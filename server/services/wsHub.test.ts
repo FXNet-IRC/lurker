@@ -23,10 +23,13 @@ let ircManager: typeof import('./ircManager.js').default;
 let buildBufferBacklog: typeof import('./wsHub.js').buildBufferBacklog;
 let buildBufferShell: typeof import('./wsHub.js').buildBufferShell;
 let buildResumeSlice: typeof import('./wsHub.js').buildResumeSlice;
+let RESUME_GAP_CAP: typeof import('./wsHub.js').RESUME_GAP_CAP;
+let RESUME_LATEST_LIMIT: typeof import('./wsHub.js').RESUME_LATEST_LIMIT;
 let buildOfflineBacklogFrames: typeof import('./wsHub.js').buildOfflineBacklogFrames;
 let maxMessageId: typeof import('../db/messages.js').maxMessageId;
 let handleOpenBuffer: typeof import('./wsHub.js').handleOpenBuffer;
 let sweepWsHeartbeat: typeof import('./wsHub.js').sweepWsHeartbeat;
+let dropIfBackpressured: typeof import('./wsHub.js').dropIfBackpressured;
 let buildSystemBacklog: typeof import('./wsHub.js').buildSystemBacklog;
 let systemLineToEvent: typeof import('./wsHub.js').systemLineToEvent;
 let buildSystemHistoryReply: typeof import('./wsHub.js').buildSystemHistoryReply;
@@ -53,9 +56,12 @@ beforeAll(async () => {
     buildBufferBacklog,
     buildBufferShell,
     buildResumeSlice,
+    RESUME_GAP_CAP,
+    RESUME_LATEST_LIMIT,
     buildOfflineBacklogFrames,
     handleOpenBuffer,
     sweepWsHeartbeat,
+    dropIfBackpressured,
     buildSystemBacklog,
     systemLineToEvent,
     buildSystemHistoryReply,
@@ -132,6 +138,8 @@ describe('buildBufferBacklog', () => {
     expect(frame.networkId).toBe(networkId);
     expect(frame.target).toBe('#bl');
     expect((frame.events as unknown[]).length).toBe(3);
+    // A one-off hydrate always ships a standalone recent slice, never a gap.
+    expect(frame.mode).toBe('replace');
     // No live IRC connection in the test → the channel reads as parted.
     expect(frame.joined).toBe(false);
     expect(frame.unread).toBe(3);
@@ -141,6 +149,40 @@ describe('buildBufferBacklog', () => {
   it('reports a non-channel buffer (DM) as joined', () => {
     seed('carol', 'hi');
     expect(buildBufferBacklog(userId, networkId, 'carol').joined).toBe(true);
+  });
+
+  it('carries the buffer id on the frame AND on every event row (the wire directory)', () => {
+    seed('#idcarrier', 'hello');
+    const frame = buildBufferBacklog(userId, networkId, '#idcarrier');
+    const row = buffers.getBuffer(userId, networkId, '#idcarrier')!;
+    expect(frame.bufferId).toBe(row.id);
+    for (const e of frame.events as Array<{ bufferId?: number }>) {
+      expect(e.bufferId).toBe(row.id);
+    }
+  });
+
+  it('says hasMoreOlder:false for an empty buffer so the hydrate is not read as a shell', () => {
+    // The frame answers `open-buffer` — a client's ONE hydrate of this buffer.
+    // Omitting the field left `events:[]` indistinguishable from a shell
+    // (`events:[] + hasMoreOlder:true`), so the client stayed unhydrated on its
+    // loading spinner forever and never re-asked. Non-empty buffers hid it.
+    buffers.ensureExists(userId, networkId, 'emptybuf');
+    const frame = buildBufferBacklog(userId, networkId, 'emptybuf');
+    expect((frame.events as unknown[]).length).toBe(0);
+    expect(frame.hasMoreOlder).toBe(false);
+  });
+
+  it('says hasMoreOlder:false when the whole history fits in the slice', () => {
+    seed('#shortlog', 'only one');
+    expect(buildBufferBacklog(userId, networkId, '#shortlog').hasMoreOlder).toBe(false);
+  });
+
+  it('says hasMoreOlder:true when history predates the slice', () => {
+    // 200 is the slice cap, so 201 rows leaves exactly one older than the tail.
+    for (let i = 0; i < 201; i++) seed('#longlog', `m${i}`);
+    const frame = buildBufferBacklog(userId, networkId, '#longlog');
+    expect((frame.events as unknown[]).length).toBe(200);
+    expect(frame.hasMoreOlder).toBe(true);
   });
 
   it('server buffer unread counts notable lines only, and includes errors (#470)', () => {
@@ -200,9 +242,11 @@ describe('buildBufferBacklog', () => {
 });
 
 describe('buildResumeSlice', () => {
-  // Mirrors the server-side constants in wsHub.ts. If those change, these move.
-  const RESUME_GAP_CAP = 500;
-  const RESUME_LATEST_LIMIT = 200;
+  // The REAL constants, imported rather than mirrored. A local copy passes even
+  // when it has drifted: raise the server's cap to 800 and a test seeding 500
+  // stops being a boundary case and becomes an ordinary sub-cap gap — still
+  // green, no longer guarding anything. (Lowering the cap fails loudly, so only
+  // the raise direction was silent, which is the one that goes unnoticed.)
 
   it('ships just the missed gap and does not reset when it fits the cap', () => {
     const since = seed('#resumeSmall', 'm0');
@@ -210,6 +254,7 @@ describe('buildResumeSlice', () => {
     for (let i = 1; i <= 5; i++) ids.push(seed('#resumeSmall', `m${i}`));
     const slice = buildResumeSlice(userId, networkId, '#resumeSmall', since);
     expect(slice.reset).toBe(false);
+    expect(slice.mode).toBe('append');
     expect(slice.events.length).toBe(5);
     // The gap, oldest-first — exactly the rows after the cursor.
     expect((slice.events[0] as { id: number }).id).toBe(ids[0]);
@@ -234,6 +279,8 @@ describe('buildResumeSlice', () => {
     const slice = buildResumeSlice(userId, networkId, '#resumeEmptyGap', tail);
     expect(slice.events.length).toBe(0);
     expect(slice.reset).toBe(false);
+    // An empty gap is still a gap: appending nothing must not wipe the tail.
+    expect(slice.mode).toBe('append');
     expect(slice.hasMoreOlder).toBe(true);
   });
 
@@ -244,11 +291,33 @@ describe('buildResumeSlice', () => {
     for (let i = 1; i <= RESUME_GAP_CAP + 10; i++) lastId = seed('#resumeBig', `m${i}`);
     const slice = buildResumeSlice(userId, networkId, '#resumeBig', since);
     expect(slice.reset).toBe(true);
+    expect(slice.mode).toBe('replace');
     // Latest contiguous slice, NOT the oldest-after-cursor rows.
     expect(slice.events.length).toBe(RESUME_LATEST_LIMIT);
     expect((slice.events.at(-1) as { id: number }).id).toBe(lastId);
     // There's older history beyond the latest slice — the client can page up.
     expect(slice.hasMoreOlder).toBe(true);
+  });
+
+  it('appends a gap that exactly fills the cap without truncating it (#469)', () => {
+    // THE boundary. A gap of exactly RESUME_GAP_CAP rows is complete — the cap
+    // bounded it but nothing was dropped — so it must still append. Getting this
+    // wrong resets the client wholesale on a gap that fit, throwing away its
+    // scrollback for no reason.
+    //
+    // Guards the probe-first rewrite specifically: the old test was "did the read
+    // fill the cap AND is there another row after the last one I read", the new
+    // one is "are there MORE than cap rows after the cursor". They agree only if
+    // the probe's offset is exact — an off-by-one here flips this case to
+    // 'replace' and the cap+10 case above would never catch it.
+    const since = seed('#resumeExact', 'm0');
+    let lastId = since;
+    for (let i = 1; i <= RESUME_GAP_CAP; i++) lastId = seed('#resumeExact', `m${i}`);
+    const slice = buildResumeSlice(userId, networkId, '#resumeExact', since);
+    expect(slice.mode).toBe('append');
+    expect(slice.reset).toBe(false);
+    expect(slice.events.length).toBe(RESUME_GAP_CAP);
+    expect((slice.events.at(-1) as { id: number }).id).toBe(lastId);
   });
 
   it('ships the latest slice without reset on first connect (sinceId=0)', () => {
@@ -257,6 +326,21 @@ describe('buildResumeSlice', () => {
     const slice = buildResumeSlice(userId, networkId, '#resumeFresh', 0);
     expect(slice.reset).toBe(false);
     expect(slice.events.length).toBe(2);
+  });
+
+  it('says replace on a fresh connect even though reset is false (#668)', () => {
+    // THE regression this field exists to prevent. Both this slice and the
+    // gap-fill slice above report `reset:false`, but they mean opposite things:
+    // this one is a standalone latest slice (replace), that one is a contiguous
+    // gap (append). Nothing on the wire distinguished them — a client had to
+    // know out-of-band whether it had sent ?since. `mode` says it outright.
+    const since = seed('#resumeAmbiguous', 'm0');
+    seed('#resumeAmbiguous', 'm1');
+    const fresh = buildResumeSlice(userId, networkId, '#resumeAmbiguous', 0);
+    const gap = buildResumeSlice(userId, networkId, '#resumeAmbiguous', since);
+    expect(fresh.reset).toBe(gap.reset); // indistinguishable on the old field...
+    expect(fresh.mode).toBe('replace'); // ...and unambiguous on the new one.
+    expect(gap.mode).toBe('append');
   });
 });
 
@@ -276,10 +360,25 @@ describe('buildBufferShell', () => {
     expect(shell.speakers).toBeUndefined();
     // hasMoreOlder gates the client's open-time lazy fetch — must be true.
     expect(shell.hasMoreOlder).toBe(true);
+    // 'shell', NOT 'replace': events:[] means "nothing shipped", not "this
+    // buffer is empty". A client that replaced on this would un-hydrate a
+    // buffer it had already filled.
+    expect(shell.mode).toBe('shell');
     expect(shell.unread).toBe(2);
     // joined is caller-supplied (online membership vs offline parted).
     expect(shell.joined).toBe(true);
     expect(buildBufferShell(userId, networkId, '#shellchan', false).joined).toBe(false);
+  });
+
+  it('resolves its own bufferId, or takes a precomputed one without a lookup', () => {
+    seed('#shellid', 'x');
+    const row = buffers.getBuffer(userId, networkId, '#shellid')!;
+    expect(buildBufferShell(userId, networkId, '#shellid', true).bufferId).toBe(row.id);
+    // The snapshot walk passes the id it already holds; null is the defensive
+    // no-row contract and must pass through untouched, not be re-resolved.
+    expect(buildBufferShell(userId, networkId, '#shellid', true, { bufferId: null }).bufferId).toBe(
+      null,
+    );
   });
 });
 
@@ -432,6 +531,63 @@ describe('handleOpenBuffer', () => {
     expect(buffers.getBuffer(userId, networkId, '&local-unvisited')).toBeUndefined();
   });
 
+  it('answers with a backlog for a joined channel that has no persisted messages', () => {
+    // The permanent-spinner case. Gating only on "has messages" sent a channel you are
+    // sitting in but have no lines for — freshly joined, or history cleared — down the
+    // JOIN branch, which replies `buffer-opened` and NO backlog. An on-demand client
+    // spends its one hydrate request on something that can never be answered and sits on
+    // a loading spinner for the rest of the connection.
+    buffers.ensureExists(userId, networkId, '#emptyjoined');
+    const spy = vi.spyOn(ircManager, 'getConnection').mockReturnValue({
+      isChannelJoined: (n: string) => n.toLowerCase() === '#emptyjoined',
+    } as never);
+    try {
+      const { ws, frames } = mockWs();
+      handleOpenBuffer(ws, userId, networkId, '#emptyjoined');
+      const backlog = frames.find((f) => f.kind === 'backlog');
+      expect(backlog, 'open-buffer must always answer an existing buffer').toBeDefined();
+      expect((backlog!.events as unknown[]).length).toBe(0);
+      // hasMoreOlder:false is what lets the client read an empty answer as "hydrated,
+      // genuinely nothing here" instead of as another shell to fetch later.
+      expect(backlog!.hasMoreOlder).toBe(false);
+      expect(frames.some((f) => f.kind === 'buffer-opened')).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("stays a no-op for an unjoined '&' channel even though it has a row", () => {
+    // '&', '+' and '!' are channels per kindForTarget, but `channelJoined` answers
+    // `true` for anything not starting with '#'. Deciding the backlog branch through
+    // that helper would report an unjoined `&local` as joined and hand back a backlog
+    // for a channel we are not in. Membership is checked directly instead.
+    buffers.ensureExists(userId, networkId, '&unjoined');
+    const spy = vi
+      .spyOn(ircManager, 'getConnection')
+      .mockReturnValue({ isChannelJoined: () => false } as never);
+    try {
+      const { ws, frames } = mockWs();
+      handleOpenBuffer(ws, userId, networkId, '&unjoined');
+      expect(frames).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("answers a JOINED '&' channel, which is a channel prefix too", () => {
+    buffers.ensureExists(userId, networkId, '&joined');
+    const spy = vi
+      .spyOn(ircManager, 'getConnection')
+      .mockReturnValue({ isChannelJoined: (n: string) => n.toLowerCase() === '&joined' } as never);
+    try {
+      const { ws, frames } = mockWs();
+      handleOpenBuffer(ws, userId, networkId, '&joined');
+      expect(frames.some((f) => f.kind === 'backlog')).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('reopens a since-closed channel without re-JOINing, resolving casing case-insensitively', () => {
     seed('#reopen', 'history line');
     closeBuffer(userId, networkId, '#reopen');
@@ -447,6 +603,44 @@ describe('handleOpenBuffer', () => {
     // stored casing rather than the casing that was clicked.
     expect(frames.find((f) => f.kind === 'backlog')?.target).toBe('#reopen');
     expect(frames.find((f) => f.kind === 'buffer-opened')?.target).toBe('#reopen');
+  });
+
+  it("sizes the hydrate reply in rendered rows when asked (countBy:'renderable')", () => {
+    // For a client that hydrates with open-buffer rather than {mode:'latest'} —
+    // iOS does — this frame IS the first screenful, so it needs the same knob
+    // `history` carries (#10) or a netsplit-heavy channel opens looking blank.
+    buffers.ensureExists(userId, networkId, '#churn');
+    for (let i = 1; i <= 20; i += 1) {
+      for (let j = 0; j < 30; j += 1) {
+        insertMessage({
+          networkId,
+          target: '#churn',
+          time: new Date().toISOString(),
+          type: 'join',
+          nick: `n${j}`,
+          self: false,
+        });
+      }
+      seed('#churn', `m${i}`);
+    }
+    const messagesIn = (frames: Array<Record<string, unknown>>): unknown[] => {
+      const backlog = frames.find((f) => f.kind === 'backlog')!;
+      return (backlog.events as Array<Record<string, unknown>>)
+        .filter((e) => e.type === 'message')
+        .map((e) => e.text);
+    };
+
+    const plain = mockWs();
+    handleOpenBuffer(plain.ws, userId, networkId, '#churn');
+    const asked = mockWs();
+    handleOpenBuffer(asked.ws, userId, networkId, '#churn', 'renderable');
+
+    // The builder's fixed 200-row slice, spent on presence churn: seven messages
+    // out of twenty, and the client folds the other 193 rows into a few lines.
+    expect(messagesIn(plain.frames)).toEqual(['m14', 'm15', 'm16', 'm17', 'm18', 'm19', 'm20']);
+    // Asked in the unit it renders in, the same buffer hands back everything —
+    // the runs still ride along so consolidation can summarize them.
+    expect(messagesIn(asked.frames)).toHaveLength(20);
   });
 
   it('joins a channel with no history instead of reopening', () => {
@@ -530,6 +724,126 @@ describe('sweepWsHeartbeat', () => {
   });
 });
 
+// A ws stand-in carrying only what the backpressure check reads/calls.
+// bufferedAmount is writable so a test can drain it between observations.
+function bpWs(bufferedAmount: number) {
+  const calls = { terminate: 0 };
+  const ws = {
+    bufferedAmount,
+    backpressure: undefined as { since: number; at: number; floor: number } | undefined,
+    terminate() {
+      calls.terminate += 1;
+    },
+  };
+  return { ws, calls };
+}
+
+function drop(ws: ReturnType<typeof bpWs>['ws'], now: number): boolean {
+  return dropIfBackpressured(ws as unknown as Parameters<typeof dropIfBackpressured>[0], now);
+}
+
+describe('dropIfBackpressured', () => {
+  const CAP = 8 * 1024 * 1024; // mirrors MAX_BUFFERED_BYTES
+  const GRACE = 30_000; // mirrors BACKPRESSURE_GRACE_MS
+
+  it('keeps a socket that is draining', () => {
+    const { ws, calls } = bpWs(0);
+    expect(drop(ws, 1000)).toBe(false);
+    expect(calls.terminate).toBe(0);
+    expect(ws.backpressure).toBeUndefined();
+  });
+
+  it('keeps a socket sitting exactly at the cap', () => {
+    const { ws } = bpWs(CAP);
+    expect(drop(ws, 1000)).toBe(false);
+    expect(ws.backpressure).toBeUndefined();
+  });
+
+  it('only starts watching on the first over-cap sighting, never drops on it', () => {
+    // A large synchronous snapshot burst legitimately puts megabytes on the
+    // socket, and the first live event lands while it's still draining.
+    const { ws, calls } = bpWs(CAP + 1);
+    expect(drop(ws, 1000)).toBe(false);
+    expect(calls.terminate).toBe(0);
+    expect(ws.backpressure).toEqual({ since: 1000, at: 1000, floor: CAP + 1 });
+  });
+
+  it('spares a socket that drains back under the cap, and forgets the streak', () => {
+    const { ws, calls } = bpWs(CAP + 1);
+    drop(ws, 1000);
+    ws.bufferedAmount = 1024; // the burst flushed
+    expect(drop(ws, 5000)).toBe(false);
+    expect(ws.backpressure).toBeUndefined();
+    expect(calls.terminate).toBe(0);
+  });
+
+  it('spares a big-but-draining socket indefinitely (a slow link, not a wedge)', () => {
+    // The regression that a size-over-time rule gets wrong: a 12 MiB snapshot to
+    // a phone on a weak link stays over the cap for far longer than the grace
+    // while behaving perfectly. Every new low restarts the clock, so it is never
+    // dropped — otherwise it reconnects into an identical burst, forever.
+    const { ws, calls } = bpWs(12 * 1024 * 1024);
+    let t = 1000;
+    for (let queued = 12 * 1024 * 1024; queued > CAP; queued -= 256 * 1024) {
+      ws.bufferedAmount = queued;
+      expect(drop(ws, t)).toBe(false);
+      t += 10_000; // 10s per observation — three times the grace, cumulatively
+    }
+    expect(calls.terminate).toBe(0);
+  });
+
+  it('holds on while still inside the grace period', () => {
+    const { ws, calls } = bpWs(CAP + 1);
+    drop(ws, 1000);
+    expect(drop(ws, 1000 + GRACE - 1)).toBe(false);
+    expect(calls.terminate).toBe(0);
+  });
+
+  it('terminates a socket that made no progress for the full grace period', () => {
+    // terminate, not close(1013): a close frame would queue BEHIND the stuck
+    // bytes and ws would hold the connection for its 30s closeTimeout, so the
+    // memory this exists to reclaim would linger. The client resumes via ?since.
+    const { ws, calls } = bpWs(CAP + 1);
+    drop(ws, 1000);
+    expect(drop(ws, 1000 + GRACE)).toBe(true);
+    expect(calls.terminate).toBe(1);
+  });
+
+  it('terminates a socket whose queue is still GROWING after the grace', () => {
+    const { ws, calls } = bpWs(CAP + 1);
+    drop(ws, 1000);
+    ws.bufferedAmount = CAP * 2; // no flush; we kept adding
+    expect(drop(ws, 1000 + GRACE)).toBe(true);
+    expect(calls.terminate).toBe(1);
+  });
+
+  it('restarts the streak when the last observation is older than the grace', () => {
+    // We only look during fan-out, so a quiet account can go minutes between
+    // calls. A socket that went over once, drained unobserved, and went over
+    // again on a later burst must not be judged against the stale timestamp —
+    // that would drop it on the FIRST sighting of the new burst.
+    const { ws, calls } = bpWs(CAP + 1);
+    drop(ws, 1000);
+    const muchLater = 1000 + GRACE * 3;
+    expect(drop(ws, muchLater)).toBe(false);
+    expect(calls.terminate).toBe(0);
+    expect(ws.backpressure).toEqual({ since: muchLater, at: muchLater, floor: CAP + 1 });
+  });
+
+  it('reports the drop even when terminate throws on an already-dying socket', () => {
+    const ws = {
+      bufferedAmount: CAP + 1,
+      backpressure: { since: 1000, at: 1000, floor: CAP + 1 } as
+        | { since: number; at: number; floor: number }
+        | undefined,
+      terminate() {
+        throw new Error('already closing');
+      },
+    };
+    expect(drop(ws as unknown as ReturnType<typeof bpWs>['ws'], 1000 + GRACE)).toBe(true);
+  });
+});
+
 describe('system buffer delivery (#355)', () => {
   function sysLine(uid: number | null, over: Record<string, unknown> = {}): number {
     return systemMessages.insert({
@@ -577,6 +891,11 @@ describe('system buffer delivery (#355)', () => {
     expect(frame.networkId).toBeNull();
     expect(frame.target).toBe(':system:');
     expect(frame.joined).toBe(true);
+    // The system buffer has always shipped `reset:false` while MEANING replace
+    // (it ignores ?since — its own id sequence makes the cursor meaningless).
+    // That mismatch is the other half of what #668 fixes.
+    expect(frame.reset).toBe(false);
+    expect(frame.mode).toBe('replace');
     const evIds = (frame.events as Array<{ id: number }>).map((e) => e.id);
     expect(evIds.slice(-3)).toEqual(ids); // our three, oldest-first
     expect(frame).toHaveProperty('lastReadId');
@@ -786,15 +1105,21 @@ describe('computeTotalHighlights', () => {
 // precedence on a live network (finding #3), and per-buffer highlight parity
 // between the frames the client receives and the total the badge shows.
 describe('eachUserBufferTarget / badge-vs-snapshot parity (#454)', () => {
-  // A minimal live-connection stand-in: the enumerator only reads network.id and
-  // the lowercased-keyed channels map (has() for join-precedence, values().name to
-  // surface joined-but-history-less channels). Injected straight into the shared
-  // ircManager singleton — remember to clear it so sibling "offline" tests aren't
-  // poisoned by a lingering live connection.
+  // A minimal live-connection stand-in: the enumerator reads network.id, the
+  // lowercased-keyed channels map (values().name to surface joined-but-
+  // history-less channels), and the fold-aware isChannelJoined probe (#707)
+  // — stubbed here with the legacy fold, which is exact for these undeclared
+  // test networks. Injected straight into the shared ircManager singleton —
+  // remember to clear it so sibling "offline" tests aren't poisoned by a
+  // lingering live connection.
   type LiveConn = ReturnType<typeof ircManager.listConnections>[number];
   function stubLiveConn(netId: number, joinedChannels: string[]): LiveConn {
     const channels = new Map(joinedChannels.map((c) => [c.toLowerCase(), { name: c }]));
-    return { network: { id: netId }, channels } as unknown as LiveConn;
+    return {
+      network: { id: netId },
+      channels,
+      isChannelJoined: (name: string) => channels.has(name.toLowerCase()),
+    } as unknown as LiveConn;
   }
   function setLiveConn(uid: number, conn: LiveConn) {
     // connectionsForUser creates the inner map if absent — same seam the bouncer

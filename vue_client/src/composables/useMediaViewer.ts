@@ -18,6 +18,17 @@ import { computed, ref } from 'vue';
 export interface GalleryItem {
   url: string;
   filename?: string | null;
+  /**
+   * The address to hand a human, when it differs from the one we render.
+   *
+   * ⚠ Link previews render through our own media proxy, so `url` is `/api/link-preview/media/…`
+   * — a relative, auth-gated path that resolves to nothing for anyone else, not even another
+   * user on the same instance. Without somewhere to carry the origin, "copy link" on a previewed
+   * image silently produced that path, while the link TEXT two lines above it in the same
+   * message copied the real one. Falls back to `url` for everything else (uploads, plain links),
+   * where the rendered address IS the shareable one.
+   */
+  shareUrl?: string | null;
 }
 
 const isOpen = ref(false);
@@ -28,6 +39,9 @@ export function useMediaViewer() {
   const current = computed<GalleryItem | null>(() => items.value[index.value] ?? null);
   // The many call sites that only ever wanted "the image being viewed" keep working.
   const url = computed<string | null>(() => current.value?.url ?? null);
+  const shareUrl = computed<string | null>(
+    () => current.value?.shareUrl ?? current.value?.url ?? null,
+  );
   const count = computed(() => items.value.length);
   const hasPrev = computed(() => index.value > 0);
   const hasNext = computed(() => index.value < items.value.length - 1);
@@ -79,6 +93,7 @@ export function useMediaViewer() {
   return {
     isOpen,
     url,
+    shareUrl,
     items,
     index,
     current,

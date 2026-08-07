@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
+import { isChannelTarget } from '../../../shared/channels.js';
+
 // Shared candidate builder for nick completion — used by both Tab-completion in
 // MessageInput and the @-triggered NickPicker. Returns nicks matching `prefix`
 // (case-insensitive), with `recent: true` marking entries that come from the
@@ -61,7 +63,7 @@ export function buildNickCandidates(
     .map((m) => (typeof m === 'string' ? m : m.nick))
     .filter((n): n is string => !!n);
   const memberLcSet = new Set(memberNames.map((n) => n.toLowerCase()));
-  const filterSpeakersByMembership = !!buf.target?.startsWith('#');
+  const filterSpeakersByMembership = isChannelTarget(buf.target);
   const memberByLc = new Map<string, Member>();
   for (const m of buf.members || []) {
     const nick = typeof m === 'string' ? m : m?.nick;

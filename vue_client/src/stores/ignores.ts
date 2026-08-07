@@ -12,6 +12,7 @@ import {
   type IgnoreInput,
   type IgnoreVerdict,
 } from '../utils/ignoreMatch.js';
+import { isChannelTarget } from '../../../shared/channels.js';
 
 // The two "mute" modifier levels (issue #359). A per-buffer or per-network mute
 // rung is a canonical rule carrying only these (no hide levels, no mask/pattern/
@@ -211,7 +212,7 @@ export const useIgnoresStore = defineStore('ignores', {
           target: m.target,
           text: m.text ?? m.body ?? '',
           type: m.type ?? 'message',
-          isDm: !m.target.startsWith('#') && !m.target.startsWith(':server:'),
+          isDm: !isChannelTarget(m.target) && !m.target.startsWith(':server:'),
         }).hide;
       },
 

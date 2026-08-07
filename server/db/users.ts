@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import db from './index.js';
+import { ensureSystemBuffer } from './buffers.js';
+import { nonConformingReason } from '../../shared/username.js';
 
 /** User account roles. The first registered user is promoted to 'admin'. */
 export type UserRole = 'admin' | 'user';
@@ -20,30 +22,46 @@ export interface User {
   // (FXNet public mode). It behaves like any other user but is reaped once idle,
   // and can be claimed into a permanent account (flips this to 0).
   is_guest: number;
+  // Admin-set identd override (#643), NULL for "derive from the username".
+  // Never writable by the account it belongs to — see shared/ident.ts.
+  ident: string | null;
 }
 
+// One list, so a column added to `User` can't reach one lookup and miss another.
+const USER_COLUMNS = 'id, username, role, created_at, last_seen_at, is_paused, is_guest, ident';
+
+// Usernames are matched case-insensitively: 'Brad' and 'brad' are one account.
+// Exact match wins first, so a grandfathered case-twin pair (two rows that
+// pre-date the case-insensitive rule) still resolves to whichever one the
+// person actually typed. Only when there is no exact hit do we fold case, and
+// then only if EXACTLY ONE row matches — with an ambiguous legacy pair, folding
+// would otherwise pick an arbitrary row and could authenticate the wrong
+// person. NOCASE is ASCII-only, which is all the username charset allows.
 export function findUserByUsername(username: string): User | undefined {
-  return db
-    .prepare(
-      'SELECT id, username, role, created_at, last_seen_at, is_paused, is_guest FROM users WHERE username = ?',
-    )
-    .get(username) as User | undefined;
+  const exact = db.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE username = ?`).get(username) as
+    | User
+    | undefined;
+  if (exact) return exact;
+  const folded = db
+    .prepare(`SELECT ${USER_COLUMNS} FROM users WHERE username = ? COLLATE NOCASE`)
+    .all(username) as User[];
+  return folded.length === 1 ? folded[0] : undefined;
+}
+
+// Is this name already claimed, ignoring case? The signup gate — distinct from
+// findUserByUsername because "may I have this name" must answer yes to an
+// ambiguous legacy pair (the name is definitely taken), while "who is this"
+// must refuse to guess between them.
+export function usernameTaken(username: string): boolean {
+  return !!db.prepare('SELECT 1 FROM users WHERE username = ? COLLATE NOCASE').get(username);
 }
 
 export function findUserById(id: number | bigint): User | undefined {
-  return db
-    .prepare(
-      'SELECT id, username, role, created_at, last_seen_at, is_paused, is_guest FROM users WHERE id = ?',
-    )
-    .get(id) as User | undefined;
+  return db.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).get(id) as User | undefined;
 }
 
 export function listUsers(): User[] {
-  return db
-    .prepare(
-      'SELECT id, username, role, created_at, last_seen_at, is_paused, is_guest FROM users ORDER BY id',
-    )
-    .all() as User[];
+  return db.prepare(`SELECT ${USER_COLUMNS} FROM users ORDER BY id`).all() as User[];
 }
 
 // Throttled to once per minute via the WHERE clause so a busy client (many
@@ -81,6 +99,10 @@ export function createUser(username: string, { role = 'user' }: { role?: UserRol
   const info = db.prepare('INSERT INTO users (username, role) VALUES (?, ?)').run(username, role);
   const user = findUserById(info.lastInsertRowid);
   if (!user) throw new Error('createUser: row missing immediately after insert');
+  // The app-scoped system buffer is a real registry row (kind 'system',
+  // schema 17) that everything else — read pointers, the connect walk —
+  // resolves by id, so it's minted with the account rather than lazily.
+  ensureSystemBuffer(user.id);
   return user;
 }
 
@@ -150,6 +172,39 @@ export function setUserPaused(userId: number, paused: boolean): boolean {
     .prepare('UPDATE users SET is_paused = ? WHERE id = ?')
     .run(paused ? 1 : 0, userId);
   return info.changes > 0;
+}
+
+// Set (or clear, with null) the admin-assigned identd override. Takes effect on
+// the account's next IRC connect: the ident is answered once, during the ircd's
+// registration handshake, so rewriting the live identd map would change nothing
+// the servers have already recorded. Returns false only when no row matched.
+export function setUserIdent(userId: number, ident: string | null): boolean {
+  const info = db.prepare('UPDATE users SET ident = ? WHERE id = ?').run(ident, userId);
+  return info.changes > 0;
+}
+
+// Accounts whose names couldn't be created under today's rules — a space, or a
+// case-twin of another account. They're grandfathered (they keep the name and
+// keep logging in with it), so this exists purely so the operator learns about
+// them from a boot line instead of from a confused user. Returns [] on the
+// overwhelmingly common instance where every name already conforms.
+export function listGrandfatheredUsernames(): Array<{ id: number; username: string; why: string }> {
+  const rows = listUsers();
+  const foldedCounts = new Map<string, number>();
+  for (const u of rows) {
+    const key = u.username.toLowerCase();
+    foldedCounts.set(key, (foldedCounts.get(key) ?? 0) + 1);
+  }
+  const out: Array<{ id: number; username: string; why: string }> = [];
+  for (const u of rows) {
+    const shape = nonConformingReason(u.username);
+    // The case-twin is reported on BOTH rows: neither one is "the wrong one",
+    // and the operator needs to see the pair to decide which to rename.
+    const twin = (foldedCounts.get(u.username.toLowerCase()) ?? 0) > 1;
+    const why = shape ?? (twin ? 'differs from another account only by case' : null);
+    if (why) out.push({ id: u.id, username: u.username, why });
+  }
+  return out;
 }
 
 // Hard delete. FKs are ON DELETE CASCADE for sessions / networks / messages /

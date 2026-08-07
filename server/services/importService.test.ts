@@ -22,6 +22,7 @@ let setUserSetting: typeof import('../db/settings.js').setUserSetting;
 let createRule: typeof import('../db/highlightRules.js').createRule;
 let setNote: typeof import('../db/nickNotes.js').setNote;
 let pinBuffer: typeof import('../db/pinnedBuffers.js').pinBuffer;
+let favoriteBuffer: typeof import('../db/favoriteBuffers.js').favoriteBuffer;
 let addRule: typeof import('../db/ignoredMasks.js').addRule;
 let addBookmark: typeof import('../db/bookmarks.js').addBookmark;
 // Seed an ALL-level ignore the way the pre-#301 addMask helper did.
@@ -66,6 +67,7 @@ beforeAll(async () => {
   ({ createRule } = await import('../db/highlightRules.js'));
   ({ setNote } = await import('../db/nickNotes.js'));
   ({ pinBuffer } = await import('../db/pinnedBuffers.js'));
+  ({ favoriteBuffer } = await import('../db/favoriteBuffers.js'));
   ({ addRule } = await import('../db/ignoredMasks.js'));
   ({ addBookmark } = await import('../db/bookmarks.js'));
   ({ setReadState, setClearedState, getClearedState } = await import('../db/bufferReads.js'));
@@ -111,6 +113,7 @@ function seedAlice(): { alice: User; net: Network; ruleId: number } {
     nick: 'alice',
     text: 'hello',
     self: true,
+    msgid: 'seed-msgid-1',
   });
   insertMessage({
     networkId: net.id,
@@ -126,6 +129,7 @@ function seedAlice(): { alice: User; net: Network; ruleId: number } {
   setNote({ userId: alice.id, networkId: net.id, nick: 'bob', note: 'lives in berlin' });
   addMask({ userId: alice.id, networkId: net.id, mask: 'spammer!*@*' });
   pinBuffer(alice.id, net.id, '#general');
+  favoriteBuffer(alice.id, net.id, '#general');
   addBookmark(alice.id, m1.id as number);
   setReadState(alice.id, net.id, '#general', m1.id as number);
   insertUpload(alice.id, {
@@ -142,6 +146,61 @@ function seedAlice(): { alice: User; net: Network; ruleId: number } {
 }
 
 describe('importFromZipBuffer — roundtrip', () => {
+  it('restores an rfc1459 network with per-network folds — no mid-restore fork (#707)', async () => {
+    // The archive carries the network's declared CASEMAPPING, and the buffer
+    // rows must be re-folded under THAT rule on the way in: a legacy
+    // toLowerCase here writes folds the message import's own resolver then
+    // misses, minting a duplicate buffer during the restore — and the healing
+    // refold never runs, because the imported mapping makes the first
+    // reconnect's stored===declared check a no-op.
+    const src = createUser(`refold_src_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    const net = createNetwork(src.id, {
+      name: 'rfc1459net',
+      host: 'irc.example.test',
+      port: 6697,
+      tls: true,
+      nick: 'src',
+    })!;
+    buffers.ensureOpen(src.id, net.id, '#foo[bar]');
+    insertMessage({
+      networkId: net.id,
+      target: '#foo[bar]',
+      time: new Date().toISOString(),
+      type: 'message',
+      nick: 'peer',
+      text: 'bracket history',
+    });
+    const { refoldNetworkBuffers } = await import('../db/refoldBuffers.js');
+    refoldNetworkBuffers(src.id, net.id, 'rfc1459');
+
+    const dst = createUser(`refold_dst_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    const result = await importFromZipBuffer(
+      dst.id,
+      await exportToBuffer(src.id, {
+        includeMessages: true,
+      }),
+    );
+    expect(result.manifest.export_format_version).toBe(EXPORT_FORMAT_VERSION);
+
+    const dstNet = db
+      .prepare(`SELECT id, casemapping FROM networks WHERE user_id = ?`)
+      .get(dst.id) as { id: number; casemapping: string | null };
+    expect(dstNet.casemapping).toBe('rfc1459');
+    // ONE channel row, folded under the imported mapping, holding the history.
+    const rows = db
+      .prepare(
+        `SELECT id, target, target_folded FROM buffers WHERE network_id = ? AND kind = 'channel'`,
+      )
+      .all(dstNet.id) as Array<{ id: number; target: string; target_folded: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].target).toBe('#foo[bar]');
+    expect(rows[0].target_folded).toBe('#foo{bar}');
+    const msgRows = db
+      .prepare(`SELECT buffer_id FROM messages WHERE network_id = ?`)
+      .all(dstNet.id) as Array<{ buffer_id: number }>;
+    expect(msgRows.map((m) => m.buffer_id)).toEqual([rows[0].id]);
+  });
+
   it('rehydrates networks, channels, messages, bookmarks, highlights, pins, notes, masks, settings, uploads', async () => {
     const { alice, net } = seedAlice();
     const bob = createUser(`bob_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
@@ -167,9 +226,11 @@ describe('importFromZipBuffer — roundtrip', () => {
 
     const bobMessages = db
       .prepare('SELECT * FROM messages WHERE network_id = ? ORDER BY id ASC')
-      .all(bobNets[0].id) as Array<{ text: string }>;
+      .all(bobNets[0].id) as Array<{ text: string; msgid: string | null }>;
     expect(bobMessages.length).toBe(2);
     expect(bobMessages.map((m) => m.text)).toEqual(['hello', 'hi alice']);
+    // The IRCv3 msgid column (#450) round-trips losslessly.
+    expect(bobMessages.map((m) => m.msgid)).toEqual(['seed-msgid-1', null]);
 
     const bobBookmarks = db
       .prepare('SELECT * FROM user_bookmarks WHERE user_id = ?')
@@ -188,11 +249,24 @@ describe('importFromZipBuffer — roundtrip', () => {
     expect(bobRules[0].pattern).toBe('alice');
 
     const bobPins = db
-      .prepare('SELECT * FROM pinned_buffers WHERE user_id = ?')
+      .prepare(
+        `SELECT p.network_id, b.target FROM pinned_buffers p
+         JOIN buffers b ON b.id = p.buffer_id WHERE p.user_id = ?`,
+      )
       .all(bob.id) as Array<{ network_id: number; target: string }>;
     expect(bobPins.length).toBe(1);
     expect(bobPins[0].network_id).toBe(bobNets[0].id);
     expect(bobPins[0].target).toBe('#general');
+
+    // Favorites ride the same buffer_id rekey; the imported row points at
+    // bob's minted #general, not alice's id.
+    const bobFavorites = db
+      .prepare(
+        `SELECT b.network_id, b.target FROM favorite_buffers f
+         JOIN buffers b ON b.id = f.buffer_id WHERE f.user_id = ?`,
+      )
+      .all(bob.id) as Array<{ network_id: number; target: string }>;
+    expect(bobFavorites).toEqual([{ network_id: bobNets[0].id, target: '#general' }]);
 
     const bobMasks = db
       .prepare('SELECT * FROM ignored_masks WHERE user_id = ?')
@@ -795,6 +869,72 @@ describe('importFromZipBuffer — roundtrip', () => {
     expect(buffers.getBuffer(pat.id, patNet, '#dev')).toBeUndefined();
   });
 
+  it("skips a pre-v19 archive's contacts sections (tables dropped with buffer favorites)", async () => {
+    // Backups taken before schema v19 carry `contacts`/`contact_targets`
+    // sections; the registry no longer declares them, and import iterates the
+    // registry — never the archive's keys — so they must be silently ignored,
+    // not fatal. This pins the property the drop relied on.
+    const { alice, net } = seedAlice();
+    const buf = await exportToBuffer(alice.id, { includeMessages: false });
+    const yauzl = await import('yauzl');
+    const { ZipArchive } = await import('archiver');
+
+    const entries = await new Promise<Map<string, Buffer>>((resolve, reject) => {
+      yauzl.fromBuffer(buf, { lazyEntries: true }, (err, zip) => {
+        if (err) return reject(err);
+        const out = new Map<string, Buffer>();
+        zip.readEntry();
+        zip.on('entry', (entry) => {
+          if (entry.fileName.endsWith('/')) {
+            zip.readEntry();
+            return;
+          }
+          zip.openReadStream(entry, (e2, stream) => {
+            if (e2) return reject(e2);
+            const chunks: Buffer[] = [];
+            stream.on('data', (c: Buffer) => chunks.push(c));
+            stream.on('end', () => {
+              out.set(entry.fileName, Buffer.concat(chunks));
+              zip.readEntry();
+            });
+            stream.on('error', reject);
+          });
+        });
+        zip.on('end', () => resolve(out));
+        zip.on('error', reject);
+      });
+    });
+
+    const data = JSON.parse(entries.get('data.json')!.toString('utf8'));
+    data.contacts = [
+      { id: 1, user_id: alice.id, display_name: 'Zoe', notify_online: 1, created_at: '2026-01-01' },
+    ];
+    data.contact_targets = [{ contact_id: 1, network_id: net.id, nick: 'zoe', is_primary: 1 }];
+    entries.set('data.json', Buffer.from(JSON.stringify(data)));
+
+    const archive = new ZipArchive();
+    const rebuiltChunks: Buffer[] = [];
+    archive.on('data', (c: Buffer) => rebuiltChunks.push(c));
+    for (const [name, content] of entries) archive.append(content, { name });
+    await archive.finalize();
+    const rebuilt = Buffer.concat(rebuiltChunks);
+
+    const quinn = createUser(`quinn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    const result = await importFromZipBuffer(quinn.id, rebuilt);
+    // The rest of the archive lands normally — including the real
+    // favorite_buffers section (seedAlice favorites #general) — while the
+    // contacts payload never surfaces: no tables to land in, and no favorite
+    // conjured from Zoe's contact row.
+    expect(result.counts.networks).toBeGreaterThan(0);
+    const quinnFavorites = db
+      .prepare(
+        `SELECT b.target AS target FROM favorite_buffers f
+         JOIN buffers b ON b.id = f.buffer_id WHERE f.user_id = ?`,
+      )
+      .all(quinn.id) as Array<{ target: string }>;
+    expect(quinnFavorites).toEqual([{ target: '#general' }]);
+  });
+
   it('rejects an archive without a manifest', async () => {
     createUser(`eve_${Date.now()}`);
     // A zip with only an unrelated file.
@@ -1075,8 +1215,19 @@ describe('importFromZipBuffer — end-to-end equivalence', () => {
       if (table === 'users') continue;
 
       const anyDef = def as unknown as AnyTableDef;
-      const aliceRows = rowsFor(alice.id, table, anyDef);
-      const bobRows = rowsFor(bob.id, table, anyDef);
+      let aliceRows = rowsFor(alice.id, table, anyDef);
+      let bobRows = rowsFor(bob.id, table, anyDef);
+
+      // Sentinel buffer rows (:system:, :server:<id>) are install-local
+      // fixtures, excluded from the archive on export and minted by each
+      // install for itself (alice's exist for her networks; bob's imported
+      // networks mint theirs on first use) — so equivalence is over the real
+      // buffers only.
+      if (table === 'buffers') {
+        const real = (r: Record<string, unknown>) => !String(r.target).startsWith(':');
+        aliceRows = aliceRows.filter(real);
+        bobRows = bobRows.filter(real);
+      }
 
       // Count parity first — catches missing inserts before we get into
       // payload comparisons (the payload diff would also catch it, but the
@@ -1233,5 +1384,61 @@ describe('uploader_config — export/import', () => {
     // An instance id means nothing on the target, so the pointer is dropped and
     // Bob lands on the target's own default rather than a dangling id.
     expect(getUserSettings(bob.id)['uploads.uploader_id']).toBeUndefined();
+  });
+});
+
+describe('user_themes — export/import', () => {
+  it('round-trips saved themes and rewrites the look.theme.* pointers through the id map', async () => {
+    const themesService = (await import('./themesService.js')).default;
+    const settingsService = (await import('./settingsService.js')).default;
+    const { getUserSettings } = await import('../db/settings.js');
+    const { alice } = seedAlice();
+    const created = themesService.create(alice.id, {
+      name: 'Ocean',
+      values: { 'look.color.bg': '#101010', 'look.color.fg': '#f0f0f0' },
+    });
+    if (!created.ok) throw new Error(created.error);
+    settingsService.update(alice.id, {
+      'look.theme.active': String(created.theme.id),
+      // Built-in ids travel as-is; non-default so the row persists.
+      'look.theme.light': 'dark',
+    });
+
+    const buf = await exportToBuffer(alice.id, { includeMessages: false });
+    const bob = createUser(`bob_themes_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    await importFromZipBuffer(bob.id, buf);
+
+    const imported = themesService.list(bob.id).find((t) => t.name === 'Ocean');
+    expect(imported).toBeDefined();
+    expect(imported!.values).toEqual({ 'look.color.bg': '#101010', 'look.color.fg': '#f0f0f0' });
+    // The pointer follows the theme's NEW id on the target; built-ins pass through.
+    expect(getUserSettings(bob.id)['look.theme.active']).toBe(String(imported!.id));
+    expect(getUserSettings(bob.id)['look.theme.light']).toBe('dark');
+  });
+
+  it("replaces a zero-network account's pre-existing themes instead of colliding on the name", async () => {
+    const themesService = (await import('./themesService.js')).default;
+    const { alice } = seedAlice();
+    const created = themesService.create(alice.id, {
+      name: 'Ocean',
+      values: { 'look.color.bg': '#101010' },
+    });
+    if (!created.ok) throw new Error(created.error);
+    const buf = await exportToBuffer(alice.id, { includeMessages: false });
+
+    // accountIsEmpty checks networks only, so a fresh account can still hold a
+    // saved theme — with a case-twin name that would abort the whole import on
+    // the NOCASE UNIQUE constraint if the import merged instead of replacing.
+    const bob = createUser(`bob_twin_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    const twin = themesService.create(bob.id, {
+      name: 'ocean',
+      values: { 'look.color.bg': '#eeeeee' },
+    });
+    if (!twin.ok) throw new Error(twin.error);
+
+    await importFromZipBuffer(bob.id, buf);
+    const names = themesService.list(bob.id).map((t) => t.name);
+    expect(names).toEqual(['Ocean']);
+    expect(themesService.list(bob.id)[0].values['look.color.bg']).toBe('#101010');
   });
 });

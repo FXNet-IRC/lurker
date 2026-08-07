@@ -114,6 +114,7 @@ export function buildFcmMessage(
         networkId: String(payload.networkId),
         target: payload.target,
         ...(payload.messageId != null ? { messageId: String(payload.messageId) } : {}),
+        ...(payload.bufferId != null ? { bufferId: String(payload.bufferId) } : {}),
         ...(typeof payload.badge === 'number' ? { badge: String(payload.badge) } : {}),
       },
     },

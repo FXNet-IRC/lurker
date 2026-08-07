@@ -10,8 +10,8 @@
 // testable in isolation; the recentBuffers store wires it to networks.activeKey.
 
 // activeKey strings exactly as networks.activeKey holds them:
-// `${networkId}::${target}` for real buffers, or a bare sentinel (:system:,
-// :friends:) for the virtual panes.
+// `${networkId}::${target}` for real buffers, or a bare sentinel (:system:)
+// for the virtual panes.
 export interface RecentBuffers {
   keys: string[]; // most-recent first
 }
