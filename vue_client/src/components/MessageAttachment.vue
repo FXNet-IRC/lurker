@@ -19,9 +19,9 @@
        inline image in Chrome jumped 0 -> 240px at DECODE time, long after the atomic reveal's
        `previewRevision` re-pin had run, so a buffer opened at the tail landed 240px short of it.
 
-       So the wrapper carries the geometry for every non-strip image, derived from the server's
+       So the wrapper carries the geometry for every untiled image, derived from the server's
        dimensions rather than from bytes: `reserveStyle` resolves to exactly the box the loaded
-       image occupies. In a strip the row's fixed height governs and the wrapper stays out of the
+       image occupies. In a mosaic the cell's fixed size governs and the wrapper stays out of the
        way — see `dim-passthrough`.
 
        ⚠ Geometry on the WRAPPER also keeps the empty letterbox out of the image: pinned on the
@@ -32,14 +32,12 @@
        pixels keep belonging to the row. Same defect class as the `@click.stop` note below. -->
   <span
     v-if="preview.kind === 'image' && preview.src"
-    :class="
-      inStrip ? 'dim-passthrough' : hasDimensions ? 'dim-reserve' : 'dim-reserve dim-fallback'
-    "
+    :class="tiled ? 'dim-passthrough' : hasDimensions ? 'dim-reserve' : 'dim-reserve dim-fallback'"
     :style="reserveStyle"
   >
     <img
       class="inline-image"
-      :class="{ 'strip-item': inStrip, 'in-reserve': !inStrip }"
+      :class="{ 'tile-item': tiled, 'in-reserve': !tiled }"
       :src="preview.src"
       :width="preview.thumbWidth || undefined"
       :height="preview.thumbHeight || undefined"
@@ -55,30 +53,97 @@
       @keydown.space.prevent="activate"
     />
   </span>
-  <!-- ⚠ `@loadedmetadata` matters more here than the image's `@load` does. The server measures
-       dimensions for images only, so a video has NO width/height to reserve a box with and lays
-       out at the UA default 300x150 until its metadata arrives — then jumps to full size. The
-       resolve-time `previewRevision` has already fired by then, and the scroller's ResizeObserver
-       watches its own box rather than its content, so without this nothing at all notices. -->
-  <video
-    v-else-if="preview.kind === 'video' && preview.src"
-    class="inline-video"
-    :class="{ 'strip-item': inStrip }"
-    :src="preview.src"
-    controls
-    preload="metadata"
-    @click.stop
-    @loadedmetadata="$emit('measured')"
-  />
-  <audio
-    v-else-if="preview.kind === 'audio' && preview.src"
-    class="inline-audio"
-    :src="preview.src"
-    controls
-    preload="metadata"
-    @click.stop
-    @loadedmetadata="$emit('measured')"
-  />
+  <!-- MEDIA, not a link card: a clip or track whose poster we hold renders the way an image
+       does — the frame inline, no chrome, a badge naming what it is — because a pasted media
+       URL is content, not a citation. The reserve span carries the geometry exactly like the
+       image branch above (the poster's dimensions ride thumbWidth/thumbHeight), so the box is
+       byte-independent and the atomic reveal holds.
+       ⚠ The poster is OUR OWN decode served from our own route (no origin fetch happens by
+       rendering it), which is what lets it appear unasked without touching the media policy —
+       the policy's line is bytes of the CLIP, and those still move only on a deliberate act.
+       ⚠ Two interaction shapes, one look: with the viewer on, the poster is a button and the
+       deliberate act is opening the overlay's native player (which fetches the ORIGIN
+       directly); with it off, the poster is a plain link to the origin — because the body
+       hides the URL text for inline-rendered media (MessageBody.rendersInline), this element
+       is the only remaining path to the clip and MUST navigate somewhere. -->
+  <span
+    v-else-if="isMediaFile && preview.thumb"
+    class="media-reserve"
+    :class="hasDimensions ? 'dim-reserve' : 'dim-reserve dim-fallback'"
+    :style="reserveStyle"
+  >
+    <img
+      v-if="viewerEnabled"
+      class="inline-image in-reserve"
+      :src="preview.thumb"
+      :width="preview.thumbWidth || undefined"
+      :height="preview.thumbHeight || undefined"
+      alt=""
+      loading="lazy"
+      decoding="async"
+      role="button"
+      tabindex="0"
+      :aria-label="`Play ${mediaName}`"
+      @load="$emit('measured')"
+      @click="onImageClick"
+      @keydown.enter.prevent="activate"
+      @keydown.space.prevent="activate"
+    />
+    <a
+      v-else
+      class="media-link"
+      :href="preview.url"
+      target="_blank"
+      rel="noreferrer noopener"
+      :aria-label="`Open ${mediaName}`"
+      @click.stop
+    >
+      <img
+        class="inline-image in-reserve"
+        :src="preview.thumb"
+        :width="preview.thumbWidth || undefined"
+        :height="preview.thumbHeight || undefined"
+        alt=""
+        loading="lazy"
+        decoding="async"
+        @load="$emit('measured')"
+      />
+    </a>
+    <span class="media-badge" aria-hidden="true">{{ preview.kind === 'video' ? '▶' : '♪' }}</span>
+  </span>
+  <!-- ⚠⚠ A FILE CARD, not a player, and the absence of a `src` is the whole point. An inline
+       `<video>` fetches before anyone asks — `preload="metadata"` at minimum, and the `#t=`
+       poster trick this replaces made it a range request for real frames — so the element
+       itself was the involuntary fetch. The server no longer mints `src` for these kinds
+       (`toDescriptor`), which also stops one clip being relayed per viewer, per view, forever:
+       the byte cache stores images only, so video never got cheap on the second read. That
+       relay exhausted the control plane's socket memory on 2026-08-10. Pressing the link is a
+       deliberate act and goes straight to the origin, where a hidden IP was never buying the
+       reader anything a click wouldn't reveal a second later.
+       The operator-facing statement of this is in docs/SELF_HOSTING.md.
+       ⚠ Only the TITLE is a link, not the whole card. A full-card anchor would swallow the row
+       click, which on touch is the only thing that opens the message-actions sheet — the same
+       defect the wrapper note above is written about.
+       ⚠ No `measured` emit: unlike an image or a player this box has no bytes coming, so its
+       height is final at first paint and there is no late growth for the scroller to chase. -->
+  <div v-else-if="isMediaFile" class="card card-file">
+    <span class="file-badge" aria-hidden="true">{{ preview.kind === 'video' ? '▶' : '♪' }}</span>
+    <div class="card-text">
+      <!-- ⚠ Still a real anchor — copy, middle-click and modifier-clicks keep their browser
+           meanings — but a plain click with the viewer on opens the overlay's player instead
+           of a tab: the posterless card is the only rendering these kinds have, so it owes
+           the same deliberate-act-in-place behaviour the poster gets. -->
+      <a
+        class="card-title"
+        :href="preview.url"
+        target="_blank"
+        rel="noreferrer noopener"
+        @click="onMediaTitleClick"
+        >{{ mediaName }}</a
+      >
+      <div class="card-desc">{{ mediaTypeLabel }}</div>
+    </div>
+  </div>
 
   <!-- A page, or a video page. Discord's panel treatment: the card sits on its own slightly
        raised background so it reads as a distinct object rather than as more chat text.
@@ -90,7 +155,11 @@
        ⚠ No site/author LINE. Discord doesn't have one and it was the least useful line on the
        card: the URL it names is already in the message, a word above it. The site name is still
        what the card falls back to when a page has no title — see `heading`. -->
-  <div v-else class="card" :class="{ 'card-video': isVideo }">
+  <div
+    v-else
+    class="card"
+    :class="{ 'card-video': isVideo, 'card-column': isVideo || cardShape === 'hero' }"
+  >
     <!-- ⚠⚠ BOTH unconditional, and that is the fix for a whole class of empty card. `pageRecord`
          returns ok on a title OR an image, so `preview.title` is absent on ordinary answers —
          an og:image with no og:title, and the deliberately-degraded video record that keeps an
@@ -186,11 +255,26 @@
         <span class="play-badge" aria-hidden="true">▶</span>
       </button>
     </div>
+    <!-- THE HERO. A full-width band under the text, Discord's large-embed shape, and the default
+         for any card whose picture is not a logo — see `cardShape`.
+         ⚠⚠ A FIXED box with the image fitted inside it, rather than a box derived from the
+         image. `og:image:width`/`og:image:height` are DECLARED, not measured: a page can lie,
+         omit one of the pair, or describe an image it isn't sending. Sizing the band from those
+         numbers would put a card's height at the mercy of a stranger's markup — and R1 says no
+         layout may depend on bytes, so the alternative (read the real ratio at decode) is not
+         available either. One box the whole app agrees on cannot be wrong about anything; the
+         declared shape is used only to CHOOSE between the two shapes, never to size one.
+         ⚠ `contain`, not `cover`: 1200x630 is a convention rather than a rule, and a 4:3 or a
+         portrait share image cropped to a 1.9:1 band loses its subject. Letterboxed against the
+         card's own panel it merely sits in a wider frame. -->
+    <div v-else-if="cardShape === 'hero'" class="card-hero">
+      <img class="card-hero-img" :src="preview.thumb" alt="" loading="lazy" decoding="async" />
+    </div>
     <!-- ⚠ NO block at all without an image, rather than an empty square. A card is `ok` on a
          title OR an image, so a title-only card is an ordinary answer — and a reserved box with
          nothing coming is furniture. -->
     <img
-      v-else-if="preview.thumb"
+      v-else-if="cardShape === 'square'"
       class="card-thumb"
       :src="preview.thumb"
       alt=""
@@ -210,11 +294,12 @@ import { useSettingsStore } from '../stores/settings.js';
 // MessageAttachments, which needs the resolved set anyway to decide the arrangement.
 const props = defineProps<{
   preview: LinkPreview;
-  /** Sized by the strip's row height rather than by its own dimensions. */
-  inStrip?: boolean;
+  /** A mosaic cell: sized by the grid rather than by its own dimensions, and cropped to fill. */
+  tiled?: boolean;
 }>();
 
-// ⚠⚠ `measured` is emitted by IMAGE, VIDEO and AUDIO. The image `@load` emit was removed once,
+// ⚠⚠ `measured` is emitted by the IMAGE only, now that video and audio render as a static file
+// card with nothing to load — see the template. The image `@load` emit was removed once,
 // on the reasoning that "every rendered image now has its box before any bytes" and so `@load`
 // could no longer report growth — the cost cited was five idempotent scroll corrections for a
 // five-image message. The premise was false in Blink (see the template: pending 0x0), the
@@ -226,8 +311,9 @@ const props = defineProps<{
 // that makes it safe lives in the list: `repinAfterPreviewGrowth(true)` returns immediately
 // unless the reader is at the tail, so a scrolled-up reader is never moved by a late decode.
 // `activate` rather than opening the viewer here: what a click MEANS depends on the
-// arrangement, and the arrangement is the parent's business. A tap on one image of a strip
-// should open the whole strip as a gallery, and only the parent knows what the strip holds.
+// arrangement, and the arrangement is the parent's business. A tap on one tile of a mosaic
+// should open the whole message's images as a gallery, positioned on the one that was tapped,
+// and only the parent knows what the rest of the set is.
 const emit = defineEmits<{ measured: []; activate: [] }>();
 
 const settings = useSettingsStore();
@@ -274,29 +360,103 @@ const heading = computed(() => {
   }
 });
 
-/*
- * ⚠⚠ There is deliberately NO per-card layout choice, and it is a decision rather than an
- * omission — the version that had one was built and then removed.
+/** A bare media FILE — a link that resolved to video or audio bytes rather than to a page.
  *
- * It read `thumbWidth`/`thumbHeight` and gave a landscape image the full-width band Discord uses,
- * keeping the square for logos and portraits. It worked, and the shape it produced was worse:
- * a 240px picture per link reads as the message rather than as a note about it, and two links in
- * a row take a screenful. The square annotates. That is what a preview is for, and it is now the
- * answer for every image regardless of its shape.
+ * ⚠ Keyed on `kind` alone, deliberately, and not on `!preview.src`. A descriptor minted before
+ * the media-policy change may still be sitting in an open tab's memory with a `src` on it, and
+ * the point is that those stop being played inline too — the server would answer that token
+ * with a 404 now (`proxyableContentType` is images-only), so honouring it would render a player
+ * wired to a broken source. Descriptors are minted per request and never persisted, so this
+ * window closes at the next resolve either way. */
+const isMediaFile = computed(
+  () => props.preview.kind === 'video' || props.preview.kind === 'audio',
+);
+
+/**
+ * What to call the file.
  *
- * Recorded because the evidence gathered for it is the expensive part and someone will want it
- * again. Real markup, sampled from the sites themselves: GitHub declares `og:image:width` 1200 by
- * 600, Ars Technica 512x512 (a square LOGO), Wikipedia 869x1200 (portrait), while the New York
- * Times and the BBC declare an image and no size at all. And ⚠⚠ `twitter:card` cannot stand in
- * for the missing sizes: Ars Technica declares `summary_large_image` beside that square logo, so
- * the author's stated intent disagrees with the author's own picture in exactly the direction
- * that produces the bad crop.
+ * ⚠ The last path segment, not `heading`. These records have no title and no siteName — nothing
+ * was scraped, because the URL *is* the content — so `heading` falls all the way through to the
+ * hostname, and a card reading "cdn.lurker.chat" tells a reader nothing about which of three
+ * clips it is. The filename is the only distinguishing thing a bare media URL carries.
  *
- * Whatever replaces this must still take its shape from the DESCRIPTOR rather than the image.
- * Reading `naturalWidth` on load would be accurate and is the one thing this component may not
+ * ⚠ Decoded, and length-clamped. A percent-encoded name is unreadable, and an over-long one
+ * would push the card's layout around before `.card-title`'s clamp could catch it.
+ */
+const mediaName = computed(() => {
+  try {
+    const path = new URL(props.preview.url).pathname;
+    const last = path.slice(path.lastIndexOf('/') + 1);
+    const name = last ? decodeURIComponent(last) : '';
+    if (name) return name.length > 80 ? `${name.slice(0, 79)}…` : name;
+  } catch {
+    // Falls through to the heading, which is itself guaranteed non-empty.
+  }
+  return heading.value;
+});
+
+/** The second line: what kind of thing this is, from the server's measured content type.
+ *  ⚠ `mime` is the server's, read off the response rather than guessed from the extension, so
+ *  it is trustworthy in the one place a filename is not. Subtype only — "Video · MP4" reads,
+ *  "Video · video/mp4" is redundant twice over. */
+const mediaTypeLabel = computed(() => {
+  const noun = props.preview.kind === 'video' ? 'Video' : 'Audio';
+  const sub = props.preview.mime?.split('/')[1]?.split(';')[0]?.trim();
+  return sub ? `${noun} · ${sub.toUpperCase()}` : noun;
+});
+
+/**
+ * Which of the two card layouts this preview gets, from the DECLARED shape of its image.
+ *
+ * ⚠⚠ HISTORY, because this reverses a decision and the evidence is the expensive part. A
+ * landscape band was built once, run against real links, and REJECTED on looking at it: "a 240px
+ * picture per link reads as the message rather than as a note about it". What made that verdict
+ * fair at the time was that it fired almost at random — `imageWidth`/`imageHeight` were only ever
+ * populated from an oEmbed thumbnail, so for an ordinary og:image card they were NULL and the
+ * choice fell through to a default. `scrapeMeta` reads `og:image:width`/`og:image:height` now
+ * (resolver v4), so the rule finally has the input it always assumed it had.
+ *
+ * Measured from the live markup, twice, a week apart:
+ *
+ *   reddit.com, /r/irc     256x256     square  — the case this exception exists for
+ *   Ars Technica           512x512     square  — a LOGO
+ *   Wikipedia              869x1200    square  — portrait; a hero band would crop its subject out
+ *   GitHub                 1200x600    hero
+ *   firecore.com/infuse    1200x630    hero
+ *   bradroot.me            undeclared  hero    — by the default below
+ *   NYT, BBC               undeclared  hero    — by the default below
+ *
+ * ⚠⚠ HERO IS THE DEFAULT when nothing is declared, and the trade is deliberate. The undeclared
+ * population is mostly editorial (NYT, BBC), which is exactly what wants a hero; the cost is that
+ * an undeclared square logo gets letterboxed in a wide frame. `contain` is what makes that cost
+ * survivable — the logo is small and centred rather than cropped into a band.
+ *
+ * ⚠⚠ `twitter:card` is NOT consulted, and it is the obvious thing to reach for. It is the
+ * author's stated INTENT and it disagrees with the author's own picture in exactly the direction
+ * that produces the bad result: Ars Technica declares `summary_large_image` beside that 512x512
+ * logo. Re-verified against live markup while writing this. Declared dimensions can be wrong too,
+ * but they are wrong about the thing they describe rather than about something else.
+ *
+ * ⚠ Reading `naturalWidth` on load would be accurate and is the one thing this component may not
  * do: the layout would then depend on bytes and every card would re-arrange on decode, which is
  * R1, the rule the rest of this file exists to keep.
+ *
+ * Not consulted for a video — `isVideo` claims that branch first, because a player's box is the
+ * embed's geometry rather than a choice about a picture.
  */
+const SQUARE_MAX_RATIO = 1.3;
+
+const cardShape = computed<'hero' | 'square' | 'none'>(() => {
+  // A card is `ok` on a title OR an image, so having no picture at all is an ordinary answer.
+  if (!props.preview.thumb) return 'none';
+  const w = props.preview.thumbWidth;
+  const h = props.preview.thumbHeight;
+  // ⚠ Square AND portrait both take the chip. The threshold sits just under 4:3 (1.333), so a
+  // conventional photo is a hero and anything approaching square is not — the shapes that read
+  // as "this is an icon of the site" rather than "this is a picture of the thing".
+  if (w && h && w / h < SQUARE_MAX_RATIO) return 'square';
+  return 'hero';
+});
 
 /**
  * Whether the server could measure this image.
@@ -313,8 +473,8 @@ const MAX_IMAGE_HEIGHT = 240;
 /**
  * The box this image will occupy, resolved from the server's dimensions instead of from bytes.
  *
- * Null in the two cases that must not carry geometry: inside a strip, where the row's fixed
- * height governs and a second box would fight it, and for an unmeasured image, which has no
+ * Null in the two cases that must not carry geometry: inside a mosaic, where the cell's fixed
+ * size governs and a second box would fight it, and for an unmeasured image, which has no
  * ratio to derive one from and falls back to `.dim-fallback`'s flat height.
  *
  * ⚠⚠ The HEIGHT CAP IS APPLIED AS A WIDTH, and that is what makes this exact rather than
@@ -338,7 +498,7 @@ const MAX_IMAGE_HEIGHT = 240;
  * binding were deleted. Two plain declarations are observable by the test that guards them.
  */
 const reserveStyle = computed(() => {
-  if (props.inStrip || !hasDimensions.value) return null;
+  if (props.tiled || !hasDimensions.value) return null;
   const w = props.preview.thumbWidth!;
   const h = props.preview.thumbHeight!;
   return {
@@ -378,11 +538,11 @@ const reserveStyle = computed(() => {
  *     never runs. And an `ok` preview is never re-asked at all, so the flag was permanent — a
  *     two-second network blip greyed out every inline image for the life of the row.
  *   - Dropping `role`/`tabindex` on failure removed them from an element that may currently HOLD
- *     focus, dumping a keyboard user back to `<body>` mid-strip.
+ *     focus, dumping a keyboard user back to `<body>` mid-mosaic.
  *
  * The byte-independence rule this file serves is already satisfied without any of it, and since
  * lurker#705 it is satisfied MORE strongly than this paragraph used to claim: the reservation does
- * not depend on the image element at all — `.dim-reserve` holds the box for every non-strip image,
+ * not depend on the image element at all — `.dim-reserve` holds the box for every untiled image,
  * from the descriptor, whether the bytes arrive or not. (The old claim, that "the width/height
  * attributes survive a failed load", was doubly wrong: those attributes reserve nothing once author
  * CSS sets `width: auto`, so what survived a failed load was nothing at all in Blink.)
@@ -396,7 +556,7 @@ const reserveStyle = computed(() => {
  * `document.activeElement` at the moment a keyboard user presses Enter on it, so focus falls to
  * `<body>` and the next Tab restarts at the top of the document — past every message above, and
  * never reaching the player they just opened. This file already names that failure in so many
- * words for a different case ("dumping a keyboard user back to `<body>` mid-strip"), which is
+ * words for a different case ("dumping a keyboard user back to `<body>` mid-mosaic"), which is
  * how it was noticed here.
  *
  * `nextTick` because the iframe does not exist until the re-render, and `?.` because a card
@@ -420,7 +580,7 @@ const viewerEnabled = computed(() => settings.effective('chat.image_modal.enable
  * time this is a control at all — a plain inline image stays decoration of the message text,
  * which the surrounding link already names.
  *
- * The filename is included when the URL yields one, so a strip of five doesn't present five
+ * The filename is included when the URL yields one, so a mosaic of four doesn't present four
  * identically-named buttons to anyone moving through them by keyboard.
  */
 const imageLabel = computed(() => {
@@ -455,6 +615,24 @@ function activate(): void {
   if (!viewerEnabled.value) return;
   emit('activate');
 }
+
+/**
+ * A plain click on a media file card's title plays the file in the viewer; everything else a
+ * link click can mean is left to the browser.
+ *
+ * ⚠ The modifier guard is the difference between "opens in the overlay" and "breaks
+ * cmd-click": `preventDefault` on a modified click would eat open-in-new-tab and
+ * shift-click-to-window, which are exactly the affordances keeping this an <a> is for.
+ * Propagation stops either way — a consumed OR navigating click must not also open the
+ * message-actions sheet under it.
+ */
+function onMediaTitleClick(e: MouseEvent): void {
+  e.stopPropagation();
+  if (!viewerEnabled.value) return;
+  if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  e.preventDefault();
+  emit('activate');
+}
 </script>
 
 <style scoped>
@@ -476,10 +654,10 @@ function activate(): void {
   border-radius: var(--radius-md);
   display: block;
 }
-/* In a strip the ROW's fixed height is the reservation, so the wrapper generates no box at all
-   and layout, flex participation and the strip's snap points behave exactly as they did when the
-   image was the direct child (MessageAttachments' `.filmstrip :deep(.inline-image)` depends on
-   this — a snap point on a `display: contents` span would have nothing to align). */
+/* In a mosaic the CELL is the reservation, so the wrapper generates no box at all and the image
+   becomes the tile's own child for layout. That is load-bearing rather than incidental:
+   `.tile`'s clipping, rounding and overflow overlay all apply to the picture only because
+   nothing boxed stands between them. */
 .dim-passthrough {
   display: contents;
 }
@@ -520,41 +698,76 @@ function activate(): void {
 .inline-image[role='button'] {
   cursor: pointer;
 }
-.inline-video,
-.inline-audio {
-  max-width: 100%;
-  width: auto;
-  border-radius: var(--radius-md);
+/* The media FILE card — a video or audio link that is named rather than played.
+   ⚠ It reuses `.card` wholesale, so it sits on the same panel, at the same inset, with the same
+   mobile left rule as a page card. That is the point: these are the same KIND of object now —
+   something the reader may choose to open — and a second visual language for them would only
+   say "this one is special" about the case that is now the most ordinary.
+   ⚠ No fixed height and no reserved box, unlike the player this replaces. That whole apparatus
+   (a pinned 300px, so a `loadedmetadata` jump could not move a scrolled-up reader) existed
+   because the element's size arrived with its bytes. Nothing here is fetched, so the card's
+   height is known at first paint and R1 is satisfied by construction rather than by a pin. */
+.card-file {
+  align-items: center;
+}
+/* The wrapper that gives the badge somewhere to sit; geometry comes from `.dim-reserve`. */
+.media-reserve {
+  position: relative;
+}
+.media-link {
   display: block;
-}
-/* ⚠ A FIXED height, not a max. The server measures dimensions for images only, so a video has
-   no intrinsic ratio to reserve a box from: it lays out at the UA default 300x150 and jumps to
-   its real size when `loadedmetadata` fires. `@loadedmetadata` lets the list re-pin, but that is
-   only a mitigation — the re-pin can follow the bottom and cannot hold a scrolled-up reader
-   still, because by the time we hear about the growth it has already happened.
-   Pinning the height removes the jump instead of compensating for it: the box is correct before
-   a single byte arrives. Width still settles when the ratio is known, which costs nothing —
-   only vertical movement disturbs a scroll position.
-   Matches the filmstrip's landscape row, so a lone video and a video in a group are the same
-   height. */
-.inline-video {
-  height: 200px;
-}
-.inline-audio {
   width: 100%;
+  height: 100%;
+}
+/* `.play-badge`'s shape on an inline poster. `pointer-events: none` because the image (or the
+   anchor) under it owns the click — a badge that intercepts taps is a control nothing wired. */
+.media-badge {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--fg) 25%, transparent);
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-left: 3px;
+  pointer-events: none;
+}
+/* ⚠ Sized and centred like `.play-badge`, and for the same reason: it is the only thing on a
+   card with no picture that says at a glance what sort of file this is. It is NOT a control —
+   the title is the link — so it is `aria-hidden` and carries no focus ring; a badge that looked
+   pressable but wasn't is worse than one that plainly isn't. */
+.file-badge {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-pill);
+  border: 1px solid color-mix(in srgb, var(--fg) 25%, transparent);
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Optically centred: a triangle glyph's visual mass sits left of its box. Applied to both
+     glyphs so the two badges are the same object at different labels. */
+  padding-left: 3px;
 }
 
-/* Inside a strip the ROW decides the height and every item fills it, so the group reads as
-   one band. Widths then vary with each image's aspect ratio, which is what makes a strip look
-   like a strip rather than a grid of letterboxed cells. `cover` because a uniform height is
-   the point — a panorama is cropped rather than allowed to be 2000px wide. */
-.strip-item {
+/* A mosaic cell: fill it exactly, whatever shape the picture is.
+   ⚠ All four of `.inline-image`'s sizing declarations have to be undone, not merely added to —
+   `max-height: 240px` would letterbox a tile in the two-row layouts and `width/height: auto`
+   would leave a portrait image sitting in a corner of its cell. `cover` is the whole bargain the
+   mosaic makes: a uniform grid, laid out before any bytes arrive, at the price of a crop that
+   any tap undoes by opening the full picture in the viewer. */
+.tile-item {
+  width: 100%;
   height: 100%;
-  width: auto;
-  max-width: 360px;
+  max-width: none;
   max-height: none;
   object-fit: cover;
-  flex: none;
 }
 
 .card {
@@ -589,17 +802,17 @@ function activate(): void {
     padding-left: var(--space-5);
   }
 }
-/* The exception: a video's facade goes UNDER the text and full width, because a player reduced
-   to a 72px square is not a player. ⚠ This is about the PLAYER, not about the picture — an
-   iframe replaces that box on the first click, so its 16:9 is the embed's geometry and not a
-   choice about how to present an image.
+/* The picture goes UNDER the text and full width — a video's facade, because a player reduced to
+   a 72px square is not a player, and a hero image, because that is the shape being asked for.
+   ⚠ For a video this is about the PLAYER, not the picture: an iframe replaces that box on the
+   first click, so its 16:9 is the embed's geometry and not a choice about how to present an image.
    ⚠⚠ Load-bearing beyond the arrangement: without it the card stays a ROW, and the flex maths
-   then deletes the text rather than shrinking the player. `.card-text` is `flex: 1` (basis 0%)
-   while `.card-media` carries `width: 100%` (basis = the whole content box), so the bases
+   then deletes the text rather than shrinking the picture. `.card-text` is `flex: 1` (basis 0%)
+   while the media box carries `width: 100%` (basis = the whole content box), so the bases
    already consume the line and the text resolves to 0px wide — title and description vanish
    behind their own `overflow: hidden`, with no overflow anywhere to hint at it. The class
    binding has a test for exactly this reason. */
-.card-video {
+.card-column {
   flex-direction: column;
   gap: var(--space-3);
 }
@@ -667,6 +880,50 @@ function activate(): void {
   line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+/* The hero band: a fixed box with the picture fitted inside it.
+   ⚠⚠ The RATIO IS A CONSTANT, never derived from `thumbWidth`/`thumbHeight`. Those are numbers a
+   stranger's page declared about a file we have not measured — a page can lie, ship one of the
+   pair, or describe an image it is not serving — and a band sized from them puts a card's height
+   at the mercy of that markup. Deriving it from the bytes instead is R1, which this file exists
+   to keep. A constant box cannot be wrong: the declared shape only picks BETWEEN this and the
+   chip, and a wrong pick is a letterboxed logo rather than a broken layout.
+   1200x630 because that is the og:image convention the declaring half of the web targets, so the
+   common case fills the frame exactly and nothing is bordered at all.
+   ⚠ `contain`, not `cover`. The convention is not a rule — 4:3 and portrait share images are
+   ordinary — and cropping one to a 1.9:1 band cuts the subject out. Fitted, it merely sits in a
+   wider frame.
+   ⚠⚠ NO fill, so the letterbox is the card's own panel. It was `var(--bg)` — the CHAT background,
+   which is darker than the panel — while both comments here claimed the opposite, so an
+   undeclared-size logo (which now defaults to the hero) rendered as a small picture inside a dark
+   rectangle inside a lighter card: three nested tones, and exactly the "reads as a layout
+   mistake" failure the width note above was written to avoid. Transparent rather than
+   `--embed-bg` so it cannot drift from whatever the card is actually painted with. */
+.card-hero {
+  aspect-ratio: 1200 / 630;
+  /* ⚠ NO width cap of its own — the card's 400px does the work (MessageAttachments), and the
+     ratio carries the height down with it: ~197px against ~239px at the old 480. A cap here
+     instead was tried and is worse in a way that only shows on screen, which is why it is
+     recorded: a hero narrower than its own card sits against a band of empty panel, and that
+     reads as a layout mistake rather than as a deliberately smaller picture. Height is not a
+     handle either — capping it holds the box full-width and letterboxes a correctly-shaped
+     image between two bars. Width is the only honest control, and it belongs to the card. */
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+/* ⚠⚠ Scoped to the column, exactly like `.card-video .card-media` below and for the identical
+   reason: unscoped, a `width: 100%` basis beside `.card-text`'s 0% basis resolves the text to
+   0px wide and deletes it. Expressed in the selector because happy-dom applies no stylesheet, so
+   no test can observe it. */
+.card-column .card-hero {
+  width: 100%;
+}
+.card-hero-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
 }
 
 /* The small square. ⚠ A fixed CSS box, so it reserves its own height with no dimensions and no

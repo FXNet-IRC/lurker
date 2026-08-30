@@ -69,6 +69,19 @@
       class="file-hidden"
       @change="onFileSelected"
     />
+    <!-- Shoot-now, from the attach menu on touch devices. A SECOND input rather
+         than toggling `capture` on the one above: the attribute is read when the
+         browser opens the picker, so flipping it per tap would race the click it
+         is meant to configure. Its @change is the same handler — a captured photo
+         is just a File. -->
+    <input
+      ref="cameraInputEl"
+      type="file"
+      :accept="CAMERA_CAPTURE_TYPES"
+      capture="environment"
+      class="file-hidden"
+      @change="onFileSelected"
+    />
     <input
       ref="e2eImportInputEl"
       type="file"
@@ -155,6 +168,7 @@ import { useThemesStore } from '../stores/themes.js';
 import { foldThemeName, themeNameError } from '../../../shared/themePresets.js';
 import type { ThemePreset } from '../../../shared/themePresets.js';
 import { formatColumns } from '../lib/commands/output.js';
+import { api } from '../api.js';
 import { REGISTRY, getOption, optionVisible, CATEGORIES } from '../utils/settingsRegistry.js';
 import type { SettingOption } from '../../../shared/settingsRegistry.js';
 import { useConfigStore } from '../stores/config.js';
@@ -171,15 +185,16 @@ import { useIgnoresStore, type IgnoreEntry } from '../stores/ignores.js';
 import { useRelayBotsStore } from '../stores/relayBots.js';
 import { useHighlightRulesStore, type HighlightRule } from '../stores/highlightRules.js';
 import { isChannelTarget } from '../../../shared/channels.js';
+import { escapeRegex } from '../../../shared/textMatch.js';
 import { parseIgnoreArgs } from '../../../shared/parseIgnore.js';
 import { parseHighlightArgs } from '../../../shared/parseHighlight.js';
 import { highlightRuleDetailParts } from '../utils/highlightFormat.js';
 import { joinMeta } from '../utils/metaLine.js';
-import { ACCEPTED_FILE_TYPES, isUploadableType } from '../utils/uploaders.js';
+import { ACCEPTED_FILE_TYPES, CAMERA_CAPTURE_TYPES, isUploadableType } from '../utils/uploaders.js';
 import { useWhoisStore } from '../stores/whois.js';
 import { useChanlistStore } from '../stores/chanlist.js';
 import { useChannelListModal } from '../composables/useChannelListModal.js';
-import { socketSend, socketSendWithAck } from '../composables/useSocket.js';
+import { socketSend, socketSendWithAck, type AckResult } from '../composables/useSocket.js';
 import { requestScrollToBottom } from '../composables/useScrollState.js';
 import { setComposingState } from '../composables/useComposing.js';
 import {
@@ -213,6 +228,7 @@ import {
   setNickStrip,
   setEmojiStrip,
   setColorPickerOpen,
+  setUploadMenuOpen,
   moveEmojiActive,
   confirmEmojiActive,
   hasEmojiCandidates,
@@ -223,6 +239,7 @@ import {
 } from '../composables/useComposerOverlay.js';
 import { useNickColors } from '../composables/useNickColors.js';
 import type { Buffer } from '../stores/buffers.js';
+import { isImeKey } from '../composables/useImeSafeInput.js';
 
 const networks = useNetworksStore();
 const buffers = useBuffersStore();
@@ -276,6 +293,7 @@ function combinedHighlights(
 const inputEl = ref<HTMLTextAreaElement | null>(null);
 const formEl = ref<HTMLElement | null>(null);
 const fileInputEl = ref<HTMLInputElement | null>(null);
+const cameraInputEl = ref<HTMLInputElement | null>(null);
 const e2eImportInputEl = ref<HTMLInputElement | null>(null);
 const e2eImportNetworkId = ref<number | null>(null);
 const dragOver = ref(false);
@@ -536,7 +554,7 @@ function bodyForSplit(raw: string): { body: string; isAction: boolean } {
   if (!m) return { body: '', isAction: false };
   const cmd = m[1].toLowerCase();
   // ⚠ Every branch below counts the POST-rewrite bytes, for the same reason the plain path above
-  // does: the spoiler rewrite ADDS bytes (`\x0301,01` … `\x03`), so a message that fits before it
+  // does: the spoiler rewrite ADDS bytes (`\x0314,14` … `\x03`), so a message that fits before it
   // may not after, and counting the typed form drifts the estimate LOW.
   //
   // ⚠ …and each branch reproduces its command's own whitespace handling, because `computeChunks`
@@ -638,8 +656,8 @@ function endTypingTo(target: { networkId: number; target: string } | null | unde
 interface CompletionState {
   prefix: string;
   tail: string;
-  // What follows the pick: ': ' for a nick being addressed at line start, ' '
-  // for a channel committed out of the ChannelPicker, '' otherwise. Stored on
+  // What follows the pick: addressSuffix() for a nick being addressed at line
+  // start, ' ' for a channel committed out of the ChannelPicker, '' otherwise. Stored on
   // the session rather than re-derived on each cycle so every Tab reproduces
   // the same shape of insertion the first one made — the picker commits with a
   // trailing space, in-place completion doesn't, and a cycle seeded from the
@@ -788,12 +806,53 @@ function tokenAtCursor(
 // True when `before` (the text preceding a token) sits at the start of a
 // logical line — nothing but whitespace since the last newline, or the very
 // start of the input. Callers use this to detect a nick that's being
-// *addressed* and so wants an opening ': '. Shared by Tab-completion and both
+// *addressed* and so wants addressSuffix(). Shared by Tab-completion and both
 // @-driven selectors so all three detect line starts identically, including
 // on multi-line drafts; what each appends *off* a line start still differs
 // (see the call sites).
 function isAtLineStart(before: string): boolean {
   return /(^|\n)\s*$/.test(before);
+}
+
+// The punctuation a nick takes when it opens the line, per the setting. The
+// value stores the mark alone and the space is always ours to add (see the
+// registry entry), so "space only" is the empty string. Trailing whitespace is
+// dropped rather than doubled: the description shows the form as `nick: `, and
+// typing exactly that into the field is the natural mistake — and it lets
+// `/set … " "` land on "space only" too.
+function addressPunct(): string {
+  return String(settings.effective('input.completion.nick_suffix')).trimEnd();
+}
+
+// What a nick takes when it opens the line — the addressing form. Read once
+// when a session is seeded, never per cycle: the suffix rides on
+// CompletionState so a setting change mid-walk can't change the shape of the
+// insertion under the caret. Shared by Tab, the @ picker, the strip, and Reply
+// (#835).
+function addressSuffix(): string {
+  return `${addressPunct()} `;
+}
+
+// A character that cannot continue a nick, which is what "punctuation after
+// the nick" has to mean for isAddressedTo(): not a letter or digit (Unicode —
+// `\w` is ASCII-only, so `bobł` would read as bob + a mark), not whitespace,
+// and not one of the RFC 2812 nick specials `[]\`_^{|}-` — or `bob_: hi`
+// would count as addressing bob, and bob_ is every ghost's nick.
+const NOT_NICK_CHAR = '[^\\p{L}\\p{N}\\s_\\[\\]\\\\`^{|}-]';
+
+// Whether `draft` already opens by addressing `nick`, so Reply is idempotent.
+// Not just the configured form: a draft can carry an older setting's form, or
+// one another client wrote (iOS still says `nick: `, and drafts sync), so any
+// run of punctuation after the nick counts — plus the configured mark
+// verbatim, whatever it is. The bare `nick ` form only counts when it IS the
+// configured form — otherwise a draft that merely opens with a nick that is
+// also a word ("will you come?") would swallow the Reply. Under an empty
+// setting that draft is indistinguishable from an addressed one, which is the
+// ambiguity of the convention itself, not something to second-guess.
+function isAddressedTo(draft: string, nick: string): boolean {
+  const punct = addressPunct();
+  const marks = punct ? `(?:${escapeRegex(punct)}|${NOT_NICK_CHAR}+)` : `${NOT_NICK_CHAR}*`;
+  return new RegExp(`^${escapeRegex(nick)}${marks}\\s`, 'iu').test(draft);
 }
 
 function buildNickMatches(buf: Buffer, networkId: number, prefix: string): string[] {
@@ -1009,16 +1068,16 @@ function onKeydown(e: KeyboardEvent): void {
   // Escape-closes-color-picker — had predictably been missed). While an IME
   // composition is live, every key belongs to the IME: arrows/Tab/Enter drive
   // its candidate window, Escape cancels its preedit — nothing here should
-  // act. keyCode 229 is gated too: Safari fires the Enter that confirms a CJK
-  // composition AFTER compositionend, with isComposing already false but
-  // keyCode still 229 — without this, committing a word would send the message
-  // (the standard ProseMirror/Slate guard).
+  // act. isImeKey also covers keyCode 229, for Safari's confirm-Enter arriving
+  // after compositionend; it is shared with the other fields that had to stop
+  // acting on the IME's keys once their model went live (#622), so the rule is
+  // stated once.
   //
   // Tab still preventDefaults on the way out: the IME has already consumed the
   // key, and letting the default through would walk focus out of the composer
   // onto Send — which on Firefox/Gboard Android, where a composition is open
   // for every word, would be the *only* thing Tab ever did.
-  if (e.isComposing || e.keyCode === 229) {
+  if (isImeKey(e)) {
     if (e.key === 'Tab') e.preventDefault();
     return;
   }
@@ -1335,9 +1394,9 @@ function onKeydown(e: KeyboardEvent): void {
 
   const prefix = value.slice(0, start);
   const tail = value.slice(end);
-  // A nick at line start is being *addressed* and wants an opening ': '.
+  // A nick at line start is being *addressed* and wants the addressing suffix.
   // Channels never take one — the '#' is already part of the name.
-  const suffix = !isChannel && isAtLineStart(prefix) ? ': ' : '';
+  const suffix = !isChannel && isAtLineStart(prefix) ? addressSuffix() : '';
 
   completion = { prefix, tail, suffix, matches, index: 0, caret: 0 };
   applyCompletion();
@@ -1600,13 +1659,13 @@ function onPickerSelect(nick: string): void {
   }
   const buf = buffer.value;
   const networkId = active.value?.networkId;
-  // A nick at the start of a line is being addressed → ': '; mid-sentence gets
-  // a bare space. Identical to the mobile strip (onStripSelect). In-place Tab-
-  // completion shares the isAtLineStart() check but appends nothing
-  // mid-sentence — which is exactly why the suffix rides on the session instead
-  // of being re-derived on each cycle: a walk seeded from here has to keep
-  // reproducing the space the picker already inserted.
-  const suffix = isAtLineStart(text.value.slice(0, pickerTokenStart)) ? ': ' : ' ';
+  // A nick at the start of a line is being addressed → addressSuffix();
+  // mid-sentence gets a bare space. Identical to the mobile strip
+  // (onStripSelect). In-place Tab-completion shares the isAtLineStart() check
+  // but appends nothing mid-sentence — which is exactly why the suffix rides on
+  // the session instead of being re-derived on each cycle: a walk seeded from
+  // here has to keep reproducing the space the picker already inserted.
+  const suffix = isAtLineStart(text.value.slice(0, pickerTokenStart)) ? addressSuffix() : ' ';
   // pickerQuery is the token minus its '@' — the bare prefix buildNickMatches
   // expects. Read before commitCompletion, which closes the picker and clears it.
   commitCompletion({
@@ -1626,7 +1685,7 @@ function onChannelPickerSelect(channel: string): void {
   const networkId = active.value?.networkId;
   const token = text.value.slice(channelPickerTokenStart, channelPickerTokenEnd);
   // Channels just get a trailing space — there's no "addressing" form like
-  // nicks' ': ', and the '#' is already part of the inserted name. The sent
+  // nicks' addressSuffix(), and the '#' is already part of the inserted name. The sent
   // `#channel` renders as a clickable join link for the recipient
   // (RenderSegments → openChannel), which is the whole point (issue #154).
   commitCompletion({
@@ -1645,11 +1704,11 @@ function onStripSelect(nick: string): void {
   }
   const buf = buffer.value;
   const networkId = active.value?.networkId;
-  // A nick at the start of a line is being addressed → ': '; mid-sentence
-  // gets a bare space (what the old @-menu was missing — task #198). Shares
-  // isAtLineStart() with Tab-completion and the desktop picker.
+  // A nick at the start of a line is being addressed → addressSuffix();
+  // mid-sentence gets a bare space (what the old @-menu was missing — task
+  // #198). Shares isAtLineStart() with Tab-completion and the desktop picker.
   const draft = text.value;
-  const suffix = isAtLineStart(draft.slice(0, stripTokenStart)) ? ': ' : ' ';
+  const suffix = isAtLineStart(draft.slice(0, stripTokenStart)) ? addressSuffix() : ' ';
   // The strip is prefix-less: its token is the bare word under the cursor, which
   // is already the prefix buildNickMatches wants (no '@' to strip).
   const token = draft.slice(stripTokenStart, stripTokenEnd);
@@ -1662,9 +1721,10 @@ function onStripSelect(nick: string): void {
   });
 }
 
-// Reply action from the message list's action bar: prepend `nick: ` to the
-// current draft (unless it's already addressed to them) and focus the
-// composer. Mirrors the history-recall focus dance — setInputAndCaretEnd owns
+// Reply action from the message list's action bar: prepend the addressing form
+// (`nick: ` under the default suffix) to the current draft, unless it's already
+// addressed to them, and focus the composer. Mirrors the history-recall focus
+// dance — setInputAndCaretEnd owns
 // the `cycling` guard, and the focus()-in-a-microtask matches onHistorySelect
 // so iOS raises the keyboard from the originating tap.
 function addressInComposer(nick: string): void {
@@ -1675,10 +1735,8 @@ function addressInComposer(nick: string): void {
   // old text afterward. Same reset onHistorySelect does for the same reason.
   resetCompletion();
   resetHistoryNav();
-  const prefix = `${nick}: `;
   const cur = text.value;
-  const next = cur.startsWith(prefix) ? cur : cur ? `${prefix}${cur}` : prefix;
-  setInputAndCaretEnd(next);
+  setInputAndCaretEnd(isAddressedTo(cur, nick) ? cur : nick + addressSuffix() + cur);
   queueMicrotask(() => inputEl.value?.focus());
 }
 
@@ -1872,6 +1930,7 @@ onBeforeUnmount(() => {
   closeEmojiStrip();
   closeEmojiPicker();
   closeColorPicker();
+  setUploadMenuOpen(false);
 });
 
 function insertUrlAtCaret(url: string): void {
@@ -1914,6 +1973,7 @@ onMounted(() => {
     onColorReset: onPickReset,
     onColorClose: closeColorPicker,
     onPickFile,
+    onPickCamera,
     onAddress: addressInComposer,
   });
 });
@@ -1922,9 +1982,15 @@ function blobFromClipboardItem(item: DataTransferItem): File | null {
   // Same gate as drop, from the same definition — pasting a video file from Finder
   // used to silently do nothing. `kind === 'file'` keeps pasted rich text from being
   // hijacked into an upload; the server has the final say on the type.
-  if (!item || item.kind !== 'file' || !isUploadableType(item.type)) return null;
+  //
+  // ⚠ The file is taken BEFORE the type gate, because the gate needs its name: a
+  // platform with no registered mime for `.md` reports an empty type, and the
+  // extension is then the only thing distinguishing a README from a stray binary
+  // (#788). `kind` is still checked first, so rich text never reaches getAsFile().
+  if (!item || item.kind !== 'file') return null;
   const file = item.getAsFile();
-  return file || null;
+  if (!file || !isUploadableType(file.type, file.name)) return null;
+  return file;
 }
 
 function onPaste(e: ClipboardEvent): void {
@@ -1948,6 +2014,13 @@ function onPickFile() {
   fileInputEl.value?.click();
 }
 
+function onPickCamera() {
+  cameraInputEl.value?.click();
+}
+
+// Serves both inputs — a captured photo arrives as a plain File, so the picked
+// and the shot path are the same from here on. `e.target` is whichever input
+// fired, which is also what gets cleared.
 function onFileSelected(e: Event): void {
   const input = e.target as HTMLInputElement;
   const file = input.files?.[0];
@@ -2005,13 +2078,42 @@ function onDrop(e: DragEvent): void {
   dragOver.value = false;
   if (!sendable.value) return;
   const file = e.dataTransfer?.files?.[0];
-  if (!file || !isUploadableType(file.type)) return;
+  if (!file || !isUploadableType(file.type, file.name)) return;
   uploads.upload(file, file.name).catch(() => {});
 }
 
 defineExpose({
   focus: () => inputEl.value?.focus(),
 });
+
+/**
+ * Put a failed send's text back where the user can act on it.
+ *
+ * ⚠⚠ The clear is OPTIMISTIC — commitInput runs before the ACK resolves, so by the time a send
+ * comes back `not-connected` the composer and the synced draft have already been emptied. That
+ * was survivable while a failed send was a rarity; the writable-connection gate (#809) makes it
+ * the ordinary outcome of any outage, and "your message vanished, there's a toast, press up-arrow"
+ * is not a thing a chat client should ask of you.
+ *
+ * Restoring the DRAFT is what does the work: the composer's `text` is a computed over the draft
+ * for the active buffer, so this refills the input if you're still looking at that buffer, and
+ * leaves it waiting for you (on every device) if you're not.
+ *
+ * ⚠⚠ Addressed to the buffer the send came FROM, never through `text.value` — whose setter
+ * targets whatever buffer is active NOW. `/msg nick text` activates the DM before we get here, so
+ * writing through the setter would strand the text in the wrong composer. Same trap commitInput
+ * documents (#4).
+ *
+ * ⚠ Never clobbers. The user may have started typing something else in the gap; theirs wins, and
+ * the toast (which carries the body) plus up-arrow are the fallback.
+ */
+function restoreFailedSend(networkId: number, target: string, raw: string): void {
+  if (drafts.forBuffer(networkId, target).trim() !== '') return;
+  drafts.setLocal(networkId, target, raw);
+  // Straight to the server rather than on the debounce, so closing the tab or
+  // switching buffers can't lose what we just recovered.
+  drafts.flushBuffer(networkId, target);
+}
 
 function toastSendFailure(error: string, body: string): void {
   // Translate the small set of ack/error strings into something a person can
@@ -2205,9 +2307,17 @@ async function submit() {
     // synchronously if the socket is closed so we don't silently swallow
     // them either.
     const said = chatMessagesSent;
+    // Cleared first so a stale ack from an earlier command can't be mistaken for
+    // this one's.
+    pendingCommandAck = null;
     const handled = await handleCommand(raw, networkId, target);
     if (!handled) return;
     commitInput(raw, networkId, target, { isChatMessage: chatMessagesSent > said });
+    const ack = takeCommandAck();
+    if (ack) {
+      const result = await ack.promise;
+      if (!result.ok) restoreFailedSend(ack.origin.networkId, ack.origin.target, ack.origin.line);
+    }
     return;
   }
 
@@ -2229,7 +2339,10 @@ async function submit() {
   clearInactivityTimer();
   commitInput(raw, networkId, target, { isChatMessage: true });
   const result = await pending;
-  if (!result.ok) toastSendFailure(result.error ?? 'unknown', raw);
+  if (!result.ok) {
+    toastSendFailure(result.error ?? 'unknown', raw);
+    restoreFailedSend(networkId, target, raw);
+  }
 }
 
 async function onLongMessageConfirm() {
@@ -2326,6 +2439,7 @@ const COMMANDS_LINES = [
   '  /part [#chan] [reason] — leave channel (keeps buffer; aliases: /leave, /p)',
   '  /close                 — close current buffer (parts if channel)',
   '  /clear [off]           — hide buffer up to now (off = undo, show again)',
+  '  /retention [n|off|default] — per-buffer history cap (no arg = show current)',
   '  /away [message]        — set away across every network (no arg clears)',
   '  /back                  — clear away',
   '  /whois <nick>          — query user info (renders in server buffer)',
@@ -2339,7 +2453,7 @@ const COMMANDS_LINES = [
   '  /mode <target> <flags> — set modes (target defaults to current channel)',
   '  /topic [text]          — set/clear topic on current channel',
   '  /nick <newnick>        — change your nick',
-  '  /quit [reason]         — disconnect from current network',
+  '  /quit [reason]         — disconnect from current network (alias: /disconnect)',
   '  /reconnect             — reconnect to current network',
   '  /list                  — list channels on current network',
   '  /who [mask]            — find users (also /whowas /userhost /ison /names)',
@@ -2484,7 +2598,39 @@ function sendOrToast(payload: Record<string, unknown>, body: string): boolean {
 // to sequence wrongly against the read.
 let chatMessagesSent = 0;
 
-function ackedSend(payload: Record<string, unknown>, body: string): boolean {
+// The ACK of the last command that put something on the wire, plus the buffer it
+// was TYPED IN and the line as typed. submit() picks this up AFTER commitInput.
+//
+// ⚠⚠ Handed up rather than restored inside ackedSend, and the ordering is the
+// reason. submit does `await handleCommand(...)` — one microtask — and only then
+// calls commitInput to clear the composer. An ACK that resolves inside that
+// window would be restored and then immediately cleared again. A real socket
+// can't answer that fast, but "correct because the network is slow" is not an
+// invariant worth shipping.
+interface CommandAck {
+  promise: Promise<AckResult>;
+  origin: { networkId: number; target: string; line: string };
+}
+let pendingCommandAck: CommandAck | null = null;
+
+// Read-and-clear. A function rather than a bare read because TypeScript narrows
+// the module-level `let` to `null` at the reset in submit() and doesn't widen it
+// back across the `await handleCommand(...)` that fills it in.
+function takeCommandAck(): CommandAck | null {
+  const ack = pendingCommandAck;
+  pendingCommandAck = null;
+  return ack;
+}
+
+// `origin` is the buffer the command was TYPED IN plus the line as typed, so a
+// failure can hand the whole thing back — `/notice bob hi`, not the bare `hi`
+// that `body` carries. Not the payload's target: `/notice bob …` is addressed to
+// bob but was written in #chan, and #chan is where the text belongs.
+function ackedSend(
+  payload: Record<string, unknown>,
+  body: string,
+  origin?: { networkId: number; target: string; line: string },
+): boolean {
   const pending = socketSendWithAck(payload);
   if (!pending) {
     toastSendFailure('disconnected', body);
@@ -2493,10 +2639,11 @@ function ackedSend(payload: Record<string, unknown>, body: string): boolean {
   // 'notice' is deliberately not counted: it's addressed to someone else and
   // puts nothing in the buffer the command was run from.
   if (payload.type === 'send' || payload.type === 'action') chatMessagesSent += 1;
-  pending.then((result) => {
+  const settled = pending.then((result) => {
     if (!result.ok) toastSendFailure(result.error ?? 'unknown', body);
     return result;
   });
+  if (origin) pendingCommandAck = { promise: settled, origin };
   return true;
 }
 
@@ -3022,7 +3169,10 @@ function runSet(argLine: string, networkId: number | null, target: string): void
   const opt = lookupSetting(args.key);
   if (!opt) return reply(`/set: unknown setting "${args.key}" — /set lists available keys`);
   if (args.kind === 'keyonly') {
-    return reply(`usage: /set ${opt.key} <value>  (or /get ${opt.key} to read it)`);
+    // A text key's empty value is only reachable as `""` — a bare `/set key `
+    // trims down to exactly this branch — so say so where the user is stuck.
+    const empty = opt.type === 'string' || opt.type === 'string-list' ? '; "" to empty it' : '';
+    return reply(`usage: /set ${opt.key} <value>  (or /get ${opt.key} to read it${empty})`);
   }
   const coerced = coerceSettingValue(opt, args.rawValue);
   if (!coerced.ok) return reply(`/set: ${coerced.error}`);
@@ -3139,7 +3289,11 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       // relay mark is per-(network, nick), so it needs an active network.
       return runRelay(argLine, networkId, target);
     case 'me':
-      return ackedSend({ type: 'action', networkId, target, text: chatBody(argLine) }, argLine);
+      return ackedSend({ type: 'action', networkId, target, text: chatBody(argLine) }, argLine, {
+        networkId,
+        target,
+        line,
+      });
     case 'ctcp': {
       // /ctcp <nick> <type> [args] — send a CTCP query (#263). The cell frames
       // and sends it, echoes locally, and routes the reply back to this buffer.
@@ -3184,7 +3338,13 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       if (!who) return true;
       const body = msgParts.join(' ');
       if (body) {
-        if (!ackedSend({ type: 'send', networkId, target: who, text: chatBody(body) }, body))
+        if (
+          !ackedSend({ type: 'send', networkId, target: who, text: chatBody(body) }, body, {
+            networkId,
+            target,
+            line,
+          })
+        )
           return false;
       }
       buffers.activate(networkId, who);
@@ -3263,6 +3423,84 @@ function handleCommand(line: string, networkId: number | null, target: string): 
         return sendOrToast({ type: 'unclear-buffer', networkId, target }, line);
       }
       return sendOrToast({ type: 'clear-buffer', networkId, target }, line);
+    }
+    case 'retention': {
+      // /retention           — what's kept in THIS buffer, and why
+      // /retention <lines>   — cap this buffer (0 or >= 1000; deletion is permanent)
+      // /retention off       — unlimited here (still under any server ceiling)
+      // /retention default   — drop the override, inherit Settings → Data
+      // Server/system pseudo-buffers don't hold prunable history (the server
+      // verb refuses them SILENTLY, like every malformed verb) — say so here
+      // instead of letting a set look like it worked.
+      if (!networkId || target.startsWith(':server:') || target === SYSTEM_KEY) {
+        localInfo(networkId, target, 'retention: not available in this buffer');
+        return true;
+      }
+      // The registry's own bounds — the same numbers the server validates
+      // with, so this guard can't drift from what the verb accepts.
+      const linesOpt = getOption('data.retention.lines');
+      const floor = linesOpt?.type === 'int' ? (linesOpt.minNonzero ?? 0) : 1000;
+      const maxLines = linesOpt?.type === 'int' ? linesOpt.max : 10_000_000;
+      const arg = argLine.trim().toLowerCase();
+      if (!arg) {
+        void (async () => {
+          try {
+            const info = await api(
+              `/api/retention/buffer?networkId=${networkId}&target=${encodeURIComponent(target)}`,
+            );
+            const cap =
+              info.effectiveLines > 0
+                ? `the last ${info.effectiveLines.toLocaleString()} lines`
+                : 'everything (no line cap)';
+            const src =
+              info.overrideLines === null
+                ? 'inherited from Settings → Data'
+                : info.overrideLines === 0
+                  ? 'override: unlimited here'
+                  : `override: ${info.overrideLines.toLocaleString()}`;
+            localInfo(networkId, target, `retention: keeping ${cap} (${src})`);
+            if (info.effectiveEventHours > 0) {
+              localInfo(
+                networkId,
+                target,
+                `retention: join/part/quit noise is pruned after ${info.effectiveEventHours}h`,
+              );
+            }
+            if (info.recentLinesPerDay > 0 && info.effectiveLines > 0) {
+              const days = info.effectiveLines / info.recentLinesPerDay;
+              localInfo(
+                networkId,
+                target,
+                `retention: recent pace ~${info.recentLinesPerDay.toLocaleString()} lines/day` +
+                  ` — the cap holds ${days >= 1 ? `≈ ${Math.round(days)} day(s)` : 'under a day'} here`,
+              );
+            }
+          } catch {
+            localInfo(networkId, target, 'retention: could not load info for this buffer');
+          }
+        })();
+        return true;
+      }
+      if (arg === 'default' || arg === 'inherit') {
+        return sendOrToast(
+          { type: 'set-buffer-retention', networkId, target, maxLines: null },
+          line,
+        );
+      }
+      if (arg === 'off' || arg === 'unlimited') {
+        return sendOrToast({ type: 'set-buffer-retention', networkId, target, maxLines: 0 }, line);
+      }
+      const n = Number(arg);
+      if (!Number.isInteger(n) || n < 0 || n > maxLines || (n !== 0 && n < floor)) {
+        localInfo(
+          networkId,
+          target,
+          `usage: /retention [lines | off | default] — lines is 0 or ` +
+            `${floor.toLocaleString()}–${maxLines.toLocaleString()}; deletion is permanent`,
+        );
+        return true;
+      }
+      return sendOrToast({ type: 'set-buffer-retention', networkId, target, maxLines: n }, line);
     }
     case 'raw':
     case 'quote':
@@ -3386,6 +3624,11 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       }
       return sendOrToast({ type: 'raw', networkId, line: `MODE ${argLine}` }, line);
     }
+    // `/disconnect` is the word people reach for when a network is stuck in a
+    // reconnect loop, and until #785 it fell through to the raw-line default —
+    // so it went out as an unknown IRC command (and during a backoff, nowhere at
+    // all). It means the same thing as /quit here: stop this network.
+    case 'disconnect':
     case 'quit': {
       // Route through the intentional-disconnect path (POST .../disconnect →
       // ircManager.stopNetwork → client.quit()), which sets irc-framework's
@@ -3396,7 +3639,7 @@ function handleCommand(line: string, networkId: number | null, target: string): 
       // an auto-disconnect.
       const reason = argLine || undefined;
       networks.disconnect(networkId, reason).catch((err) => {
-        localInfo(networkId, target, `/quit failed: ${err.message || 'could not disconnect'}`);
+        localInfo(networkId, target, `/${verb} failed: ${err.message || 'could not disconnect'}`);
       });
       return true;
     }
@@ -3424,7 +3667,11 @@ function handleCommand(line: string, networkId: number | null, target: string): 
         return true;
       }
       const url = `https://meet.jit.si/lurker-${randomRoomId()}`;
-      return ackedSend({ type: 'send', networkId, target, text: url }, url);
+      return ackedSend({ type: 'send', networkId, target, text: url }, url, {
+        networkId,
+        target,
+        line,
+      });
     }
     case 'op':
       return modeShortcut(networkId, target, rest, '+', 'o', 'usage: /op [#chan] <nick…>', line);
@@ -3563,7 +3810,11 @@ function handleCommand(line: string, networkId: number | null, target: string): 
         localInfo(networkId, target, 'usage: /notice <target> <text>');
         return true;
       }
-      return ackedSend({ type: 'notice', networkId, target: who, text: chatBody(body) }, body);
+      return ackedSend({ type: 'notice', networkId, target: who, text: chatBody(body) }, body, {
+        networkId,
+        target,
+        line,
+      });
     }
     case 'slap': {
       // mIRC's classic: a CTCP ACTION with the canonical trout line, so it rides
@@ -3578,7 +3829,11 @@ function handleCommand(line: string, networkId: number | null, target: string): 
         return true;
       }
       const slapText = `slaps ${who} around a bit with a large trout`;
-      return ackedSend({ type: 'action', networkId, target, text: slapText }, slapText);
+      return ackedSend({ type: 'action', networkId, target, text: slapText }, slapText, {
+        networkId,
+        target,
+        line,
+      });
     }
     case 'shrug': {
       // A plain message, not an ACTION: everywhere this convention comes from
@@ -3589,7 +3844,11 @@ function handleCommand(line: string, networkId: number | null, target: string): 
         return true;
       }
       const shrugText = shrugBody(argLine);
-      return ackedSend({ type: 'send', networkId, target, text: chatBody(shrugText) }, shrugText);
+      return ackedSend({ type: 'send', networkId, target, text: chatBody(shrugText) }, shrugText, {
+        networkId,
+        target,
+        line,
+      });
     }
     // Info/query commands. These already function via the raw fallback now that
     // unhandled server numerics surface in the server buffer (#269) — listing

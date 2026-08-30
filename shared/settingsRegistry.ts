@@ -96,6 +96,12 @@ export interface IntOption extends BaseOption {
   type: 'int';
   min: number;
   max: number;
+  // Extra floor applied to NONZERO values only, for knobs where 0 means
+  // "off/unlimited" but a small live value is almost certainly a mistake
+  // (retention: deletion is irreversible, so 50 lines is a typo, not an
+  // intent). Valid values are 0 or >= minNonzero; plain min/max can't
+  // express that hole.
+  minNonzero?: number;
   default: number;
 }
 
@@ -351,40 +357,53 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     type: 'string-list',
     // 16 entries, one per mIRC color code 0..15. The chromatic slots default
     // to the closest hue from look.nick.colors so coloured chat text harmonises
-    // with the rest of the theme; the mono-ish slots track the theme so they
-    // stay legible when the user changes look.color.bg / look.color.fg.
+    // with the rest of the theme.
     //
-    // ⚠ A slot must never resolve to the SURFACE it's drawn on. Slot 1 was
-    // var(--bg) — the background by definition — so black text rendered in
-    // exactly the colour behind it and disappeared. Anything derived from
-    // var(--fg) is safe; var(--bg) never is. Keep in sync with
+    // ⚠ EVERY slot is a literal colour, and must stay one. A mIRC code names a
+    // colour — `\x0300` means white, not "whatever this theme calls text" — and
+    // a sender who writes `\x0300,01` has specified both halves of a
+    // self-sufficient pair that we have no business overriding.
+    //
+    // Slots 0/14/15 were theme references (var(--fg), var(--fg-muted), 70% of
+    // var(--fg)) on the theory that they'd stay legible on any background. They
+    // don't: a run carries its OWN background, which is a second surface the
+    // theory never considered. In a light theme `\x0300,01` drew near-black on
+    // black, and `\x0301,00` — where slot 0 is the *background* — drew a dark
+    // box with black text in it. Both unreadable, both entirely the palette's
+    // doing. A slot that can't be named without knowing what it's painted on
+    // isn't a colour.
+    //
+    // The cost is accepted and is the sender's: white on a light canvas is
+    // invisible, exactly as black on a dark one already was. Keep in sync with
     // MIRC_PALETTE_FALLBACK in vue_client/src/utils/nickColor.ts.
     default: [
-      'var(--fg)', //                                       0  white
-      '#000000', //                                         1  black — NOT var(--bg)
-      '#6799f3', //                                         2  navy
-      '#a9dc76', //                                         3  green
-      '#ff6188', //                                         4  red
-      '#ed6c89', //                                         5  maroon
-      '#ab9df2', //                                         6  purple
-      '#fc9867', //                                         7  orange
-      '#ffd866', //                                         8  yellow
-      '#b3db82', //                                         9  lime
-      '#78dce8', //                                         10 teal
-      '#a0f1ff', //                                         11 cyan
-      '#7ba4ff', //                                         12 blue
-      '#ff7494', //                                         13 magenta
-      'var(--fg-muted)', //                                 14 gray
-      'color-mix(in srgb, var(--fg) 70%, transparent)', //  15 light gray
+      '#ffffff', // 0  white
+      '#000000', // 1  black
+      '#6799f3', // 2  navy
+      '#a9dc76', // 3  green
+      '#ff6188', // 4  red
+      '#ed6c89', // 5  maroon
+      '#ab9df2', // 6  purple
+      '#fc9867', // 7  orange
+      '#ffd866', // 8  yellow
+      '#b3db82', // 9  lime
+      '#78dce8', // 10 teal
+      '#a0f1ff', // 11 cyan
+      '#7ba4ff', // 12 blue
+      '#ff7494', // 13 magenta
+      '#7f7f7f', // 14 gray       — mIRC's own grey
+      '#d2d2d2', // 15 light gray — mIRC's own light grey
     ],
     description:
       'How the 16 mIRC color codes (0-15) render in chat. One CSS color per line, ' +
       'in order: white, black, navy, green, red, maroon, purple, orange, yellow, ' +
       'lime, teal, cyan, blue, magenta, gray, light gray. Defaults pick the ' +
       'closest hue from your nick palette so coloured text matches the rest of ' +
-      'the theme. Any CSS color value works (hex, rgb(), var(--name), color-mix()) — ' +
-      'except var(--bg), which is the chat background itself, so text set to it is ' +
-      'invisible.',
+      'the theme. Any CSS color value works (hex, rgb(), var(--name), color-mix()), ' +
+      'but prefer a literal: a code names a colour, and a slot that follows the ' +
+      'theme instead is wrong the moment a sender pairs it with a background of ' +
+      'their own. var(--bg) is the worst case — it IS the chat background, so text ' +
+      'set to it is invisible.',
   },
 
   // ─── Alternating message rows ─────────────────────────────────────────
@@ -830,7 +849,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'consolidation is on. "Smart filter" shows events only for nicks who have recently ' +
       'spoken, so silent lurkers cycling on and off stay invisible. "Hide all" removes ' +
       'event rows entirely, leaving conversation only. Kicks, topic changes and ' +
-      'invites are never hidden — they are things that happened, not churn.',
+      'invites are never hidden at any setting.',
   },
   {
     key: 'chat.events.mobile',
@@ -849,10 +868,10 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'the settings below are shared.',
   },
 
-  // ─── Join/part consolidation (IRCCloud-style summary line) ────────────
+  // ─── Event consolidation (IRCCloud-style summary line) ────────────────
   {
     key: 'chat.consolidate_joins',
-    label: 'Consolidate join/part/quit/nick/host-change events',
+    label: 'Consolidate join/part/quit/nick/host-change and op/voice events',
     category: 'events',
     group: 'consolidate',
     type: 'bool',
@@ -861,6 +880,10 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     description:
       'Merge consecutive join/part/quit/nick/host-change events into a single summary line ' +
       'per nick (e.g. "Alice and Bob joined; Dave left; Eve → Eve_afk"). ' +
+      'Mode changes that only grant or revoke member status join the same line ' +
+      '("…; Alice and Bob were opped; Carol was briefly voiced"), naming who it ' +
+      'was done to rather than who did it — bans, channel keys, limits and ' +
+      'channel flags always keep their own line. ' +
       'Off shows every event individually. Composes with the "smart" tier — events ' +
       'it hides are excluded from the summary.',
   },
@@ -877,7 +900,8 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     // transitively through chat.consolidate_joins.
     dependsOn: [{ key: 'chat.consolidate_joins', in: [true] }],
     description:
-      'In each category (joined / left / reconnected / renamed / changed host) of a summary ' +
+      'In each category (joined / left / reconnected / renamed / changed host / ' +
+      'opped / voiced / briefly opped …) of a summary ' +
       'line, show at most this many nicks before collapsing the rest into ' +
       '"and N others". Recent speakers (those tracked for nick completion) ' +
       'are preferred when picking which names to show.',
@@ -916,7 +940,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'that collapse into the consolidation summary above stay account-less.',
   },
 
-  // ─── Smart filter tuning (join/part/quit/nick noise) ──────────────────
+  // ─── Smart filter tuning (join/part/quit/nick/mode noise) ─────────────
   // Last of the three Events groups, and the narrowest — it only does anything
   // on one rung of the filter.
   //
@@ -934,9 +958,11 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     default: 5,
     dependsOn: EVENTS_SMART,
     description:
-      'Window in minutes for "recently spoke". A join/part/quit/nick event is hidden ' +
-      'if the affected nick has not posted a message within this many minutes before ' +
-      'the event.',
+      'Window in minutes for "recently spoke". An event is hidden if the nick it ' +
+      'concerns has not posted a message within this many minutes before it. For ' +
+      'joins, parts, quits and nick changes that is the nick the event is about; ' +
+      'for op and voice changes it is the nick being opped or voiced, not whoever ' +
+      'set the mode.',
   },
   {
     key: 'chat.smart_filter_join',
@@ -967,6 +993,21 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     default: true,
     dependsOn: EVENTS_SMART,
     description: 'Apply smart filter to NICK change events.',
+  },
+  {
+    key: 'chat.smart_filter_mode',
+    label: 'Filter op and voice changes',
+    category: 'events',
+    group: 'smart-filter',
+    type: 'bool',
+    default: true,
+    dependsOn: EVENTS_SMART,
+    description:
+      'Apply smart filter to MODE events that only grant or revoke member status ' +
+      '(+o, +v, and the equivalents your network offers). The event is hidden when ' +
+      'none of the nicks it acts on has spoken recently. Bans, channel keys, user ' +
+      'limits and channel flags are never hidden, and a single MODE that mixes one ' +
+      'of those in with an op change is shown in full.',
   },
   {
     key: 'chat.smart_filter_join_unmask',
@@ -1070,10 +1111,19 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     group: 'viewing',
     type: 'bool',
     default: false,
+    // ⚠⚠ THE PRIVACY SENTENCE IS SCOPED TO IMAGES, and the scoping is the point rather than
+    // pedantry. This string is the whole basis on which someone decides to turn the setting on,
+    // and it used to promise that "the file is fetched and served by your Lurker server" for
+    // video and audio too. That stopped being true when those kinds stopped being relayed: the
+    // card links straight to the origin, so a reader who enabled this on the old promise would
+    // hand their address to a stranger's host the moment they pressed the filename. A guarantee
+    // a user acts on has to be narrower than the truth, never wider.
     description:
-      'When enabled, a link that points straight at an image, video, or audio file ' +
-      'renders under the message instead of showing only as a link. The file is fetched ' +
-      'and served by your Lurker server, so the site hosting it never sees your device.',
+      'When enabled, a link that points straight at an image renders under the message ' +
+      'instead of showing only as a link, and the image is fetched and served by your ' +
+      'Lurker server, so the site hosting it never sees your device. Video and audio ' +
+      'links get a card naming the file — opening one goes to the site hosting it, ' +
+      'like any other link.',
   },
   {
     key: 'chat.link_previews.enabled',
@@ -1622,6 +1672,28 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       "input as you type any 2+ character prefix (no '@' required), tap or " +
       'click a nick to insert it.',
   },
+  // What a nick picks up when completed at the START of a line — the
+  // addressing form, `nick: `. Stored as the punctuation alone, with the
+  // trailing space always appended by the client (irssi's completion_char):
+  // every meaningful value is then visible in a text field, `/set
+  // input.completion.nick_suffix ,` needs no quoting, and "space only" is the
+  // empty string rather than an invisible ' '. The trade is that "no space"
+  // and "two spaces" are inexpressible, which nobody has asked for. Not an
+  // enum — the ask (#835) was for the common four AND free-form, and a string
+  // gets both without a new registry type.
+  {
+    key: 'input.completion.nick_suffix',
+    label: 'Nick completion suffix',
+    category: 'input',
+    group: 'autocomplete',
+    type: 'string',
+    default: ':',
+    description:
+      'Punctuation placed after a nick completed at the start of a line — the ' +
+      '"nick: " addressing form: ":" (default), ",", ";", or empty for a bare ' +
+      'space. A space always follows it. Applies to Tab, the @ picker, the ' +
+      'suggestion strip, and Reply; mid-line completions are unaffected.',
+  },
 
   // ─── Input bar (formatting) ──────────────────────────────────────────
   // Surfaces the mIRC palette popover for users who want to insert colour /
@@ -1738,6 +1810,81 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'devices. Must default to false: settingsService drops any row whose value ' +
       'equals the registry default, so a true default would be unstorable.',
   },
+
+  // ─── Data / retention ─────────────────────────────────────────────────
+  // How much stored history to keep, per buffer (lurker-dev/RETENTION_PLAN.md).
+  // Rendered by the bespoke DataPane via an embedded RegistryPane. The min/max
+  // here are NOT the enforcement surface: the operator ceiling is the env var
+  // LURKER_MAX_RETENTION_LINES, and every enforcement path resolves through
+  // effectiveRetentionLines() (services/retentionLimits.ts), which clamps a
+  // stored value regardless of what a client managed to write. minNonzero is
+  // write-time-only guardrailing (validate()): pruning is irreversible, and a
+  // cap like 50 is a mis-typed 5000, not a plan.
+  {
+    key: 'data.retention.lines',
+    label: 'History limit (lines per buffer)',
+    category: 'data',
+    group: 'retention',
+    type: 'int',
+    min: 0,
+    max: 10_000_000,
+    minNonzero: 1000,
+    default: 0,
+    description:
+      'Each buffer keeps at most this many lines; older lines are deleted ' +
+      'permanently. 0 keeps everything (up to any limit this server sets); ' +
+      'the smallest nonzero limit is 1,000. Bookmarked messages are never ' +
+      'deleted. Export your data first if you want an archive.',
+  },
+  // The noise clock: presence/server churn ages out on its own (shorter)
+  // schedule regardless of the line limit. Default ON at one week — the
+  // operator weighed 72h against 168h and chose the week because these rows
+  // feed search-driven fact-finding ("when did X last quit"). The deletable
+  // set is shared/eventFilter.ts EARLY_PRUNE_TYPES, not something clients
+  // enumerate. Enforced through effectiveEventRetentionHours(), ceiling env
+  // var LURKER_MAX_EVENT_RETENTION_HOURS — same stack as the line cap.
+  {
+    key: 'data.retention.event_hours',
+    label: 'Event history age limit (hours)',
+    category: 'data',
+    group: 'retention',
+    type: 'int',
+    min: 0,
+    max: 87_600,
+    // Same guardrail rationale as the lines floor, and this knob acts FASTER
+    // (the settings listener flags the sweep due immediately): a typed 1 or
+    // 17 would permanently delete nearly all event history within a tick.
+    minNonzero: 24,
+    default: 168,
+    description:
+      'Presence and server noise — joins, parts, quits, nick and mode ' +
+      'changes, MOTDs, away toggles — is deleted permanently once older than ' +
+      'this many hours, regardless of the line limit. 168 = one week; the ' +
+      'smallest nonzero limit is 24. 0 keeps events as long as regular ' +
+      'messages. Bookmarked messages are never deleted.',
+  },
+  // Closed-buffer garbage collection: a buffer closed for longer than this
+  // is deleted ENTIRELY — row and history. Default OFF, deliberately and
+  // unlike the noise clock: closing is sidebar tidiness, not a judgment on
+  // the history (search/highlights reach into closed buffers), and this is
+  // the one knob that deletes chat rather than churn. Hosted can force it
+  // through the ceiling env var LURKER_MAX_CLOSED_BUFFER_DAYS. Buffers still
+  // holding a bookmarked message are always skipped.
+  {
+    key: 'data.retention.closed_buffer_days',
+    label: 'Delete closed buffers after (days)',
+    category: 'data',
+    group: 'retention',
+    type: 'int',
+    min: 0,
+    max: 3650,
+    minNonzero: 7,
+    default: 0,
+    description:
+      'Buffers closed for longer than this many days are deleted entirely, ' +
+      'history included. 0 keeps closed buffers forever; the smallest nonzero ' +
+      'value is 7. Buffers containing a bookmarked message are never deleted.',
+  },
 ]);
 
 const BY_KEY = new Map(REGISTRY.map((opt) => [opt.key, opt] as const));
@@ -1847,4 +1994,5 @@ export const GROUPS: Readonly<Record<string, string>> = Object.freeze({
   autocomplete: 'Autocomplete',
   formatting: 'Formatting',
   locale: 'Locale',
+  retention: 'Retention',
 });

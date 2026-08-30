@@ -430,6 +430,9 @@ describe('ircManager optimistic-publish gating', () => {
       notice,
       publish,
       client: { user: { nick: 'me' } },
+      // The writable gate (#809) reads this — these cases are about echo
+      // adoption, so they all start from a live socket.
+      state: 'connected',
       supportsMultiline: () => false,
       echoActive: () => true,
       noteSentCiphertext: () => {},
@@ -477,6 +480,41 @@ describe('ircManager optimistic-publish gating', () => {
     ircManager.send(userId, networkId, '#gate', 'a\nb');
     expect(noEcho.publish).toHaveBeenCalledTimes(1);
     expect(noEcho.publish.mock.calls[0][0]).toMatchObject({ text: 'a\nb', self: true });
+  });
+
+  // #809: a network in reconnect backoff keeps its IrcConnection, but every line
+  // written to it is dropped by irc-framework. send/action/notice must refuse
+  // rather than persist a self row and fan it out to every device as sent.
+  it('refuses send/action/notice while the connection is not writable', () => {
+    for (const state of ['reconnecting', 'connecting', 'disconnected']) {
+      const { conn, say, action, notice, publish } = fakeConn({ state, echoActive: () => false });
+      vi.spyOn(ircManager, 'getConnection').mockReturnValue(conn);
+      expect(ircManager.send(userId, networkId, '#gate', 'hi')).toBe(false);
+      expect(ircManager.action(userId, networkId, '#gate', 'waves')).toBe(false);
+      expect(ircManager.notice(userId, networkId, '#gate', 'psst')).toBe(false);
+      expect(say).not.toHaveBeenCalled();
+      expect(action).not.toHaveBeenCalled();
+      expect(notice).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    }
+  });
+
+  // The gate sits AHEAD of the E2E branch, so a doomed send can't advance the
+  // ratchet or burn a queued rekey on a line that never leaves the process.
+  it('refuses an E2E send while not writable, without encrypting', () => {
+    e2eManager.setChannelConfig(userId, networkId, '#e2eoffline', true, 'normal');
+    const flushE2eRekeys = vi.fn<() => void>();
+    const { conn, say, publish } = fakeConn({ state: 'reconnecting', flushE2eRekeys });
+    vi.spyOn(ircManager, 'getConnection').mockReturnValue(conn);
+    expect(ircManager.send(userId, networkId, '#e2eoffline', 'secret hello')).toBe(false);
+    expect(say).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    // ⚠⚠ This is the assertion that pins WHERE the gate sits. say/publish alone
+    // would still pass with the gate moved to just after encryptOutgoing() —
+    // which advances the ratchet and DRAINS the pending rekey queue into a dead
+    // socket, losing those rekeys for good. Only flushE2eRekeys catches that.
+    expect(flushE2eRekeys).not.toHaveBeenCalled();
   });
 
   it('the E2E branch keeps its optimistic plaintext publish even with echo active', () => {

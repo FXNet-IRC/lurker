@@ -9,7 +9,8 @@
       <header class="head">
         <input
           ref="inputEl"
-          v-model="query"
+          :value="query"
+          @input="onQueryInput"
           class="filter"
           type="text"
           placeholder="jump to channel or DM…"
@@ -51,6 +52,7 @@ import { useNickColors } from '../composables/useNickColors.js';
 import { flattenBufferOrder, bufferSortKey } from '../utils/bufferOrder.js';
 import { smartSortRows } from '../utils/switcherSort.js';
 import { isChannelTarget } from '../../../shared/channels.js';
+import { isImeKey, useImeSafeInput } from '../composables/useImeSafeInput.js';
 
 interface Row {
   networkId: string | number;
@@ -79,6 +81,7 @@ const recent = useRecentBuffersStore();
 const nicks = useNickColors();
 
 const query = ref('');
+const onQueryInput = useImeSafeInput(query);
 const selected = ref(0);
 const inputEl = ref<HTMLInputElement | null>(null);
 const listEl = ref<HTMLUListElement | null>(null);
@@ -184,6 +187,10 @@ function onPointerMove(e: MouseEvent, i: number) {
 }
 
 function onKeydown(e: KeyboardEvent) {
+  // While a composition is live every key belongs to the IME: arrows and Enter
+  // drive its candidate window, Escape cancels its preedit. One gate for the
+  // whole handler, as in the composer (MessageInput's onKeydown).
+  if (isImeKey(e)) return;
   if (e.key === 'ArrowDown') {
     e.preventDefault();
     if (rows.value.length === 0) return;

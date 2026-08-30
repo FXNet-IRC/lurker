@@ -9,6 +9,7 @@ import path from 'path';
 import fs from 'fs';
 import { isNodeMode } from '../utils/edition.js';
 import { isPublicModeEnabled } from '../utils/publicMode.js';
+import { EARLY_PRUNE_TYPES } from '../../shared/eventFilter.js';
 import { foldBufferCase } from './foldBufferCase.js';
 import {
   normalizeMessagesBufferIds,
@@ -264,11 +265,46 @@ function migrate() {
       used_by_user_id INTEGER,
       used_at TEXT,
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      -- Both ends CASCADE: an invite row describes a transaction between two
+      -- live accounts, so it dies with either. used_by_user_id was SET NULL
+      -- (#590) — which silently RESURRECTED a spent invite when its redeemer
+      -- was deleted: used_by_user_id went NULL, inviteStatus() read 'valid'
+      -- again, and a one-time link admins believed was spent became live for a
+      -- second stranger. See the schemaVersion 20 rebuild for existing DBs.
       FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE,
-      FOREIGN KEY (used_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+      FOREIGN KEY (used_by_user_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_invite_tokens_unused
       ON invite_tokens(token) WHERE used_by_user_id IS NULL;
+
+    -- Admin-issued account recovery links (#855). A member locked out of an
+    -- account redeems one to set a password or enroll a fresh passkey; there is
+    -- no email address to run a self-service reset against.
+    --
+    -- Only the SHA-256 of the token is stored. The raw value exists solely in
+    -- the link the admin hands over, so a read of this table cannot recover an
+    -- account -- unlike invite_tokens, which stores its token raw because an
+    -- invite only creates a NEW account rather than taking over an existing one.
+    --
+    -- user_id is UNIQUE: issuing a link replaces any outstanding one, so there
+    -- is at most one row per account and 'invalidate the others' costs nothing.
+    -- Redemption DELETEs the row, which is what makes a link single-use.
+    --
+    -- created_by is SET NULL rather than CASCADE because the link belongs to the
+    -- account being recovered, not to the admin who issued it -- an admin
+    -- leaving must not strand a member mid-recovery. The #590 resurrection trap
+    -- that made invite_tokens.used_by_user_id CASCADE cannot recur here:
+    -- liveness reads expires_at only, and a spent row is gone rather than
+    -- flagged, so no nulled column can turn a dead link live again.
+    CREATE TABLE IF NOT EXISTS account_recovery_tokens (
+      token_hash TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL UNIQUE,
+      created_by INTEGER,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+    );
 
     CREATE TABLE IF NOT EXISTS webauthn_credentials (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -440,6 +476,22 @@ function migrate() {
     );
     CREATE INDEX IF NOT EXISTS idx_favorite_buffers_user
       ON favorite_buffers(user_id, position);
+
+    -- Per-buffer override of data.retention.lines
+    -- (lurker-dev/RETENTION_PLAN.md). Sparse: a row exists only where the
+    -- user set an override; max_lines 0 is an EXPLICIT "unlimited here"
+    -- (still clamped to the operator ceiling at enforcement), absence means
+    -- "inherit the global setting". Born buffer_id-keyed like
+    -- favorite_buffers — never part of the v18 name-key rebuilds.
+    CREATE TABLE IF NOT EXISTS buffer_retention (
+      user_id INTEGER NOT NULL,
+      buffer_id INTEGER NOT NULL,
+      max_lines INTEGER NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (user_id, buffer_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (buffer_id) REFERENCES buffers(id) ON DELETE CASCADE
+    );
 
     -- Per-(user, network, channel) override for the desktop nicklist's
     -- collapsed state. Only channels the user has explicitly toggled get a
@@ -697,6 +749,11 @@ function migrate() {
       image_height INTEGER,
       embed_url TEXT,
       mime TEXT,
+      -- Byte-cache key of a stored poster frame (video/audio kinds only), set only
+      -- when the poster was actually stored — so descriptor minting can be a plain
+      -- column read rather than a cache-existence probe. NULL means "no poster",
+      -- which is a complete, renderable state.
+      poster_key TEXT,
       fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
       expires_at TEXT NOT NULL
     );
@@ -925,6 +982,20 @@ interface TableInfoRow {
   pk: number;
 }
 
+// PRAGMA foreign_key_list(<table>) — one row per foreign key. Used to detect a
+// constraint that a migration needs to rewrite, since SQLite can only change a
+// foreign key by rebuilding the table.
+interface ForeignKeyListRow {
+  id: number;
+  seq: number;
+  table: string;
+  from: string;
+  to: string | null;
+  on_update: string;
+  on_delete: string;
+  match: string;
+}
+
 function ensureColumn(table: string, column: string, def: string): void {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as TableInfoRow[];
   if (!cols.find((c) => c.name === column)) {
@@ -1013,6 +1084,9 @@ if (columnExists('channel_notify_settings', 'target')) {
   db.exec(`ALTER TABLE channel_notify_settings DROP COLUMN muted`);
 }
 
+// Poster frames for video/audio link previews arrived with the lurker-previews
+// decoder split; rows from before it simply have no poster until they re-resolve.
+ensureColumn('link_previews', 'poster_key', 'TEXT');
 ensureColumn('messages', 'extra', 'TEXT');
 // nick!user@host of the sender, captured at ingest so client-side hostmask
 // ignore filters can match incoming and persisted messages. NULL for system
@@ -1241,6 +1315,31 @@ ensureColumn('upload_history', 'removed', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('upload_history', 'uploader_config_id', 'INTEGER');
 ensureColumn('upload_history', 'ref', 'TEXT');
 
+// Starred uploads — the user's own quick-access set (the reaction gif they post
+// weekly, the diagram they keep re-linking). A nullable TIMESTAMP rather than a
+// boolean for two reasons: it records WHEN you starred something, which is the
+// order the favourites views want (star a two-year-old upload today and it
+// belongs at the FRONT, not buried under things you starred long ago); and a
+// nullable column survives importing an archive written before it existed, where
+// a NOT NULL one would fail the insert (see the synced_to_cp note in
+// exportSchema.ts for the same trap).
+ensureColumn('upload_history', 'favorited_at', 'TEXT');
+
+// The favourites view orders by favorited_at, which idx_upload_history_user
+// (user_id, id DESC) cannot serve — SQLite falls back to walking EVERY row the
+// user has ever uploaded and sorting them in a temp b-tree, then applying LIMIT.
+// The id-ordered browse stops after a page of index entries; this one does not,
+// so its cost grows with total history, and the composer's attach menu fires it
+// on every tap of the paperclip.
+//
+// PARTIAL, on the same predicate the query uses: the index then holds one entry
+// per STARRED row rather than one per upload, which is the whole point — a
+// curated set is tiny next to the history it was curated from. `removed` is left
+// out deliberately; filtering a handful of tombstones out of an already-small
+// set is free, and including it would only bloat the index.
+db.exec(`CREATE INDEX IF NOT EXISTS idx_upload_history_favorites
+  ON upload_history(user_id, favorited_at DESC) WHERE favorited_at IS NOT NULL`);
+
 // The offer's address/port, persisted so an unsolicited DCC SEND recorded as
 // pending_approval can be accepted later (the user clicks Accept seconds/minutes
 // after the bot offered). #270 phase 2.
@@ -1261,7 +1360,7 @@ ensureColumn('push_subscriptions', 'transport', "TEXT NOT NULL DEFAULT 'webpush'
 // Schema versioning lets us retire one-shot recovery blocks once every
 // production DB has run through them. Bump SCHEMA_VERSION when adding a new
 // recovery block, and delete blocks for versions far enough in the past.
-const SCHEMA_VERSION = 19;
+const SCHEMA_VERSION = 20;
 const schemaVersionRow = db
   .prepare(`SELECT value FROM app_meta WHERE key = 'schema_version'`)
   .get() as { value: string } | undefined;
@@ -2119,6 +2218,98 @@ if (schemaVersion < 16 && tableExists('channels')) {
   }
 }
 
+// The search-filter indexes: filter-only searches (from:/in:/on: with no free
+// text — searchMessages in db/messages.ts) must satisfy `ORDER BY id DESC
+// LIMIT n` from the messages table, and before these existed a from: search
+// was a full rowid-desc scan whose stopping point depended on how recently the
+// nick spoke (a typo'd nick scanned the whole table, every time).
+//
+// idx_messages_net serves on:-only; idx_messages_net_nick serves every
+// nick-filtered shape ((network_id, nick) equality prefix, `id DESC` for the
+// ORDER BY and the `before` cursor, the rest payload-only so wrong-buffer /
+// non-chat / ignored / mirrored rows are rejected in-index — same recipe as
+// idx_messages_buf_unread above). COLLATE NOCASE on the indexed column is
+// load-bearing: searchMessages compares `nick COLLATE NOCASE`, and an index
+// without the matching collation is invisible to that predicate.
+//
+// These two are a PAIR and idx_messages_net must be created first: with only
+// the nick index present the planner uses its bare network_id prefix for
+// on:-only queries, which has no id-ordering (nick sits between network_id and
+// id), so it gathers and sorts the network's entire history — measurably worse
+// than the full scan it replaced. messagesEqp.test.ts pins both plans.
+//
+// One-shot and non-resumable like the buf_unread build; a sort per index
+// (~2.5s + ~14s measured on a 2M-row database on NVMe), run once.
+if (
+  (!indexExists('idx_messages_net') || !indexExists('idx_messages_net_nick')) &&
+  db.prepare(`SELECT 1 FROM messages LIMIT 1 OFFSET ?`).get(INDEX_BUILD_WARN_ROWS)
+) {
+  console.warn(
+    `[db] building the search-filter indexes — one-time, blocks startup, not resumable. ` +
+      `Do not kill the process.`,
+  );
+}
+db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_net
+         ON messages(network_id, id DESC, type, from_ignored, mirrored)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_net_nick
+         ON messages(network_id, nick COLLATE NOCASE, id DESC,
+                     buffer_id, type, from_ignored, mirrored)`);
+
+// Retention's noise clock (lurker-dev/RETENTION_PLAN.md §3.3): age-based
+// pruning needs a time-ordered access path, and messages.time is otherwise
+// unindexed — count-based retention deliberately never needed one. Partial
+// over exactly the early-prune types (roughly a third of rows), so the b-tree
+// stays small and every entry the sweep walks is a deletion candidate;
+// buffer_id rides along so the per-user ownership join reads index-only.
+// The predicate list is GENERATED from shared EARLY_PRUNE_TYPES — the sweep
+// statements in db/retention.ts generate theirs the same way (and pin the
+// index with INDEXED BY, which refuses to prepare against a predicate the
+// query no longer implies). Sorted so the rendering is deterministic.
+export const EARLY_PRUNE_TYPES_SQL = [...EARLY_PRUNE_TYPES]
+  .sort()
+  // '' → '''' escaping: today's members are internal constants, but this
+  // string becomes DDL and statement text verbatim — cheap to make that safe
+  // against a future type name containing a quote.
+  .map((t) => `'${t.replace(/'/g, "''")}'`)
+  .join(', ');
+
+/**
+ * Build — or REBUILD — the noise-clock index so its predicate always matches
+ * the current EARLY_PRUNE_TYPES. Self-healing on purpose: `CREATE INDEX IF
+ * NOT EXISTS` keys on the name alone, so after an edit to the shared set a
+ * deployed database would keep its stale index and the INDEXED BY statements
+ * in db/retention.ts would fail to prepare AT MODULE LOAD — a boot
+ * crash-loop, on every instance, that a fresh-DB CI run can never see.
+ * Comparing the live DDL and dropping on mismatch turns "the set changed"
+ * into an ordinary one-time rebuild instead. Exported so the rebuild path is
+ * testable against a deliberately-stale index (messagesEqp.test.ts).
+ */
+export function ensureNoiseIndexCurrent(): void {
+  const ddl = `CREATE INDEX IF NOT EXISTS idx_messages_noise_time
+         ON messages(time, buffer_id)
+         WHERE type IN (${EARLY_PRUNE_TYPES_SQL})`;
+  const live = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`)
+    .get('idx_messages_noise_time') as { sql: string } | undefined;
+  if (
+    live &&
+    (!live.sql.includes(`(${EARLY_PRUNE_TYPES_SQL})`) || !live.sql.includes('(time, buffer_id)'))
+  ) {
+    db.exec(`DROP INDEX idx_messages_noise_time`);
+  }
+  if (
+    !indexExists('idx_messages_noise_time') &&
+    db.prepare(`SELECT 1 FROM messages LIMIT 1 OFFSET ?`).get(INDEX_BUILD_WARN_ROWS)
+  ) {
+    console.warn(
+      `[db] building idx_messages_noise_time — one-time, blocks startup, not resumable. ` +
+        `Do not kill the process.`,
+    );
+  }
+  db.exec(ddl);
+}
+ensureNoiseIndexCurrent();
+
 // --- v18: satellite tables onto buffer_id (#695) -----------------------------
 //
 // The six per-buffer view-state tables (read pointers, input history, pins,
@@ -2177,6 +2368,92 @@ if (schemaVersion < 19 && tableExists('contacts')) {
   const seeded = db.transaction(() => seedFavoritesFromContacts(db));
   const count = seeded.immediate();
   if (count > 0) console.log(`[db] migrated ${count} friend(s) into buffer favorites`);
+}
+
+// Issue #590: invite_tokens.used_by_user_id carried ON DELETE SET NULL, so
+// deleting a user RESURRECTED the invite they had redeemed — the id went NULL,
+// inviteStatus() saw no redeemer and reported 'valid', and a one-time link the
+// admin considered spent was live again for whoever still had the URL. Rebuild
+// the table with ON DELETE CASCADE (SQLite cannot alter a foreign key in place)
+// — same swap shape as the #301/#350 migrations above.
+//
+// Then purge the invites this already resurrected. `consumeInvite` writes
+// used_by_user_id and used_at together, so a row with used_at set but no
+// redeemer is not an ambiguous case: it is precisely an invite that WAS spent
+// and whose redeemer has since been deleted. Flipping the constraint only stops
+// the next revival; without this sweep every already-revived link on an
+// instance that has ever deleted a user stays redeemable.
+//
+// Deleting them is what makes history CONSISTENT rather than what makes it
+// lossy: from here on a user deletion takes the invite with it, so these rows
+// are exactly the ones that would already be gone had the constraint been right
+// when their redeemer was removed. The sweep finishes a deletion that was
+// botched. Carrying them forward instead is the asymmetric option — an
+// ownerless consumed row that could only ever exist for deletions predating
+// this upgrade. Only a count is logged, deliberately: an invite token is a
+// credential and does not belong in the log.
+//
+// Gated on the live constraint rather than on schema_version alone: fresh
+// installs get CASCADE from the CREATE TABLE above and must copy nothing.
+if (schemaVersion < 20) {
+  const usedByFk = (
+    db.prepare(`PRAGMA foreign_key_list(invite_tokens)`).all() as ForeignKeyListRow[]
+  ).find((f) => f.from === 'used_by_user_id');
+  if (usedByFk && usedByFk.on_delete !== 'CASCADE') {
+    const rebuild = db.transaction(() => {
+      const doomed = (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM invite_tokens
+             WHERE used_by_user_id IS NULL AND used_at IS NOT NULL`,
+          )
+          .get() as { n: number }
+      ).n;
+      db.exec(`DROP INDEX IF EXISTS idx_invite_tokens_unused`);
+      db.exec(`
+        CREATE TABLE invite_tokens_new (
+          token TEXT PRIMARY KEY,
+          created_by INTEGER NOT NULL,
+          expires_at TEXT,
+          used_by_user_id INTEGER,
+          used_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE,
+          FOREIGN KEY (used_by_user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+      `);
+      // Copy everything EXCEPT the resurrected rows — they are spent invites
+      // wearing a pending row's shape, and carrying them over would leave the
+      // very links this migration exists to close still usable.
+      db.exec(`
+        INSERT INTO invite_tokens_new
+          (token, created_by, expires_at, used_by_user_id, used_at, created_at)
+        SELECT token, created_by, expires_at, used_by_user_id, used_at, created_at
+        FROM invite_tokens
+        WHERE NOT (used_by_user_id IS NULL AND used_at IS NOT NULL)
+      `);
+      db.exec(`DROP TABLE invite_tokens`);
+      db.exec(`ALTER TABLE invite_tokens_new RENAME TO invite_tokens`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_invite_tokens_unused
+               ON invite_tokens(token) WHERE used_by_user_id IS NULL`);
+      return doomed;
+    });
+    const prevFk = db.pragma('foreign_keys', { simple: true });
+    db.pragma('foreign_keys = OFF');
+    let purged = 0;
+    try {
+      // .immediate(), because this transaction opens with a read: on a hosted
+      // cell a deferred BEGIN takes a snapshot that Litestream's once-a-second
+      // sync can stale, and the write upgrade then dies with SQLITE_BUSY_SNAPSHOT,
+      // which busy_timeout does not retry (see lurker#603).
+      purged = rebuild.immediate();
+    } finally {
+      db.pragma(`foreign_keys = ${prevFk ? 'ON' : 'OFF'}`);
+    }
+    if (purged > 0) {
+      console.log(`[db] closed ${purged} invite(s) resurrected by a user deletion (#590)`);
+    }
+  }
 }
 
 // Issue #510: seed the uploader data model — instance x0/catbox rows +
@@ -2252,6 +2529,17 @@ try {
 } catch (err) {
   console.warn('[db] smart-filter→event-tier migration failed (will retry next boot):', err);
 }
+
+// buffer_id-leading indexes on the two satellite tables that scale with the
+// INSTANCE (not the user): a `DELETE FROM buffers` cascades into eight child
+// tables, and every one of them is keyed (user_id, buffer_id) — without these
+// the cascade full-scans buffer_reads and input_history per deleted buffer.
+// Interactive closes paid that once; closed-buffer GC (retention plan §4.5)
+// deletes buffers in bulk on the shared connection, where a per-delete scan
+// that grows with the instance is the event-loop-starvation class again.
+// After the v18 rebuild on purpose (those tables are recreated there).
+db.exec(`CREATE INDEX IF NOT EXISTS idx_buffer_reads_buffer_id ON buffer_reads(buffer_id)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_input_history_buffer_id ON input_history(buffer_id)`);
 
 // Gate on uploaderSeedOk: if the uploader seed threw, leave schema_version
 // un-bumped so the seed retries on the next boot instead of being silently

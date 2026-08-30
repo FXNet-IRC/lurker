@@ -7,7 +7,7 @@ import { useChannelListModal } from './useChannelListModal.js';
 import { useJoinChannelModal } from './useJoinChannelModal.js';
 import { useNetworkEditor } from './useNetworkEditor.js';
 import { useNotifyLadder } from './useNotifyLadder.js';
-import { useNetworksStore, type Network } from '../stores/networks.js';
+import { canDisconnect, useNetworksStore, type Network } from '../stores/networks.js';
 
 // Buffer-list action logic for network rows. Analogous to useBufferActions for
 // channel/DM rows. Builds the network context menu — Join Channel / Channel List,
@@ -21,15 +21,23 @@ export function useNetworkActions() {
   const notify = useNotifyLadder();
   const networks = useNetworksStore();
 
-  function toggleConnection(networkId: number): void {
-    const state = networks.states[networkId]?.state;
-    const p =
-      state === 'connected' ? networks.disconnect(networkId) : networks.reconnect(networkId);
+  // ⚠ Takes the decision rather than re-deriving it. buildItems snapshots the state when the
+  // menu OPENS; re-reading it at click time lets the two disagree while the menu sits there —
+  // and it is reachable: right-click during a backoff (item reads "Disconnect"), the reconnect
+  // gate then refuses (paused account, host dropped from the allowlist) and stopReconnecting
+  // settles the state to 'disconnected', so the click on "Disconnect" would fire a RECONNECT.
+  function toggleConnection(networkId: number, offerDisconnect: boolean): void {
+    const p = offerDisconnect ? networks.disconnect(networkId) : networks.reconnect(networkId);
     p.catch((err) => console.error('[useNetworkActions] toggle connection failed', err));
   }
 
   function buildItems(net: Network): ContextMenuItem[] {
-    const isConnected = networks.states[net.id]?.state === 'connected';
+    const state = networks.states[net.id]?.state;
+    const isConnected = state === 'connected';
+    // ⚠ Not `isConnected`. Disconnect is what stops a reconnect loop, so it has to be reachable
+    // DURING one — see canDisconnect (#785). Join below stays on isConnected, which is the
+    // different question of whether there's a socket to send JOIN on.
+    const offerDisconnect = canDisconnect(state);
     return [
       // Channel actions first — the common reason to reach for a network's menu.
       // Join needs a live connection; the channel list is still browsable from
@@ -52,9 +60,9 @@ export function useNetworkActions() {
         onClick: () => networkEditor.open(net),
       },
       {
-        label: isConnected ? 'Disconnect' : 'Reconnect',
-        icon: isConnected ? 'fa-solid fa-plug-circle-xmark' : 'fa-solid fa-plug',
-        onClick: () => toggleConnection(net.id),
+        label: offerDisconnect ? 'Disconnect' : 'Reconnect',
+        icon: offerDisconnect ? 'fa-solid fa-plug-circle-xmark' : 'fa-solid fa-plug',
+        onClick: () => toggleConnection(net.id, offerDisconnect),
       },
       // Network-wide notification ladder (issue #359): Highlights only (default)
       // / Nothing / Muted — a -network-scoped NONOTIFY(+NOUNREAD) rule covering

@@ -14,7 +14,8 @@
   <div class="picker">
     <div class="search-row">
       <input
-        v-model="query"
+        :value="query"
+        @input="onQueryInput"
         class="search"
         type="search"
         placeholder="Search networks…"
@@ -109,6 +110,7 @@ import {
   type NetworkPreset,
 } from '../utils/builtinNetworks.js';
 import { useNetworkPresetsStore } from '../stores/networkPresets.js';
+import { useImeSafeInput } from '../composables/useImeSafeInput.js';
 
 defineEmits<{ select: [net: NetworkPreset]; manual: [] }>();
 
@@ -131,6 +133,7 @@ function hasLurker(net: NetworkPreset): boolean {
 const showTagFilter = computed(() => presets.allowUserDefined && builtinNetworkTags.length > 0);
 
 const query = ref('');
+const onQueryInput = useImeSafeInput(query);
 // Single-select tag filter: clicking a chip selects it (clearing any other);
 // clicking the active chip again clears the filter. The chip tray is collapsed
 // behind the Filter button by default.

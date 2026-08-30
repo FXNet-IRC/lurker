@@ -54,6 +54,7 @@ export default defineConfig({
           text: 'Self-Hosting & Operations',
           items: [
             { text: 'Self-Hosting Lurker', link: '/SELF_HOSTING' },
+            { text: 'Switching to the IRC engine', link: '/MIGRATION_ENGINE' },
             { text: 'Deploy on DigitalOcean', link: '/digitalocean' },
           ],
         },
@@ -62,6 +63,7 @@ export default defineConfig({
           items: [
             { text: 'Client Protocol & API', link: '/CLIENT_PROTOCOL' },
             { text: 'Client Migration: 1.1.x → 2.0', link: '/MIGRATION_2_0' },
+            { text: 'Client Migration: Search → REST', link: '/MIGRATION_SEARCH_REST' },
             { text: 'MCP & HTTP API', link: '/MCP' },
             { text: 'IRCv3 Support', link: '/IRCV3' },
           ],

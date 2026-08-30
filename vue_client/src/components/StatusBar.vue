@@ -58,19 +58,28 @@
         >
       </div>
       <div class="bar-tools">
-        <!-- No @mousedown.prevent here (unlike the palette/send buttons): this
-             opens the native iOS file picker, which dismisses the soft keyboard
-             no matter what. Preventing the tap-blur only delays that dismissal a
-             beat — keyboard stays up, then drops as the picker sheet animates in
-             — which reads as jank. Letting the tap blur gives one clean
-             dismissal instead. -->
+        <!-- One control for every way a file gets into a message. It used to open
+             the OS file dialog straight away, with starred uploads on a second
+             button beside it — two controls for one intent. It opens the attach
+             menu now, and the menu carries both.
+
+             @mousedown.prevent, which the direct-to-dialog version deliberately did
+             NOT have: this is an in-app panel, so the composer should keep focus and
+             the soft keyboard should stay up. The old reasoning (a native sheet
+             dismisses the keyboard regardless, so preventing the blur only delays
+             it into jank) still holds — it has moved onto the menu's own upload
+             buttons, which are what actually opens that sheet. -->
         <button
+          ref="uploadMenuBtnEl"
           type="button"
           class="tool-btn"
+          :class="{ on: overlay.uploadMenuOpen }"
           :disabled="!sendable"
-          title="upload file"
-          aria-label="upload file"
-          @click="onPickFile"
+          title="attach a file"
+          aria-label="attach a file"
+          :aria-expanded="overlay.uploadMenuOpen"
+          @mousedown.prevent
+          @click="onToggleUploadMenu"
         >
           <i class="fa-solid fa-paperclip"></i>
         </button>
@@ -129,6 +138,14 @@
       @reset="resetColor"
       @close="closeColorPicker"
     />
+    <!-- v-if, not v-show: the menu refetches favourites on mount, so the DOM
+         lifecycle IS the "load on open" trigger. It also has to be handed its own
+         toggle button to exclude from outside-tap dismissal. -->
+    <UploadMenu
+      v-if="overlay.uploadMenuOpen"
+      :ignore="[uploadMenuBtnEl]"
+      @close="setUploadMenuOpen(false)"
+    />
   </div>
 </template>
 
@@ -151,6 +168,7 @@ import { formatTimestamp } from '../utils/timestamp.js';
 import { isPeerOffline, isPeerAway } from '../utils/peerPresence.js';
 import SuggestionStrip from './SuggestionStrip.vue';
 import MircColorPicker from './MircColorPicker.vue';
+import UploadMenu from './UploadMenu.vue';
 import {
   useComposerOverlay,
   selectNick,
@@ -161,7 +179,7 @@ import {
   resetColor,
   closeColorPicker,
   setColorPickerOpen,
-  pickComposerFile,
+  setUploadMenuOpen,
   type NickStripItem,
 } from '../composables/useComposerOverlay.js';
 import type { EmojiMatch } from '../utils/emojiData.js';
@@ -433,14 +451,26 @@ function onJumpToUnread() {
   requestScrollToUnread();
 }
 
-function onPickFile() {
-  if (!sendable.value) return;
-  pickComposerFile();
-}
-
+// ⚠ The bar's two popovers are anchored to the SAME corner with the same z-index,
+// so opening one must close the other or they render stacked on top of each other.
+// The colour picker has no outside-tap dismissal of its own (only its own `close`
+// action), so nothing else would ever take it down.
 function onToggleColorPicker() {
   if (!sendable.value) return;
-  setColorPickerOpen(!overlay.colorPickerOpen);
+  const open = !overlay.colorPickerOpen;
+  if (open) setUploadMenuOpen(false);
+  setColorPickerOpen(open);
+}
+
+// Passed to the menu as its `ignore` element: a tap on the toggle must not also
+// count as an outside-tap dismissal, or the two cancel out and it never closes.
+const uploadMenuBtnEl = ref<HTMLButtonElement | null>(null);
+
+function onToggleUploadMenu() {
+  if (!sendable.value) return;
+  const open = !overlay.uploadMenuOpen;
+  if (open) setColorPickerOpen(false);
+  setUploadMenuOpen(open);
 }
 </script>
 
@@ -584,6 +614,11 @@ function onToggleColorPicker() {
   line-height: 1.4;
 }
 .tool-btn:hover:not(:disabled) {
+  color: var(--fg);
+}
+/* An open popover's toggle stays lit, so the star doesn't read as a stray
+   permanently-highlighted control while its panel is up. */
+.tool-btn.on:not(:disabled) {
   color: var(--fg);
 }
 .tool-btn:disabled {

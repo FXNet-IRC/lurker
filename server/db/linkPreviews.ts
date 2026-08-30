@@ -23,6 +23,11 @@ export interface PreviewRecord {
   imageHeight: number | null;
   embedUrl: string | null;
   mime: string | null;
+  /** Byte-cache key of a stored poster frame — video/audio kinds only, and only when the
+   *  poster was actually stored. ⚠ For those rows, `imageWidth`/`imageHeight` describe the
+   *  POSTER (they were always null for video before posters existed); `imageUrl` still names
+   *  the media itself and is never minted into a byte URL for these kinds. */
+  posterKey: string | null;
   expiresAt: string;
 }
 
@@ -88,8 +93,20 @@ export const FAIL_TTL_MS = 60 * 60 * 1000;
  *        a targeted migration could use, because the blunt cost is not a cost here: link
  *        previews have not shipped to anyone, so there is no cache in the world worth keeping.
  *        A later bump against a live fleet should weigh that predicate instead.
+ *   v4 — `scrapeMeta` now reads `og:image:width`/`og:image:height`, so `kind: 'page'` rows carry
+ *        the declared shape of their card image where they stored null. Squarely the
+ *        fills-in-a-FIELD case this comment warns about two paragraphs up: every page row cached
+ *        before this is a live, perfectly valid `ok` with no dimensions on it, and the client
+ *        reads their absence as "no declared shape" — which is the HERO default. So without the
+ *        bump, every link anyone had already pasted would render a logo as a stretched band for
+ *        a week, and only newly-seen URLs would come out right. Nothing about that presents as
+ *        a stale cache.
+ *   v5 — resolution moved into the lurker-previews decoder, and video/audio rows gained
+ *        `posterKey` (a stored first frame) with the poster's shape in image_width/height.
+ *        The fills-in-a-FIELD case again: every video row cached before this is a live `ok`
+ *        that would render posterless for up to a week while newly-pasted clips get frames.
  */
-const RESOLVER_VERSION = 3;
+const RESOLVER_VERSION = 5;
 
 /**
  * Cache key: the requested URL, scoped to the resolver version.
@@ -176,17 +193,17 @@ const selectStmt = db.prepare(SELECT_SQL);
 const upsertStmt = db.prepare(`
   INSERT INTO link_previews (
     url_hash, url, status, kind, title, description, site_name, author,
-    image_url, image_width, image_height, embed_url, mime, fetched_at, expires_at
+    image_url, image_width, image_height, embed_url, mime, poster_key, fetched_at, expires_at
   ) VALUES (
     @urlHash, @url, @status, @kind, @title, @description, @siteName, @author,
-    @imageUrl, @imageWidth, @imageHeight, @embedUrl, @mime, datetime('now'), @expiresAt
+    @imageUrl, @imageWidth, @imageHeight, @embedUrl, @mime, @posterKey, datetime('now'), @expiresAt
   )
   ON CONFLICT(url_hash) DO UPDATE SET
     status = excluded.status, kind = excluded.kind, title = excluded.title,
     description = excluded.description, site_name = excluded.site_name,
     author = excluded.author, image_url = excluded.image_url,
     image_width = excluded.image_width, image_height = excluded.image_height,
-    embed_url = excluded.embed_url, mime = excluded.mime,
+    embed_url = excluded.embed_url, mime = excluded.mime, poster_key = excluded.poster_key,
     fetched_at = datetime('now'), expires_at = excluded.expires_at
 `);
 
@@ -205,6 +222,7 @@ interface Row {
   image_height: number | null;
   embed_url: string | null;
   mime: string | null;
+  poster_key: string | null;
   expires_at: string;
 }
 
@@ -222,6 +240,7 @@ function toRecord(row: Row): PreviewRecord {
     imageHeight: row.image_height,
     embedUrl: row.embed_url,
     mime: row.mime,
+    posterKey: row.poster_key,
     expiresAt: row.expires_at,
   };
 }

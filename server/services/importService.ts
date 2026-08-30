@@ -30,6 +30,13 @@ import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { Statement, RunResult } from 'better-sqlite3';
 import db from '../db/index.js';
 import { EXPORT_TABLES, EXPORT_FORMAT_VERSION, IMPORT_ORDER } from '../db/exportSchema.js';
+import {
+  seedAllBuffersDirty,
+  clearNoiseCursorForUser,
+  beginImport,
+  endImport,
+} from '../db/retention.js';
+import { getOption } from './settingsRegistry.js';
 import { isBuiltinThemeId, THEME_POINTER_KEYS } from '../../shared/themePresets.js';
 import themesService from './themesService.js';
 import { encryptSecret } from '../utils/secretCrypto.js';
@@ -603,6 +610,8 @@ export async function importFromZipFile(
   zipPath: string,
 ): Promise<ImportResult> {
   const { zip, entries } = await openZipEntries(zipPath);
+  // Pauses the retention sweeper for the duration — see importInProgress.
+  beginImport();
   try {
     // ---- manifest ----
     const manifestEntry = entries.get('manifest.json');
@@ -755,8 +764,33 @@ export async function importFromZipFile(
       throw new ImportError('insert_failed', `import failed: ${(err as Error).message}`);
     }
 
+    // The message stream above bypasses insertMessage, so nothing marked the
+    // imported buffers for the retention sweeper — without this, an over-cap
+    // archive sits unexamined until the next restart or a live line lands in
+    // each buffer. The noise-clock cursor needs the matching treatment:
+    // imported noise can be older than the account's low-water mark, and the
+    // insert-side rewind never saw it — forget the cursor so the next pass
+    // walks from the beginning.
+    seedAllBuffersDirty();
+    clearNoiseCursorForUser(targetUserId);
+    // Imported buffer_retention rows arrive through the generic table copy,
+    // which enforces no value constraints — clamp them into the registry
+    // knob's validity hole (0 or >= minNonzero, <= max) by DROPPING invalid
+    // rows back to "inherit" rather than letting a crafted archive plant a
+    // 1-line cap the UI could never have written.
+    {
+      const opt = getOption('data.retention.lines');
+      if (opt?.type === 'int') {
+        db.prepare(
+          `DELETE FROM buffer_retention
+            WHERE user_id = ? AND (max_lines > ? OR (max_lines <> 0 AND max_lines < ?))`,
+        ).run(targetUserId, opt.max, opt.minNonzero ?? 0);
+      }
+    }
+
     return { manifest, counts, thumbnailsAttached };
   } finally {
+    endImport();
     zip.close();
   }
 }

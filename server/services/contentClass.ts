@@ -3,10 +3,12 @@
 
 // What IS this file? Decided from its magic bytes, on the server, every time.
 //
-// THE RULE: the bytes have absolute authority over the class. The client's claimed
-// MIME is consulted for exactly one thing — telling text apart from SVG among
-// signature-less UTF-8 content — where it cannot cause a bypass, because a real
-// image would have been caught by the sniff regardless of what it was called.
+// THE RULE: the bytes have absolute authority over the CLASS. The client's claim is
+// consulted only where it cannot cause a bypass, because a real image would have been
+// caught by the sniff regardless of what it was called:
+//   • telling text apart from SVG among signature-less UTF-8 content
+//   • naming which text dialect that content is — .txt, .md or .json (#788)
+// Both answer "what do we call these bytes", never "do we take them".
 //
 // Why it has to be this way: the route used to take the client's word for it
 // (`req.file.mimetype === 'text/plain'`). That was survivable while the only two
@@ -23,6 +25,11 @@
 
 import { fileTypeFromFile } from 'file-type';
 import fs from 'node:fs';
+import {
+  PLAIN_TEXT,
+  TEXT_DIALECT_BY_MIME,
+  dialectFromFilename,
+} from '../../shared/textDialects.js';
 import { isFileUtf8 } from '../utils/utf8.js';
 import type { ContentClass } from './uploadProviders/types.js';
 
@@ -124,6 +131,43 @@ export const ACCEPTED_SUMMARY = 'images, text, and audio/video (mp4, mov, m4v, m
  */
 const TEXTISH_SNIFF = new Set(['application/xml', 'text/xml']);
 
+/**
+ * The text dialect table moved to shared/ — the CLIENT's paste/drop gate needs the
+ * extension half for the same portability reason this file needs it, and a second
+ * hand-written copy of the rule is how the two drift. The security note about what
+ * may be added to it lives with the table.
+ *
+ * ⚠ Consulted here for exactly two things, and the ORDER matters — see the call site:
+ * the mime table decides whether the SVG probe runs, and the filename table then picks
+ * the label, filename FIRST.
+ */
+
+/**
+ * The Content-Type to STORE for an upload, which is not always its classified mime.
+ *
+ * A text file served with a bare `text/plain` and no charset is decoded by whatever
+ * legacy encoding the browser falls back to — Latin-1 on Safari — so a UTF-8 paste
+ * comes back as `â€"` for every `—`. That is #788: the bytes are fine, the label is
+ * incomplete. `routes/localUploads.ts` has always sent the parameter when serving
+ * from disk; this is for the drivers that hand a stored header to someone else.
+ *
+ * ⚠⚠ NOT for the `dropper` driver, and not something to apply to `Classification.mime`
+ * globally. Dropper matches the claim against an exact allowlist of BARE types, so a
+ * `text/plain; charset=utf-8` claim 415s every text upload on the hosted service. The
+ * bare mime is the identity; the charset belongs only on a header we are writing.
+ *
+ * JSON gets none: RFC 8259 defines no charset parameter for `application/json` and
+ * mandates UTF-8 outright.
+ */
+const STORED_CONTENT_TYPE = new Map<string, string>([
+  ['text/plain', 'text/plain; charset=utf-8'],
+  ['text/markdown', 'text/markdown; charset=utf-8'],
+]);
+
+export function storedContentType(mime: string): string {
+  return STORED_CONTENT_TYPE.get(mime) ?? mime;
+}
+
 /** file-type THROWS (End-Of-Stream) on a file too short to finish parsing a
  *  signature it started to recognize — it doesn't just return undefined. A
  *  truncated upload must not become a 500; "couldn't identify it" is the same
@@ -158,10 +202,20 @@ async function looksLikeSvg(path: string): Promise<boolean> {
  * Classify an uploaded file. Throws UnsupportedTypeError (→ 415) for anything
  * outside the accepted set.
  *
- * `claimedMime` is the client's multipart Content-Type. It is untrusted, and it is
- * used for exactly one decision — see looksLikeSvg's caller below.
+ * `claimedMime` is the client's multipart Content-Type. It is untrusted, and it
+ * decides exactly two things, both of them bounded: whether to run the SVG probe
+ * (see looksLikeSvg's caller below), and which of three text dialects to label
+ * signature-less UTF-8 as. It can never widen what is ACCEPTED.
+ *
+ * `filename` is the client's original filename, and is even more tightly bounded —
+ * its extension is a fallback signal for the dialect label and nothing else. It is
+ * never the served extension — see TEXT_DIALECT_BY_MIME.
  */
-export async function classifyUpload(path: string, claimedMime: string): Promise<Classification> {
+export async function classifyUpload(
+  path: string,
+  claimedMime: string,
+  filename = '',
+): Promise<Classification> {
   const sniff = await sniffType(path);
 
   if (sniff) {
@@ -190,16 +244,31 @@ export async function classifyUpload(path: string, claimedMime: string): Promise
   // UTF-8 (not just a window) is what stops "claim text/plain" from smuggling
   // arbitrary bytes through as a .txt.
   if (await isFileUtf8(path)) {
-    // The ONE place the client's claim is consulted. An SVG picked from a file
-    // dialog arrives as image/svg+xml; the long-message → .txt flow ALWAYS claims
-    // text/plain, so this guard keeps it from being hijacked into the image path
-    // when someone pastes raw SVG markup into the composer. Neither direction is a
-    // bypass: a real image would have sniffed above, and a text file misrouted to
-    // sharp simply fails to decode and 415s.
-    if (claimedMime !== 'text/plain' && (await looksLikeSvg(path))) {
+    // An SVG picked from a file dialog arrives as image/svg+xml; a claim that is
+    // already a text dialect exempts it from the probe, which is what keeps the
+    // long-message → .txt flow (ALWAYS text/plain) from being hijacked into the
+    // image path when someone pastes raw SVG markup into the composer. Neither
+    // direction is a bypass: a real image would have sniffed above, and a text file
+    // misrouted to sharp simply fails to decode and 415s.
+    //
+    // ⚠ Decided from the CLAIM alone, before the filename is consulted at all. The
+    // exemption widened from `text/plain` to the dialects together with the map, so
+    // an explicitly-picked `.md` full of SVG markup stays markdown — served as
+    // text/markdown it is just as inert, and calling a file the user named `.md` an
+    // image is the more surprising answer.
+    const claimed = TEXT_DIALECT_BY_MIME.get(claimedMime);
+    if (!claimed && (await looksLikeSvg(path))) {
       return { contentClass: 'image', mime: 'image/svg+xml', ext: 'svg' };
     }
-    return { contentClass: 'text', mime: 'text/plain', ext: 'txt' };
+    // ⚠ FILENAME first, claim second. Backwards from what you'd expect, and the
+    // reverse does not work: on a platform with no registered mime for `.md` the
+    // claim arrives as `text/plain`, which is itself a dialect — so a claim-first
+    // order matches it, returns `.txt`, and the filename fallback never runs in the
+    // one case it exists for. The extension is also the more specific signal: it is
+    // what the user named the file, where the claim is what their OS guessed about
+    // it. Plain text when neither says anything.
+    const dialect = dialectFromFilename(filename) ?? claimed ?? PLAIN_TEXT;
+    return { contentClass: 'text', mime: dialect.mime, ext: dialect.ext };
   }
 
   throw new UnsupportedTypeError(

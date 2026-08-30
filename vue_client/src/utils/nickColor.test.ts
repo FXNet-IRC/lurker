@@ -21,18 +21,23 @@ function parse(text: string) {
 }
 
 describe('MIRC_PALETTE_FALLBACK', () => {
-  // The bug that prompted this: slot 1 ("black") was var(--bg), which IS the
-  // surface the text is drawn on — so black text rendered in precisely the
-  // colour behind it and vanished.
+  // Every slot is a literal, and this is the test that keeps it that way.
   //
-  // The rule is narrow on purpose. Theme variables are RIGHT for the mono-ish
-  // slots: look.color.bg and look.color.fg are user-settable, so a slot pinned
-  // to a literal near-white would vanish the moment someone sets a light
-  // background — the same bug mirrored. What can never appear is the background
-  // itself, which is the one value guaranteed to match its own surface.
-  it('never paints a slot in the background colour', () => {
+  // It has been narrowed once already, to "no var(--bg)", on the theory that
+  // theme references were right for the mono-ish slots and only the background
+  // could ever match its own surface. That theory is wrong, and this is the
+  // second time round: a run carries its OWN background, so var(--fg) collides
+  // just as thoroughly the moment a sender writes `\x0300,01`. Worse, slot 0
+  // can BE the background (`\x0301,00`), and then a foreground reference paints
+  // the box.
+  //
+  // So: no var(), no color-mix(), nothing that has to be resolved against a
+  // surface to know what it is. A colour code names a colour. If the named
+  // colour is invisible on the reader's canvas, that is the sender's doing and
+  // it is allowed to look that way.
+  it('is entirely literal colours', () => {
     for (const [i, entry] of MIRC_PALETTE_FALLBACK.entries()) {
-      expect(entry, `slot ${i}`).not.toMatch(/var\(\s*--bg\b/);
+      expect(entry, `slot ${i}`).toMatch(/^#[0-9a-f]{6}$/);
     }
   });
 
@@ -187,7 +192,24 @@ describe('segmentInlineStyle / segmentHasStyle — background colour', () => {
     expect(segmentInlineStyle({ text: 'x', fg: 4, bg: 8 }, null)).toEqual({
       color: '#ff6188',
       backgroundColor: '#ffd866',
+      padding: 'var(--mirc-bg-bleed) 0',
     });
+  });
+
+  // The bleed rides with the background and nothing else. Stacked coloured rows
+  // need it to form a solid field rather than a striped one; a run with only a
+  // foreground has no fill to extend, and padding there would widen the hit
+  // area for no paint.
+  //
+  // ⚠ The vertical-only shorthand is the whole trick. A horizontal value would
+  // push the run past its own characters and shear ASCII art off the monospace
+  // grid — the exact bug removed from the spoiler box.
+  it('bleeds the background vertically, and only when there is one', () => {
+    expect(segmentInlineStyle({ text: 'x', fg: 4, bg: 8 }, null).padding).toBe(
+      'var(--mirc-bg-bleed) 0',
+    );
+    expect(segmentInlineStyle({ text: 'x', fg: 4 }, null).padding).toBeUndefined();
+    expect(segmentInlineStyle({ text: 'x' }, null).padding).toBeUndefined();
   });
 
   it('renders a background even when the foreground is the default (99)', () => {
@@ -293,6 +315,62 @@ describe('splitTextByTokens — emoji shortcodes', () => {
       { text: '🎉' },
       { text: ' ' },
       { text: 'alice', color: '#f00', self: false },
+    ]);
+  });
+});
+
+describe('splitTextByTokens — <angle-bracketed> URLs', () => {
+  // RFC 3986 Appendix C's delimiter convention. Discord reads it as "link, but no unfurl", and
+  // Lurker does the same — `previewableUrls` refuses to resolve what the brackets wrap. Here the
+  // job is the other half: the brackets are plumbing, so they are not rendered.
+
+  it('renders the link without its brackets', () => {
+    expect(parse('<https://example.com>')).toEqual([
+      { text: 'https://example.com', url: 'https://example.com' },
+    ]);
+  });
+
+  it('keeps the surrounding prose, minus the brackets', () => {
+    expect(parse('see <https://example.com> for more')).toEqual([
+      { text: 'see ' },
+      { text: 'https://example.com', url: 'https://example.com' },
+      { text: ' for more' },
+    ]);
+  });
+
+  it('does NOT trim trailing punctuation inside brackets', () => {
+    // ⚠⚠ The whole point of the convention: the author has said where the address ends, so it is
+    // not guessed at. Unbracketed, that period is sentence punctuation and comes off.
+    expect(parse('<https://example.com/a.>')).toEqual([
+      { text: 'https://example.com/a.', url: 'https://example.com/a.' },
+    ]);
+    expect(parse('https://example.com/a.')).toEqual([
+      { text: 'https://example.com/a', url: 'https://example.com/a' },
+      { text: '.' },
+    ]);
+  });
+
+  it('leaves a lone bracket alone, since it is ordinary prose', () => {
+    expect(parse('a < https://example.com')).toEqual([
+      { text: 'a < ' },
+      { text: 'https://example.com', url: 'https://example.com' },
+    ]);
+    expect(parse('<https://example.com')).toEqual([
+      { text: '<' },
+      { text: 'https://example.com', url: 'https://example.com' },
+    ]);
+  });
+
+  it('emits no empty segment where the opening bracket was', () => {
+    // Dropping the `<` can leave nothing between the previous token and the link — a message that
+    // IS a bracketed link starts its URL at index 1 — and an empty text segment is one more node
+    // for the renderer to walk on every row.
+    expect(parse('<https://example.com>').every((s) => s.text !== '')).toBe(true);
+  });
+
+  it('applies to a bare www host too, which is the same convention', () => {
+    expect(parse('<www.example.com>')).toEqual([
+      { text: 'www.example.com', url: 'http://www.example.com' },
     ]);
   });
 });

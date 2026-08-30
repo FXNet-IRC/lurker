@@ -111,11 +111,15 @@
         </div>
       </section>
 
-      <!-- Transient waiting state — only while we're genuinely in the dark.
-           If we already know they're offline (MONITOR or not_found whois)
-           the presence dot in the header carries that, so we skip the
-           redundant line and let "Your note" stand on its own. -->
-      <section v-if="!hasDetails && !isOffline" class="section status">
+      <!-- One status line, chosen in `statusLine` — see the note there for why
+           the miss has to be said out loud rather than left to the header
+           dot (#818). -->
+      <section v-if="statusLine === 'not-found'" class="section status">
+        <p class="muted">
+          <i class="fa-solid fa-circle-question"></i> {{ nick }} isn't on this network.
+        </p>
+      </section>
+      <section v-else-if="statusLine === 'waiting'" class="section status">
         <p class="muted">
           <i class="fa-solid fa-circle-notch fa-spin"></i> Waiting for whois reply…
         </p>
@@ -216,8 +220,12 @@ const presenceClass = computed(() => {
   if (isPeerOffline(peer.value)) return 'offline';
   if (isPeerAway(peer.value) || awayMessage.value) return 'away';
   if (isPeerOnline(peer.value)) return 'online';
-  // No presence data — if whois returned an identity we know they're online.
-  if (whois.value && !isNotFound.value) return 'online';
+  // No presence data — the whois reply settles it either way: an identity
+  // means they're online, and a not-found means there's nobody there to be
+  // anything else. Without the second branch a missing nick showed "Unknown",
+  // which is the one thing we do know it isn't (#818).
+  if (isNotFound.value) return 'offline';
+  if (whois.value) return 'online';
   return 'unknown';
 });
 const presenceLabel = computed(() => {
@@ -308,6 +316,36 @@ const channelsList = computed(() => {
       const m = token.match(/^([~&@%+]*)(.*)$/);
       return { prefix: m?.[1] || '', name: m?.[2] || token };
     });
+});
+
+const isLookingUp = computed(() => whoisStore.isRefreshing(props.networkId, props.nick));
+
+// What the body says when it has something to say about the lookup itself.
+//
+// 'not-found' is the fix for #818: a whois that answers "nobody there" used to
+// render a name, a note prompt and nothing else, which is indistinguishable
+// from a profile we simply have no details for. The header dot can't carry it
+// either — with no MONITOR data a not-found nick read as "Unknown", the one
+// status we can rule out.
+//
+// But only once the claim is current. A cached miss goes stale the instant a
+// refresh goes out (they may have connected since), so an in-flight lookup
+// demotes it back to 'waiting' rather than asserting they aren't there.
+//
+// 'waiting' otherwise covers being genuinely in the dark. If MONITOR already
+// knows they're offline the presence dot carries that, so we skip the
+// redundant line and let "Your note" stand on its own.
+//
+// ⚠ That last test reads isPeerOffline, NOT isOffline. isOffline folds a
+// not-found whois in with MONITOR's verdict, which is right for hiding Send DM
+// (a DM bounces either way) and wrong here: it would send a miss we're
+// re-checking down the quiet path and blank the modal — the very bug #818 is
+// about. The two questions only look like one.
+const statusLine = computed<'not-found' | 'waiting' | null>(() => {
+  if (isNotFound.value && !isLookingUp.value) return 'not-found';
+  if (hasDetails.value) return null;
+  if (isNotFound.value) return 'waiting';
+  return isPeerOffline(peer.value) ? null : 'waiting';
 });
 
 // Any detail row present → render the table. Covers every row (identity +

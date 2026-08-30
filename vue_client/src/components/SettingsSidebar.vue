@@ -20,7 +20,8 @@
   <nav class="settings-sidebar" aria-label="settings sections">
     <div class="search-wrap">
       <input
-        v-model="searchInput"
+        :value="searchInput"
+        @input="onSearchInput"
         type="search"
         class="search"
         placeholder="Search settings…"
@@ -103,6 +104,7 @@ import { useRouter } from 'vue-router';
 import type { SettingCategory } from '../../../shared/settingsRegistry.js';
 import { REGISTRY, CATEGORIES, optionVisible } from '../utils/settingsRegistry.js';
 import { useConfigStore } from '../stores/config.js';
+import { useImeSafeInput } from '../composables/useImeSafeInput.js';
 
 const props = defineProps<{
   activeCategoryId: string;
@@ -123,6 +125,7 @@ interface SettingsSubsection {
 const router = useRouter();
 const config = useConfigStore();
 const searchInput = ref('');
+const onSearchInput = useImeSafeInput(searchInput);
 const searchEl = ref<HTMLInputElement | null>(null);
 
 const searchActive = computed(() => searchInput.value.trim().length > 0);

@@ -113,7 +113,8 @@
         >
         <div class="row">
           <input
-            v-model="form.pattern"
+            :value="form.pattern"
+            @input="onPatternInput"
             type="text"
             class="grow"
             placeholder="word or phrase to highlight"
@@ -138,7 +139,8 @@
           >Sender mask <span class="muted small">(who — blank = anyone)</span></span
         >
         <input
-          v-model="form.mask"
+          :value="form.mask"
+          @input="onMaskInput"
           type="text"
           placeholder="nick or nick!user@host — highlights everything they say"
           spellcheck="false"
@@ -153,7 +155,8 @@
           >Channels <span class="muted small">(where — blank = all buffers)</span></span
         >
         <input
-          v-model="form.channels"
+          :value="form.channels"
+          @input="onChannelsInput"
           type="text"
           placeholder="#chan #other (space-separated)"
           spellcheck="false"
@@ -190,6 +193,7 @@ import IconButton from '../IconButton.vue';
 import { parseChannelList } from '../../../../shared/channels.js';
 import { highlightRuleDetailParts } from '../../utils/highlightFormat.js';
 import { joinMeta } from '../../utils/metaLine.js';
+import { imeSafeValue } from '../../composables/useImeSafeInput.js';
 
 type RuleKind = 'substr' | 'full' | 'glob' | 'regex';
 
@@ -274,6 +278,20 @@ const form = reactive({
   caseSensitive: false,
   enabled: true,
 });
+
+// `form` is a reactive object, not three refs, so these take the value off the
+// element directly rather than through useImeSafeInput. Bound this way because
+// canSubmit reads pattern/mask as you type, and because all three are written
+// programmatically — cleared after a save, repopulated when you edit a rule.
+function onPatternInput(e: Event) {
+  form.pattern = imeSafeValue(e);
+}
+function onMaskInput(e: Event) {
+  form.mask = imeSafeValue(e);
+}
+function onChannelsInput(e: Event) {
+  form.channels = imeSafeValue(e);
+}
 
 const canSubmit = computed(() => {
   if (scopeMode.value === 'network' && !scopeNetworkId.value) return false;

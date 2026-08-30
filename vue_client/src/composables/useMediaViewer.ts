@@ -14,9 +14,20 @@
 // there is no second place that could disagree about what a `.mp4` is.
 
 import { computed, ref } from 'vue';
+import type { MediaKind } from '../utils/uploadHostMatch.js';
 
 export interface GalleryItem {
   url: string;
+  /**
+   * The kind the SERVER classified from Content-Type, when the caller knows it.
+   *
+   * ⚠ The viewer otherwise guesses kind from the URL extension, which is wrong for exactly
+   * the media the click-to-play policy now funnels here: a `video/*` URL with no extension
+   * (or `.mkv`/`.ogv` outside the guesser's allowlist) would open as a broken `<img>`. A
+   * caller that has the server's verdict passes it; uploads (which have real extensions) and
+   * plain links leave it null and the guess stands.
+   */
+  kind?: MediaKind | null;
   filename?: string | null;
   /**
    * The address to hand a human, when it differs from the one we render.
@@ -47,8 +58,8 @@ export function useMediaViewer() {
   const hasNext = computed(() => index.value < items.value.length - 1);
 
   /** Open a single file — a gallery of one. */
-  function open(nextUrl: string): void {
-    openGallery([{ url: nextUrl }], 0);
+  function open(nextUrl: string, kind?: MediaKind | null): void {
+    openGallery([{ url: nextUrl, kind }], 0);
   }
 
   /** Open a list of files, starting at `startIndex` (the uploads browser). */

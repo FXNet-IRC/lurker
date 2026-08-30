@@ -1,0 +1,121 @@
+# Copyright (c) 2026 Brad Root
+# SPDX-License-Identifier: MPL-2.0
+#
+# IRC engine — keep IRC connected across Lurker upgrades. Available from 2.1.4.
+#
+# Layer it on top of the base compose file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.engine.yml up -d
+#
+# (Combine with -f docker-compose.caddy.yml / -f docker-compose.previews.yml
+# freely — the overlays touch different things.)
+#
+# What it does: the IRC sockets move into a SECOND container, `lurker-engine`,
+# that the ordinary upgrade never recreates. `docker compose pull && docker
+# compose up -d` then replaces only `lurker` — the app, the web UI, the database
+# writer — and your IRC connections stay up: same nick, same channels, nothing
+# re-registers, and whatever was said while the app was down is delivered when
+# it comes back. Pointing Lurker at the engine (LURKER_ENGINE_URL) is the
+# entire switch; without this overlay the app dials IRC itself exactly as
+# before.
+#
+# ⚠ The one upgrade that still drops IRC is the ENGINE's. Its image tag is
+# `engine-1` (see `image:` below), which only moves when a release changes the
+# engine itself — the changelog says so when one does. Everything else moves
+# `latest` and leaves the engine running. A release that needs `engine-2`
+# says so too, and for that one: STOP THE ENGINE FIRST, then upgrade — the
+# old engine would otherwise keep every session alive while the new app,
+# refused by it, dials its own and collides with its own ghosts (the engine
+# does reap sessions nobody has claimed for an hour, but that is a backstop).
+#
+# ⚠ Opting in drops IRC once: the `up -d` that adds the engine recreates
+# `lurker` with the new setting. Opting back out: STOP THE ENGINE FIRST, then
+# bring the stack up WITHOUT this file — and if you put the overlay in a
+# COMPOSE_FILE line in .env, take it out of there first, or the plain command
+# still loads it:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.engine.yml stop lurker-engine
+#   COMPOSE_FILE=docker-compose.yml docker compose up -d --remove-orphans
+#
+# ⚠ The secret is shared: set LURKER_ENGINE_SECRET once, in a .env file beside
+# this compose (`openssl rand -hex 32` makes a good one). The app authenticates
+# to the engine with it; both sides read the same variable.
+#
+# identd moves WITH the socket. If you run the built-in identd or the oidentd
+# file (LURKER_IDENTD_ENABLED / LURKER_OIDENTD_FILE), those now belong on the
+# engine — it is the process holding the connection the network asks about.
+# This file forwards them from .env; if yours live in an `environment:` block
+# on `lurker` in a docker-compose.override.yml instead, move that block to
+# `lurker-engine` there. The host :113 mapping and, for oidentd, the bind
+# mount are yours to add on `lurker-engine` too (they were yours to add on
+# `lurker` before) — they are deliberately NOT published here, because a host
+# that already runs its own identd owns :113. See "IRC engine" in
+# docs/SELF_HOSTING.md for the snippet. LURKER_OUTGOING_ADDR stays on
+# `lurker`: the app tells the engine which address to bind.
+
+services:
+  lurker:
+    environment:
+      # The presence of this variable IS the feature gate.
+      - LURKER_ENGINE_URL=tcp://lurker-engine:8016
+      - LURKER_ENGINE_SECRET=${LURKER_ENGINE_SECRET:?set LURKER_ENGINE_SECRET in .env (openssl rand -hex 32)}
+    depends_on:
+      lurker-engine:
+        condition: service_healthy
+
+  lurker-engine:
+    # ⚠ NOT `latest`. Compose recreates every service whose image changed on
+    # `up -d`; on `latest` every app release would restart the engine too and
+    # drop IRC — the thing this overlay exists to prevent. `engine-1` moves only
+    # with engine releases. The `1` is the engine protocol major: a `lurker`
+    # release that needs `engine-2` will say so, and refuses to talk to an
+    # `engine-1` (it falls back to dialing IRC directly rather than hang).
+    # LURKER_ENGINE_IMAGE overrides the whole reference — for a locally built
+    # image, or to pin a release.
+    image: ${LURKER_ENGINE_IMAGE:-ghcr.io/amiantos/lurker:engine-1}
+    container_name: lurker-engine
+    restart: unless-stopped
+    command: ['node_modules/.bin/tsx', 'server/engine.ts']
+    # No volumes: the engine holds no data. The database, uploads and sessions
+    # stay with `lurker`. (oidentd file mode is the one thing that wants a mount
+    # here — see above.)
+    environment:
+      - LURKER_ENGINE_SECRET=${LURKER_ENGINE_SECRET:?set LURKER_ENGINE_SECRET in .env (openssl rand -hex 32)}
+      # ⚠ REQUIRED here, and not a stray default. The engine binds 127.0.0.1
+      # unless told otherwise, which is right for an engine running beside the
+      # app on a host but wrong in a container: containers do not share a
+      # network namespace, so a loopback bind here is unreachable from the
+      # `lurker` container and every connection fails. Nothing is exposed by
+      # this — the service publishes no ports, so :8016 exists only on the
+      # compose network. Remove this line and the stack stops working.
+      - LURKER_ENGINE_LISTEN=${LURKER_ENGINE_LISTEN:-0.0.0.0:8016}
+      # Ident — see the note above. Empty is the same as unset, so declaring
+      # them costs nothing; the engine logs which mode it resolved at boot.
+      - LURKER_IDENTD_ENABLED=${LURKER_IDENTD_ENABLED:-}
+      - LURKER_IDENTD_PORT=${LURKER_IDENTD_PORT:-}
+      - LURKER_IDENTD_BIND=${LURKER_IDENTD_BIND:-}
+      - LURKER_OIDENTD_FILE=${LURKER_OIDENTD_FILE:-}
+      # How much of what arrives while the app is down the engine keeps, per
+      # connection and in total (bytes, digits only, at least 65536). Past the
+      # cap the OLDEST lines go and the app is told where the hole is.
+      # Defaults: 4 MiB / 256 MiB.
+      - LURKER_ENGINE_BUFFER_BYTES=${LURKER_ENGINE_BUFFER_BYTES:-}
+      - LURKER_ENGINE_BUFFER_TOTAL_BYTES=${LURKER_ENGINE_BUFFER_TOTAL_BYTES:-}
+    # The engine answers a plain HTTP probe on its own port; `lurker` waits for
+    # it so the first connect attempts don't race the engine's own start.
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "require('http').get('http://127.0.0.1:8016/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      options:
+        max-size: 20m
+        max-file: '3'

@@ -282,6 +282,7 @@
       v-if="viewer.isOpen && viewer.url !== null"
       :url="viewer.url"
       :share-url="viewer.shareUrl"
+      :kind="viewer.current?.kind ?? null"
       :filename="viewer.current?.filename ?? null"
       :index="viewer.index"
       :count="viewer.count"
@@ -314,7 +315,7 @@ import type { Network } from '../stores/networks.js';
 import { useBuffersStore, type Buffer } from '../stores/buffers.js';
 import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
 import { useSocket } from '../composables/useSocket.js';
-import { useNetworksStore } from '../stores/networks.js';
+import { canDisconnect, useNetworksStore } from '../stores/networks.js';
 import { useConfigStore } from '../stores/config.js';
 import { useChatBootstrap } from '../composables/useChatBootstrap.js';
 import { useActiveBuffer } from '../composables/useActiveBuffer.js';
@@ -637,23 +638,20 @@ function editActiveNetwork() {
   if (net) networkEditor.open(net);
 }
 
-// State-aware connect/disconnect for the server buffer header. We label the
-// button "Disconnect" only while we're confidently connected; every other
-// state (idle, connecting, reconnecting, disconnected, unknown) reads as
-// "Reconnect" because the action — fire a fresh connect — is the same in
-// each case, and "Reconnect" is what the user reaches for when something
-// looks stuck.
+// State-aware connect/disconnect for the server buffer header. See canDisconnect:
+// "Disconnect" covers connected AND the in-flight states, because during a
+// reconnect backoff Disconnect is the only thing that STOPS the loop — Reconnect
+// tears the connection down and starts a fresh one (#785).
 const serverConnectionState = computed(() => {
   if (!active.value || !isServerBuffer.value) return null;
   return networks.states[active.value.networkId]?.state ?? null;
 });
+const serverOffersDisconnect = computed(() => canDisconnect(serverConnectionState.value));
 const serverConnectActionLabel = computed(() =>
-  serverConnectionState.value === 'connected' ? 'Disconnect' : 'Reconnect',
+  serverOffersDisconnect.value ? 'Disconnect' : 'Reconnect',
 );
 const serverConnectActionIcon = computed(() =>
-  serverConnectionState.value === 'connected'
-    ? 'fa-solid fa-plug-circle-xmark'
-    : 'fa-solid fa-plug',
+  serverOffersDisconnect.value ? 'fa-solid fa-plug-circle-xmark' : 'fa-solid fa-plug',
 );
 function toggleServerConnection() {
   if (!active.value) return;
@@ -662,8 +660,7 @@ function toggleServerConnection() {
   // success reflects itself. A failed call stays observable via the state
   // (label doesn't flip), so we just log and let the user retry rather
   // than wiring a toast through the topic bar for this case.
-  const p =
-    serverConnectionState.value === 'connected' ? networks.disconnect(id) : networks.reconnect(id);
+  const p = serverOffersDisconnect.value ? networks.disconnect(id) : networks.reconnect(id);
   p.catch((err) => console.error('[DesktopChat] toggle server connection failed', err));
 }
 

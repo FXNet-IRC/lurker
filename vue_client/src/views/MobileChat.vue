@@ -204,6 +204,7 @@
       v-if="viewer.isOpen && viewer.url !== null"
       :url="viewer.url"
       :share-url="viewer.shareUrl"
+      :kind="viewer.current?.kind ?? null"
       :filename="viewer.current?.filename ?? null"
       :index="viewer.index"
       :count="viewer.count"
@@ -234,7 +235,7 @@ import { computed, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import type { Network } from '../stores/networks.js';
 import type { BufferLike } from '../composables/useBufferActions.js';
-import { useNetworksStore } from '../stores/networks.js';
+import { canDisconnect, useNetworksStore } from '../stores/networks.js';
 import { useConfigStore } from '../stores/config.js';
 import { useSocket } from '../composables/useSocket.js';
 import { useChatBootstrap } from '../composables/useChatBootstrap.js';
@@ -406,7 +407,15 @@ function openBufferActions() {
       {
         label: serverConnectActionLabel.value,
         icon: serverConnectActionIcon.value,
-        onClick: toggleServerConnection,
+        // ⚠ The decision goes WITH the label. Unlike the desktop header — whose
+        // button binds the computed reactively, so the two are read at the same
+        // instant — this kebab snapshots the label into a static array when the
+        // menu opens, and the menu then sits there. Re-reading state at click
+        // time lets the item say "Disconnect" and fire a reconnect: open it
+        // during a backoff, have the retry gate refuse (paused account, host
+        // dropped from the allowlist) so stopReconnecting settles the state to
+        // 'disconnected', and tap. Same trap as useNetworkActions.buildItems.
+        onClick: () => toggleServerConnection(serverOffersDisconnect.value),
       },
       { label: 'Edit network', icon: 'fa-solid fa-gear', onClick: editActiveNetwork },
     );
@@ -431,30 +440,28 @@ function editActiveNetwork() {
 }
 
 // State-aware connect/disconnect for the server buffer header. Mirrors the
-// desktop logic — "Disconnect" only while we're confidently connected;
-// everything else labels as "Reconnect" because a fresh connect is the
-// same action and that's what the user reaches for when things look stuck.
+// desktop logic, via the shared canDisconnect: "Disconnect" covers connected AND
+// the in-flight states, because during a reconnect backoff it is the only thing
+// that stops the loop (#785).
 const serverConnectionState = computed(() => {
   if (!active.value || !isServerBuffer.value) return null;
   return networks.states[active.value.networkId]?.state ?? null;
 });
+const serverOffersDisconnect = computed(() => canDisconnect(serverConnectionState.value));
 const serverConnectActionLabel = computed(() =>
-  serverConnectionState.value === 'connected' ? 'Disconnect' : 'Reconnect',
+  serverOffersDisconnect.value ? 'Disconnect' : 'Reconnect',
 );
 const serverConnectActionIcon = computed(() =>
-  serverConnectionState.value === 'connected'
-    ? 'fa-solid fa-plug-circle-xmark'
-    : 'fa-solid fa-plug',
+  serverOffersDisconnect.value ? 'fa-solid fa-plug-circle-xmark' : 'fa-solid fa-plug',
 );
-function toggleServerConnection() {
+function toggleServerConnection(offerDisconnect: boolean) {
   if (!active.value) return;
   const id = active.value.networkId;
   // Fire-and-forget — the button's label is driven by networks.states so
   // success reflects itself. A failed call stays observable via the state
   // (label doesn't flip), so we just log and let the user retry rather
   // than wiring a toast through the bar for this case.
-  const p =
-    serverConnectionState.value === 'connected' ? networks.disconnect(id) : networks.reconnect(id);
+  const p = offerDisconnect ? networks.disconnect(id) : networks.reconnect(id);
   p.catch((err) => console.error('[MobileChat] toggle server connection failed', err));
 }
 

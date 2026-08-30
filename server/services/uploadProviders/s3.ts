@@ -23,6 +23,7 @@
 
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { USER_AGENT } from '../../utils/userAgent.js';
+import { storedContentType } from '../contentClass.js';
 import { putSource, isOk } from './multipart.js';
 import { hashOf, type UploadSource } from './source.js';
 import type { ConfigField, DriverCapabilities, UploadMeta, UploadResult } from './types.js';
@@ -284,7 +285,12 @@ export async function upload(
     bucket,
     key,
     payloadHash,
-    contentType: mime,
+    // The bucket replays this header verbatim to every viewer, and nothing of ours
+    // sits in front of it to add the charset later — so a bare `text/plain` here is
+    // what a browser decodes as Latin-1, turning a UTF-8 paste into mojibake (#788).
+    // ⚠ Only for a header WE are writing: the dropper driver posts `mime` as its
+    // multipart claim, and dropper matches claims against bare types.
+    contentType: storedContentType(mime),
     region,
     accessKeyId,
     secretAccessKey,

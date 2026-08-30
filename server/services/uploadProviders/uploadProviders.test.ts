@@ -314,6 +314,28 @@ describe('dropper provider', () => {
     expect(result.url).toBe('https://cdn.test/aB3kZ.gif');
   });
 
+  // ⚠⚠ The claim posted to dropper must stay the BARE mime, never the stored-header
+  // form the s3 driver sends (#788). Dropper matches a claim against an exact
+  // allowlist of bare types, so a `text/plain; charset=utf-8` claim 415s EVERY text
+  // upload on the hosted service — dropper pins the charset on its own PutObject.
+  // The bare mime is the identity; the parameter belongs only on a header we write.
+  it('posts the bare mime as its claim, with no charset parameter', async () => {
+    for (const mime of ['text/plain', 'text/markdown', 'application/json']) {
+      const cap = capturePost();
+      postResponse = {
+        status: 200,
+        headers: {},
+        text: JSON.stringify({ url: 'https://cdn.test/x.txt' }),
+      };
+      await dropper.upload(
+        src([0x68, 0x69]),
+        { filename: 'note.txt', mime },
+        { url: 'https://upload.example.com', api_key: 'k' },
+      );
+      expect(filePart(cap, 'file').contentType).toBe(mime);
+    }
+  });
+
   it('strips trailing slash from base URL', async () => {
     const cap = capturePost();
     postResponse = {
@@ -717,6 +739,31 @@ describe('s3 provider', () => {
     );
     expect(cap.headers!['content-type']).toBe('image/png');
     expect(cap.headers!.authorization).toContain('AWS4-HMAC-SHA256');
+  });
+
+  // #788, the self-host half. The bucket replays this header verbatim to every viewer
+  // and nothing of ours is in front of it to add the charset later — so a bare
+  // `text/plain` is what a browser decodes as Latin-1, turning a UTF-8 paste into
+  // mojibake. routes/localUploads.ts has always sent the parameter when serving from
+  // disk; a bucket-backed self-host was the path that didn't.
+  it('states the charset on the stored content-type for text', async () => {
+    const cases: [string, string, string][] = [
+      ['n.txt', 'text/plain', 'text/plain; charset=utf-8'],
+      ['r.md', 'text/markdown', 'text/markdown; charset=utf-8'],
+      // RFC 8259 defines no charset parameter for application/json.
+      ['d.json', 'application/json', 'application/json'],
+      // Untouched for everything else.
+      ['x.png', 'image/png', 'image/png'],
+    ];
+    for (const [filename, mime, stored] of cases) {
+      const cap = capturePut();
+      postResponse = { status: 200, headers: {}, text: '' };
+      await s3.upload(src([0x68, 0x69]), { filename, mime }, SECRETS);
+      expect({ mime, sent: cap.headers!['content-type'] }).toEqual({ mime, sent: stored });
+      // ⚠ And it must be the SIGNED value: content-type is in SignedHeaders, so a
+      // header the signature didn't cover is a 403 from the store, not a wrong label.
+      expect(cap.headers!.authorization).toContain('content-type');
+    }
   });
 
   it('rejects with PROVIDER_CONFIG when any required setting is missing', async () => {

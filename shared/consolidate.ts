@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: MPL-2.0
 
 // Consolidation of join/part/quit/nick/chghost "noise" events into a per-identity
-// net effect, IRCCloud-style. Pure, side-effect-free, no DOM/Vue deps — safe
-// to import from the Vue renderer, the Node demo script, and tests.
+// net effect, IRCCloud-style, plus op/voice churn folded alongside it. Pure,
+// side-effect-free, no DOM/Vue deps — safe to import from the Vue renderer, the
+// Node demo script, and tests.
 //
 // Algorithm:
-//   1. Walk a stream of message rows; group consecutive consolidatable events
-//      into a "run". Any non-consolidatable row (real message, kick, mode,
-//      topic, divider, etc.) terminates the run.
+//   1. Walk a stream of message rows; group consecutive foldable events into a
+//      "run". Any other row (a real message, a kick, a topic, a divider)
+//      terminates it. A `mode` row folds when it is pure member-status churn
+//      and terminates the run otherwise — one ban or channel flag in the
+//      message and it stands alone (see foldsIntoRun / isChurnMode). Before
+//      that, EVERY mode row broke the run, which is why a netsplit rejoin on an
+//      auto-op channel came out as summary, mode, summary, mode, summary.
 //   2. Inside a run, walk per nick and accumulate an action sequence:
 //        'J' = join
 //        'L' = leave (part or quit)
@@ -28,8 +33,15 @@
 //      sequence is [J, H]; that must read as a plain "joined" rather than
 //      splitting the summary into "N joined" plus "N changed host". The
 //      host change only earns its own category when nothing else happened.
-//   4. A run of exactly one event is passed through unchanged (so a lone
-//      "Alice joined" still renders with the familiar --> styling).
+//   4. Mode rows are folded by a SECOND pass, keyed on (nick, letter) rather
+//      than on identity, since a mode change has no join/leave sequence and its
+//      target need never have joined inside the run. The run's last change to a
+//      pair wins and nothing is dropped — see modeGroups.
+//   5. A run of exactly one event is passed through unchanged (so a lone
+//      "Alice joined" still renders with the familiar --> styling, and a lone
+//      "+o alice" still renders as its narrated mode line).
+
+import { isChurnMode, modeLetter, type ModeChange } from './modes.js';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -41,6 +53,8 @@ export interface ConsolidatableMessage {
   newNick?: string;
   time: string;
   to?: string;
+  /** A `mode` row's parsed change list, each entry stamped with its `kind`. */
+  modes?: readonly ModeChange[] | null;
 }
 
 /**
@@ -59,14 +73,35 @@ export interface MessageStreamRow {
  */
 type EventAction = 'J' | 'L' | 'R' | 'H';
 
-/** The six ways a run's net effect on an identity can be classified. */
+/**
+ * How a run's net effect is classified.
+ *
+ * The first six are per-identity: one nick, one verdict, derived from its
+ * join/leave/rename/rehost sequence. The last two are per-(nick, mode letter)
+ * and come from a separate pass — see modeGroups for why they can't share the
+ * identity chain.
+ */
 export type ConsolidationKind =
   | 'joined'
   | 'left'
   | 'reconnected'
   | 'joinedAndLeft'
   | 'renamed'
-  | 'rehosted';
+  | 'rehosted'
+  | 'modeGranted'
+  | 'modeRevoked'
+  | 'modeBriefly'
+  | 'modeRegranted';
+
+/**
+ * The kinds the per-identity walk can produce. Split out so the bucket record
+ * below stays exhaustive by construction: adding a mode kind to
+ * ConsolidationKind must not silently leave a hole there.
+ */
+type IdentityKind = Exclude<
+  ConsolidationKind,
+  'modeGranted' | 'modeRevoked' | 'modeBriefly' | 'modeRegranted'
+>;
 
 /** A nick that joined / left / reconnected / rehosted within the run. */
 export interface NickEntry {
@@ -84,6 +119,13 @@ export interface ConsolidationGroup {
   kind: ConsolidationKind;
   visible: Array<NickEntry | RenameEntry>;
   hidden: number;
+  /**
+   * For the four `mode*` kinds only: the member-prefix letter the group
+   * is about (`o`, `v`, …). The WORDS for it are the renderer's business —
+   * each client picks its own phrasing, the way it already does for joined /
+   * left — so only the letter travels.
+   */
+  letter?: string;
 }
 
 /** Synthetic row that replaces a run of consolidated presence-noise rows. */
@@ -126,7 +168,29 @@ const CONSOLIDATABLE_TYPES: ReadonlySet<string> = new Set([
   'chghost',
 ]);
 
-function classify(actions: readonly EventAction[]): ConsolidationKind {
+/**
+ * Whether a message can sit inside a consolidation run.
+ *
+ * Wider than CONSOLIDATABLE_TYPES, and deliberately a separate question. A
+ * `mode` row folds when it is pure member-status churn, but it is NOT a member
+ * of that set — because that set also defines the `renderable` page unit
+ * (shared/eventFilter.ts), and moving `mode` into it would change what a
+ * `countBy:'renderable'` page contains for every client, shipped iOS builds
+ * included.
+ *
+ * What folds and what counts are therefore two questions, and they must stay in
+ * step: `countsTowardPage` subtracts churn modes under `renderable` for exactly
+ * this reason. Folding MORE than the unit counts is the harmful direction — the
+ * page renders shorter than budgeted and the client re-fetches (#10). Folding
+ * LESS is harmless: the page renders longer than asked, which is where a client
+ * that folds presence but not mode sits.
+ */
+function foldsIntoRun(m: ConsolidatableMessage): boolean {
+  if (CONSOLIDATABLE_TYPES.has(m.type)) return true;
+  return m.type === 'mode' && isChurnMode(m.modes);
+}
+
+function classify(actions: readonly EventAction[]): IdentityKind {
   const jl = actions.filter((a) => a === 'J' || a === 'L');
   // No presence change: a rename outranks a rehost, since "alice → bob" says
   // more than "alice changed host" for an identity that did both.
@@ -171,6 +235,118 @@ function cap<T extends { nick?: string; to?: string }>(
   };
 }
 
+/** Mutable per-(nick, letter) bookkeeping while walking a run's mode changes. */
+interface ModeState {
+  nick: string;
+  letter: string;
+  /** The run's first change to this pair — which implies the state BEFORE it. */
+  first: '+' | '-';
+  /** The run's last change, i.e. the state after. */
+  last: '+' | '-';
+  seenIndex: number;
+}
+
+/**
+ * Classify a (nick, letter) pair by its first and last change in the run —
+ * the same first/last reading `classify()` gives a presence identity, and for
+ * the same reason: the FIRST change implies the prior state. An opening `-o`
+ * means they held op before the run started.
+ *
+ *   +…+  didn't have it, does now          → modeGranted     "was opped"
+ *   -…-  had it, doesn't now               → modeRevoked     "was deopped"
+ *   +…-  didn't have it, blipped, doesn't  → modeBriefly     "was briefly opped"
+ *   -…+  had it, lost it, has it again     → modeRegranted   "was opped again"
+ *
+ * The last two are the mode-side of `joinedAndLeft` and `reconnected`. Keeping
+ * them means a cancelled pair is never silently dropped OR misreported as its
+ * end state alone — which matters here more than for presence, because the
+ * summary row has no expand affordance to recover the detail from.
+ */
+function classifyMode(first: '+' | '-', last: '+' | '-'): ConsolidationKind {
+  if (first === '+') return last === '+' ? 'modeGranted' : 'modeBriefly';
+  return last === '+' ? 'modeRegranted' : 'modeRevoked';
+}
+
+/**
+ * Fold a run's member-status changes into per-(nick, letter) net effects.
+ *
+ * This is a SEPARATE pass from the identity walk, and has to be. That walk is
+ * keyed on identity and classifies by a join/leave sequence; a mode change has
+ * neither shape — its subject is a (nick, letter) pair, its verdict is a sign,
+ * and its target need never have joined inside the run at all. Trying to reuse
+ * the identity chain would mean two meanings for one bucket. The cost is a
+ * second summary vocabulary, which is exactly what the lurker-ios prototype
+ * flagged when it tried this and backed it out; we pay it deliberately.
+ *
+ * Each pair is classified by its first and last change (see classifyMode), so a
+ * nick appears exactly once per letter and a cancelled pair reads "was briefly
+ * opped" — the mode-side of `joinedAndLeft`, and the same vocabulary the
+ * presence half already uses for the same shape. Nothing is ever dropped: the
+ * summary row has no expand affordance, so a nick dropped here would be
+ * information deleted with no way to get it back.
+ *
+ * Renames are NOT followed. The identity walk migrates a nick across an 'R'
+ * action; this keys on the parameter as written, so alice→bob opped as bob is
+ * reported as bob. Threading two identity models through one run costs more
+ * than it buys.
+ */
+function modeGroups(
+  events: readonly ConsolidatableMessage[],
+  maxNames: number,
+  speakersLc: ReadonlySet<string> | null,
+): ConsolidationGroup[] {
+  const net = new Map<string, ModeState>();
+  let seen = 0;
+  for (const e of events) {
+    for (const c of e.modes ?? []) {
+      // Only member-status changes fold. A run can only contain mode rows that
+      // passed isChurnMode, so this is a narrowing rather than a second filter.
+      if (!c || c.kind !== 'prefix' || !c.param) continue;
+      const letter = modeLetter(c.mode);
+      if (!letter) continue;
+      const key = `${c.param.toLowerCase()}\u0000${letter}`;
+      const sign: '+' | '-' = c.mode.startsWith('-') ? '-' : '+';
+      const prev = net.get(key);
+      net.set(key, {
+        nick: c.param,
+        letter,
+        // The first change is captured once and never overwritten — it is what
+        // says whether they held the mode before the run.
+        first: prev ? prev.first : sign,
+        last: sign,
+        // First appearance fixes the display order; later changes to the same
+        // pair update the verdict without moving it.
+        seenIndex: prev ? prev.seenIndex : seen++,
+      });
+    }
+  }
+
+  interface Bucket {
+    kind: ConsolidationKind;
+    letter: string;
+    entries: NickEntry[];
+    seenIndex: number;
+  }
+  const buckets = new Map<string, Bucket>();
+  for (const st of Array.from(net.values()).toSorted((a, b) => a.seenIndex - b.seenIndex)) {
+    const kind = classifyMode(st.first, st.last);
+    const bucketKey = `${kind}${st.letter}`;
+    let bucket = buckets.get(bucketKey);
+    if (!bucket) {
+      bucket = { kind, letter: st.letter, entries: [], seenIndex: st.seenIndex };
+      buckets.set(bucketKey, bucket);
+    }
+    bucket.entries.push({ nick: st.nick });
+  }
+
+  const groups: ConsolidationGroup[] = [];
+  for (const bucket of Array.from(buckets.values()).toSorted((a, b) => a.seenIndex - b.seenIndex)) {
+    const { visible, hidden } = cap(bucket.entries, maxNames, speakersLc);
+    groups.push({ kind: bucket.kind, visible, hidden, letter: bucket.letter });
+  }
+  return groups;
+}
+
 function consolidateRun(
   events: readonly ConsolidatableMessage[],
   opts: RunOptions,
@@ -180,6 +356,11 @@ function consolidateRun(
     : null;
   const maxNames = Math.max(1, opts.maxNames || 5);
 
+  // The two passes read disjoint slices of the run: the identity walk below
+  // takes presence events, modeGroups takes the mode rows.
+  const modeEvents = events.filter((e) => e.type === 'mode');
+  const presenceEvents = modeEvents.length > 0 ? events.filter((e) => e.type !== 'mode') : events;
+
   // identityKey (lowercased current nick) → identity bookkeeping
   const ids = new Map<string, IdentityState>();
   // Preserve first-seen order across rename migrations: when a rename moves an
@@ -188,7 +369,7 @@ function consolidateRun(
   // appeared in the run.
   let seenCounter = 0;
 
-  for (const e of events) {
+  for (const e of presenceEvents) {
     if (e.type === 'nick') {
       const oldLc = String(e.nick || '').toLowerCase();
       const newLc = String(e.newNick || '').toLowerCase();
@@ -226,7 +407,7 @@ function consolidateRun(
 
   // Uniform element type per bucket so the generic `cap()` infers a single
   // entry type; `renamed` happens to only ever receive RenameEntry values.
-  const buckets: Record<ConsolidationKind, Array<NickEntry | RenameEntry>> = {
+  const buckets: Record<IdentityKind, Array<NickEntry | RenameEntry>> = {
     joined: [],
     left: [],
     reconnected: [],
@@ -246,7 +427,7 @@ function consolidateRun(
 
   // Fixed display order across all categories so the readout reads the same
   // way every time.
-  const groupOrder: ConsolidationKind[] = [
+  const groupOrder: IdentityKind[] = [
     'joined',
     'left',
     'reconnected',
@@ -260,6 +441,9 @@ function consolidateRun(
     const { visible, hidden } = cap(buckets[kind], maxNames, speakersLc);
     groups.push({ kind, visible, hidden });
   }
+  // Mode groups trail the presence ones: who is here reads first, what they
+  // were given second.
+  groups.push(...modeGroups(modeEvents, maxNames, speakersLc));
   return groups;
 }
 
@@ -288,6 +472,16 @@ export function consolidateRows<R extends MessageStreamRow>(
     // Every row in `run` was pushed only after `r.m` was confirmed present.
     const events = run.map((r) => r.m as ConsolidatableMessage);
     const groups = consolidateRun(events, opts);
+    // A run that produced nothing to say renders as its own rows rather than as
+    // an empty summary. Unreachable today — every foldable row contributes a
+    // group — but it is the guard that keeps it that way, since widening
+    // foldsIntoRun without teaching a pass about the new type would otherwise
+    // swallow those rows into a blank line. lurker-ios has had this since #59.
+    if (groups.length === 0) {
+      out.push(...run);
+      run = [];
+      return;
+    }
     out.push({
       consolidation: true,
       groups,
@@ -301,7 +495,7 @@ export function consolidateRows<R extends MessageStreamRow>(
   };
 
   for (const r of rows) {
-    if (r && r.m && CONSOLIDATABLE_TYPES.has(r.m.type)) {
+    if (r && r.m && foldsIntoRun(r.m)) {
       run.push(r);
     } else {
       flush();

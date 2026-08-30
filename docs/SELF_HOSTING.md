@@ -25,9 +25,35 @@ The very first time you open the app it'll prompt you to create the initial admi
 
 - Invite additional users (each user gets their own IRC networks, history, and settings)
 - Reset their own password from the settings panel
+- Issue recovery links for anyone locked out (see [Account recovery](#account-recovery))
 - Eventually manage the system from the admin panel
 
 Lurker is multi-user — anyone you invite gets their own private set of networks. There is no public sign-up; new accounts can only be created through admin-issued invite links.
+
+## Account recovery
+
+Lurker accounts have no email address, so there is no "forgot my password" email to send. Recovery runs through you instead: in **Admin → Users**, the **recovery link** button on a member's row mints a single-use URL, and you hand it to them over a channel you already trust — IRC, Signal, in person.
+
+Opening it lets them set a password _or_ enroll a new passkey. Both matter: a member whose only credential was a passkey on a lost phone has no password to reset.
+
+Either way, the account ends up with **exactly one** sign-in method — the one they just chose. Recovery assumes the account may have been taken over, and a password an attacker set or a passkey they enrolled would otherwise survive it.
+
+A few things worth knowing:
+
+- **The URL is shown once.** Only its hash is stored, so nothing can display it again. Lost it? Issue another — that invalidates the first.
+- **Single use, 24 hours.** Redeeming it or letting it expire ends it; **revoke recovery** ends it early.
+- **Redeeming cuts off every other way in.** A lockout is indistinguishable from a takeover, so recovery assumes one: web sessions, open connections, attached bouncer clients, API tokens, and push registrations for that account all go. The member will need to sign in again on their other devices, re-issue any API tokens, and re-enable notifications.
+- **Every other credential is replaced.** The old password and all previously enrolled passkeys stop working, so a member with several passkeys re-enrolls the ones they still have.
+
+### When the only admin is locked out
+
+Nobody is left to click the button, so mint the link from a shell on the server:
+
+```bash
+docker compose exec lurker npm run recovery-link -- your-username
+```
+
+It prints the same URL. `WEBAUTHN_ORIGIN` supplies the base address; pass `--url https://lurker.example.com` if you haven't set it.
 
 ## Updating
 
@@ -48,6 +74,7 @@ Everything Lurker persists lives in `./data/`:
 
 - `lurker.db` (and `-shm`, `-wal` files) — IRC history, settings, users, etc.
 - `session-secret.key` — the secret used to sign session cookies. Backing this up means existing browser sessions survive a restore.
+- `preview-cache/` — only if you enabled [preview image caching](#caching-preview-images-required-for-video-posters), and worth **excluding**: it's up to 2 GiB of re-fetchable bytes that would otherwise land in every backup. Restoring without it costs a re-fetch and nothing else.
 
 A `cp -r data/ data-backup-$(date +%F)/` (with the server stopped, to avoid copying mid-write WAL files) is sufficient. If you need a hot copy, use the SQLite `.backup` command:
 
@@ -161,7 +188,7 @@ environment:
 
 Restart Lurker, log in with your password, then visit **Settings → Passkeys** and register one. Passkeys require HTTPS for any non-localhost hostname — browsers won't allow the WebAuthn ceremony otherwise.
 
-**Lost your passkey?** Just log in with your password and remove the dead passkey from the settings panel.
+**Lost your passkey?** Just log in with your password and remove the dead passkey from the settings panel. If it was your only way in, ask your admin for a [recovery link](#account-recovery).
 
 ### Web Push notifications
 
@@ -223,6 +250,214 @@ If you set this rule up before Lurker 1.0 it will say `/uploads/local/`. Uploads
 
 See [Uploaded images are broken for other people](#uploaded-images-are-broken-for-other-people-403) if you've already hit this.
 :::
+
+### Link previews & inline media
+
+Off by default. When enabled, a link pasted into chat can unfurl into a preview
+card (title, description, image — the way Slack or Discord do it); a link
+straight to an image renders inline; and a link to a **video or audio file**
+renders a poster frame that plays in place when clicked.
+
+⚠ That last one needs one more setting: **video posters require the byte cache**
+(`LURKER_PREVIEW_CACHE_MODE=local`). See
+[Caching preview images](#caching-preview-images-required-for-video-posters)
+below — without it, video links get a card with no frame on it.
+
+It's off by default because it makes your deployment fetch third-party URLs that
+appear in chat — a behavior an operator should choose, not inherit.
+
+#### You run a second container: `lurker-previews`
+
+All of the fetching and media parsing happens in a separate service,
+[`lurker-previews`](https://github.com/amiantos/lurker-previews), not in the main
+server. That split is the point: the main process holds your users' sessions and
+your database, and it never dials a stranger's URL or runs an image/video decoder
+(`sharp`, `ffmpeg`) on bytes someone pasted. The decoder does that, in a box built
+to be thrown away if it's ever compromised.
+
+**Setting `LURKER_PREVIEWS_URL` to point at a running decoder is the entire enable
+switch** — there's no separate on/off flag.
+
+If you run the stock `docker-compose.yml`, there's a ready-made overlay that adds
+the decoder and sets that variable for you:
+
+```bash
+curl -O https://raw.githubusercontent.com/amiantos/lurker/main/docker-compose.previews.yml
+docker compose -f docker-compose.yml -f docker-compose.previews.yml up -d
+```
+
+(Add `-f docker-compose.caddy.yml` too if you front Lurker with Caddy.) On a
+DigitalOcean droplet, [`ENABLE_LINK_PREVIEWS="true"`](digitalocean.md) in the
+deploy script does all of this — including the hardening below — unattended.
+
+If you keep your own compose file, the service is this:
+
+```yaml
+services:
+  lurker:
+    environment:
+      - LURKER_PREVIEWS_URL=http://lurker-previews:8030
+      # ...your other settings
+
+  lurker-previews:
+    image: ghcr.io/amiantos/lurker-previews:latest
+    restart: unless-stopped
+    # The decoder is meant to reach the public internet but nothing on your
+    # private network. It proves that at boot and REFUSES TO START if it can
+    # reach a private address — which, on a plain Docker network, it can (the
+    # host is one hop away). For a home/VPS self-host, tell it to skip that
+    # check: the in-process SSRF guard still refuses private URLs, so this is the
+    # same protection the feature had before it was split out. See "Hardening"
+    # below to enforce it at the network layer instead.
+    environment:
+      - LURKER_PREVIEWS_ALLOW_PRIVATE=1
+      # Optional: what the decoder tells sites it is when it fetches a preview.
+      # The default names Lurker and the traffic class (a social-preview fetch),
+      # so an operator reading their logs can recognise and block it on purpose.
+      # - LURKER_PREVIEW_USER_AGENT=
+    # No ports published — only the Lurker container talks to it, over the
+    # shared Docker network.
+```
+
+⚠ **Both containers must be on the same Docker network.** Declaring
+`lurker-previews` as a service in the _same_ compose file does this for you — that
+is the whole reason the block above is one file. If you instead start the decoder
+on its own (a separate `docker run`, or a different compose project), the Lurker
+container can't resolve the name `lurker-previews`, every preview silently fails
+to resolve, and nothing renders even though the settings are on. The cell logs one
+throttled `link-preview decoder unreachable` line when this happens — check for it
+if previews stay blank.
+
+**Enabling the instance doesn't show anyone a preview yet.** The feature is
+double-gated: each user also has two toggles in **Settings → Chat** — **Link
+previews** and **Inline media** — both defaulting to off. Those toggles only
+_appear_ once a decoder is configured, so if a user can't find the setting,
+`LURKER_PREVIEWS_URL` is the reason.
+
+The decoder identifies itself honestly in its User-Agent, guards every fetch
+against SSRF (loopback, RFC-1918, link-local including cloud metadata, CGNAT and
+IPv4-in-IPv6 all refused, with DNS pinned so the answer can't change between the
+check and the connection), and proxies preview **images** back through your
+Lurker server so users' browsers never touch the third-party host. A video or
+audio clip is never relayed — only its poster frame is — so pressing play goes
+straight to the origin, the one request the reader deliberately made.
+
+#### Hardening: enforce the egress limit at the network layer
+
+`LURKER_PREVIEWS_ALLOW_PRIVATE=1` turns off the decoder's boot self-test so it
+runs on an ordinary Docker network. The in-process SSRF guard is still active, so
+a malicious _URL_ is refused either way — what you give up is protection against a
+malicious _process_ (an RCE in the decoder reaching your LAN). For a trusted
+group that's a fair trade; to close it, firewall the decoder so it can reach the
+internet but not private ranges, and let the self-test run.
+
+On a Linux host, [`deploy/previews-egress.sh`](https://github.com/amiantos/lurker/blob/main/deploy/previews-egress.sh)
+does that for you:
+
+```bash
+# with LURKER_PREVIEWS_ALLOW_PRIVATE=0 in a .env beside your compose file
+curl -O https://raw.githubusercontent.com/amiantos/lurker/main/deploy/previews-egress.sh
+chmod +x previews-egress.sh
+sudo ./previews-egress.sh --install
+```
+
+Two things to set alongside it:
+
+- **Stop skipping the self-test.** The overlay reads
+  `LURKER_PREVIEWS_ALLOW_PRIVATE` from your `.env`, so `=0` there is enough. If
+  you wrote your own compose file from the block above, that hardcoded
+  `- LURKER_PREVIEWS_ALLOW_PRIVATE=1` wins over any `.env` — delete the line.
+- **Give the self-test a target that answers.** Its built-in probes are the
+  cloud metadata address and the bridge gateway's `:22`/`:80`; on a box with no
+  sshd and nothing on `:80` they all time out whether or not your rules exist,
+  and it passes vacuously. Name something private you know is listening —
+  usually your Docker host's LAN address — via
+  `LURKER_PREVIEWS_SELFTEST_TARGETS=192.168.1.10:22`.
+
+The script adds `DOCKER-USER` rules dropping traffic from the decoder's address
+to `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16` and
+`100.64.0.0/10`, plus an `INPUT` rule for the host itself (⚠ container→host
+traffic never reaches `DOCKER-USER`, so forward rules alone leave your own sshd
+reachable from the container that parses hostile input). Replies to Lurker are
+allowed by connection state rather than by subnet, so the decoder can answer
+Lurker but cannot dial it. `--install` adds a systemd unit that re-applies
+everything on boot and whenever Docker restarts. Then it restarts the decoder
+and reads back its verdict, so you know it worked.
+
+⚠ **DNS is deliberately allowed** — port 53 to any address. Without it, a host
+whose resolver is a LAN address (a home router, a Pi-hole, systemd-resolved
+pointing at either) resolves nothing, every preview fails, and the self-test
+still passes, because it probes IP literals and cannot see DNS at all. What it
+grants a compromised decoder is talking to DNS servers; not ssh, not an internal
+API, not the metadata service. To close even that, give the decoder public
+resolvers of its own with `dns:` in the overlay and delete the two port-53
+rules.
+
+Re-run the script after two things:
+
+- **Anything that recreates the decoder container.** The rules are scoped to the
+  address Docker gave it, and an update can hand it a new one. This failure is
+  loud: the self-test stops passing, the decoder refuses to serve, and previews
+  report themselves unavailable while everything else carries on.
+- **Any change to a host firewall that owns the filter table** (`ufw allow …`,
+  `firewall-cmd`). A reload rewrites `INPUT` and takes the host-protection rule
+  with it. ⚠ This one is _not_ loud — the decoder only re-tests its containment
+  when it starts — so it is the one case where you have to remember. The script
+  warns at the end when it sees ufw or firewalld running.
+
+(This is what the hosted fleet does per-cell, and why.)
+
+#### Caching preview images (required for video posters)
+
+For links and images this is a tuning knob: without a cache everything still
+works, the server just re-fetches an image when nobody's browser has it cached.
+**For video and audio it is the difference between a poster frame and a bare
+card**, so if you want the feature described at the top of this section, turn it
+on.
+
+Why a video needs it when an image doesn't: a poster is the one preview image
+with **no origin URL**. The decoder produces those bytes from the video itself,
+so they exist nowhere else on the internet — if your instance has nowhere to put
+them, there is nothing to serve later. The server is consistent about that
+rather than half-working: with the cache off it doesn't ask the decoder for a
+poster at all, won't record one against the link, and its poster route answers 404. The card renders without a frame and nothing logs, because a posterless
+card is a supported state.
+
+⚠ **Turning it on doesn't backfill.** A video someone pasted while the cache was
+off is remembered as posterless for a week (the success TTL); it grows a frame
+once that entry expires and someone posts the link again.
+
+`LURKER_PREVIEW_CACHE_MODE` trades a little disk or a bucket for this, and for
+not re-fetching popular images:
+
+- **`off`** (default) — fetch through, store nothing. No video posters.
+- **`local`** — the sensible self-host choice. Cached bytes live in a directory
+  next to the database (2 GiB cap by default, least-recently-used eviction).
+  It's a cache, not data: safe to delete while the server is stopped.
+- **`s3`** — for instances already running behind a CDN: cached images go to a
+  bucket you own and get served from its **public** base URL, so your server
+  ships zero bytes for an image it has already fetched. This one has real
+  operational requirements — the objects are publicly readable, the base URL
+  must be https, and **you** own eviction via a lifecycle rule on the bucket.
+  Thirty days is the recommendation: Lurker serves a stored object for up to 25
+  days (judged on the object's own `Last-Modified`), so a rule comfortably above
+  that keeps it from ever pointing a browser at an object you have deleted. That
+  25 days is also the staleness ceiling for an image that changes at a fixed URL,
+  so shorten the rule — but not below 25 days — if you want them refreshed sooner.
+
+Posters work under `local` or `s3` — the gate is "a cache exists", not `local`
+specifically.
+
+Misconfiguration is never fatal: a bad cache config logs one warning, caching
+turns off, and previews keep working.
+
+Every variable is carried as a commented block in `docker-compose.previews.yml`,
+on the `lurker` service — storing bytes needs credentials, and the container that
+parses hostile input is the last place to keep any, so the decoder hands bytes
+back and Lurker decides where they go. The full per-mode reference — every field,
+the s3 caveats, and the reasoning — lives in
+[`.env.example`](https://github.com/amiantos/lurker/blob/main/.env.example),
+which is worth reading in full before turning on `s3`.
 
 ### Secure cookies
 
@@ -322,23 +557,84 @@ Playback replays the last 50 lines per joined channel (plus your 20 most recentl
 
 Known limitations (shared-connection bouncer semantics): replies to one attached client's WHOIS/LIST are visible to all attached clients on that network; Lurker-side ignore rules don't filter the live relay; and on end-to-end encrypted channels an attached client sees the wire ciphertext for incoming messages.
 
+### IRC engine (upgrade without dropping IRC)
+
+_Available from 2.1.4._ Every Lurker upgrade restarts the container, and the container holds your IRC connections — so every upgrade has meant a reconnect: re-register, re-identify, rejoin, and a `Quit`/`Join` for everyone in your channels. The **engine** ends that. It is a second container that holds the IRC sockets and nothing else, and the ordinary upgrade never recreates it.
+
+**Switching an instance you already run?** [Switching to the IRC engine](/MIGRATION_ENGINE) walks the whole thing through once, in order, including moving identd and proving it works. This section is the reference.
+
+Enable it with the overlay:
+
+```bash
+echo "LURKER_ENGINE_SECRET=$(openssl rand -hex 32)" >> .env
+docker compose -f docker-compose.yml -f docker-compose.engine.yml up -d
+```
+
+⚠ **If you keep a `docker-compose.override.yml`, name it too** — `-f docker-compose.yml -f docker-compose.engine.yml -f docker-compose.override.yml`. Compose merges the override automatically only while resolving files by default; the moment you pass `-f` you get exactly the files you list, and an unnamed override is silently dropped along with whatever lives in it (your reverse-proxy network, a `113:113` mapping, secrets). The same applies to the `COMPOSE_FILE` tip below.
+
+That first `up -d` recreates `lurker` with the new setting and drops IRC one last time. From then on:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.engine.yml pull
+docker compose -f docker-compose.yml -f docker-compose.engine.yml up -d
+```
+
+replaces only the app. Your connections stay up — same nick, same channels, nothing re-registers — and whatever was said while the app was down is delivered when it comes back. The web UI reconnects on its own, as it does after any restart. (Tip: put `COMPOSE_FILE=docker-compose.yml:docker-compose.engine.yml` in `.env` — appending `:docker-compose.override.yml` if you keep one, per the warning above — and the commands go back to plain `pull` / `up -d`; remember that line when you turn the engine off again, below.)
+
+Without the overlay nothing changes: the app dials IRC itself exactly as before. `LURKER_ENGINE_URL` is the whole switch.
+
+**What still drops IRC:** an upgrade of the engine itself. Its image tag is `engine-1`, which only moves when a release changes the engine — rare, and called out in that release's notes. `pull` fetches nothing new for it otherwise, and `up -d` leaves it running. A release that needs `engine-2` is called out too, and for that one **stop the engine first** (`docker compose … stop lurker-engine`), then upgrade both: an old engine that refuses the new app would otherwise keep every session alive while the app dials its own and collides with its own ghosts. (The engine ends any session no app has claimed for an hour — `LURKER_ENGINE_ORPHAN_MS` — but that is a backstop, not a procedure.)
+
+**identd moves with the socket.** If you run the built-in identd (`LURKER_IDENTD_ENABLED`, and `LURKER_IDENTD_PORT`/`LURKER_IDENTD_BIND` if set) or the oidentd file (`LURKER_OIDENTD_FILE`), they now belong on the engine — it is the process holding the connection the network asks about; the app ignores them while an engine is configured, and the engine logs which mode it resolved at boot. Where they live decides what to do:
+
+- In `.env`: nothing to edit — the overlay forwards them to `lurker-engine`.
+- In an `environment:` block on `lurker` in your `docker-compose.override.yml` (how most people set them): move that block to `lurker-engine`. The overlay cannot see values set there.
+
+The host `:113` mapping is yours to add on `lurker-engine`, as it was yours to add on `lurker` — the overlay deliberately does not publish it, because a host that already runs its own ident daemon owns that port (that is what `LURKER_OIDENTD_FILE` mode is for). For oidentd, the file's bind mount moves too. In `docker-compose.override.yml`:
+
+```yaml
+services:
+  lurker-engine:
+    ports:
+      - '113:113' # built-in identd
+    volumes:
+      - ./oidentd:/oidentd # oidentd file mode: LURKER_OIDENTD_FILE=/oidentd/lurker.conf
+```
+
+…and remove the same from `lurker` (if you used the DigitalOcean deploy's identd overlay, that is where its `113:113` lives). `LURKER_OUTGOING_ADDR` is the exception: it **stays on `lurker`** — the app reads it and tells the engine which address to bind — but the address must of course exist on the engine's host.
+
+**Turning it off again.** Stop the engine first, or the network briefly sees two of you; then bring the stack up _without_ the overlay — and if you added the `COMPOSE_FILE` line to `.env`, take the overlay out of it first, otherwise the plain command still loads it and simply restarts the engine you just stopped:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.engine.yml stop lurker-engine
+COMPOSE_FILE=docker-compose.yml docker compose up -d --remove-orphans
+```
+
+**If the engine refuses the app** — wrong `LURKER_ENGINE_SECRET`, or an app that needs a newer engine — the app logs exactly that at startup and falls back to dialing IRC directly for that run: IRC works, but ident is not answered until you fix it (the engine owns `:113` now). **If the engine is merely unreachable** — it is down, or `LURKER_ENGINE_URL` has a typo — that is _not_ a fallback: the app stays in engine mode and its connections wait for it, retrying and logging that they are waiting, because the sockets may well still be alive in there. `docker compose logs lurker` says which of the two you are looking at.
+
+**Buffering while the app is down.** The engine keeps what arrives per connection (4 MiB by default, 256 MiB in total; `LURKER_ENGINE_BUFFER_BYTES` / `LURKER_ENGINE_BUFFER_TOTAL_BYTES`, digits, at least 65536). Past that the oldest lines go, and the app notes where the hole is in the network's server buffer when it comes back. Deploys take seconds; the buffer covers hours of normal traffic.
+
+**One engine, more than one Lurker.** Sessions are keyed to the Lurker database that opened them, not just to a user and network number — those are row ids, and two separate Lurker databases both number their first user and first network `1`. Each Lurker generates an identity for itself the first time it talks to an engine and keeps it in its own database, so two of them on one engine cannot see, attach to, drive or close each other's connections, and neither is told the other's exist. The engine refuses an app that does not identify itself at all rather than letting it share an id space with everyone else.
+
+That makes the arrangement safe, not tuned: the buffer budget (`LURKER_ENGINE_BUFFER_TOTAL_BYTES`) is shared across everything the engine holds, and so is `:113` — one identd answers for every connection on that host, which is fine when the connections are yours and not what you want between strangers. **Keep the engine on a private network either way.** `LURKER_ENGINE_SECRET` is the only thing standing between the internet and every connection the engine holds, and the overlay deliberately publishes no port.
+
+**Where the engine listens.** It binds `127.0.0.1:8016` unless told otherwise, so an engine nobody configured is not reachable from another machine. The overlay sets `LURKER_ENGINE_LISTEN=0.0.0.0:8016` because containers do not share a network namespace — a loopback bind inside `lurker-engine` is unreachable from `lurker` — and that is safe there precisely because no port is published: `:8016` exists only on the compose network. **Running without Docker**, app and engine on one host, the default already works — [the walkthrough](/MIGRATION_ENGINE#running-without-docker) has systemd units for both processes; point `LURKER_ENGINE_URL` at `tcp://127.0.0.1:8016` rather than `localhost`, which can resolve to `::1` first and be refused. Putting the engine on a _different_ host means widening the bind yourself, and then the secret is doing real work over a real network — give it a private network or a tunnel, not the open internet.
+
+**Health.** `curl http://lurker-engine:8016/healthz` from inside the compose network answers `{"ok":true,"held":N}` with the number of connections it is holding; the overlay uses the same probe as the service's healthcheck. `LURKER_ENGINE_IMAGE` overrides the image reference — a locally built image, or a pinned release.
+
 ---
 
 ## Troubleshooting
 
-### Forgot the admin password
+### Locked out of an account
 
-The cleanest path is to invite a second admin from your phone if you're still logged in there, then have them reset things from the admin panel.
-
-If you're locked out everywhere, the fallback is to clear the password hash directly with sqlite and re-bootstrap. With the server stopped:
+If you're an admin and still signed in somewhere, issue that member a recovery link from **Admin → Users**. If it's your own account and you're locked out everywhere, mint one from a shell:
 
 ```bash
-docker compose down
-sqlite3 data/lurker.db "DELETE FROM users WHERE username = 'your-username';"
-docker compose up -d
+docker compose exec lurker npm run recovery-link -- your-username
 ```
 
-This destroys that user's account and history. If you were the only user, the next visit will return you to the first-run wizard so you can create a fresh admin. (A proper password-reset CLI is on the roadmap.)
+Either way, see [Account recovery](#account-recovery) — nothing is deleted and no history is lost.
 
 ### Port 8015 already in use
 
@@ -419,3 +715,5 @@ npm start
 ```
 
 The server listens on port 8010 by default. Configure with the same envvars described above (set them in a `.env` file next to `package.json`, or export them in your shell). Use a process supervisor (`systemd`, `pm2`, etc.) to keep it running: it restarts the server after a crash, which nothing else on this page does. Backgrounding with `disown` and logging out also works — the server survives its terminal going away — but console output is gone for good at that point (the in-app system log keeps recording), and a crash stays down until you notice.
+
+Adding the IRC engine to a bare-metal install — a second process, so a second unit — is walked through in [Switching to the IRC engine → Running without Docker](/MIGRATION_ENGINE#running-without-docker).

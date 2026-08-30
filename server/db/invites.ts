@@ -90,6 +90,20 @@ export function deleteInvite(token: string): boolean {
   return info.changes > 0;
 }
 
+// An invite is spent if EITHER half of the consume is on the row. consumeInvite
+// writes used_by_user_id and used_at together, so under normal operation the two
+// always agree — but only the id is a foreign key, so only the id can be rewritten
+// out from under us by a user deletion. Reading both means a row that loses its
+// redeemer stays spent instead of turning back into a live link (#590), and it is
+// the one rule the admin list and the redemption path have to agree on, so they
+// share it rather than each re-deriving it.
+export function isInviteSpent(row: {
+  usedByUserId: number | null;
+  usedAt: string | null;
+}): boolean {
+  return row.usedByUserId != null || row.usedAt != null;
+}
+
 // Check status without mutating. Returns one of:
 //   { status: 'unknown' } — no row for this token
 //   { status: 'consumed' } — already redeemed
@@ -98,7 +112,7 @@ export function deleteInvite(token: string): boolean {
 export function inviteStatus(token: string): InviteStatusResult {
   const invite = getInvite(token);
   if (!invite) return { status: 'unknown' };
-  if (invite.usedByUserId != null) return { status: 'consumed' };
+  if (isInviteSpent(invite)) return { status: 'consumed' };
   if (invite.expiresAt && Date.parse(invite.expiresAt) < Date.now()) {
     return { status: 'expired' };
   }
@@ -106,15 +120,16 @@ export function inviteStatus(token: string): InviteStatusResult {
 }
 
 // Mark an invite consumed atomically. Returns true if we won the race; false
-// if it was already used or doesn't exist. The UPDATE guards on
-// used_by_user_id IS NULL so two simultaneous redemptions can't both succeed.
+// if it was already used or doesn't exist. The UPDATE guards on the same
+// spent-ness rule isInviteSpent() reads, so two simultaneous redemptions can't
+// both succeed AND a row whose redeemer was deleted can't be redeemed again.
 export function consumeInvite(token: string, userId: number): boolean {
   const info = db
     .prepare(
       `
     UPDATE invite_tokens
     SET used_by_user_id = ?, used_at = datetime('now')
-    WHERE token = ? AND used_by_user_id IS NULL
+    WHERE token = ? AND used_by_user_id IS NULL AND used_at IS NULL
   `,
     )
     .run(userId, token);

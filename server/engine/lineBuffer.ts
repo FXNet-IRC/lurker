@@ -1,0 +1,154 @@
+// Copyright (c) 2026 Brad Root
+// SPDX-License-Identifier: MPL-2.0
+
+// The per-connection backlog: every inbound IRC line the app has not yet acked,
+// numbered so a re-attaching app can resume exactly where the last one stopped.
+//
+// Bounded in BYTES, not lines, because one busy channel and one quiet one differ
+// by orders of magnitude in line length and what we actually protect is the
+// engine's memory. When the cap is hit the OLDEST lines go — the app will learn
+// the shape of the hole from the recorded gap and can say so (or backfill from
+// CHATHISTORY where the network offers it). Newer lines are kept because they
+// are the ones that describe the state the app is about to attach to.
+//
+// Deliberately in memory only. The app's SQLite is the durable store; this
+// buffer exists to bridge a redeploy, not to be a second message log. A
+// spill-to-disk implementation would slot in behind the same interface if
+// cross-host engines ever need to cover hour-long detaches.
+
+import type { Gap } from './protocol.js';
+
+export interface BufferedLine {
+  seq: number;
+  line: string;
+}
+
+// Shared across every buffer in the process so the total is bounded too. A cell
+// with a hundred connections mid-netsplit must not be able to take the engine
+// down by each staying under its own cap. Under global pressure it is the
+// LARGEST backlog that sheds, not whichever connection happened to receive the
+// next line — otherwise one quiet DM would be squeezed to nothing while the
+// hoarders kept their full 4 MiB each.
+export class ByteBudget {
+  used = 0;
+  private readonly buffers = new Set<LineBuffer>();
+  constructor(readonly max: number) {}
+
+  register(b: LineBuffer): void {
+    this.buffers.add(b);
+  }
+
+  unregister(b: LineBuffer): void {
+    this.buffers.delete(b);
+  }
+
+  // Drop oldest lines from the largest buffer until the total fits (a buffer is
+  // never emptied below one line, so a single over-long line can't wedge this).
+  reclaim(): void {
+    while (this.used > this.max) {
+      let largest: LineBuffer | null = null;
+      for (const b of this.buffers) {
+        if (b.length > 1 && (!largest || b.bytes > largest.bytes)) largest = b;
+      }
+      if (!largest) return;
+      largest.dropOldest();
+    }
+  }
+}
+
+const lineBytes = (line: string): number => Buffer.byteLength(line, 'utf8') + 2;
+
+export class LineBuffer {
+  private lines: BufferedLine[] = [];
+  private nextSeq = 1;
+  private gap: Gap | null = null;
+  bytes = 0;
+
+  constructor(
+    private readonly maxBytes: number,
+    private readonly budget: ByteBudget,
+  ) {
+    budget.register(this);
+  }
+
+  get length(): number {
+    return this.lines.length;
+  }
+
+  // Latest seq handed out; 0 before the first line.
+  get lastSeq(): number {
+    return this.nextSeq - 1;
+  }
+
+  push(line: string): number {
+    const seq = this.nextSeq++;
+    const size = lineBytes(line);
+    this.lines.push({ seq, line });
+    this.bytes += size;
+    this.budget.used += size;
+    while (this.lines.length > 1 && this.bytes > this.maxBytes) this.dropOldest();
+    this.budget.reclaim();
+    return seq;
+  }
+
+  // Also called by the budget on whichever buffer is largest; not part of the
+  // public contract otherwise.
+  dropOldest(): void {
+    const dropped = this.lines.shift();
+    if (!dropped) return;
+    const size = lineBytes(dropped.line);
+    this.bytes -= size;
+    this.budget.used -= size;
+    // Extend a gap that is already open rather than recording a second one:
+    // the app only needs the outer bounds of the hole.
+    if (this.gap) {
+      this.gap.lastDroppedSeq = dropped.seq;
+      this.gap.at = Date.now();
+    } else {
+      this.gap = { firstDroppedSeq: dropped.seq, lastDroppedSeq: dropped.seq, at: Date.now() };
+    }
+  }
+
+  ack(seq: number): void {
+    // An ack into the hole says the app had those lines after all (it was
+    // attached and simply slow to ack, or the burst replay just delivered
+    // them): shrink the reported hole to what is actually unaccounted for.
+    if (this.gap) {
+      if (seq >= this.gap.lastDroppedSeq) this.gap = null;
+      else if (seq >= this.gap.firstDroppedSeq) this.gap.firstDroppedSeq = seq + 1;
+    }
+    let freed = 0;
+    let i = 0;
+    while (i < this.lines.length && this.lines[i].seq <= seq) {
+      freed += lineBytes(this.lines[i].line);
+      i++;
+    }
+    if (i === 0) return;
+    this.lines.splice(0, i);
+    this.bytes -= freed;
+    this.budget.used -= freed;
+  }
+
+  pending(): readonly BufferedLine[] {
+    return this.lines;
+  }
+
+  peekGap(): Gap | null {
+    return this.gap;
+  }
+
+  // Hand over the recorded hole (if any) and forget it, so it is reported once.
+  takeGap(): Gap | null {
+    const g = this.gap;
+    this.gap = null;
+    return g;
+  }
+
+  // Release this buffer's share of the budget; called when the connection ends.
+  dispose(): void {
+    this.budget.used -= this.bytes;
+    this.bytes = 0;
+    this.lines = [];
+    this.budget.unregister(this);
+  }
+}

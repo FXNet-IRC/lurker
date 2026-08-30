@@ -24,25 +24,23 @@ export const useNetworkPresetsStore = defineStore('networkPresets', {
       if (this.loading) return this.loading;
       this.loading = (async () => {
         const data = await api('/api/network-presets');
-        this.presets = (data.presets ?? []).map(
-          (p: Record<string, unknown>): NetworkPreset => ({
-            instanceId: Number(p.id),
-            name: String(p.name),
-            host: String(p.host),
-            port: Number(p.port),
-            tls: !!p.tls,
-            saslLikelyRequired: !!p.saslLikelyRequired,
-            recommendedChannels: Array.isArray(p.channels) ? (p.channels as string[]) : [],
-            // Instance presets carry none of the netsplit browse metadata, and
-            // shouldn't pretend to: no popularity counts to sort by, no tags to
-            // filter on. They're pinned to the top of the picker instead.
-            website: '',
-            users: null,
-            channels: null,
-            tags: [],
-            isInstance: true,
-          }),
-        );
+        this.presets = (data.presets ?? []).map((p: Record<string, unknown>): NetworkPreset => ({
+          instanceId: Number(p.id),
+          name: String(p.name),
+          host: String(p.host),
+          port: Number(p.port),
+          tls: !!p.tls,
+          saslLikelyRequired: !!p.saslLikelyRequired,
+          recommendedChannels: Array.isArray(p.channels) ? (p.channels as string[]) : [],
+          // Instance presets carry none of the netsplit browse metadata, and
+          // shouldn't pretend to: no popularity counts to sort by, no tags to
+          // filter on. They're pinned to the top of the picker instead.
+          website: '',
+          users: null,
+          channels: null,
+          tags: [],
+          isInstance: true,
+        }));
         this.allowUserDefined = data.allowUserDefined !== false;
         this.loaded = true;
       })();

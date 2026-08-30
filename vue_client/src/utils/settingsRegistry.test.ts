@@ -147,6 +147,7 @@ describe('optionEnabled (#666)', () => {
       'chat.smart_filter_join',
       'chat.smart_filter_quit',
       'chat.smart_filter_nick',
+      'chat.smart_filter_mode',
       'chat.smart_filter_join_unmask',
     ]) {
       expect(optionEnabled(opt(key), mobileSmart)).toBe(true);

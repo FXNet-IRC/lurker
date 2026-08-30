@@ -259,6 +259,26 @@ describe('live relay', () => {
     expect(acct.upstream.rawSent.some((l) => l.includes('+typing'))).toBe(false);
   });
 
+  // #809. ircManager now refuses a write on a network in reconnect backoff rather
+  // than persisting a message that never reaches IRC. The bouncer ignored the
+  // boolean, so for a BYOC client the line simply evaporated — no error, no echo,
+  // nothing. It has to say so, because unlike the web composer there is no toast.
+  it('tells the client when the upstream is not writable, and sends nothing', async () => {
+    const acct = harnessMod.seedAccount({ nick: 'downstream' });
+    const c = await harness.connect();
+    c.send(`PASS ${acct.user.username}:${acct.password}`);
+    c.send('NICK client');
+    c.send('USER client 0 * :client');
+    await c.waitForCommand('422');
+    acct.upstream.state = 'reconnecting';
+    c.send('PRIVMSG #chan :are you there');
+    const notice = await c.waitFor((l) => l.includes('NOTICE') && l.includes('not sent'));
+    expect(notice).toContain('reconnecting');
+    // ⚠ And nothing left for the network. registerEcho is skipped too, so the
+    // keys don't sit in the pending list waiting to time out.
+    expect(acct.upstream.rawSent.some((l) => l.includes('are you there'))).toBe(false);
+  });
+
   it('never forwards a post-registration AUTHENTICATE to the upstream', async () => {
     const acct = harnessMod.seedAccount({ nick: 'noauth' });
     const c = await harness.connect();

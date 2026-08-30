@@ -31,6 +31,22 @@ const EXTENSIONS: Record<MediaKind, readonly string[]> = {
   image: ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif', '.bmp'],
   video: ['.mp4', '.mov', '.m4v', '.webm', '.3gp', '.3g2'],
   audio: ['.mp3', '.m4a', '.ogg', '.oga', '.wav', '.flac'],
+  // ⚠ `.md` and `.json` are deliberately ABSENT, though the uploader mints both
+  // (#788). This table judges ARBITRARY chat links by extension, and those two are
+  // overwhelmingly PAGE urls rather than raw files — a GitHub blob, a docs page, an
+  // API endpoint. Listing them costs twice over, on links that have nothing to do
+  // with us: `RenderSegments.isViewableUrl` would swallow the click on
+  // `…/blob/main/README.md` and land the user on the viewer's "could not read this
+  // file" card instead of GitHub, and `previewUrls` would count the same link as
+  // media, so it silently loses its preview card for anyone running link previews
+  // without inline media.
+  //
+  // `.txt` earns its place because a `.txt` url is almost always the file itself.
+  // The failure modes aren't symmetric: a wrong guess here breaks a link the user
+  // did not upload, while the cost of omitting them is only that OUR OWN `.md`
+  // opens in a browser tab. Re-add them keyed on the url being one of the user's
+  // upload hosts — this module's name is aspirational, no such check exists yet —
+  // never on the extension alone.
   text: ['.txt'],
 };
 

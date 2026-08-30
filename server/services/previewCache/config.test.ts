@@ -15,6 +15,9 @@ const KEYS = [
   'LURKER_PREVIEW_CACHE_S3_SECRET_ACCESS_KEY',
   'LURKER_PREVIEW_CACHE_S3_PUBLIC_BASE_URL',
   'LURKER_PREVIEW_CACHE_S3_PREFIX',
+  'LURKER_PREVIEW_CACHE_DROPPER_URL',
+  'LURKER_PREVIEW_CACHE_DROPPER_API_KEY',
+  'LURKER_PREVIEW_CACHE_DROPPER_PUBLIC_BASE_URL',
 ];
 
 /** Every field `s3` requires, so a test can remove exactly one. */
@@ -25,6 +28,14 @@ function setS3Env(): void {
   process.env.LURKER_PREVIEW_CACHE_S3_ACCESS_KEY_ID = 'key';
   process.env.LURKER_PREVIEW_CACHE_S3_SECRET_ACCESS_KEY = 'secret';
   process.env.LURKER_PREVIEW_CACHE_S3_PUBLIC_BASE_URL = 'https://cdn.example.com';
+}
+
+/** Every field `dropper` requires, so a test can remove exactly one. */
+function setDropperEnv(): void {
+  process.env.LURKER_PREVIEW_CACHE_MODE = 'dropper';
+  process.env.LURKER_PREVIEW_CACHE_DROPPER_URL = 'http://10.0.0.2:8025';
+  process.env.LURKER_PREVIEW_CACHE_DROPPER_API_KEY = 'upload-key';
+  process.env.LURKER_PREVIEW_CACHE_DROPPER_PUBLIC_BASE_URL = 'https://cdn.example.com/previews';
 }
 
 afterEach(() => {
@@ -39,7 +50,7 @@ describe('resolveCacheConfig', () => {
   });
 
   it('rejects an unknown mode rather than guessing at it, and says so', () => {
-    for (const mode of ['r2', 'bucket', 'dropper']) {
+    for (const mode of ['r2', 'bucket', 'hoarder']) {
       process.env.LURKER_PREVIEW_CACHE_MODE = mode;
       const warnings: string[] = [];
       expect(`${mode} → ${resolveCacheConfig((m) => warnings.push(m)).mode}`).toBe(`${mode} → off`);
@@ -173,6 +184,102 @@ describe('resolveCacheConfig', () => {
       if (cfg.mode !== 's3') throw new Error('unreachable');
       expect(cfg.endpoint).toBe('https://endpoint.example.com');
       expect(cfg.publicBaseUrl).toBe('https://cdn.example.com');
+    });
+  });
+
+  describe('mode dropper', () => {
+    it('resolves a complete config', () => {
+      setDropperEnv();
+      const cfg = resolveCacheConfig();
+      if (cfg.mode !== 'dropper') throw new Error('unreachable');
+      expect(cfg.url).toBe('http://10.0.0.2:8025');
+      expect(cfg.apiKey).toBe('upload-key');
+      expect(cfg.publicBaseUrl).toBe('https://cdn.example.com/previews');
+      expect(cfg.stagingDir).toMatch(/preview-cache$/);
+    });
+
+    it('falls back to OFF, loudly, when any required field is missing', () => {
+      for (const key of [
+        'LURKER_PREVIEW_CACHE_DROPPER_URL',
+        'LURKER_PREVIEW_CACHE_DROPPER_API_KEY',
+        'LURKER_PREVIEW_CACHE_DROPPER_PUBLIC_BASE_URL',
+      ]) {
+        setDropperEnv();
+        delete process.env[key];
+        const warnings: string[] = [];
+        const cfg = resolveCacheConfig((m) => warnings.push(m));
+        expect(`${key} → ${cfg.mode}`).toBe(`${key} → off`);
+        expect(`${key} named: ${warnings.some((w) => w.includes(key))}`).toBe(`${key} named: true`);
+      }
+    });
+
+    // The service URL is dialled over the fleet's private VPC — plain http is the
+    // genuinely provisioned shape — but the PUBLIC base is handed to browsers on an
+    // https page, where an http image is mixed content that never renders.
+    it('accepts an http service URL but refuses an http public base', () => {
+      setDropperEnv();
+      const ok = resolveCacheConfig();
+      expect(ok.mode).toBe('dropper');
+
+      for (const bad of ['http://cdn.example.com/previews', 'not a url', 'ftp://cdn/previews']) {
+        setDropperEnv();
+        process.env.LURKER_PREVIEW_CACHE_DROPPER_PUBLIC_BASE_URL = bad;
+        const warnings: string[] = [];
+        const cfg = resolveCacheConfig((m) => warnings.push(m));
+        expect(`${bad} → ${cfg.mode}`).toBe(`${bad} → off`);
+        expect(`${bad}: ${warnings.length > 0 ? 'warned' : 'silent'}`).toBe(`${bad}: warned`);
+      }
+    });
+
+    it('refuses a service URL that is not a URL at all', () => {
+      setDropperEnv();
+      process.env.LURKER_PREVIEW_CACHE_DROPPER_URL = 'not a url';
+      const warnings: string[] = [];
+      expect(resolveCacheConfig((m) => warnings.push(m)).mode).toBe('off');
+      expect(warnings.length).toBeGreaterThan(0);
+    });
+
+    // ⚠ The backend appends /api/previews itself, so a pasted full endpoint (a
+    // natural misread of "the dropper URL") would make every store POST to
+    // /api/previews/api/previews — a working-looking mode where every store
+    // fails. Caught at boot instead.
+    it('refuses a service URL carrying a path, query or fragment', () => {
+      for (const bad of [
+        'http://10.0.0.2:8025/api/previews',
+        'http://10.0.0.2:8025/dropper',
+        'http://10.0.0.2:8025?token=x',
+        'http://10.0.0.2:8025#frag',
+      ]) {
+        setDropperEnv();
+        process.env.LURKER_PREVIEW_CACHE_DROPPER_URL = bad;
+        const warnings: string[] = [];
+        const cfg = resolveCacheConfig((m) => warnings.push(m));
+        expect(`${bad} → ${cfg.mode}`).toBe(`${bad} → off`);
+        expect(`${bad}: ${warnings.length > 0 ? 'warned' : 'silent'}`).toBe(`${bad}: warned`);
+      }
+      // ...but a bare trailing slash is the pathname '/', which is fine.
+      setDropperEnv();
+      process.env.LURKER_PREVIEW_CACHE_DROPPER_URL = 'http://10.0.0.2:8025/';
+      expect(resolveCacheConfig().mode).toBe('dropper');
+    });
+
+    it('trims trailing slashes so minted URLs never double up a separator', () => {
+      setDropperEnv();
+      process.env.LURKER_PREVIEW_CACHE_DROPPER_URL = 'http://10.0.0.2:8025/';
+      process.env.LURKER_PREVIEW_CACHE_DROPPER_PUBLIC_BASE_URL =
+        'https://cdn.example.com/previews//';
+      const cfg = resolveCacheConfig();
+      if (cfg.mode !== 'dropper') throw new Error('unreachable');
+      expect(cfg.url).toBe('http://10.0.0.2:8025');
+      expect(cfg.publicBaseUrl).toBe('https://cdn.example.com/previews');
+    });
+
+    it('honours an explicit staging directory', () => {
+      setDropperEnv();
+      process.env.LURKER_PREVIEW_CACHE_DIR = '/tmp/somewhere-else';
+      const cfg = resolveCacheConfig();
+      if (cfg.mode !== 'dropper') throw new Error('unreachable');
+      expect(cfg.stagingDir).toBe('/tmp/somewhere-else');
     });
   });
 });

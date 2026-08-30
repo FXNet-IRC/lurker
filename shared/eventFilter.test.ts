@@ -99,6 +99,9 @@ describe('tier resolution', () => {
       'chat.smart_filter_join',
       'chat.smart_filter_quit',
       'chat.smart_filter_nick',
+      // The event kinds read in wire order — join, part/quit, nick, mode — with
+      // the join-specific unmask tuning left trailing behind them.
+      'chat.smart_filter_mode',
       'chat.smart_filter_join_unmask',
     ]);
     expect([...new Set(events.map((o) => o.group))]).toEqual([
@@ -131,23 +134,65 @@ describe('page sizing', () => {
     expect(pageUnitFor('none', false)).toBe('chat');
   });
 
+  const churnMode = {
+    type: 'mode',
+    modes: [{ mode: '+o', param: 'alice', kind: 'prefix' as const }],
+  };
+  const banMode = {
+    type: 'mode',
+    modes: [{ mode: '+b', param: '*!*@host', kind: 'list' as const }],
+  };
+
   it('counts every row under `event`', () => {
     for (const type of [...NOISE_TYPES, 'message', 'kick']) {
-      expect(countsTowardPage(type, 'event')).toBe(true);
+      expect(countsTowardPage({ type }, 'event')).toBe(true);
     }
+    expect(countsTowardPage(churnMode, 'event')).toBe(true);
   });
 
-  it('makes mode free under `chat` but not under `renderable`', () => {
-    expect(countsTowardPage('mode', 'renderable')).toBe(true);
-    expect(countsTowardPage('mode', 'chat')).toBe(false);
+  it('makes no mode row count under `chat`', () => {
+    // `none` hides every mode row, churn or not, so none of them spend budget.
+    expect(countsTowardPage(churnMode, 'chat')).toBe(false);
+    expect(countsTowardPage(banMode, 'chat')).toBe(false);
+    expect(countsTowardPage({ type: 'mode' }, 'chat')).toBe(false);
+  });
+
+  it('stops counting folded op/voice churn under `renderable`', () => {
+    // The unit has to be no FINER than what the client draws. A folding client
+    // collapses a whole run of `+o` rows into one summary line, so counting
+    // them would hand back a page of `limit` units that renders as two lines —
+    // exactly the short-page loop this unit exists to prevent.
+    expect(countsTowardPage(churnMode, 'renderable')).toBe(false);
+  });
+
+  it('keeps counting the mode rows that still stand alone', () => {
+    expect(countsTowardPage(banMode, 'renderable')).toBe(true);
+    // Mixed: one ban in the message and the whole row renders, so it counts.
+    expect(
+      countsTowardPage(
+        {
+          type: 'mode',
+          modes: [
+            { mode: '+o', param: 'alice', kind: 'prefix' as const },
+            { mode: '-b', param: '*!*@host', kind: 'list' as const },
+          ],
+        },
+        'renderable',
+      ),
+    ).toBe(true);
+    // Unstamped backlog never folds, so it must never stop counting either.
+    expect(
+      countsTowardPage({ type: 'mode', modes: [{ mode: '+o', param: 'alice' }] }, 'renderable'),
+    ).toBe(true);
+    expect(countsTowardPage({ type: 'mode' }, 'renderable')).toBe(true);
   });
 
   it('makes presence churn free under both of the counted units', () => {
     for (const unit of ['renderable', 'chat'] as const) {
-      expect(countsTowardPage('join', unit)).toBe(false);
-      expect(countsTowardPage('quit', unit)).toBe(false);
-      expect(countsTowardPage('message', unit)).toBe(true);
-      expect(countsTowardPage('kick', unit)).toBe(true);
+      expect(countsTowardPage({ type: 'join' }, unit)).toBe(false);
+      expect(countsTowardPage({ type: 'quit' }, unit)).toBe(false);
+      expect(countsTowardPage({ type: 'message' }, unit)).toBe(true);
+      expect(countsTowardPage({ type: 'kick' }, unit)).toBe(true);
     }
   });
 

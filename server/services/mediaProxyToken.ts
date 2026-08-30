@@ -24,6 +24,7 @@
 
 import crypto from 'node:crypto';
 import { resolveSessionSecret } from '../utils/sessionSecret.js';
+import { isPosterKey } from './previewCache/config.js';
 
 const INFO = Buffer.from('lurker-media-proxy-v1');
 
@@ -84,4 +85,29 @@ export function verifyProxyToken(token: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * A poster frame has NO origin URL — its bytes were decoded by this instance and live only in
+ * the byte cache under `posterCacheKey`. So a poster capability signs the KEY itself, prefixed
+ * so it can never be confused with a URL-bearing media token.
+ *
+ * ⚠⚠ The signature is the whole security of the poster route. `posterCacheKey` and
+ * `byteCacheKey` are UNSALTED sha256 that share one cache index, so without this any
+ * authenticated user could compute `byteCacheKey(anyUrl)` and read whatever the instance had
+ * proxied — the exact cross-user oracle the media route's HMAC exists to prevent. The poster
+ * route must serve nothing whose key we did not sign.
+ */
+const POSTER_TOKEN_PREFIX = 'poster:';
+
+export function mintPosterToken(key: string): string {
+  return mintProxyToken(`${POSTER_TOKEN_PREFIX}${key}`);
+}
+
+/** Recover a poster cache key from a token, or null if unsigned, mis-prefixed, or mis-shaped. */
+export function verifyPosterToken(token: string): string | null {
+  const payload = verifyProxyToken(token);
+  if (payload === null || !payload.startsWith(POSTER_TOKEN_PREFIX)) return null;
+  const key = payload.slice(POSTER_TOKEN_PREFIX.length);
+  return isPosterKey(key) ? key : null;
 }

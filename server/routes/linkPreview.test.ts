@@ -11,10 +11,12 @@ import {
   createAuthedAgent,
   createAnonAgent,
 } from '../test-utils/testApp.js';
+import { startStubDecoder, type StubDecoder } from '../test-utils/stubDecoder.js';
 import type { User } from '../db/users.js';
 
 const ctx = setupTestDb('routes-link-preview');
 
+let stub: StubDecoder;
 let app: Express;
 let agent: LurkerTestAgent;
 let alice: User;
@@ -27,13 +29,18 @@ let createUser: typeof import('../db/users.js').createUser;
 
 const SAVED_SECRET = process.env.SESSION_SECRET;
 
-const SAVED_FLAG = process.env.LURKER_LINK_PREVIEWS;
-
 beforeAll(async () => {
+  // The decoder stub answers `refused` unless a test says otherwise — the shape the old
+  // in-cell SSRF guard produced, and a verdict the cell caches as `unavailable`. The guard
+  // itself is pinned in the lurker-previews repo now; what these tests hold onto is the
+  // cell's half: nothing in THIS process ever dials an origin, and a refusal is a cached
+  // answer rather than a per-scroll refetch.
+  stub = await startStubDecoder();
+  stub.onResolve = () => ({ status: 'refused', reason: 'refused by test stub' });
   process.env.SESSION_SECRET = 'link-preview-route-test-secret';
-  // The feature is off by default now, and `previewsEnabled()` gates the routes from inside as
-  // well as their mounting. Every test here is about behaviour WHEN enabled.
-  process.env.LURKER_LINK_PREVIEWS = 'on';
+  // Previews are ON here because startStubDecoder set LURKER_PREVIEWS_URL — which IS the
+  // feature gate now. Every test is about behaviour WHEN enabled; the one 'off' test below
+  // clears that URL.
   ({ createUser } = await import('../db/users.js'));
   ({ putPreview, OK_TTL_MS, urlHash } = await import('../db/linkPreviews.js'));
   db = (await import('../db/index.js')).default;
@@ -45,11 +52,10 @@ beforeAll(async () => {
   agent = await createAuthedAgent(app, alice.id);
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await stub.close();
   if (SAVED_SECRET === undefined) delete process.env.SESSION_SECRET;
   else process.env.SESSION_SECRET = SAVED_SECRET;
-  if (SAVED_FLAG === undefined) delete process.env.LURKER_LINK_PREVIEWS;
-  else process.env.LURKER_LINK_PREVIEWS = SAVED_FLAG;
   ctx.cleanup();
 });
 
@@ -68,6 +74,7 @@ function seed(url: string, over: Partial<Parameters<typeof putPreview>[0]> = {})
     imageHeight: 630,
     embedUrl: null,
     mime: null,
+    posterKey: null,
     expiresAt: new Date(Date.now() + OK_TTL_MS).toISOString(),
     ...over,
   });
@@ -401,11 +408,21 @@ describe('GET /api/link-preview/media/:token', () => {
     expect((await agent.get(`/api/link-preview/media/${payload}.${sig}`)).status).toBe(403);
   });
 
-  it('refuses a validly-signed token that points somewhere internal', async () => {
-    // Belt and braces: even a token WE signed gets re-vetted, because the DNS
-    // answer may have moved since it was minted.
-    const token = mintProxyToken('http://127.0.0.1/secret.png');
-    expect((await agent.get(`/api/link-preview/media/${token}`)).status).toBe(403);
+  it('folds the decoder’s re-vet refusal into the 404 an <img> can hold', async () => {
+    // Belt and braces still exists — a token WE signed gets re-vetted, because the DNS
+    // answer may have moved since it was minted — but the re-vet lives in the DECODER now
+    // (its /fetch runs the pinned lookup from scratch; pinned in lurker-previews' own
+    // tests). What this end owes the client is the translation: the decoder's 403 is a
+    // permanent fact about the URL, and 404 is how an <img> is told one.
+    stub.onFetch = (_url, res) => {
+      res.writeHead(403, { 'content-type': 'text/plain' }).end('refused');
+    };
+    try {
+      const token = mintProxyToken('http://127.0.0.1/secret.png');
+      expect((await agent.get(`/api/link-preview/media/${token}`)).status).toBe(404);
+    } finally {
+      stub.onFetch = null;
+    }
   });
 
   it('is a 404, not a crash, when the origin cannot be reached', async () => {
@@ -413,9 +430,10 @@ describe('GET /api/link-preview/media/:token', () => {
     expect((await agent.get(`/api/link-preview/media/${token}`)).status).toBe(404);
   });
 
-  it('goes dark entirely when the feature flag is off', async () => {
-    const saved = process.env.LURKER_LINK_PREVIEWS;
-    delete process.env.LURKER_LINK_PREVIEWS;
+  it('goes dark entirely when no decoder is configured', async () => {
+    // Off IS "no LURKER_PREVIEWS_URL" now — the presence of a decoder is the whole gate.
+    const saved = process.env.LURKER_PREVIEWS_URL;
+    delete process.env.LURKER_PREVIEWS_URL;
     try {
       const token = mintProxyToken('https://cdn.example.com/a.png');
       expect((await agent.get(`/api/link-preview/media/${token}`)).status).toBe(404);
@@ -426,8 +444,8 @@ describe('GET /api/link-preview/media/:token', () => {
         (await agent.post('/api/link-preview/resolve').send({ urls: ['https://e.test/a'] })).status,
       ).toBe(404);
     } finally {
-      if (saved === undefined) delete process.env.LURKER_LINK_PREVIEWS;
-      else process.env.LURKER_LINK_PREVIEWS = saved;
+      if (saved === undefined) delete process.env.LURKER_PREVIEWS_URL;
+      else process.env.LURKER_PREVIEWS_URL = saved;
     }
   });
 });

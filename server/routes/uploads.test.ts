@@ -167,6 +167,48 @@ describe('POST /api/uploads', () => {
     expect(row.thumbnail_url).toBeUndefined();
   });
 
+  // #788, end to end. These bytes always went through — a `.md` is signature-less
+  // UTF-8, exactly what the text branch takes — but came back as `.txt`, and the
+  // recorded mime lost the one thing telling an editor how to read the file.
+  it('keeps a markdown or JSON upload under its own name and mime', async () => {
+    const cases: [string, string, string, string][] = [
+      ['README.md', 'text/markdown', 'md', 'text/markdown'],
+      ['data.json', 'application/json', 'json', 'application/json'],
+      // The Windows gap: no registered mime for `.md`, so the claim arrives as plain
+      // text and the filename is the only signal left.
+      ['notes.md', 'text/plain', 'md', 'text/markdown'],
+    ];
+    for (const [filename, contentType, ext, mime] of cases) {
+      const res = await agent
+        .post('/api/uploads')
+        .attach('image', Buffer.from('# notes — ünïcodé\n'), { filename, contentType });
+      expect({ filename, status: res.status }).toEqual({ filename, status: 200 });
+      expect(res.body.url).toMatch(new RegExp(`\\.${ext}$`));
+
+      const list = await agent.get('/api/uploads');
+      const row = list.body.items.find((r: { id: number }) => r.id === res.body.id);
+      expect({ filename, mime: row.mime }).toEqual({ filename, mime });
+      // …and it is findable under the filter it belongs to, which for JSON only works
+      // because the kind clause names the mime explicitly (shared/uploadKinds.ts).
+      const filtered = await agent.get('/api/uploads?kind=text');
+      expect(filtered.body.items.map((r: { id: number }) => r.id)).toContain(res.body.id);
+    }
+  });
+
+  // The relaxation is bounded by the dialect table, not by the caller. An `.html` that
+  // decodes as UTF-8 is still text, and must never name the key we serve.
+  it('will not let an unlisted extension become the served one', async () => {
+    const res = await agent
+      .post('/api/uploads')
+      .attach('image', Buffer.from('<b>not markup to us</b>'), {
+        filename: 'evil.html',
+        contentType: 'text/html',
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.url).toMatch(/\.txt$/);
+    expect(res.body.url).not.toContain('html');
+  });
+
   it('preserves an animated GIF (no re-encode)', async () => {
     // sharp().gif() above produces a single-frame GIF, which the pipeline
     // re-encodes as JPEG. The 'animated bypass' branch is exercised when
@@ -472,6 +514,137 @@ describe('GET /api/uploads — search params', () => {
     const res = await agent.get('/api/uploads?q=zzzz-no-such-file');
     expect(res.status).toBe(200);
     expect(res.body.items).toEqual([]);
+  });
+});
+
+// Starred uploads — the user's own quick-access set, backing the composer picker.
+describe('uploads favourites', () => {
+  const upload = async (filename: string) => {
+    const res = await agent
+      .post('/api/uploads')
+      .attach('image', smallPng, { filename, contentType: 'image/png' });
+    return res.body.id as number;
+  };
+  const favorites = async (query = '') =>
+    (await agent.get(`/api/uploads?favorites=1${query}`)).body.items as Array<{
+      id: number;
+      filename: string;
+      favorite: boolean;
+    }>;
+
+  // Every test starts from an empty starred set — they share one DB, and a star
+  // left behind by a neighbour would show up as an extra row in someone else's
+  // assertion about the whole list.
+  afterEach(async () => {
+    for (const row of await favorites()) await agent.delete(`/api/uploads/${row.id}/favorite`);
+  });
+
+  it('stars an upload, and the list reflects it both ways', async () => {
+    const id = await upload('star-me.png');
+
+    const before = await agent.get('/api/uploads');
+    expect(before.body.items.find((r: { id: number }) => r.id === id).favorite).toBe(false);
+    expect(await favorites()).toEqual([]);
+
+    const put = await agent.put(`/api/uploads/${id}/favorite`);
+    expect(put.status).toBe(200);
+    expect(put.body).toEqual({ ok: true, favorite: true });
+
+    expect((await favorites()).map((r) => r.id)).toEqual([id]);
+    const after = await agent.get('/api/uploads');
+    expect(after.body.items.find((r: { id: number }) => r.id === id).favorite).toBe(true);
+  });
+
+  it('unstars it again', async () => {
+    const id = await upload('unstar-me.png');
+    await agent.put(`/api/uploads/${id}/favorite`);
+
+    const del = await agent.delete(`/api/uploads/${id}/favorite`);
+    expect(del.status).toBe(200);
+    expect(del.body).toEqual({ ok: true, favorite: false });
+    expect(await favorites()).toEqual([]);
+  });
+
+  // The route's 404 has to mean "no such upload", not "wasn't starred" — otherwise
+  // a client that unstars a row it already unstarred (a double click, a second tab)
+  // surfaces a phantom error.
+  it('unstarring an already-unstarred upload succeeds rather than 404ing', async () => {
+    const id = await upload('never-starred.png');
+    const del = await agent.delete(`/api/uploads/${id}/favorite`);
+    expect(del.status).toBe(200);
+  });
+
+  it("404s for an upload that doesn't exist", async () => {
+    expect((await agent.put('/api/uploads/999999/favorite')).status).toBe(404);
+    expect((await agent.delete('/api/uploads/999999/favorite')).status).toBe(404);
+  });
+
+  // ⚠ The whole reason favourites store a timestamp instead of a boolean. Star a
+  // two-year-old upload today and it belongs at the FRONT of your quick-access
+  // list — under `id DESC` it would sink to the bottom, which is exactly the
+  // opposite of what starring it meant.
+  it('orders by when you starred, not by when you uploaded', async () => {
+    const older = await upload('older-upload.png');
+    const newer = await upload('newer-upload.png');
+    expect(newer).toBeGreaterThan(older);
+
+    await agent.put(`/api/uploads/${newer}/favorite`);
+    // favorited_at has millisecond resolution and `id DESC` breaks exact ties, so
+    // without a gap here the assertion could pass for the wrong reason.
+    await new Promise((r) => setTimeout(r, 10));
+    await agent.put(`/api/uploads/${older}/favorite`);
+
+    expect((await favorites()).map((r) => r.id)).toEqual([older, newer]);
+  });
+
+  it('composes with the kind and search filters', async () => {
+    const png = await upload('starred-picture.png');
+    const txt = (
+      await agent.post('/api/uploads').attach('image', Buffer.from('notes'), {
+        filename: 'starred-notes.txt',
+        contentType: 'text/plain',
+      })
+    ).body.id as number;
+    const unstarred = await upload('starred-picture-decoy.png');
+
+    await agent.put(`/api/uploads/${png}/favorite`);
+    await agent.put(`/api/uploads/${txt}/favorite`);
+
+    expect((await favorites()).map((r) => r.id).toSorted()).toEqual([png, txt].toSorted());
+    expect((await favorites('&kind=image')).map((r) => r.id)).toEqual([png]);
+    expect((await favorites('&q=notes')).map((r) => r.id)).toEqual([txt]);
+    // The decoy matches the search but was never starred.
+    expect((await favorites('&q=starred-picture')).map((r) => r.id)).toEqual([png]);
+    expect(unstarred).toBeGreaterThan(0);
+  });
+
+  // A moderated takedown destroys the bytes but keeps the row as a tombstone. It
+  // must not sit in a quick-access list offering to insert a URL that now 404s —
+  // but the owner still has to be able to unstar it.
+  it('drops a moderated upload out of the starred view, yet still lets it be unstarred', async () => {
+    const { markUploadRemovedById } = await import('../db/uploadHistory.js');
+    const id = await upload('taken-down.png');
+    await agent.put(`/api/uploads/${id}/favorite`);
+    expect((await favorites()).map((r) => r.id)).toEqual([id]);
+
+    markUploadRemovedById(id);
+    expect(await favorites()).toEqual([]);
+
+    // Still reachable through the unfiltered browse, still flagged as starred, and
+    // the unstar goes through.
+    const all = await agent.get('/api/uploads');
+    const row = all.body.items.find((r: { id: number }) => r.id === id);
+    expect(row.removed).toBe(true);
+    expect(row.favorite).toBe(true);
+    expect((await agent.delete(`/api/uploads/${id}/favorite`)).status).toBe(200);
+  });
+
+  it('never leaks the favourite timestamp to the client — just the boolean', async () => {
+    const id = await upload('boolean-only.png');
+    await agent.put(`/api/uploads/${id}/favorite`);
+    const row = (await favorites())[0];
+    expect(row.favorite).toBe(true);
+    expect(row).not.toHaveProperty('favorited_at');
   });
 });
 

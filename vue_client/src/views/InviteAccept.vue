@@ -28,7 +28,9 @@
           <label>
             <span>Username</span>
             <input
-              v-model="username"
+              :value="username"
+              @input="onUsernameInput"
+              @keydown.enter="blockImeEnter"
               autocomplete="username"
               autofocus
               required
@@ -70,6 +72,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth.js';
 import WordBackdrop from '../components/WordBackdrop.vue';
 import { USERNAME_PATTERN, MAX_USERNAME_LENGTH } from '../../../shared/username.js';
+import { blockImeEnter, useImeSafeInput } from '../composables/useImeSafeInput.js';
 
 const route = useRoute();
 const router = useRouter();
@@ -83,6 +86,7 @@ interface InviteStatus {
 const status = ref<InviteStatus | null>(null);
 const checking = ref(true);
 const username = ref('');
+const onUsernameInput = useImeSafeInput(username);
 const password = ref('');
 const working = ref(false);
 

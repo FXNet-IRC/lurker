@@ -22,7 +22,9 @@
       <label>
         <span>Name</span>
         <input
-          v-model="newName"
+          :value="newName"
+          @input="onNameInput"
+          @keydown.enter="blockImeEnter"
           type="text"
           maxlength="64"
           placeholder="e.g. claude-desktop, autonotes"
@@ -79,6 +81,7 @@
 import { ref, onMounted } from 'vue';
 import { api } from '../../api.js';
 import { formatRelative } from '../../utils/timestamp.js';
+import { blockImeEnter, useImeSafeInput } from '../../composables/useImeSafeInput.js';
 
 interface ApiToken {
   id: string;
@@ -96,6 +99,7 @@ interface RevealedToken {
 
 const tokens = ref<ApiToken[]>([]);
 const newName = ref('');
+const onNameInput = useImeSafeInput(newName);
 const newAllowWrite = ref(false);
 const revealed = ref<RevealedToken | null>(null);
 const copied = ref(false);

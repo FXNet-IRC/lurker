@@ -57,6 +57,32 @@ export interface ActiveBuffer {
   network: Network | undefined;
 }
 
+/**
+ * Whether Disconnect is the action this network needs, rather than Connect.
+ *
+ * ⚠⚠ The question is "is Lurker holding a connection for this network", NOT "is it on the wire".
+ * Since the auto-reconnect overhaul a dropped network keeps its IrcConnection for the whole
+ * outage while the retry controller backs off, so `reconnecting` is a network Lurker is very
+ * much still working on — and the retry ladder is deliberately unbounded. Testing for
+ * `connected` instead made Reconnect the only offered action during a backoff, and Reconnect
+ * routes through restartNetwork: it tears the connection down and starts a fresh loop. A
+ * network stuck against a dead server therefore had NO reachable stop, which is #785. Turning
+ * off `autoconnect` doesn't stop it either — that flag is about boot, not about retries.
+ *
+ * ⚠⚠ `connecting` is deliberately NOT included, though it is equally "Lurker is working on it".
+ * `setState('connecting')` fires the moment irc-framework opens the socket — tens of milliseconds
+ * after the POST, well inside a double-click. So a user who clicks Reconnect on a down network and
+ * impatiently clicks again would hit a button that had already relabelled itself Disconnect, and
+ * tear down the connection they just asked for. Before this predicate existed the second click
+ * re-fired restartNetwork harmlessly, and it still does. A hung TLS handshake is real but
+ * transient and self-resolving; the unbounded retry ladder is the stuck state #785 is about.
+ *
+ * An absent state means we've never heard about this network, which reads as Connect.
+ */
+export function canDisconnect(state: string | null | undefined): boolean {
+  return state === 'connected' || state === 'reconnecting';
+}
+
 export const useNetworksStore = defineStore('networks', {
   state: () => ({
     networks: [] as Network[],

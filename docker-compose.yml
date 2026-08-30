@@ -65,6 +65,20 @@ services:
       # - LURKER_BOUNCER_ENABLED=true
       # - LURKER_BOUNCER_PORT=6667
       #
+      # ───── Optional: Link previews & inline media ────────────────────────
+      # Off by default. A pasted link can unfurl into a card, an image can
+      # render inline, and a video can show a poster frame — but all of the
+      # fetching and media parsing happens in a SECOND container, so this one
+      # never dials a stranger's URL. Run both with:
+      #
+      #   curl -O https://raw.githubusercontent.com/amiantos/lurker/main/docker-compose.previews.yml
+      #   docker compose -f docker-compose.yml -f docker-compose.previews.yml up -d
+      #
+      # That overlay sets the variable below for you (its presence is the whole
+      # enable switch) and adds the decoder service. See docs/SELF_HOSTING.md
+      # for the egress model and the hardening step.
+      # - LURKER_PREVIEWS_URL=http://lurker-previews:8030
+      #
       # ───── Optional: Secure cookie flag ──────────────────────────────────
       # Off by default so cookies work over plain HTTP (localhost / LAN) and
       # behind TLS-terminating proxies (Cloudflare Tunnel, Caddy, etc.)

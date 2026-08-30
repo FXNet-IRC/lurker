@@ -28,6 +28,11 @@ export function validate(key: string, raw: unknown): ValidateResult {
         return { ok: false, error: `${key} must be >= ${opt.min}` };
       if (typeof opt.max === 'number' && n > opt.max)
         return { ok: false, error: `${key} must be <= ${opt.max}` };
+      // Neutral wording on purpose: what 0 MEANS (off, unlimited, …) is the
+      // option description's job — for retention "off" would be wrong, 0 keeps
+      // everything.
+      if (typeof opt.minNonzero === 'number' && n !== 0 && n < opt.minNonzero)
+        return { ok: false, error: `${key} must be 0 or >= ${opt.minNonzero}` };
       return { ok: true, value: n };
     }
     case 'string':

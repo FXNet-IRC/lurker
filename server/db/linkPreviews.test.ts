@@ -31,6 +31,7 @@ function record(url: string, over: Partial<PreviewRecord> = {}): PreviewRecord {
     imageHeight: null,
     embedUrl: null,
     mime: null,
+    posterKey: null,
     expiresAt: new Date(Date.now() + mod.OK_TTL_MS).toISOString(),
     ...over,
   };

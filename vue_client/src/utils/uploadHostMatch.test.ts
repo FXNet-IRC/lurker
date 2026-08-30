@@ -97,6 +97,21 @@ describe('mediaKindForUrl', () => {
     expect(mediaKindForUrl(url)).toBeNull();
   });
 
+  // ⚠ Regression guard, NOT an oversight. The uploader mints `.md` and `.json`
+  // (#788) and it is tempting to list them here so our own upload opens in-app —
+  // but this table judges arbitrary chat links, and those extensions are
+  // overwhelmingly PAGE urls. Listing them swallows the click on a GitHub blob and
+  // lands the user on "could not read this file" instead of GitHub, and makes
+  // previewUrls count the same link as media so it loses its preview card. See the
+  // note in uploadHostMatch.ts before changing this.
+  it.each([
+    'https://github.com/o/r/blob/main/README.md',
+    'https://x.test/docs/guide.markdown',
+    'https://api.x.test/v1/users.json',
+  ])('leaves %s alone rather than swallowing the click', (url) => {
+    expect(mediaKindForUrl(url)).toBeNull();
+  });
+
   it('keeps isImageUrl in agreement with itself', () => {
     expect(isImageUrl('https://x.test/a.png')).toBe(true);
     // An image-only caller must not start treating videos as images.

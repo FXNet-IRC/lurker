@@ -9,6 +9,7 @@ import { useAuthStore } from '../stores/auth.js';
 import { useSettingsStore } from '../stores/settings.js';
 import { useThemesStore } from '../stores/themes.js';
 import { THEME_POINTER_KEYS } from '../../../shared/themePresets.js';
+import { WS_CLOSE_SESSION_REVOKED } from '../../../shared/wsCloseCodes.js';
 import { primePreviews } from './useLinkPreview.js';
 import { previewableEventTexts } from '../utils/previewEvents.js';
 import { useConfigStore } from '../stores/config.js';
@@ -17,7 +18,6 @@ import { useInputHistoryStore } from '../stores/inputHistory.js';
 import { bufferClosed, applyBufferRenamed } from '../lib/bufferLifecycle.js';
 import { useDraftStore } from '../stores/drafts.js';
 import { useChanlistStore } from '../stores/chanlist.js';
-import { useSearchStore } from '../stores/search.js';
 import { usePinsStore } from '../stores/pins.js';
 import { useFavoritesStore, type FavoriteEntry } from '../stores/favorites.js';
 import { useNicklistCollapseStore } from '../stores/nicklistCollapse.js';
@@ -274,7 +274,11 @@ function applyEvent(event: any): void {
       buffers.pushMessage(event);
       break;
     case 'names':
-      buffers.setMembers(event.networkId, event.target, event.members);
+      // Provisional while an engine re-attach has not heard the channel's
+      // NAMES yet (#863): keep the list already held, see setMembers.
+      buffers.setMembers(event.networkId, event.target, event.members, {
+        provisional: !!event.membersPending,
+      });
       break;
     // Incremental nicklist patch — not persisted, so no pushMessage/dedupe.
     case 'member-update':
@@ -602,7 +606,9 @@ function applySnapshot(snapshot: any[], globalIgnores: any[] = []): void {
           ? { nick: m, modes: [], away: false }
           : { nick: m.nick, modes: m.modes || [], away: !!m.away },
       );
-      buffers.setMembers(net.networkId, ch.name, normalized);
+      buffers.setMembers(net.networkId, ch.name, normalized, {
+        provisional: !!ch.membersPending,
+      });
       buffers.setTopic(net.networkId, ch.name, ch.topic);
       buffers.setChannelModes(net.networkId, ch.name, ch.modes || '');
     }
@@ -821,11 +827,6 @@ function handleMessage(raw: string): void {
     chanlist.applyResult(payload);
     return;
   }
-  if (payload.kind === 'search-result') {
-    const search = useSearchStore();
-    search.applyResult(payload);
-    return;
-  }
   if (payload.kind === 'e2eExport') {
     // Response to `/e2e export` — download the JSON as a file rather than render
     // it (it carries the private key). Reaches only the requesting tab.
@@ -1016,7 +1017,7 @@ function open() {
   );
   socket.addEventListener(
     'close',
-    () => {
+    (ev) => {
       connected.value = false;
       socket = null;
       // A probe armed against the socket that just died must not survive into
@@ -1041,6 +1042,31 @@ function open() {
         /* store not yet initialized; nothing in flight */
       }
       const auth = useAuthStore();
+      // The server evicted this device: the session behind this socket was
+      // revoked mid-connection by an account recovery. Reconnecting is futile —
+      // /ws will 401 for the rest of this tab's life — and an ordinary drop is
+      // indistinguishable without the code, which is why the server sends one.
+      //
+      // Clearing the user first is what stops the reconnect arm below (the same
+      // ordering the logout path relies on), then a full navigation to `/`
+      // rebuilds the app against the dead cookie and lands on sign-in. That's
+      // the mechanism api.ts already uses for a session that died under a REST
+      // call; here it's the WS noticing first. A reload rather than an in-app
+      // route change on purpose: every store still holds the evicted account's
+      // data, and resetSession() can't be called from here without an import
+      // cycle (useSessionReset imports resetSocket from this module).
+      if (ev.code === WS_CLOSE_SESSION_REVOKED) {
+        auth.user = null;
+        // ...except in the tab doing the recovering. The server closes sockets
+        // BEFORE it mints the new session, so on a browser that was still signed
+        // in to this account the close frame beats the redemption response —
+        // navigating here would cancel that in-flight fetch and throw away the
+        // Set-Cookie, dumping the member at /login with their single-use link
+        // already spent. That tab routes itself to `/` on success anyway, so
+        // leaving it alone costs nothing.
+        if (!window.location.pathname.startsWith('/recover/')) window.location.assign('/');
+        return;
+      }
       if (auth.user) {
         // A socket that lived a while proves the server is healthy and this was
         // an ordinary drop — start over at the base delay. One that died young

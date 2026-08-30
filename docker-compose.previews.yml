@@ -1,0 +1,225 @@
+# Copyright (c) 2026 Brad Root
+# SPDX-License-Identifier: MPL-2.0
+#
+# Link previews & inline media — the `lurker-previews` decoder.
+#
+# Layer it on top of the base compose file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.previews.yml up -d
+#
+# (Add -f docker-compose.caddy.yml as well if you front Lurker with Caddy —
+# the overlays touch different things and can be combined in any order.)
+#
+# Everything that dials a URL someone pasted in chat, and everything that
+# parses the bytes it gets back, runs in the SECOND container — never in the
+# one holding your database, your uploads and your users' sessions. Pointing
+# Lurker at the decoder is the entire enable switch; there is no separate
+# on/off flag. Each user then opts in for themselves under Settings → Chat
+# (Link previews and Inline media, both off by default).
+#
+# ⚠ EGRESS, and it is the reason this file has a hardening story at all. The
+# decoder is meant to reach the public internet and NOTHING private, and it
+# proves that at boot — on an ordinary Docker network it can reach your host,
+# so it would refuse to serve. This file therefore ships
+# LURKER_PREVIEWS_ALLOW_PRIVATE=1, which skips that self-test. The decoder's
+# in-process SSRF guard is unaffected, so a malicious *link* is refused either
+# way; what you give up is containment of a malicious *process*.
+#
+# On a Linux host you can have both. Put LURKER_PREVIEWS_ALLOW_PRIVATE=0 in a
+# .env file beside this one and run deploy/previews-egress.sh, which installs
+# the firewall rules that make the self-test pass — and a systemd unit that
+# re-applies them on every boot and whenever Docker restarts. ⚠ One gap it
+# cannot cover: a host firewall that rewrites the filter table later (a `ufw
+# allow …` reload) drops the host-protection rule, and the decoder only
+# re-tests itself when it starts — so re-run the script after changing ufw or
+# firewalld. See "Link previews & inline media" in docs/SELF_HOSTING.md.
+
+services:
+  lurker:
+    environment:
+      # Merges into the base file's environment list. The presence of this
+      # variable IS the feature gate: drop this overlay and previews are off.
+      - LURKER_PREVIEWS_URL=http://lurker-previews:8030
+      #
+      # ───── Caching the preview image BYTES ───────────────────────────────
+      # Optional for links and images; ⚠⚠ REQUIRED FOR VIDEO POSTERS. With the
+      # cache off, a video link renders as a card with no frame on it and
+      # nothing logs, because a posterless card is a supported state. The
+      # reason is structural rather than a policy: a poster is the one preview
+      # image with NO ORIGIN URL — the decoder makes those bytes and they exist
+      # nowhere else — so if nothing can store them there is nothing to serve.
+      # The server acts on that in three places: it doesn't ask the decoder for
+      # a poster, it won't put a poster key on the row, and the poster route
+      # answers 404. Uncomment the mode below and posters work.
+      #
+      # ⚠ Turning it on doesn't backfill. A video someone pasted while the
+      # cache was off is remembered as posterless for OK_TTL (7 days); it grows
+      # a frame when that row expires and the link is seen again.
+      #
+      # For links and images this is only about how often the same picture is
+      # re-fetched from the site hosting it: uncached, the metadata is
+      # remembered but the bytes are not, so ten people scrolling past the same
+      # image is ten fetches from its origin (once per person per day — the
+      # browsers hold their own copies). Misconfiguration is never fatal: a bad
+      # value logs one warning, caching turns off, previews keep working.
+      #
+      # ⚠ These belong on THIS service, not the decoder. Storing bytes needs
+      # credentials, and the container that parses hostile input is the last
+      # place to keep any — it hands bytes back, Lurker decides where they go.
+      #
+      # ⚠ Cached CONTENT is images only: video and audio are never stored (they
+      # are read in ranges, so one seek is many requests for one object, and
+      # caching them would trade the bandwidth this saves for memory it cannot
+      # bound). A poster is a still, which is why it can be kept at all.
+      #
+      #   off     stream through, store nothing. The default — and no posters.
+      #   local   a directory beside the database. The sensible self-host
+      #           choice — it needs no extra volume, since it lives inside the
+      #           ./data mount the base compose file already has.
+      #   s3      a bucket you own, served from its public base URL. Posters
+      #           work under this one too; the gate is "not off", not "local".
+      #
+      # Set these in a .env file beside this compose — they are declared at the
+      # bottom of this list, so a value there reaches the container:
+      #
+      #   LURKER_PREVIEW_CACHE_MODE=local
+      #   LURKER_PREVIEW_CACHE_DIR=          # default: <data dir>/preview-cache
+      #   LURKER_PREVIEW_CACHE_MAX_BYTES=    # local only; default 2 GiB, digits only
+      #
+      # ───── mode=s3 ───────────────────────────────────────────────────────
+      # For an instance already behind a CDN: cached images are served from
+      # the bucket's public URL, so your server ships zero bytes for an image
+      # it has already fetched. All five of the first fields are REQUIRED —
+      # leave any one unset and caching stays off, naming the field.
+      #
+      # ⚠⚠ THE OBJECTS ARE PUBLIC. Anyone with the URL can read a cached image
+      # for as long as it is kept — the same property Slack's and Discord's
+      # image proxies have. Only allowlisted image types are stored (SVG is
+      # refused) and only your logged-in users can cause an image to be cached
+      # at all, but do not point this at a bucket holding anything else.
+      #
+      # ⚠ PUBLIC_BASE_URL must be https. A browser blocks an http:// image on
+      # an https page as mixed content — an http base URL is a cache that
+      # never renders.
+      #
+      # ⚠ Retention is YOURS. Set a lifecycle rule on the prefix (30 days is
+      # the recommendation — Lurker stops serving an object after 7 and drops
+      # its index row). Nothing here deletes objects for you.
+      #
+      # ⚠ Of the six hardening headers the proxy sends, only three survive on
+      # a stored object (Content-Type, Content-Disposition, Cache-Control).
+      # Add nosniff / CSP / CORP at your CDN edge if you want them here too.
+      #
+      # ⚠⚠ NEEDS AN UP-TO-DATE iOS APP. Cached images are served from the CDN
+      # URL rather than through this server, and Lurker for iOS only learned
+      # to follow an absolute image URL alongside this feature. Older builds
+      # show every cached preview as blank for the rest of the session. The
+      # web client is unaffected.
+      #
+      # ⚠ Switching modes (local <-> s3) leaves the old backend's bytes behind:
+      # the index rows are swept, but the server only knows where the CURRENT
+      # backend stores things and will not guess a path and delete what is
+      # there. Remove the old directory or bucket prefix by hand.
+      #
+      # In that same .env file:
+      #
+      #   LURKER_PREVIEW_CACHE_MODE=s3
+      #   LURKER_PREVIEW_CACHE_S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+      #   LURKER_PREVIEW_CACHE_S3_BUCKET=
+      #   LURKER_PREVIEW_CACHE_S3_ACCESS_KEY_ID=
+      #   LURKER_PREVIEW_CACHE_S3_SECRET_ACCESS_KEY=
+      #   LURKER_PREVIEW_CACHE_S3_PUBLIC_BASE_URL=https://cdn.example.com
+      #   LURKER_PREVIEW_CACHE_S3_PREFIX=previews  # optional; sanitised to [A-Za-z0-9._-]/
+      #   LURKER_PREVIEW_CACHE_S3_REGION=          # default: auto (correct for R2)
+      # ⚠ LURKER_PREVIEW_CACHE_DIR is still used in s3 mode — it is where bytes
+      # are staged on their way to the bucket, so it stays inside ./data.
+      #
+      # The full reference — every field, every caveat, and the reasoning — is
+      # in .env.example, worth reading before turning on s3.
+      #
+      # ⚠ The plumbing for all of the above. Compose passes a variable to the
+      # container only if the service NAMES it, so documenting these as
+      # commented-out lines would have made "put it in .env" quietly do
+      # nothing. Empty is exactly equivalent to unset — the server trims and
+      # falls back for every one of them — so declaring them costs nothing and
+      # the default stays "no cache".
+      - LURKER_PREVIEW_CACHE_MODE=${LURKER_PREVIEW_CACHE_MODE:-}
+      - LURKER_PREVIEW_CACHE_DIR=${LURKER_PREVIEW_CACHE_DIR:-}
+      - LURKER_PREVIEW_CACHE_MAX_BYTES=${LURKER_PREVIEW_CACHE_MAX_BYTES:-}
+      - LURKER_PREVIEW_CACHE_S3_ENDPOINT=${LURKER_PREVIEW_CACHE_S3_ENDPOINT:-}
+      - LURKER_PREVIEW_CACHE_S3_BUCKET=${LURKER_PREVIEW_CACHE_S3_BUCKET:-}
+      - LURKER_PREVIEW_CACHE_S3_ACCESS_KEY_ID=${LURKER_PREVIEW_CACHE_S3_ACCESS_KEY_ID:-}
+      - LURKER_PREVIEW_CACHE_S3_SECRET_ACCESS_KEY=${LURKER_PREVIEW_CACHE_S3_SECRET_ACCESS_KEY:-}
+      - LURKER_PREVIEW_CACHE_S3_PUBLIC_BASE_URL=${LURKER_PREVIEW_CACHE_S3_PUBLIC_BASE_URL:-}
+      - LURKER_PREVIEW_CACHE_S3_PREFIX=${LURKER_PREVIEW_CACHE_S3_PREFIX:-}
+      - LURKER_PREVIEW_CACHE_S3_REGION=${LURKER_PREVIEW_CACHE_S3_REGION:-}
+    networks:
+      # ⚠ `priority` keeps Lurker's DEFAULT ROUTE on the default network even
+      # though it is attached to two. That matters once you harden: the egress
+      # rules are scoped to addresses on the previews bridge, and Lurker's own
+      # outbound traffic — IRC, uploads, push — must not leave from there.
+      default:
+        priority: 100
+      previews: {}
+
+  lurker-previews:
+    image: ghcr.io/amiantos/lurker-previews:latest
+    container_name: lurker-previews
+    restart: unless-stopped
+    # Deliberately on its own bridge, and NOT on the default network: the
+    # egress rules key off this subnet, and only Lurker needs to reach it.
+    # No ports are published — nothing on your host or LAN talks to it.
+    networks:
+      - previews
+    environment:
+      - LURKER_PREVIEWS_ALLOW_PRIVATE=${LURKER_PREVIEWS_ALLOW_PRIVATE:-1}
+      - LURKER_PREVIEWS_SELFTEST_TARGETS=${LURKER_PREVIEWS_SELFTEST_TARGETS:-}
+      # ⚠ Only read when ALLOW_PRIVATE=0, and then it matters a lot. The
+      # built-in probes are the cloud metadata address and this host's bridge
+      # gateway on :22/:80 — and a probe that nothing is LISTENING at passes
+      # whether or not your firewall exists. Name something private you know
+      # answers, most simply your Docker host's LAN address with sshd on it,
+      # and the self-test becomes a real test. (Verified: with the rules gone,
+      # a named listening target is what makes the decoder refuse to serve.)
+      # Set it in a .env file beside this compose:
+      #   LURKER_PREVIEWS_SELFTEST_TARGETS=192.168.1.10:22
+      # Optional: what the decoder tells sites it is when it fetches a
+      # preview. The default names Lurker and the traffic class (a social
+      # preview fetch), so a site operator reading their logs can recognise
+      # it and block it on purpose.
+      # - LURKER_PREVIEW_USER_AGENT=
+      # Optional: a contact URL or mailto: appended to that User-Agent.
+      # - USER_AGENT_CONTACT=https://lurker.example.com
+    # ⚠ The decoder only ever resolves names it found on the public internet,
+    # so it can use public resolvers — and if it does, the hardening script has
+    # no reason to allow it DNS to your LAN at all (see the port 53 note in
+    # deploy/previews-egress.sh). Uncomment to close that last gap; leave it
+    # alone to inherit whatever this host uses.
+    # dns:
+    #   - 1.1.1.1
+    #   - 9.9.9.9
+    # This process runs memory-unsafe parsers (libvips, ffmpeg) on bytes
+    # strangers chose — so it gets no filesystem, no capabilities, no way to
+    # gain any, and hard resource ceilings.
+    read_only: true
+    # ⚠ ffmpeg's scratch space, and it is RAM: a tmpfs counts against the
+    # memory limit below, which is what bounds it.
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    # ⚠ Counts THREADS, not processes: node's pool plus one capped ffmpeg
+    # decode fits in 128. Meaningfully lower starves thread creation, and the
+    # first symptom is silently posterless cards — a missing poster is a
+    # supported state, so nothing logs.
+    pids_limit: 128
+    logging:
+      options:
+        max-size: 20m
+        max-file: '3'
+
+networks:
+  previews:

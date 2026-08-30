@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import { describe, it, expect } from 'vitest';
-import { parseRelayMessage, compileRelayTemplate, DEFAULT_RELAY_TEMPLATES } from './parseRelay.js';
+import {
+  parseRelayMessage,
+  parseRelayChain,
+  compileRelayTemplate,
+  DEFAULT_RELAY_TEMPLATES,
+} from './parseRelay.js';
 
 describe('parseRelayMessage — default formats', () => {
   it('parses the bracketed-source form `[source] <nick> message`', () => {
@@ -200,5 +205,102 @@ describe('compileRelayTemplate', () => {
     const parsed = parseRelayMessage('a.*b ivan done', '{source}.*b {nick} {message}');
     expect(parsed).toEqual({ source: 'a', nick: 'ivan', text: 'done' });
     expect(parseRelayMessage('aXXb ivan done', '{source}.*b {nick} {message}')).toBeNull();
+  });
+});
+
+// Marks, as the relay-bot store holds them: nick → custom template ('' means the
+// built-in formats). Anything absent is not a relay bot.
+const marks = (m: Record<string, string>) => (nick: string) => m[nick] ?? null;
+
+describe('parseRelayChain — chained bridges (#801)', () => {
+  // The reported line, verbatim from the corpus: `nR` bridges the IRC-nERDs
+  // network, where a bot nicked `|` is itself bridging Matrix/OFTC.
+  const nested =
+    '\x02[IRC-nERDs]\x02 <~\x0306|\x03> \x0313<yrdsb3222[m]/OFTC> \x0fIs their a discord';
+
+  it('stops at the intermediate bridge when only the outer bot is marked', () => {
+    expect(parseRelayChain(nested, '', marks({}))).toEqual({
+      source: 'IRC-nERDs',
+      nick: '|',
+      text: '\x0313<yrdsb3222[m]/OFTC> \x0fIs their a discord',
+    });
+  });
+
+  it('reaches the real speaker once the intermediate bridge is marked too', () => {
+    expect(parseRelayChain(nested, '', marks({ '|': '' }))).toEqual({
+      source: 'IRC-nERDs',
+      nick: 'yrdsb3222[m]/OFTC',
+      text: '\x0fIs their a discord',
+    });
+  });
+
+  it('leaves a quoted nick alone — quoting looks exactly like an envelope', () => {
+    // Real line: raah, on efnet, quoting ultros. `ultros` carries no mark, so
+    // the line stays raah's. This is the whole reason each hop needs one.
+    const quote = '\x02[efnet]\x02 <+\x0303raah\x03> <\x0310ultros\x03> blasphemer! and a heretic!';
+    expect(parseRelayChain(quote, '', marks({ '|': '' }))?.nick).toBe('raah');
+  });
+
+  it('follows a three-deep chain and prefers the innermost [source] tag', () => {
+    // `DeltaCharlie1888` relays `nR`, which relays rizon. The rizon tag is the
+    // one closest to the speaker, so it wins over the hops outside it.
+    const deep = '<nR> [rizon] <Nsane> Looks like the sequel bombed';
+    expect(parseRelayChain(deep, '', marks({ nR: '' }))).toEqual({
+      source: 'rizon',
+      nick: 'Nsane',
+      text: 'Looks like the sequel bombed',
+    });
+  });
+
+  it('prefers the innermost [source] when every hop carries one', () => {
+    // Both tags present, so this is the case that actually pins the direction
+    // of the coalesce — the tests either side of it have a tag on one hop only,
+    // and pass whichever way it's written.
+    expect(parseRelayChain('[A] <bridge> [B] <alice> hi', '', marks({ bridge: '' }))).toEqual({
+      source: 'B',
+      nick: 'alice',
+      text: 'hi',
+    });
+  });
+
+  it('strips a membership prefix on an inner hop too', () => {
+    const line = '<+DOMF> <+Nelluk> many ghosts living and dead abound';
+    expect(parseRelayChain(line, '', marks({ DOMF: '' }))).toEqual({
+      source: null,
+      nick: 'Nelluk',
+      text: 'many ghosts living and dead abound',
+    });
+  });
+
+  it("uses the inner bot's OWN custom template", () => {
+    const line = '[net] <bridge> matrix » alice » hey';
+    expect(parseRelayChain(line, '', marks({ bridge: '{source} » {nick} » {message}' }))).toEqual({
+      source: 'matrix',
+      nick: 'alice',
+      text: 'hey',
+    });
+  });
+
+  it('ends the chain where a marked hop speaks in its own voice', () => {
+    // `bridge` is marked, but this line of its own isn't an envelope — so it
+    // stays attributed to `bridge` rather than falling apart.
+    const line = '[net] <bridge> reconnected to matrix';
+    expect(parseRelayChain(line, '', marks({ bridge: '' }))).toEqual({
+      source: 'net',
+      nick: 'bridge',
+      text: 'reconnected to matrix',
+    });
+  });
+
+  it('terminates on a bot whose envelope names itself', () => {
+    const line = '<loop> <loop> <loop> <loop> <loop> <loop> <loop> done';
+    const parsed = parseRelayChain(line, '', marks({ loop: '' }));
+    // Depth-capped rather than looping: it stops mid-chain, still attributed.
+    expect(parsed?.nick).toBe('loop');
+    expect(parsed?.text).toBe('<loop> <loop> <loop> done');
+  });
+
+  it('returns null when the outer envelope does not parse at all', () => {
+    expect(parseRelayChain('just a line the bot said', '', marks({}))).toBeNull();
   });
 });

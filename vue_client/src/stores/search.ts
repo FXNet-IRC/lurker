@@ -2,42 +2,60 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import { defineStore } from 'pinia';
-import { socketSend } from '../composables/useSocket.js';
+import { api } from '../api.js';
 import { useNetworksStore } from './networks.js';
 import { parseSearchQuery } from '../utils/searchQuery.js';
 
 const PAGE_SIZE = 50;
 
+// The rows are full decorated events; only the fields the UI reads are typed.
 export interface SearchResult {
   id: number;
   networkId: number;
   target: string;
   nick: string;
-  body: string;
-  createdAt: string;
+  text?: string;
+  time?: string;
+  networkName?: string;
   // Sender hostmask, when known — drives client-side ignore filtering.
   userhost?: string | null;
 }
 
-// Full-text message search. WS-based (like chanlist) rather than REST — the
-// server owns the FTS index and there's no separate HTTP route. The store is a
-// thin view of the most recent query's results plus its pagination cursor.
+// A fresh search aborts the in-flight one — over REST a superseded
+// search-as-you-type request is actually cancelled (the server checks
+// req.destroyed before spending the query), where the old WS verb ran every
+// stale search to completion and merely discarded the reply. Module-level
+// because an AbortController doesn't belong in reactive store state.
+let inflight: AbortController | null = null;
+
+// Full-text message search over GET /api/search (#676) — the same
+// search_messages verb the deprecated WS `search` command wraps, behind the
+// same `{items, nextBefore}` feed contract as highlights and bookmarks. This
+// store is the reference REST implementation for clients migrating off the WS
+// command (docs/MIGRATION_SEARCH_REST.md). The store is a thin view of the
+// most recent query's results plus its pagination cursor.
 export const useSearchStore = defineStore('search', {
   state: () => ({
     query: '', // Raw input string, including the from:/in:/on: syntax.
     results: [] as SearchResult[],
-    hasMore: false,
     nextBefore: null as number | null, // Message id cursor for the next page.
     loading: false,
     error: '',
-    // Monotonic token tagged onto each fresh search; the server echoes it and
-    // results for a superseded token are dropped (debounced typing fires
+    // Monotonic token tagged onto each fresh search; a response that resolves
+    // after its token has been superseded is dropped (debounced typing fires
     // several searches). Pagination reuses the current token — it continues a
     // search rather than starting a new one.
     token: 0,
     // True once a search has actually been dispatched, so the modal can tell
     // "no matches" apart from "haven't searched yet".
     searched: false,
+    // URL of the last dispatched fresh search. The modal's typing debounce
+    // fires on ANY input change, including ones that parse to the same query
+    // (a trailing space, an incomplete `from:` token still in free text) —
+    // without this, each of those cleared the results and refetched identical
+    // rows. History is immutable, so serving the standing results for an
+    // identical effective query is always correct.
+    lastUrl: null as string | null,
     // Persist the modal's scroll position and keyboard cursor across
     // open/close. Tapping a result jumps to a buffer and closes the modal;
     // reopening should put the user back exactly where they were so a series
@@ -45,90 +63,108 @@ export const useSearchStore = defineStore('search', {
     // continuous. Reset by runSearch() — a brand-new query starts fresh.
     scrollTop: 0,
   }),
+  getters: {
+    hasMore: (state) => state.nextBefore != null,
+  },
   actions: {
     setQuery(raw: string) {
       this.query = raw;
     },
-    // Build the structured WS payload from the raw query. Returns null when
-    // there's nothing to search on (no free text and no structured filter).
-    buildPayload(before: number | null) {
+    // Build the request URL from the raw query. Returns null when there's
+    // nothing to search on (no free text and no structured filter).
+    buildUrl(before: number | null): string | null {
       const parsed = parseSearchQuery(this.query);
-      const payload: Record<string, unknown> = {
-        type: 'search',
-        token: this.token,
-        limit: PAGE_SIZE,
-      };
-      if (parsed.query) payload.query = parsed.query;
-      if (parsed.from.length) payload.nicks = parsed.from;
-      if (parsed.in) payload.target = parsed.in;
+      const params = new URLSearchParams();
+      params.set('limit', String(PAGE_SIZE));
+      if (parsed.query) params.set('q', parsed.query);
+      // `from:` may repeat (a friend's alts) — append each so the server
+      // OR-matches every nick.
+      for (const nick of parsed.from) params.append('nick', nick);
+      if (parsed.in) params.set('target', parsed.in);
+      let networkId: number | null = null;
       if (parsed.on) {
         const networks = useNetworksStore();
         const match = networks.networks.find(
           (n) => n.name.toLowerCase() === parsed.on.toLowerCase(),
         );
-        if (match) payload.networkId = match.id;
+        if (match) networkId = match.id;
       }
-      if (!payload.query && !payload.nicks && !payload.target && payload.networkId == null) {
+      if (networkId != null) params.set('networkId', String(networkId));
+      if (!parsed.query && !parsed.from.length && !parsed.in && networkId == null) {
         return null;
       }
-      if (before) payload.before = before;
-      return payload;
+      if (before) params.set('before', String(before));
+      return `/api/search?${params.toString()}`;
     },
-    runSearch() {
-      this.token += 1;
+    async runSearch() {
+      const url = this.buildUrl(null);
+      // Same effective query as the search already on screen — keep it. The
+      // `searched` guard covers the scoped modal's fresh slate (it patches
+      // searched:false), and an errored dispatch clears itself below so a
+      // retype retries instead of being swallowed.
+      if (url !== null && this.searched && !this.error && url === this.lastUrl) return;
+      this.lastUrl = url;
+      const token = (this.token += 1);
+      inflight?.abort();
       this.results = [];
-      this.hasMore = false;
       this.nextBefore = null;
       this.error = '';
       this.scrollTop = 0;
-      const payload = this.buildPayload(null);
-      if (!payload) {
+      if (!url) {
         this.loading = false;
         this.searched = false;
         return;
       }
+      const controller = new AbortController();
+      inflight = controller;
       this.loading = true;
       this.searched = true;
-      if (!socketSend(payload)) {
-        this.loading = false;
-        this.error = 'not connected';
+      try {
+        const { items, nextBefore } = await api(url, { signal: controller.signal });
+        if (token !== this.token) return; // Superseded by a newer search.
+        this.results = items || [];
+        this.nextBefore = nextBefore ?? null;
+      } catch (e: any) {
+        if (token !== this.token || controller.signal.aborted) return;
+        this.error = e.message || 'search failed';
+      } finally {
+        if (token === this.token) this.loading = false;
       }
     },
-    loadMore() {
-      if (this.loading || !this.hasMore || this.nextBefore == null) return;
-      const payload = this.buildPayload(this.nextBefore);
-      if (!payload) return;
+    async loadMore() {
+      if (this.loading || this.nextBefore == null) return;
+      const url = this.buildUrl(this.nextBefore);
+      if (!url) return;
+      const token = this.token;
       this.loading = true;
-      if (!socketSend(payload)) {
-        this.loading = false;
-        this.error = 'not connected';
-      }
-    },
-    applyResult(payload: any) {
-      if (payload.token !== this.token) return; // Superseded query.
-      this.loading = false;
-      const incoming: SearchResult[] = Array.isArray(payload.results) ? payload.results : [];
-      if (payload.before) {
-        // Pagination append — dedupe by id in case batches overlap.
+      // Clear any stale failure so a successful retry doesn't render fresh
+      // rows under an old error banner (same pattern as the highlights store).
+      this.error = '';
+      try {
+        const { items, nextBefore } = await api(url);
+        if (token !== this.token) return; // Query changed while paging.
+        // Append — dedupe by id in case pages overlap.
         const seen = new Set(this.results.map((r) => r.id));
-        for (const r of incoming) {
+        for (const r of (items || []) as SearchResult[]) {
           if (!seen.has(r.id)) this.results.push(r);
         }
-      } else {
-        this.results = incoming;
+        this.nextBefore = nextBefore ?? null;
+      } catch (e: any) {
+        if (token !== this.token) return;
+        this.error = e.message || 'search failed';
+      } finally {
+        if (token === this.token) this.loading = false;
       }
-      this.hasMore = !!payload.hasMore;
-      const last = this.results[this.results.length - 1];
-      this.nextBefore = this.hasMore && last ? last.id : null;
     },
     reset() {
+      inflight?.abort();
       this.query = '';
       this.results = [];
-      this.hasMore = false;
       this.nextBefore = null;
       this.loading = false;
       this.error = '';
       this.searched = false;
+      this.lastUrl = null;
       this.scrollTop = 0;
     },
   },

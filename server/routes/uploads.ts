@@ -43,6 +43,7 @@ import {
   getThumbnail,
   getUploadForReap,
   deleteUpload,
+  setUploadFavorite,
 } from '../db/uploadHistory.js';
 import { reportUploadSoon } from '../services/moderationReport.js';
 
@@ -270,7 +271,10 @@ router.post('/', uploadToDisk, async (req: Request, res: Response, next: NextFun
     // the EXIF scrub lives. See services/contentClass.ts.
     let classified: Classification;
     try {
-      classified = await classifyUpload(req.file.path, req.file.mimetype);
+      // The filename rides along only so a `.md`/`.json` keeps its name on platforms
+      // that register no MIME for it (#788). It cannot widen the accepted set, and it
+      // is not where the served extension comes from — see contentClass.ts.
+      classified = await classifyUpload(req.file.path, req.file.mimetype, req.file.originalname);
     } catch (err) {
       if (err instanceof UnsupportedTypeError) {
         res.status(415).json({ error: err.message });
@@ -510,14 +514,24 @@ router.get('/', (req: Request, res: Response) => {
   // An unknown kind is ignored rather than 400'd: it can only come from a client we
   // shipped, and silently showing everything beats erroring out of a browse.
   const kind = isUploadKind(req.query.kind) ? req.query.kind : null;
-  const rows: UploadListRow[] = listUploads(req.user!.id, { before, limit, q, kind });
+  // Starred-only. `limit` still applies exactly as it does everywhere else (the
+  // composer's picker asks for a couple of rows' worth) — what does NOT apply is
+  // `before`: listUploads orders this view by when the upload was starred, and an
+  // id cursor against that ordering pages the wrong rows, so it ignores one. A
+  // caller wanting the whole curated set asks for it with limit.
+  const favorites = req.query.favorites === '1' || req.query.favorites === 'true';
+  const rows: UploadListRow[] = listUploads(req.user!.id, { before, limit, q, kind, favorites });
   const configDeletable = configDeletableCheck();
   res.json({
     items: rows.map((r) => {
       const { has_thumbnail, thumbnail_url, removed, uploader_config_id, has_ref, ...rest } = r;
+      // The client only ever needs "is it starred"; the timestamp exists to order
+      // the favourites view server-side and never leaves the server.
+      const { favorited_at, ...item } = rest;
+      const favorite = favorited_at != null;
       // A moderated-away upload keeps its row as a tombstone, but its bytes are
       // gone — advertise no thumbnail so the client renders the tombstone.
-      if (removed) return { ...rest, removed: true };
+      if (removed) return { ...item, favorite, removed: true };
       // A row is deletable only when its bytes can actually be destroyed: the
       // driver captured a delete handle at upload time AND its configured
       // uploader still exists with a delete-capable driver. No ref (x0, anonymous
@@ -526,7 +540,7 @@ router.get('/', (req: Request, res: Response) => {
       // Prefer a remote CDN thumbnail; otherwise fall back to the local
       // BLOB-serving route when an inline thumbnail exists.
       const thumb = thumbnail_url || (has_thumbnail ? `/api/uploads/${r.id}/thumb` : null);
-      return { ...rest, can_delete, ...(thumb ? { thumbnail_url: thumb } : {}) };
+      return { ...item, favorite, can_delete, ...(thumb ? { thumbnail_url: thumb } : {}) };
     }),
     providers: driverIds,
     // The same number the snapshot advertises (#627), repeated here so a
@@ -549,6 +563,31 @@ router.get('/:id/thumb', (req: Request, res: Response) => {
   res.setHeader('Content-Type', thumbnailFormat(row.thumbnail).mime);
   res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
   res.send(row.thumbnail);
+});
+
+// Star / unstar an upload — the user's own quick-access set. Server-side rather
+// than a local preference so the same starred gifs are at hand on every device
+// the account is signed in on.
+//
+// Its own subpath rather than a field on a PATCH of the row: everything else about
+// an upload is immutable once captured (the bytes, the mime, where it landed), and
+// a general-purpose PATCH would imply otherwise. `/:id` never matches `/:id/favorite`
+// — an Express path param does not span a `/` — so this sits beside DELETE /:id
+// without shadowing it.
+router.put('/:id/favorite', (req: Request, res: Response) => {
+  if (!setUploadFavorite(req.user!.id, Number(req.params.id), true)) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  res.json({ ok: true, favorite: true });
+});
+
+router.delete('/:id/favorite', (req: Request, res: Response) => {
+  if (!setUploadFavorite(req.user!.id, Number(req.params.id), false)) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  res.json({ ok: true, favorite: false });
 });
 
 // Delete = destroy the bytes, then drop the row (decision 8, revised). There is

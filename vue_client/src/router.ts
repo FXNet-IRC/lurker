@@ -17,6 +17,11 @@ const routes: RouteRecordRaw[] = [
   { path: '/login', name: 'login', component: () => import('./views/Login.vue') },
   { path: '/welcome', name: 'welcome', component: () => import('./views/Welcome.vue') },
   { path: '/invite/:token', name: 'invite', component: () => import('./views/InviteAccept.vue') },
+  {
+    path: '/recover/:token',
+    name: 'recover',
+    component: () => import('./views/AccountRecovery.vue'),
+  },
   // The three chat locations. All render the same shell; only the params differ.
   //
   // `/buffer/:id` names ONE buffer by its SERVER ID (#744) — never by name. The

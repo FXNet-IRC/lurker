@@ -17,7 +17,7 @@
 // throttles, the pool, safeRequest, the pinned lookup, the pipe, the filesystem
 // and the SQLite index are all shipping code.
 
-import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import http from 'node:http';
 import net from 'node:net';
 import fs from 'node:fs';
@@ -26,17 +26,13 @@ import type { AddressInfo } from 'node:net';
 import type { Express } from 'express';
 import type { LurkerTestAgent } from '../test-utils/testApp.js';
 import { setupTestDb, createTestApp, createAuthedAgent } from '../test-utils/testApp.js';
-
-vi.mock('../utils/ipGuard.js', () => ({
-  isBlockedIpLiteral: (host: string) => host.replace(/^\[|\]$/g, '') !== '127.0.0.1',
-  isBlockedIpv4: (ip: string) => ip !== '127.0.0.1',
-}));
+import { startStubDecoder, type StubDecoder } from '../test-utils/stubDecoder.js';
 
 const ctx = setupTestDb('routes-link-preview-cache');
-process.env.LURKER_LINK_PREVIEWS = 'on';
 process.env.LURKER_PREVIEW_CACHE_MODE = 'local';
 process.env.LURKER_PREVIEW_CACHE_DIR = path.join(ctx.tmpDir, 'preview-cache');
 
+let stub: StubDecoder;
 let app: Express;
 let agent: LurkerTestAgent;
 let mintProxyToken: typeof import('../services/mediaProxyToken.js').mintProxyToken;
@@ -55,6 +51,7 @@ let rawHits = 0;
 const tokenFor = (p: string): string => mintProxyToken(`${base}${p}`);
 
 beforeAll(async () => {
+  stub = await startStubDecoder();
   const { createUser } = await import('../db/users.js');
   ({ mintProxyToken } = await import('../services/mediaProxyToken.js'));
   ({ countCached } = await import('../db/previewCache.js'));
@@ -74,6 +71,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await stub.close();
   await new Promise<void>((resolve) => origin.close(() => resolve()));
   delete process.env.LURKER_PREVIEW_CACHE_MODE;
   delete process.env.LURKER_PREVIEW_CACHE_DIR;

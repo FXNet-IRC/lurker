@@ -104,8 +104,53 @@
      is the message row's hover fill — a card painted --bg-soft would vanish the moment
      you moved the pointer over its row. Derived rather than literal so it tracks whatever
      theme the user has chosen: one step further from the background than hover is, in the
-     same direction. */
-  --embed-bg: color-mix(in srgb, var(--fg) 6%, var(--bg-soft));
+     same direction.
+
+     ⚠⚠ The percentage is the CONTRAST DIAL, and it needs no light/dark branch — mixing --fg
+     (not white, not black) into the panel moves toward the text colour, which is lighter in a
+     dark theme and darker in a light one. Lowering it therefore softens the panel in both,
+     which is the whole reason this is a mix rather than two literals.
+
+     ⚠ 3%, down from 6%: a full-strength panel read as a distinct UI object sitting on the
+     conversation rather than as a note attached to a message. The floor is the paragraph above,
+     and it is closer than it looks — at 0% this IS --bg-soft and the card disappears under the
+     pointer. The remaining margin is deliberately slim, so treat this as tunable downward only
+     with a hovered row on screen to check it against. */
+  --embed-bg: color-mix(in srgb, var(--fg) 3%, var(--bg-soft));
+
+  /* How far a coloured mIRC background bleeds above and below its own text.
+
+     An inline span paints its background over the font's content area, not the
+     full line box — so at line-height 1.55 roughly a third of every line goes
+     unpainted, and multi-line ASCII art built from \x03FG,BG runs comes out
+     striped instead of solid. This is half that shortfall, applied as VERTICAL
+     padding, which on a non-replaced inline element paints without affecting
+     line-box height. The grid survives; the stripes close.
+
+     ⚠ The budget is EXACTLY half the leading — (1.55em - content area) / 2 —
+     and there is nothing else to spend. `.line` rows sit flush: row-gap is 0
+     and they carry no vertical padding, so a box taller than its line box
+     immediately laps the message above and below. That looks far worse than a
+     seam, because it crosses between messages, and a later row paints after the
+     earlier row's text, so the overlap also clips descenders (commas, slashes:
+     what art is made of).
+
+     The content area is font-derived (~1.15-1.25em for the mono stack) and CSS
+     can't express it, so this is a conservative constant rather than a formula:
+     small enough not to lap on any font in the stack, at the cost of a hairline
+     seam on fonts with a shorter content area. To find the exact maximum for
+     the font actually in use, measure it — the bounding rect of an inline span
+     IS the content area:
+
+       const l = document.querySelector('.line'), s = document.createElement('span');
+       s.textContent = 'X'; l.appendChild(s);
+       const cs = getComputedStyle(l);
+       console.log(((parseFloat(cs.lineHeight) - s.getBoundingClientRect().height)
+         / 2 / parseFloat(cs.fontSize)).toFixed(3) + 'em');
+       s.remove();
+
+     Tune here only; both the spoiler box and ordinary coloured runs read it. */
+  --mirc-bg-bleed: 0.15em;
 
   /* Corner radii. The app is intentionally flat (most things are square);
      these are the few deliberate exceptions. */

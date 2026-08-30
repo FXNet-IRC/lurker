@@ -120,6 +120,15 @@ router.get('/:key', async (req: Request, res: Response) => {
     mime = ft.mime;
     inline = false;
   } else if (isUtf8(trimPartialUtf8(head))) {
+    // ⚠ A `.md` or `.json` (#788) is served as text/plain here, not as its own
+    // dialect, and that is deliberate. Markdown has no signature — nothing in these
+    // bytes says "markdown" — so the only way to reach that label is the extension in
+    // the key, and "never trust a stored or claimed content-type" is the first rule
+    // this handler exists to enforce. The key is ours, so it would be *safe*; it
+    // would also be the first crack in a one-line invariant, in exchange for nothing.
+    // The link still ends in `.md`, which is what any editor or downloader reads, and
+    // text/plain is the type browsers most reliably render inline. The charset — the
+    // half of #788 that was an actual bug — is stated either way.
     mime = 'text/plain; charset=utf-8';
     inline = true;
   } else {

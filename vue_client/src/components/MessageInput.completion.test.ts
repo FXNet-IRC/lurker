@@ -19,7 +19,7 @@ import { useNetworksStore } from '../stores/networks.js';
 import { useBuffersStore } from '../stores/buffers.js';
 import { useRecentBuffersStore } from '../stores/recentBuffers.js';
 import { useDraftStore } from '../stores/drafts.js';
-import { useComposerOverlay, selectNick } from '../composables/useComposerOverlay.js';
+import { useComposerOverlay, selectNick, addressNick } from '../composables/useComposerOverlay.js';
 import { useViewport } from '../composables/useViewport.js';
 import { useSettingsStore } from '../stores/settings.js';
 import { useScrollState } from '../composables/useScrollState.js';
@@ -243,6 +243,145 @@ describe('MessageInput Tab-completion', () => {
 
       await tab(el);
       expect(el.value).toBe('alice: ');
+    });
+
+    // The addressing punctuation is a setting (#835). It stores the mark alone
+    // and the space is always appended, so the four cases below are the four
+    // code paths that seed a line-start session — picker, in-place Tab, strip,
+    // Reply — each read through the one helper, and any of them could regress
+    // back to the literal on its own.
+    it('takes the addressing punctuation from the setting, across the cycle', async () => {
+      seedStores('#zebra');
+      useSettingsStore().values['input.completion.nick_suffix'] = ',';
+      const { el } = await mountComposer();
+
+      await type(el, '@al');
+      await tab(el);
+      expect(el.value).toBe('alexis, ');
+
+      await tab(el);
+      expect(el.value).toBe('alice, ');
+    });
+
+    it('addresses with a bare space when the punctuation setting is empty', async () => {
+      // In-place Tab (no '@', no picker) is the path that appends nothing
+      // mid-line, so it is the one most likely to be handed '' and drop the
+      // space too.
+      seedStores('#zebra');
+      useSettingsStore().values['input.completion.nick_suffix'] = '';
+      const { el } = await mountComposer();
+
+      await type(el, 'al');
+      await tab(el);
+      expect(el.value).toBe('alexis ');
+    });
+
+    it('applies the setting to a strip pick at line start', async () => {
+      seedStores('#zebra');
+      useSettingsStore().values['input.completion.nick_suffix'] = ';';
+      isMobile.value = true;
+      const { el } = await mountComposer();
+
+      await type(el, 'al');
+      selectNick('alexis');
+      await flush();
+      expect(el.value).toBe('alexis; ');
+    });
+
+    it('applies the setting to Reply, and recognises an already-addressed draft', async () => {
+      seedStores('#zebra');
+      useSettingsStore().values['input.completion.nick_suffix'] = ',';
+      const { el } = await mountComposer();
+
+      await type(el, 'sure');
+      addressNick('bob');
+      await flush();
+      expect(el.value).toBe('bob, sure');
+
+      // Already addressed under THIS suffix — a second Reply must not stack a
+      // second `bob, ` (the check compares against the configured form, not
+      // the old literal).
+      addressNick('bob');
+      await flush();
+      expect(el.value).toBe('bob, sure');
+    });
+
+    it('Reply recognises a draft addressed under another form', async () => {
+      // The draft can predate a settings change, or come from a client with its
+      // own form (iOS still writes `nick: `, and drafts sync) — any punctuation
+      // after the nick counts, so this must not become `bob, bob: sure`.
+      seedStores('#zebra');
+      useSettingsStore().values['input.completion.nick_suffix'] = ',';
+      const { el } = await mountComposer();
+
+      await type(el, 'bob: sure');
+      addressNick('bob');
+      await flush();
+      expect(el.value).toBe('bob: sure');
+    });
+
+    it('Reply still addresses a draft that merely opens with the nick as a word', async () => {
+      // "will" is a nick and a word. Under any non-empty suffix the bare
+      // `will ` form is NOT an address, so Reply prepends — the "already
+      // addressed" check must demand punctuation, not just the nick.
+      seedStores('#zebra');
+      const { el } = await mountComposer();
+
+      await type(el, 'will you come?');
+      addressNick('will');
+      await flush();
+      expect(el.value).toBe('will: will you come?');
+    });
+
+    it('Reply does not mistake a longer nick for the addressed one', async () => {
+      // `bob_` is bob's ghost and `bobł` is someone else; a draft addressed to
+      // either must not read as "already addressed to bob". The mark run has
+      // to exclude nick characters — Unicode letters (`\w` is ASCII-only) and
+      // the RFC specials — not just `\w`.
+      seedStores('#zebra');
+      const { el } = await mountComposer();
+
+      await type(el, 'bob_: hi');
+      addressNick('bob');
+      await flush();
+      expect(el.value).toBe('bob: bob_: hi');
+
+      await type(el, 'bobł hi');
+      addressNick('bob');
+      await flush();
+      expect(el.value).toBe('bob: bobł hi');
+    });
+
+    it('under an empty suffix, a draft opening with the nick already counts as addressed', async () => {
+      // With "space only" the addressed form and the nick-as-a-word form are
+      // the same text; that ambiguity is the convention's, and Reply follows
+      // it rather than producing `bob bob is wrong`.
+      seedStores('#zebra');
+      useSettingsStore().values['input.completion.nick_suffix'] = '';
+      const { el } = await mountComposer();
+
+      await type(el, 'bob is wrong');
+      addressNick('bob');
+      await flush();
+      expect(el.value).toBe('bob is wrong');
+    });
+
+    it('drops trailing whitespace typed into the setting instead of doubling it', async () => {
+      // The description shows the form as `nick: `; typing exactly that into
+      // the field is the natural mistake, and a quoted " " from /set is the
+      // natural way to ask for "space only".
+      seedStores('#zebra');
+      useSettingsStore().values['input.completion.nick_suffix'] = ', ';
+      const { el } = await mountComposer();
+
+      await type(el, '@al');
+      await tab(el);
+      expect(el.value).toBe('alexis, ');
+
+      useSettingsStore().values['input.completion.nick_suffix'] = ' ';
+      await type(el, 'bo');
+      await tab(el);
+      expect(el.value).toBe('bob ');
     });
 
     it('never offers your own nick', async () => {
@@ -627,6 +766,107 @@ describe('MessageInput command dispatch', () => {
     });
   });
 
+  // #809 QA. The clear is optimistic — commitInput runs before the ACK — so a send
+  // that comes back not-connected used to leave the composer empty with nothing
+  // but a toast and up-arrow. Fine while a failed send was a rarity; the
+  // writable-connection gate makes it the ordinary outcome of any outage.
+  describe('a failed send comes back to the composer', () => {
+    async function failingSend(input: string) {
+      seedStores('#zebra');
+      vi.mocked(socketSendWithAck).mockReturnValue(
+        Promise.resolve({ ok: false, error: 'not-connected' }) as never,
+      );
+      const drafts = useDraftStore();
+      const { el } = await mountComposer();
+      await type(el, input);
+      await enter(el);
+      await flush();
+      return drafts;
+    }
+
+    it('restores a plain message as the buffer draft', async () => {
+      const drafts = await failingSend('hello there');
+      expect(drafts.forBuffer(1, '#zebra')).toBe('hello there');
+    });
+
+    it('restores the whole typed line for a command, not just its body', async () => {
+      // ⚠ `/me waves` and not `waves` — what comes back has to be re-sendable.
+      const drafts = await failingSend('/me waves');
+      expect(drafts.forBuffer(1, '#zebra')).toBe('/me waves');
+    });
+
+    it('restores a /notice to the buffer it was TYPED IN, not to its target', async () => {
+      const drafts = await failingSend('/notice bob psst');
+      expect(drafts.forBuffer(1, '#zebra')).toBe('/notice bob psst');
+      expect(drafts.forBuffer(1, 'bob')).toBe('');
+    });
+
+    // ⚠⚠ The rule that keeps this from being a regression of its own: the ACK is
+    // late, so the user may already be typing something else. Theirs wins.
+    it('never clobbers text typed while the ACK was in flight', async () => {
+      seedStores('#zebra');
+      let settle: (r: { ok: boolean; error: string }) => void = () => {};
+      vi.mocked(socketSendWithAck).mockReturnValue(
+        new Promise((r) => {
+          settle = r as typeof settle;
+        }) as never,
+      );
+      const drafts = useDraftStore();
+      const { el } = await mountComposer();
+      await type(el, 'first');
+      await enter(el);
+      await type(el, 'second thoughts');
+      settle({ ok: false, error: 'not-connected' });
+      await flush();
+      expect(drafts.forBuffer(1, '#zebra')).toBe('second thoughts');
+    });
+  });
+
+  // #785. `/disconnect` is the word people reach for when a network is stuck in a reconnect
+  // loop, and it used to fall through to the raw-line default — so it went out as an unknown
+  // IRC verb, and during a backoff nowhere at all. It shares /quit's branch: both route through
+  // the intentional-disconnect path, which is what sets irc-framework's requested_disconnect
+  // flag so the close doesn't look unexpected and trigger another auto-reconnect.
+  it.each([
+    ['/quit', undefined],
+    ['/disconnect', undefined],
+    ['/disconnect back later', 'back later'],
+  ])('%s stops the network instead of going out as a raw line', async (input, reason) => {
+    seedStores('#zebra');
+    const networks = useNetworksStore();
+    const disconnect = vi
+      .spyOn(networks, 'disconnect')
+      .mockResolvedValue(undefined as unknown as void);
+    const { el } = await mountComposer();
+
+    await type(el, input);
+    await enter(el);
+
+    expect(disconnect).toHaveBeenCalledWith(1, reason);
+    // ⚠ And emphatically not as a raw line — that is the shape of the bug.
+    expect(socketSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'raw' }));
+  });
+
+  it('reports a failed /disconnect in the buffer rather than swallowing it', async () => {
+    // The one branch the happy-path cases can't reach. It matters here more than for most
+    // commands: the whole point of #785 is a user trying to stop a network that won't stop, so
+    // "nothing happened" is precisely the wrong feedback if the call fails.
+    seedStores('#zebra');
+    const networks = useNetworksStore();
+    vi.spyOn(networks, 'disconnect').mockRejectedValue(new Error('network is paused'));
+    const buffers = useBuffersStore();
+    const pushMessage = vi.spyOn(buffers, 'pushMessage');
+    const { el } = await mountComposer();
+
+    await type(el, '/disconnect');
+    await enter(el);
+    await flush();
+
+    expect(pushMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ text: '/disconnect failed: network is paused' }),
+    );
+  });
+
   it('/part <#chan> [reason] retargets the named channel', async () => {
     seedStores('#zebra');
     const { el } = await mountComposer();
@@ -661,7 +901,7 @@ describe('MessageInput command dispatch', () => {
   // click-to-reveal box when typed and literal pipes when sent through a command. Silent and
   // non-recoverable — the spoiler is on the wire before the user can see it didn't work.
   describe('||spoiler|| markup in commands (#652)', () => {
-    const OPEN = '\x0301,01';
+    const OPEN = '\x0314,14';
     const CLOSE = '\x03';
 
     it('/me rewrites the spoiler in the ACTION body', async () => {

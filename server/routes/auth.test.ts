@@ -316,6 +316,29 @@ describe('POST /api/auth/invite/:token/password', () => {
     });
     expect(reuse.status).toBe(404);
   });
+
+  it('deleting the user who redeemed an invite does not reopen the link (#590)', async () => {
+    const { findUserByUsername, deleteUser } = await import('../db/users.js');
+    const { createInvite } = await import('../db/invites.js');
+    const admin = findUserByUsername('firstadmin')!;
+    const invite = createInvite(admin.id, { expiresInDays: 1 })!;
+    const ok = await testRequest(app).post(`/api/auth/invite/${invite.token}/password`).send({
+      username: 'later-removed',
+      password: 'longenoughpw',
+    });
+    expect(ok.status).toBe(200);
+
+    deleteUser(findUserByUsername('later-removed')!.id);
+
+    // The redeemer column was ON DELETE SET NULL, so removing the account it let
+    // in handed the one-time link back to anyone still holding the URL.
+    const sneak = await testRequest(app).post(`/api/auth/invite/${invite.token}/password`).send({
+      username: 'sneaked-in',
+      password: 'longenoughpw',
+    });
+    expect(sneak.status).toBe(404);
+    expect(findUserByUsername('sneaked-in')).toBeFalsy();
+  });
 });
 
 // The native-app front door: password in, session token out, no browser needed.

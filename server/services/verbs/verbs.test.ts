@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -16,6 +16,8 @@ let createUser: typeof import('../../db/users.js').createUser;
 let createNetwork: typeof import('../../db/networks.js').createNetwork;
 let insertMessage: typeof import('../../db/messages.js').insertMessage;
 let callVerb: typeof import('../verbRegistry.js').callVerb;
+let ircManager: typeof import('../ircManager.js').default;
+let setChannelConfig: typeof import('../../db/e2e.js').setChannelConfig;
 
 let owner: User;
 let intruder: User;
@@ -29,6 +31,8 @@ beforeAll(async () => {
   // Importing the verbs aggregator triggers registration as a side effect.
   await import('./index.js');
   ({ callVerb } = await import('../verbRegistry.js'));
+  ircManager = (await import('../ircManager.js')).default;
+  ({ setChannelConfig } = await import('../../db/e2e.js'));
 
   owner = createUser('verbs-owner');
   intruder = createUser('verbs-intruder');
@@ -555,5 +559,487 @@ describe('set_relay_bot', () => {
         pattern: '',
       }),
     ).toThrow(/scope insufficient/);
+  });
+});
+
+// The agent-control verbs. The connection-bound ones are exercised against a
+// stub IrcConnection injected into the shared ircManager singleton — the same
+// seam wsHub.test.ts uses — because the assertion that matters for most of
+// them is the exact IRC line that reaches the wire, and a not-connected-only
+// test would pass just as happily with the arguments swapped.
+// rfc1459 casefold: ASCII case plus the []\~ ↔ {}|^ equivalences. The stub
+// connection below mirrors production shape — `channels` keyed by the
+// legacy-lowercased WIRE name, resolution through a fold-aware channelState —
+// so a verb that regressed to a raw `channels.get(name.toLowerCase())` probe
+// fails the fold-variant cases rather than quietly passing.
+const fold = (s: string) =>
+  s
+    .toLowerCase()
+    .replaceAll('[', '{')
+    .replaceAll(']', '}')
+    .replaceAll('\\', '|')
+    .replaceAll('~', '^');
+
+const member = (nick: string) => [nick.toLowerCase(), { nick, modes: ['o'], away: false }];
+
+describe('agent control verbs', () => {
+  type Chan = { name: string; topic: string | null; members: Map<string, unknown> };
+
+  function stubConn(networkId: number, channels: Chan[] = [], state = 'connected') {
+    const map = new Map(channels.map((c) => [c.name.toLowerCase(), c]));
+    const sent: string[] = [];
+    const joins: Array<[string, string | undefined]> = [];
+    const parts: Array<[string, string | undefined]> = [];
+    return {
+      sent,
+      joins,
+      parts,
+      // Write verbs gate on this: an IrcConnection outlives its socket for the
+      // whole reconnect backoff, and irc-framework silently DROPS writes while
+      // it is down.
+      state,
+      network: { id: networkId },
+      channels: map,
+      raw: (line: string) => sent.push(line),
+      serverTarget: () => `:server:${networkId}`,
+      channelState: (name: string) => {
+        for (const ch of map.values()) if (fold(ch.name) === fold(name)) return ch;
+        return undefined;
+      },
+      isChannelJoined: (name: string) => {
+        for (const ch of map.values()) if (fold(ch.name) === fold(name)) return true;
+        return false;
+      },
+      join: (name: string, key?: string) => joins.push([name, key]),
+      part: (name: string, reason?: string) => parts.push([name, reason]),
+      stashJoinKey: () => {},
+    };
+  }
+
+  type Conn = ReturnType<typeof ircManager.listConnections>[number];
+  function live(channels: Chan[] = [], state = 'connected') {
+    const conn = stubConn(net.id, channels, state);
+    ircManager.connectionsForUser(owner.id).set(net.id, conn as unknown as Conn);
+    return conn;
+  }
+
+  // A lingering live connection would poison the sibling "offline" cases here
+  // and the connected=false expectation in the list_networks suite.
+  afterEach(() => ircManager.connectionsForUser(owner.id).clear());
+
+  describe('send_raw', () => {
+    it('sends the line verbatim and names the server buffer to read replies from', () => {
+      const conn = live();
+      // The advertised follow-up has to be actionable: recent_messages
+      // REQUIRES a target and list_buffers filters the server buffer out, so
+      // the literal is the only way an agent can ever read a WHOIS reply.
+      expect(
+        callVerb('send_raw', rwCtx(owner.id), { networkId: net.id, line: 'MODE #x +o a' }),
+      ).toEqual({ ok: true, serverBuffer: `:server:${net.id}` });
+      expect(conn.sent).toEqual(['MODE #x +o a']);
+      expect(
+        callVerb('recent_messages', rCtx(owner.id), {
+          networkId: net.id,
+          target: `:server:${net.id}`,
+        }),
+      ).toMatchObject({ messages: expect.any(Array) });
+    });
+
+    it('validates the line, and checks scope + ownership', () => {
+      expect(callVerb('send_raw', rwCtx(owner.id), { networkId: net.id, line: '   ' })).toEqual({
+        ok: false,
+        error: 'empty-line',
+      });
+      expect(
+        callVerb('send_raw', rwCtx(owner.id), { networkId: net.id, line: 'FOO\r\nBAR' }),
+      ).toEqual({ ok: false, error: 'line-must-be-single-line' });
+      expect(
+        callVerb('send_raw', rwCtx(owner.id), { networkId: net.id, line: 'WHOIS bob' }),
+      ).toEqual({ ok: false, error: 'not-connected' });
+      expect(() =>
+        callVerb('send_raw', rwCtx(owner.id), { networkId: otherNet.id, line: 'WHOIS bob' }),
+      ).toThrow(/unknown network/);
+      expect(() => callVerb('send_raw', rCtx(owner.id), { networkId: net.id, line: 'X' })).toThrow(
+        /scope insufficient/,
+      );
+    });
+  });
+
+  describe('set_nick', () => {
+    it('sends NICK', () => {
+      const conn = live();
+      expect(callVerb('set_nick', rwCtx(owner.id), { networkId: net.id, nick: 'newnick' })).toEqual(
+        {
+          ok: true,
+        },
+      );
+      expect(conn.sent).toEqual(['NICK newnick']);
+    });
+
+    it('rejects whitespace, and reports not-connected otherwise', () => {
+      expect(callVerb('set_nick', rwCtx(owner.id), { networkId: net.id, nick: 'a b' })).toEqual({
+        ok: false,
+        error: 'nick-must-be-single-token',
+      });
+      expect(callVerb('set_nick', rwCtx(owner.id), { networkId: net.id, nick: 'newnick' })).toEqual(
+        {
+          ok: false,
+          error: 'not-connected',
+        },
+      );
+    });
+  });
+
+  describe('whois', () => {
+    it('sends WHOIS and returns the server buffer target', () => {
+      const conn = live();
+      expect(callVerb('whois', rwCtx(owner.id), { networkId: net.id, nick: 'bob' })).toMatchObject({
+        ok: true,
+        serverBuffer: `:server:${net.id}`,
+      });
+      expect(conn.sent).toEqual(['WHOIS bob']);
+    });
+
+    it('validates the nick, and reports not-connected otherwise', () => {
+      expect(callVerb('whois', rwCtx(owner.id), { networkId: net.id, nick: 'a b' })).toEqual({
+        ok: false,
+        error: 'nick-must-be-single-token',
+      });
+      expect(callVerb('whois', rwCtx(owner.id), { networkId: net.id, nick: 'bob' })).toMatchObject({
+        ok: false,
+        error: 'not-connected',
+      });
+    });
+  });
+
+  describe('join_channel / part_channel', () => {
+    it('passes the channel and key through to the connection', () => {
+      const conn = live();
+      expect(
+        callVerb('join_channel', rwCtx(owner.id), { networkId: net.id, channel: '#x', key: 'k' }),
+      ).toEqual({ ok: true });
+      expect(conn.joins).toEqual([['#x', 'k']]);
+      expect(
+        callVerb('part_channel', rwCtx(owner.id), {
+          networkId: net.id,
+          channel: '#x',
+          reason: 'bye',
+        }),
+      ).toEqual({ ok: true });
+      expect(conn.parts).toEqual([['#x', 'bye']]);
+    });
+
+    it('rejects a channel that is not a single token', () => {
+      // conn.raw() strips CR/LF, so "#x\r\nfoo" would otherwise become a
+      // silent { ok: true } against a channel the caller never named.
+      for (const verb of ['join_channel', 'part_channel']) {
+        expect(callVerb(verb, rwCtx(owner.id), { networkId: net.id, channel: ' ' })).toEqual({
+          ok: false,
+          error: 'empty-channel',
+        });
+        expect(
+          callVerb(verb, rwCtx(owner.id), { networkId: net.id, channel: '#x\r\nfoo' }),
+        ).toEqual({
+          ok: false,
+          error: 'channel-must-be-single-token',
+        });
+      }
+    });
+
+    it('reports not-connected with no live connection', () => {
+      expect(
+        callVerb('join_channel', rwCtx(owner.id), { networkId: net.id, channel: '#x' }),
+      ).toEqual({ ok: false, error: 'not-connected' });
+      expect(
+        callVerb('part_channel', rwCtx(owner.id), { networkId: net.id, channel: '#x' }),
+      ).toEqual({ ok: false, error: 'not-connected' });
+    });
+  });
+
+  describe('set_away', () => {
+    it('is user-wide, reports state, and needs no connection', () => {
+      expect(callVerb('set_away', rwCtx(owner.id), { message: 'brb' })).toEqual({
+        ok: true,
+        away: true,
+      });
+      expect(callVerb('set_away', rwCtx(owner.id), {})).toEqual({ ok: true, away: false });
+    });
+  });
+
+  describe('get_topic / set_topic', () => {
+    it('reads the topic, resolving a fold-variant spelling of the channel', () => {
+      live([{ name: '#foo[bar]', topic: 'the topic', members: new Map() }]);
+      expect(
+        callVerb('get_topic', rCtx(owner.id), { networkId: net.id, channel: '#foo[bar]' }),
+      ).toEqual({ ok: true, channel: '#foo[bar]', topic: 'the topic' });
+      // Same channel under rfc1459 — a raw lowercase map probe misses it (#707).
+      expect(
+        callVerb('get_topic', rCtx(owner.id), { networkId: net.id, channel: '#foo{bar}' }),
+      ).toEqual({ ok: true, channel: '#foo[bar]', topic: 'the topic' });
+      expect(
+        callVerb('get_topic', rCtx(owner.id), { networkId: net.id, channel: '#elsewhere' }),
+      ).toEqual({ ok: false, error: 'not-in-channel' });
+    });
+
+    it('reports an unset topic as null', () => {
+      live([{ name: '#x', topic: null, members: new Map() }]);
+      expect(callVerb('get_topic', rCtx(owner.id), { networkId: net.id, channel: '#x' })).toEqual({
+        ok: true,
+        channel: '#x',
+        topic: null,
+      });
+    });
+
+    it('sets the topic, and clears it only on an explicit empty string', () => {
+      const conn = live();
+      expect(
+        callVerb('set_topic', rwCtx(owner.id), { networkId: net.id, channel: '#x', topic: 'hi' }),
+      ).toEqual({ ok: true });
+      expect(conn.sent).toEqual(['TOPIC #x :hi']);
+      // An OMITTED topic used to default to '' and send this same clearing
+      // line, so a forgotten argument wiped the channel topic. It is now
+      // required, and clearing has to be spelled out.
+      expect(() =>
+        callVerb('set_topic', rwCtx(owner.id), { networkId: net.id, channel: '#x' }),
+      ).toThrow(/missing required field: topic/);
+      expect(
+        callVerb('set_topic', rwCtx(owner.id), { networkId: net.id, channel: '#x', topic: '' }),
+      ).toEqual({ ok: true });
+      expect(conn.sent).toEqual(['TOPIC #x :hi', 'TOPIC #x :']);
+    });
+
+    it('rejects a multi-line topic and a malformed channel', () => {
+      expect(
+        callVerb('set_topic', rwCtx(owner.id), { networkId: net.id, channel: '#x', topic: 'a\nb' }),
+      ).toEqual({ ok: false, error: 'topic-must-be-single-line' });
+      expect(
+        callVerb('set_topic', rwCtx(owner.id), { networkId: net.id, channel: '#x y', topic: 'a' }),
+      ).toEqual({ ok: false, error: 'channel-must-be-single-token' });
+      expect(
+        callVerb('set_topic', rwCtx(owner.id), { networkId: net.id, channel: '#x', topic: 'hi' }),
+      ).toEqual({ ok: false, error: 'not-connected' });
+    });
+  });
+
+  describe('list_members', () => {
+    const chanOf = (nicks: string[]) => ({
+      name: '#big',
+      topic: null,
+      members: new Map(nicks.map((n) => member(n)) as Array<[string, unknown]>),
+    });
+
+    it('returns members sorted by nick', () => {
+      live([chanOf(['carol', 'alice', 'bob'])]);
+      expect(
+        callVerb('list_members', rCtx(owner.id), { networkId: net.id, channel: '#big' }),
+      ).toEqual({
+        ok: true,
+        channel: '#big',
+        count: 3,
+        truncated: false,
+        members: [
+          { nick: 'alice', modes: ['o'], away: false },
+          { nick: 'bob', modes: ['o'], away: false },
+          { nick: 'carol', modes: ['o'], away: false },
+        ],
+      });
+    });
+
+    it('caps the page but still reports the true total', () => {
+      // The answer goes straight into a model's context, so a 5k-nick channel
+      // must not be able to flood it — and the cap must stay visible.
+      const nicks = Array.from({ length: 300 }, (_, i) => `nick${String(i).padStart(3, '0')}`);
+      live([chanOf(nicks)]);
+      const capped = callVerb('list_members', rCtx(owner.id), {
+        networkId: net.id,
+        channel: '#big',
+        limit: 10,
+      }) as { count: number; truncated: boolean; members: Array<{ nick: string }> };
+      expect(capped.count).toBe(300);
+      expect(capped.truncated).toBe(true);
+      expect(capped.members).toHaveLength(10);
+      expect(capped.members[0].nick).toBe('nick000');
+
+      // Default cap applies with no limit given.
+      const defaulted = callVerb('list_members', rCtx(owner.id), {
+        networkId: net.id,
+        channel: '#big',
+      }) as { count: number; truncated: boolean; members: unknown[] };
+      expect(defaulted.count).toBe(300);
+      expect(defaulted.members).toHaveLength(200);
+      expect(defaulted.truncated).toBe(true);
+    });
+
+    it('reports not-in-channel and not-connected', () => {
+      live([chanOf(['alice'])]);
+      expect(
+        callVerb('list_members', rCtx(owner.id), { networkId: net.id, channel: '#other' }),
+      ).toEqual({ ok: false, error: 'not-in-channel' });
+      ircManager.connectionsForUser(owner.id).clear();
+      expect(
+        callVerb('list_members', rCtx(owner.id), { networkId: net.id, channel: '#big' }),
+      ).toEqual({ ok: false, error: 'not-connected' });
+    });
+  });
+
+  describe('connect_network / disconnect_network', () => {
+    it('enforces read-write scope and network ownership', () => {
+      // Only the registry guards are asserted for connect — they throw before
+      // the handler runs, and actually invoking startNetwork would open a
+      // real socket.
+      expect(() => callVerb('connect_network', rCtx(owner.id), { networkId: net.id })).toThrow(
+        /scope insufficient/,
+      );
+      expect(() =>
+        callVerb('connect_network', rwCtx(owner.id), { networkId: otherNet.id }),
+      ).toThrow(/unknown network/);
+    });
+
+    it('disconnect is always ok, and a no-op when offline', () => {
+      expect(callVerb('disconnect_network', rwCtx(owner.id), { networkId: net.id })).toEqual({
+        ok: true,
+      });
+    });
+  });
+  // The reconnect-backoff case: the connection OBJECT is still in the manager's
+  // map, so the old `getConnection() !== null` check said "connected" and the
+  // verb answered ok — while irc-framework dropped the line on the floor. An
+  // agent would then poll recent_messages forever for a reply that can never
+  // arrive.
+  describe('a connection whose socket is down', () => {
+    it('reports not-connected from every write verb, and sends nothing', () => {
+      const conn = live([{ name: '#x', topic: 't', members: new Map() }], 'disconnected');
+      const offline = { ok: false, error: 'not-connected' };
+      expect(callVerb('send_raw', rwCtx(owner.id), { networkId: net.id, line: 'PING x' })).toEqual(
+        offline,
+      );
+      expect(callVerb('set_nick', rwCtx(owner.id), { networkId: net.id, nick: 'n' })).toEqual(
+        offline,
+      );
+      expect(callVerb('whois', rwCtx(owner.id), { networkId: net.id, nick: 'bob' })).toEqual(
+        offline,
+      );
+      expect(
+        callVerb('set_topic', rwCtx(owner.id), { networkId: net.id, channel: '#x', topic: 'hi' }),
+      ).toEqual(offline);
+      expect(
+        callVerb('join_channel', rwCtx(owner.id), { networkId: net.id, channel: '#x' }),
+      ).toEqual(offline);
+      expect(
+        callVerb('part_channel', rwCtx(owner.id), { networkId: net.id, channel: '#x' }),
+      ).toEqual(offline);
+      expect(conn.sent).toEqual([]);
+      expect(conn.joins).toEqual([]);
+      expect(conn.parts).toEqual([]);
+    });
+
+    it('still answers reads from last-known state', () => {
+      // Deliberately NOT gated: stale membership is not a lie, and refusing
+      // mid-reconnect would be strictly less useful.
+      live([{ name: '#x', topic: 't', members: new Map() }], 'disconnected');
+      expect(callVerb('get_topic', rCtx(owner.id), { networkId: net.id, channel: '#x' })).toEqual({
+        ok: true,
+        channel: '#x',
+        topic: 't',
+      });
+    });
+  });
+
+  // CR/LF in these reaches irc-framework's own client.join/part/quit/raw, which
+  // serialise and write the line VERBATIM — unlike IrcConnection.raw(), nothing
+  // strips it, so an embedded newline really is a second injected command.
+  describe('parameters that bypass the CR/LF stripper', () => {
+    it('rejects an injected channel key', () => {
+      const conn = live();
+      expect(
+        callVerb('join_channel', rwCtx(owner.id), {
+          networkId: net.id,
+          channel: '#x',
+          key: 'k\r\nOPER admin hunter2',
+        }),
+      ).toEqual({ ok: false, error: 'key-must-be-single-token' });
+      expect(conn.joins).toEqual([]);
+    });
+
+    it('rejects an injected part reason', () => {
+      const conn = live();
+      expect(
+        callVerb('part_channel', rwCtx(owner.id), {
+          networkId: net.id,
+          channel: '#x',
+          reason: 'bye\r\nJOIN #evil',
+        }),
+      ).toEqual({ ok: false, error: 'reason-must-be-single-line' });
+      expect(conn.parts).toEqual([]);
+    });
+
+    it('rejects an injected quit reason', () => {
+      expect(
+        callVerb('disconnect_network', rwCtx(owner.id), {
+          networkId: net.id,
+          reason: 'bye\r\nJOIN #evil',
+        }),
+      ).toEqual({ ok: false, error: 'reason-must-be-single-line' });
+    });
+
+    it('rejects an injected away message', () => {
+      // set_away is user-wide, so this would have gone out on EVERY connected
+      // network at once.
+      expect(callVerb('set_away', rwCtx(owner.id), { message: 'brb\r\nJOIN #evil' })).toEqual({
+        ok: false,
+        error: 'message-must-be-single-line',
+      });
+    });
+  });
+  // send_raw is the escape hatch, so it is the one verb that can put cleartext
+  // on a channel the user believes is encrypted — ircManager.send encrypts and
+  // refuses to fall through on failure, conn.raw() does neither. There is also
+  // no local echo on this path, so the leak would be silent at BOTH ends. A
+  // sentence in the tool description is not an enforcement mechanism for a
+  // confidentiality property.
+  describe('send_raw on an E2E channel', () => {
+    it('refuses a PRIVMSG and names the verb that encrypts', () => {
+      setChannelConfig(owner.id, net.id, {
+        channel: '#secret',
+        enabled: true,
+        mode: 'normal',
+      });
+      const conn = live();
+      expect(
+        callVerb('send_raw', rwCtx(owner.id), {
+          networkId: net.id,
+          line: 'PRIVMSG #secret :the passphrase is hunter2',
+        }),
+      ).toEqual({ ok: false, error: 'e2e-channel-use-send-message' });
+      expect(conn.sent).toEqual([]);
+
+      // Case-insensitive on the command, and the extra-whitespace form still
+      // resolves to the same target.
+      expect(
+        callVerb('send_raw', rwCtx(owner.id), {
+          networkId: net.id,
+          line: 'privmsg   #secret   :hi',
+        }),
+      ).toEqual({ ok: false, error: 'e2e-channel-use-send-message' });
+      expect(conn.sent).toEqual([]);
+    });
+
+    it('still allows non-PRIVMSG commands and other channels', () => {
+      setChannelConfig(owner.id, net.id, {
+        channel: '#secret',
+        enabled: true,
+        mode: 'normal',
+      });
+      const conn = live();
+      // Moderating an E2E channel is not a leak.
+      expect(
+        callVerb('send_raw', rwCtx(owner.id), { networkId: net.id, line: 'MODE #secret +o bob' }),
+      ).toMatchObject({ ok: true });
+      // A channel with no E2E config is unaffected.
+      expect(
+        callVerb('send_raw', rwCtx(owner.id), { networkId: net.id, line: 'PRIVMSG #open :hi' }),
+      ).toMatchObject({ ok: true });
+      expect(conn.sent).toEqual(['MODE #secret +o bob', 'PRIVMSG #open :hi']);
+    });
   });
 });

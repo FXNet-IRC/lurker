@@ -34,6 +34,9 @@ export const useHighlightsStore = defineStore('highlights', {
     // been superseded (the filter changed mid-flight) is dropped. Pagination
     // reuses the current token so it continues the active filter.
     token: 0,
+    // URL of the last dispatched fresh load, for the debounced-typing path's
+    // dedupe (see loadInitial). null until the first load.
+    lastUrl: null as string | null,
   }),
   getters: {
     hasMore: (state) => state.nextBefore != null,
@@ -64,14 +67,25 @@ export const useHighlightsStore = defineStore('highlights', {
       return `/api/highlights?${params.toString()}`;
     },
     // Fresh load for the current filter — resets the list and pagination.
-    async loadInitial() {
+    //
+    // `skipIfSameFilter` is for the modal's debounced-typing path, which fires
+    // on ANY input change including ones that parse to the same filter (a
+    // trailing space, an incomplete `from:` token) — those would blank the
+    // list and refetch identical rows. Mount-time loads must NOT pass it:
+    // highlights are a live feed, so the same filter can have new rows since
+    // the modal was last open. An errored dispatch is never skipped, so a
+    // retype retries.
+    async loadInitial(skipIfSameFilter = false) {
+      const url = this.buildUrl(null);
+      if (skipIfSameFilter && !this.error && url === this.lastUrl) return;
+      this.lastUrl = url;
       const token = (this.token += 1);
       this.items = [];
       this.nextBefore = null;
       this.error = '';
       this.loading = true;
       try {
-        const { items, nextBefore } = await api(this.buildUrl(null));
+        const { items, nextBefore } = await api(url);
         if (token !== this.token) return; // Superseded by a newer filter.
         this.items = items || [];
         this.nextBefore = nextBefore ?? null;

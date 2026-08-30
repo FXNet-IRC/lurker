@@ -210,6 +210,8 @@ const props = withDefaults(
     url: string;
     /** What "copy link" should yield, when it differs from what we render. See GalleryItem. */
     shareUrl?: string | null;
+    /** The server's Content-Type verdict, when the opener had it — see `kind` below. */
+    kind?: MediaKind | null;
     // Gallery context (#547). All optional: a lone image opened from a message is a
     // gallery of one, and every one of these falls away to its single-image default.
     filename?: string | null;
@@ -218,7 +220,7 @@ const props = withDefaults(
     hasPrev?: boolean;
     hasNext?: boolean;
   }>(),
-  { filename: null, index: 0, count: 1, hasPrev: false, hasNext: false },
+  { kind: null, filename: null, index: 0, count: 1, hasPrev: false, hasNext: false },
 );
 
 const emit = defineEmits<{ close: []; prev: []; next: [] }>();
@@ -271,11 +273,12 @@ let pinchStart: PinchStart | null = null;
 let pinchOccurred = false;
 let lastTap: { time: number; x: number; y: number } | null = null;
 
-// What we're showing. Derived from the URL rather than passed in, so a link clicked in
-// a message and one clicked in the uploads grid classify identically — one rule, not
-// two that can disagree. An unrecognised URL falls back to `image`, which fails into
-// the "open in browser" card exactly as it did before this component knew about video.
-const kind = computed<MediaKind>(() => mediaKindForUrl(props.url) ?? 'image');
+// What we're showing. The SERVER's verdict when the opener had it (a video/audio card
+// carries the Content-Type-derived kind), else the URL-extension guess — which is right for
+// uploads and plain links, whose paths carry real extensions. An unrecognised URL falls back
+// to `image`, which fails into the "open in browser" card. ⚠ Passing kind is what stops an
+// extensionless video URL — the click-to-play policy's exact case — opening as a broken <img>.
+const kind = computed<MediaKind>(() => props.kind ?? mediaKindForUrl(props.url) ?? 'image');
 
 const FAILURE_MESSAGES: Record<MediaKind, string> = {
   image: 'Failed to load image.',

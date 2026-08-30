@@ -2,8 +2,10 @@
   Copyright (c) 2026 Brad Root
   SPDX-License-Identifier: MPL-2.0
 
-  Admin panel → Invites. Generate one-time invite links and revoke pending ones;
-  consumed invites are kept as an audit trail. Split out of the old combined
+  Admin panel → Invites. Generate one-time invite links, revoke pending ones, and
+  clear out spent ones once they're just clutter (#590). A spent invite belongs to
+  the member it let in and is removed with them, so this list tracks live accounts
+  rather than standing as a permanent record. Split out of the old combined
   settings-panes/UsersPane so members and invites get their own admin tabs.
   Drives the same `admin` Pinia store; the route/sidebar gate this to admins.
 -->
@@ -12,7 +14,8 @@
   <section id="admin-invites" class="settings-pane">
     <h2>invites</h2>
     <p class="section-desc">
-      Invite friends with a one-time link. Consumed invites are kept below as an audit trail.
+      Invite friends with a one-time link. A link works once. Used ones stay listed showing who
+      joined, until you remove the invite or the member.
     </p>
     <p v-if="adminError" class="error inline">{{ adminError }}</p>
 
@@ -39,16 +42,19 @@
           <template v-else-if="inv.expiresAt">expires {{ formatRelative(inv.expiresAt) }}</template>
           <template v-else>no expiry</template>
         </span>
+        <!-- Two words for two different acts: revoking kills a link someone could
+             still redeem, removing only clears the record of one already spent. -->
         <button
-          v-if="inv.status !== 'consumed'"
           class="link danger"
           :disabled="adminBusy"
-          @click="onRevokeInvite(inv)"
+          :title="
+            inv.status === 'consumed'
+              ? 'remove this record — the link is already spent'
+              : 'revoke this link so it can no longer be redeemed'
+          "
+          @click="onDeleteInvite(inv)"
         >
-          revoke
-        </button>
-        <button v-else class="link" disabled title="consumed invites are kept as an audit trail">
-          —
+          {{ inv.status === 'consumed' ? 'remove' : 'revoke' }}
         </button>
       </li>
     </ul>
@@ -100,14 +106,20 @@ async function onCreateInvite() {
   }
 }
 
-async function onRevokeInvite(invite: AdminInvite) {
-  if (!confirm(`Revoke this invite?`)) return;
+async function onDeleteInvite(invite: AdminInvite) {
+  // Take the decision from the row we were handed, not by re-reading the store
+  // at click time — the same label/action drift the menu work kept hitting.
+  const spent = invite.status === 'consumed';
+  const prompt = spent
+    ? `Remove this used invite? ${invite.usedByUsername ?? 'The member'} stays; only the record goes.`
+    : 'Revoke this invite? Anyone holding the link will no longer be able to use it.';
+  if (!confirm(prompt)) return;
   adminError.value = '';
   adminBusy.value = true;
   try {
     await adminStore.deleteInvite(invite.token);
   } catch (e: any) {
-    adminError.value = e.message || 'failed to revoke invite';
+    adminError.value = e.message || (spent ? 'failed to remove invite' : 'failed to revoke invite');
   } finally {
     adminBusy.value = false;
   }

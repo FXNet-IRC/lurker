@@ -50,6 +50,22 @@ declare module 'irc-framework' {
       address: string;
       options?: Record<string, string>;
     };
+    /**
+     * Pluggable transport (irc-framework `options.transport`): a class the
+     * Connection instantiates with these options and drives through
+     * connect/writeLine/close. Lurker supplies services/engineTransport.ts in
+     * engine mode; unset means the built-in TCP/TLS transport.
+     */
+    transport?: new (options: never) => object;
+    /** Engine mode: the connection id the engine knows this socket by. */
+    engineConnId?: string;
+    /** Engine mode: the RFC 1413 ident the engine answers for this socket. */
+    engineIdent?: string;
+    /** Engine mode: callbacks the transport reports phases through. */
+    engineHooks?: {
+      onTransport?(transport: unknown): void;
+      onPhase?(phase: string, info: Record<string, unknown>): void;
+    };
   }
 
   /** Options passed to the Client constructor. */
@@ -113,6 +129,17 @@ declare module 'irc-framework' {
      * survives a socket drop until the next 'connecting' event.
      */
     readonly connected: boolean;
+
+    /**
+     * The underlying Connection: `end()` closes the transport cleanly (what
+     * quit() ends in); `connected` mirrors the socket state.
+     */
+    connection: {
+      end(): void;
+      connected: boolean;
+      /** Feed one raw inbound line through the parser and handlers (tests). */
+      addReadBuffer(line: string): void;
+    };
 
     /** Request an IRCv3 capability during CAP negotiation. */
     requestCap(cap: string): void;

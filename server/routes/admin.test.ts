@@ -399,15 +399,37 @@ describe('invites', () => {
     expect(create.body.invite.expiresAt).toBeTruthy();
   });
 
-  it('refuses to delete a consumed invite (audit history)', async () => {
+  it('a consumed invite can be cleared out of the list (#590)', async () => {
     const { createInvite, consumeInvite } = await import('../db/invites.js');
-    const { createUser } = await import('../db/users.js');
+    const { createUser, findUserById } = await import('../db/users.js');
     const consumer = createUser('invite-consumer');
     const invite = createInvite(admin.id, { expiresInDays: 7 })!;
     consumeInvite(invite.token, consumer.id);
 
     const res = await adminAgent.delete(`/api/admin/invites/${invite.token}`);
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(200);
+
+    const list = await adminAgent.get('/api/admin/invites');
+    expect(list.body.invites.find((i: { token: string }) => i.token === invite.token)).toBeFalsy();
+    // Clearing the record doesn't touch the account it let in.
+    expect(findUserById(consumer.id)).toBeTruthy();
+  });
+
+  it('deleting the user who redeemed an invite does not revive it (#590)', async () => {
+    const { createInvite, consumeInvite } = await import('../db/invites.js');
+    const { createUser } = await import('../db/users.js');
+    const consumer = createUser('invite-revival-victim');
+    const invite = createInvite(admin.id, { expiresInDays: 7 })!;
+    consumeInvite(invite.token, consumer.id);
+
+    expect((await adminAgent.delete(`/api/admin/users/${consumer.id}`)).status).toBe(200);
+
+    // Before the fix this listed as a pending invite again — and it was: see
+    // auth.test.ts for the redemption attempt that the old shape let through.
+    const list = await adminAgent.get('/api/admin/invites');
+    expect(list.body.invites.find((i: { token: string }) => i.token === invite.token)).toBeFalsy();
+    const { inviteStatus } = await import('../db/invites.js');
+    expect(inviteStatus(invite.token).status).toBe('unknown');
   });
 
   it('404 on deleting an unknown invite', async () => {

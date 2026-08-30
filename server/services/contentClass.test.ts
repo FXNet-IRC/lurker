@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
-import { classifyUpload, UnsupportedTypeError } from './contentClass.js';
+import { classifyUpload, storedContentType, UnsupportedTypeError } from './contentClass.js';
 
 let dir: string;
 
@@ -237,6 +237,89 @@ describe('classifyUpload — text and refusals', () => {
       'text/plain',
     );
     expect(c.contentClass).toBe('text');
+  });
+
+  // #788. These bytes were ALWAYS accepted — signature-less UTF-8 is what the text
+  // branch takes — so this is about the label, not the gate. A README came back as
+  // `README.txt`, and a `.json` lost the one thing telling an editor how to read it.
+  it('names the text dialects from the claimed mime', async () => {
+    const cases: [string, string, string][] = [
+      ['text/plain', 'text/plain', 'txt'],
+      ['text/markdown', 'text/markdown', 'md'],
+      ['application/json', 'application/json', 'json'],
+    ];
+    for (const [claim, mime, ext] of cases) {
+      const c = await classifyUpload(write(`d-${ext}`, Buffer.from('# notes — ünïcodé\n')), claim);
+      expect({ claim, ...c }).toEqual({ claim, contentClass: 'text', mime, ext });
+    }
+  });
+
+  // ⚠ The portability gap the filename fallback exists for: macOS and Linux register
+  // a mime for `.md`, Windows registers none — so the same file arrives claiming
+  // `text/plain` or `application/octet-stream` and would flatten back to `.txt`. The
+  // feature would simply not work there, silently.
+  it('falls back to the filename extension when the platform sends no mime', async () => {
+    const bytes = Buffer.from('# heading\n');
+    for (const claim of ['text/plain', 'application/octet-stream', '']) {
+      const c = await classifyUpload(write('notes.md', bytes), claim, 'notes.md');
+      expect({ claim, ext: c.ext, mime: c.mime }).toEqual({
+        claim,
+        ext: 'md',
+        mime: 'text/markdown',
+      });
+    }
+    const j = await classifyUpload(write('d.json', Buffer.from('{"a":1}')), '', 'data.JSON');
+    expect(j.ext).toBe('json');
+  });
+
+  // The rule the dialect map is a bounded exception to: the served extension can only
+  // ever be one of the three, whatever the caller says it is. An `.html` that decodes
+  // as UTF-8 is still text, and still lands as `.txt`.
+  it('never lets an unlisted extension become the served one', async () => {
+    for (const name of ['evil.html', 'evil.svg', 'x.tar.gz', 'no-extension', '.bashrc']) {
+      const c = await classifyUpload(write('claim.txt', Buffer.from('plain words')), '', name);
+      expect({ name, ext: c.ext, mime: c.mime }).toEqual({
+        name,
+        ext: 'txt',
+        mime: 'text/plain',
+      });
+    }
+  });
+
+  // The claim, not the filename, decides whether the SVG probe runs — so a name can
+  // never suppress it for bytes that really are SVG.
+  it("keeps the SVG probe on the claim, out of the filename's reach", async () => {
+    const svg = Buffer.from('<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"/>');
+    const hijack = await classifyUpload(write('a.svg', svg), 'image/svg+xml', 'notes.txt');
+    expect(hijack).toEqual({ contentClass: 'image', mime: 'image/svg+xml', ext: 'svg' });
+
+    // …and the exemption widened with the map: a file the user explicitly named `.md`
+    // stays markdown rather than being called an image. Served as text/markdown it is
+    // every bit as inert, and "your README is an SVG" is the more surprising answer.
+    const md = await classifyUpload(write('b.svg', svg), 'text/markdown', 'notes.md');
+    expect(md).toEqual({ contentClass: 'text', mime: 'text/markdown', ext: 'md' });
+  });
+
+  // The bytes still rule the CLASS. A dialect claim is not a way past the UTF-8 gate.
+  it('will not let a dialect claim smuggle binary through', async () => {
+    const junk = Buffer.from([0x00, 0x01, 0xff, 0xfe, 0x00, 0x99]);
+    for (const claim of ['text/markdown', 'application/json']) {
+      await expect(classifyUpload(write('junk.md', junk), claim, 'junk.md')).rejects.toBeInstanceOf(
+        UnsupportedTypeError,
+      );
+    }
+  });
+
+  // #788's actual bug: bytes fine, label incomplete. A browser handed bare
+  // `text/plain` decodes it with a legacy fallback encoding (Latin-1 on Safari), so
+  // every `—` in a UTF-8 paste renders as `â€"`.
+  it('states the charset on stored text, but not on JSON', () => {
+    expect(storedContentType('text/plain')).toBe('text/plain; charset=utf-8');
+    expect(storedContentType('text/markdown')).toBe('text/markdown; charset=utf-8');
+    // RFC 8259 defines no charset parameter for application/json and mandates UTF-8.
+    expect(storedContentType('application/json')).toBe('application/json');
+    // Untouched for everything else — it is a header helper, not a mime rewriter.
+    expect(storedContentType('image/png')).toBe('image/png');
   });
 
   it('refuses recognized types outside the accepted set, naming what is allowed', async () => {

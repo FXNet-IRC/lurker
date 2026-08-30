@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
+import { hasTextDialectExtension } from '../../../shared/textDialects.js';
+
 // Shared shapes for the uploader-management UI (#514). The server projects these
 // from each driver's own `configSchema`, so the client renders a form for a
 // driver it has never heard of — adding a driver is a server-only change.
@@ -119,7 +121,12 @@ export function missingRequired(
 export const ACCEPTED_FILE_TYPES = [
   'image/*',
   'text/plain',
+  'text/markdown',
+  'application/json',
   '.txt',
+  '.md',
+  '.markdown',
+  '.json',
   'video/mp4',
   'video/quicktime',
   'video/x-m4v',
@@ -140,18 +147,55 @@ export const ACCEPTED_FILE_TYPES = [
   '.mp3',
 ].join(',');
 
+// What a phone camera can hand back, narrowed to what the server takes. Paired
+// with `capture` on its own hidden <input>, which is what makes a mobile browser
+// open the camera directly instead of the file browser (desktop browsers ignore
+// `capture` entirely, which is why the button offering it is touch-only).
+//
+// It has to be a SUBSET of ACCEPTED_FILE_TYPES or the recorder hands back
+// something the upload route then rejects: iOS records video as QuickTime `.mov`,
+// Android as `.mp4`, and both need their extension listed for the same
+// grey-out reason as above.
+export const CAMERA_CAPTURE_TYPES = [
+  'image/*',
+  'video/mp4',
+  'video/quicktime',
+  '.mp4',
+  '.mov',
+].join(',');
+
 // Deliberately LOOSER than the accepted set: the drop/paste gates exist to ignore
 // things that obviously aren't uploads, not to enforce policy. The server is the
 // gate, and its 415 names the problem ("webm files are not accepted — Lurker takes
 // …"), which is far more useful than a drop that silently does nothing — the bug
 // this replaces.
-export function isUploadableType(mime: string): boolean {
-  return (
+export function isUploadableType(mime: string, filename = ''): boolean {
+  if (
     mime.startsWith('image/') ||
     mime.startsWith('audio/') ||
     mime.startsWith('video/') ||
-    mime === 'text/plain'
-  );
+    // Any text/* dialect, not just text/plain: the server takes signature-less UTF-8
+    // whatever the browser called it, and this gate's job is only to ignore things
+    // that obviously aren't uploads. `application/json` needs naming because IANA
+    // files JSON outside `text/` (#788).
+    mime.startsWith('text/') ||
+    mime === 'application/json'
+  ) {
+    return true;
+  }
+
+  // ⚠ The filename is the ONLY signal left when the platform has no mime for the
+  // extension. Windows registers none for `.md`, so a dragged README arrives as `''`
+  // or `application/octet-stream` — and without this the file is silently ignored
+  // right here, one layer ABOVE the server's filename fallback, which never gets to
+  // see it. The picker path doesn't share this gate, so the bug looked like "drag and
+  // drop is broken on Windows only" while picking the same file worked.
+  //
+  // Bounded to the dialect extensions rather than "let every unknown type through":
+  // a stray `.dmg` drag should still do nothing, not start an upload that 415s. Same
+  // shared table the server labels from, so the two can't drift.
+  if (!mime || mime === 'application/octet-stream') return hasTextDialectExtension(filename);
+  return false;
 }
 
 /** A Font Awesome icon for an upload with no thumbnail, from its MIME. The recent-
@@ -162,7 +206,9 @@ export function iconForMime(mime: string | null | undefined): string {
   if (m.startsWith('video/')) return 'fa-file-video';
   if (m.startsWith('audio/')) return 'fa-file-audio';
   if (m.startsWith('image/')) return 'fa-file-image';
-  if (m.startsWith('text/')) return 'fa-file-lines';
+  // JSON is a text file IANA files under `application/` (#788) — without this it
+  // falls to the generic page glyph the rest of this function exists to avoid.
+  if (m.startsWith('text/') || m === 'application/json') return 'fa-file-lines';
   return 'fa-file';
 }
 

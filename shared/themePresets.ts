@@ -9,8 +9,13 @@
 // THEMED_KEYS). Built-ins are code, not rows: Dark IS the registry defaults
 // (computed on demand so a default change never needs a data migration), and
 // Light overrides only the literal colors — keys whose default is a var()
-// reference (link, self nick, buffer unread/highlight, alt row bg, the mono
-// mIRC slots) keep the reference so they track whichever palette is active.
+// reference (link, self nick, buffer unread/highlight, alt row bg) keep the
+// reference so they track whichever palette is active.
+//
+// The mIRC palette is NOT among them: all sixteen slots are literals in both
+// presets. A colour code names a colour, and a slot that defers to the theme
+// breaks the moment a sender pairs it with a background of their own. See the
+// ⚠ on look.color.mirc_colors.
 
 import type { SettingValue } from './settingsRegistry.js';
 import { themedDefaults } from './settingsRegistry.js';
@@ -134,25 +139,32 @@ const LIGHT_OVERRIDES: Record<string, SettingValue> = {
   ],
   // Chromatic slots track the nick palette like the dark defaults do: slots
   // whose dark value is a Pro accent take the official light accent, the rest
-  // keep OKLCH. Mono slots keep their var() derivations. Slot 1 stays literal
-  // black — correct on a light canvas, and still never var(--bg).
+  // keep OKLCH.
+  //
+  // Slots 0/1/14/15 are the SAME literals as the dark preset, deliberately. A
+  // mIRC code names a colour, and white/black/grey are the four the sender is
+  // most likely to have paired with a background of their own — see the ⚠ on
+  // the registry default. Re-tinting those per theme is what broke `\x0300,01`
+  // and `\x0301,00` here. On this canvas white and light grey are the ones that
+  // disappear when used bare; that is the sender's call to have made, and the
+  // same deal the dark preset gives black.
   'look.color.mirc_colors': [
-    'var(--fg)', //                                       0  white
-    '#000000', //                                         1  black — NOT var(--bg)
-    '#3163c0', //                                         2  navy
-    '#269d69', //                                         3  green (official)
-    '#e14775', //                                         4  red (official)
-    '#b52d55', //                                         5  maroon
-    '#7058be', //                                         6  purple (official)
-    '#e16032', //                                         7  orange (official)
-    '#cc7a0a', //                                         8  yellow (official)
-    '#688f2d', //                                         9  lime
-    '#1c8ca8', //                                         10 teal (official)
-    '#409ba9', //                                         11 cyan
-    '#4268c5', //                                         12 blue
-    '#c12d5b', //                                         13 magenta
-    'var(--fg-muted)', //                                 14 gray
-    'color-mix(in srgb, var(--fg) 70%, transparent)', //  15 light gray
+    '#ffffff', // 0  white
+    '#000000', // 1  black
+    '#3163c0', // 2  navy
+    '#269d69', // 3  green (official)
+    '#e14775', // 4  red (official)
+    '#b52d55', // 5  maroon
+    '#7058be', // 6  purple (official)
+    '#e16032', // 7  orange (official)
+    '#cc7a0a', // 8  yellow (official)
+    '#688f2d', // 9  lime
+    '#1c8ca8', // 10 teal (official)
+    '#409ba9', // 11 cyan
+    '#4268c5', // 12 blue
+    '#c12d5b', // 13 magenta
+    '#7f7f7f', // 14 gray       — mIRC's own grey
+    '#d2d2d2', // 15 light gray — mIRC's own light grey
   ],
 };
 

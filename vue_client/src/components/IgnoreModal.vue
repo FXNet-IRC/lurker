@@ -11,7 +11,9 @@
           <span class="label-text">Mask</span>
           <input
             ref="inputEl"
-            v-model="mask"
+            :value="mask"
+            @input="onMaskInput"
+            @keydown.enter="blockImeEnter"
             type="text"
             spellcheck="false"
             autocapitalize="off"
@@ -60,6 +62,7 @@
 import { onMounted, ref } from 'vue';
 import AppModal from './AppModal.vue';
 import { useIgnoresStore } from '../stores/ignores.js';
+import { blockImeEnter, useImeSafeInput } from '../composables/useImeSafeInput.js';
 
 const props = withDefaults(
   defineProps<{
@@ -88,6 +91,7 @@ const scope = ref<'global' | 'network'>('global');
 // If we don't have an observed user@host yet (member entered before WHO
 // completed and we never saw a join), fall back to nick!*@*.
 const mask = ref(props.user && props.host ? `*!${props.user}@${props.host}` : `${props.nick}!*@*`);
+const onMaskInput = useImeSafeInput(mask);
 
 function confirm() {
   const trimmed = mask.value.trim();

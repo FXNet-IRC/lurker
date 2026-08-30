@@ -16,13 +16,22 @@ let listInvites: typeof import('./invites.js').listInvites;
 let inviteStatus: typeof import('./invites.js').inviteStatus;
 let consumeInvite: typeof import('./invites.js').consumeInvite;
 let deleteInvite: typeof import('./invites.js').deleteInvite;
+let isInviteSpent: typeof import('./invites.js').isInviteSpent;
+let deleteUser: typeof import('./users.js').deleteUser;
 let admin: ReturnType<typeof import('./users.js').createUser>;
 let invitee: ReturnType<typeof import('./users.js').createUser>;
 
 beforeAll(async () => {
-  ({ createUser } = await import('./users.js'));
-  ({ createInvite, getInvite, listInvites, inviteStatus, consumeInvite, deleteInvite } =
-    await import('./invites.js'));
+  ({ createUser, deleteUser } = await import('./users.js'));
+  ({
+    createInvite,
+    getInvite,
+    listInvites,
+    inviteStatus,
+    consumeInvite,
+    deleteInvite,
+    isInviteSpent,
+  } = await import('./invites.js'));
   admin = createUser('admin', { role: 'admin' });
   invitee = createUser('invitee');
 });
@@ -98,5 +107,51 @@ describe('invites', () => {
     expect(deleteInvite(inv!.token)).toBe(true);
     expect(getInvite(inv!.token)).toBeNull();
     expect(deleteInvite(inv!.token)).toBe(false);
+  });
+});
+
+// #590. The redeemer column used to be ON DELETE SET NULL, so removing a user
+// handed their one-time link back to whoever still had the URL — a revoked
+// account's invite silently became a way in for a stranger.
+describe('a spent invite outlives its redeemer', () => {
+  it('deleting the redeemer takes the invite with it, rather than reviving it', () => {
+    const joiner = createUser('cascade-joiner');
+    const inv = createInvite(admin.id)!;
+    expect(consumeInvite(inv.token, joiner.id)).toBe(true);
+
+    expect(deleteUser(joiner.id)).toBe(true);
+
+    // The row is gone, so the token is unknown — NOT a row with a null redeemer
+    // that inviteStatus() would have read as live.
+    expect(getInvite(inv.token)).toBeNull();
+    expect(inviteStatus(inv.token).status).toBe('unknown');
+    expect(consumeInvite(inv.token, admin.id)).toBe(false);
+  });
+
+  it('deleting an unrelated user leaves a consumed invite alone', () => {
+    const joiner = createUser('cascade-bystander-joiner');
+    const bystander = createUser('cascade-bystander');
+    const inv = createInvite(admin.id)!;
+    consumeInvite(inv.token, joiner.id);
+
+    deleteUser(bystander.id);
+
+    expect(inviteStatus(inv.token).status).toBe('consumed');
+    expect(getInvite(inv.token)!.usedByUserId).toBe(joiner.id);
+  });
+
+  it('reads used_at as spent even if the redeemer id is gone', async () => {
+    const { default: db } = await import('./index.js');
+    // Belt and braces for the same invariant: used_by_user_id and used_at are
+    // written together, but only the id is a foreign key, so only the id can be
+    // rewritten out from under us. Forced here rather than produced by a
+    // deletion, since the constraint above now prevents that shape arising.
+    const inv = createInvite(admin.id)!;
+    consumeInvite(inv.token, invitee.id);
+    db.prepare(`UPDATE invite_tokens SET used_by_user_id = NULL WHERE token = ?`).run(inv.token);
+
+    expect(isInviteSpent(getInvite(inv.token)!)).toBe(true);
+    expect(inviteStatus(inv.token).status).toBe('consumed');
+    expect(consumeInvite(inv.token, admin.id)).toBe(false);
   });
 });

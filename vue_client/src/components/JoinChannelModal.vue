@@ -17,7 +17,9 @@
       <div class="body">
         <input
           ref="inputEl"
-          v-model="channel"
+          :value="channel"
+          @input="onChannelInput"
+          @keydown.enter="blockImeEnter"
           class="chan-input"
           type="text"
           placeholder="#channel"
@@ -45,6 +47,7 @@ import { useNetworksStore } from '../stores/networks.js';
 import { useBuffersStore } from '../stores/buffers.js';
 import { useChannelListModal } from '../composables/useChannelListModal.js';
 import { ensureChannelPrefix } from '../utils/channelTarget.js';
+import { blockImeEnter, useImeSafeInput } from '../composables/useImeSafeInput.js';
 
 const props = defineProps<{ networkId: number }>();
 const emit = defineEmits<{ close: [] }>();
@@ -55,6 +58,7 @@ const channelListModal = useChannelListModal();
 
 const inputEl = ref<HTMLInputElement | null>(null);
 const channel = ref('');
+const onChannelInput = useImeSafeInput(channel);
 
 const networkLabel = computed(() => {
   const net = networks.networks.find((n) => n.id === props.networkId);

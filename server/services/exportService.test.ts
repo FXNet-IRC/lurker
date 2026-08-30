@@ -293,9 +293,17 @@ describe('export under concurrent IRC writes (lurker#175 regression)', () => {
       tls: true,
       nick: 'c',
     }) as Network;
-    // Several pages' worth (MESSAGE_PAGE = 2000) so the paged stream yields to
-    // the loop multiple times, giving the writer below room to interleave.
-    for (let i = 0; i < 8000; i += 1) {
+    // What this test needs is that the stream crosses page boundaries several
+    // times, so the writer below has room to interleave. It used to buy those
+    // crossings with ROWS — 8000 of them, to clear the production MESSAGE_PAGE
+    // of 2000 four times over — which made its cost scale with a constant while
+    // its 15s timeout stayed fixed, and it duly timed out on a loaded CI runner
+    // (#820). Buy them with the page size instead: 300 rows over pages of 25 is
+    // twelve crossings, three times as many as before, for a twenty-sixth of the
+    // seeding work.
+    const PAGE = 25;
+    const SEEDED = 300; // twelve pages of seeded rows before the writer adds any
+    for (let i = 0; i < SEEDED; i += 1) {
       insertMessage({
         networkId: net.id,
         target: '#c',
@@ -310,6 +318,15 @@ describe('export under concurrent IRC writes (lurker#175 regression)', () => {
     const sink = new PassThrough();
     const chunks: Buffer[] = [];
     sink.on('data', (c: Buffer) => chunks.push(c));
+
+    // The denominator must never trail the numerator. `total` is a COUNT(*) taken
+    // before the walk, and the writer below commits rows after it — so this is
+    // the one place the generator's `Math.max(total, processed)` can actually be
+    // observed doing its job. Counting PAGES here would prove nothing (see below).
+    let progressBackwards = 0;
+    const onProgress = (processed: number, total: number): void => {
+      if (total < processed) progressBackwards += 1;
+    };
 
     // Hammer the SAME shared connection the export reads from. The export pages
     // its reads with discrete `.all()` queries and never holds a cursor across
@@ -347,7 +364,13 @@ describe('export under concurrent IRC writes (lurker#175 regression)', () => {
     setImmediate(pump);
 
     try {
-      await buildExportZip(db, u.id, { includeMessages: true }, sink);
+      await buildExportZip(
+        db,
+        u.id,
+        { includeMessages: true, messagePageSize: PAGE },
+        sink,
+        onProgress,
+      );
     } finally {
       building = false;
     }
@@ -355,7 +378,75 @@ describe('export under concurrent IRC writes (lurker#175 regression)', () => {
     expect(writeError).toBeNull();
     expect(liveWrites).toBeGreaterThan(0);
     expect(Buffer.concat(chunks).slice(0, 2).toString()).toBe('PK');
-  }, 15_000);
+    // A write that lands after the COUNT(*) must not produce "1200 of 1000".
+    expect(progressBackwards).toBe(0);
+    // ⚠ Deliberately NOT asserting the page COUNT here, though this test is the
+    // reason the fixture spans pages at all. The live writer keeps pushing rows
+    // past the keyset cursor, so that count is dominated by the interleaving
+    // rather than by seeded rows crossing page boundaries — it reads ~108 whether
+    // or not the page size is honoured, and passes with the seam broken. The
+    // sibling test below owns that property; this one owns concurrency.
+  });
+
+  it('pages the stream at the requested size, so the fixture stays cheap', () => {
+    // The guard on #820's fix. The test above needs its stream to cross page
+    // boundaries many times, and buys that with a small page rather than with
+    // thousands of rows — so if the page size ever stopped being honoured, that
+    // test would quietly become a single-page export still passing every one of
+    // its assertions, and the regression it exists to catch would go untested.
+    // No concurrent writer here: nothing must move the cursor but the pages.
+    const u = createUser('paged-reader');
+    const net = createNetwork(u.id, {
+      name: 'libera',
+      host: 'irc.libera.chat',
+      port: 6697,
+      tls: true,
+      nick: 'p',
+    }) as Network;
+    for (let i = 0; i < 300; i += 1) {
+      insertMessage({
+        networkId: net.id,
+        target: '#p',
+        time: '2026-05-17T10:00:00Z',
+        type: 'message',
+        nick: 'p',
+        text: `seed ${i}`,
+        self: false,
+      });
+    }
+
+    const sink = new PassThrough();
+    sink.resume();
+    let pages = 0;
+    return buildExportZip(db, u.id, { includeMessages: true, messagePageSize: 25 }, sink, () => {
+      pages += 1;
+    }).then(() => {
+      // 300 rows at 25 a page is 12 pages, plus the final progress report.
+      expect(pages).toBe(13);
+    });
+  });
+
+  it('falls back to the default page rather than building invalid SQL', async () => {
+    // The page size is interpolated into the LIMIT, so a nonsense value has to
+    // degrade to the default instead of failing prepare(). Infinity is the one a
+    // plain positive-integer clamp lets through: it survives Math.max and
+    // interpolates literally, as does anything from 1e21 up in exponent form.
+    const u = createUser('bad-page-size');
+    createNetwork(u.id, {
+      name: 'libera',
+      host: 'irc.libera.chat',
+      port: 6697,
+      tls: true,
+      nick: 'b',
+    });
+    for (const bad of [Number.POSITIVE_INFINITY, Number.NaN, 0, -5, 1e21]) {
+      const sink = new PassThrough();
+      sink.resume();
+      await expect(
+        buildExportZip(db, u.id, { includeMessages: true, messagePageSize: bad }, sink),
+      ).resolves.toBeUndefined();
+    }
+  });
 });
 
 describe('buildExportFilename', () => {

@@ -103,6 +103,27 @@ function urlHref(matched: string): string {
   return matched;
 }
 
+/**
+ * Whether a URL match is wrapped in angle brackets — `<https://example.com>`.
+ *
+ * The convention is RFC 3986 Appendix C's: brackets delimit a URL so a reader (and a parser)
+ * doesn't have to guess where it ends inside prose. Discord borrowed it as "link, but no
+ * unfurl", and that is the meaning both callers here implement — `splitTextByUrls` strips the
+ * brackets from the rendered text, and `previewableUrls` refuses to resolve what they wrap.
+ *
+ * ⚠⚠ The end test uses the UNTRIMMED match. `trimTrailingPunctuation` eats the `.` off
+ * `<https://example.com/a.>`, so measuring from the trimmed length looks one character short of
+ * the `>` and the brackets stop being recognised on exactly the URLs whose ends are ambiguous —
+ * which is the case the convention exists for.
+ *
+ * ⚠ No scheme test, deliberately: `<www.example.com>` is the same convention, and the callers
+ * apply their own scheme rules afterwards.
+ */
+export function isBracketedUrl(text: string, index: number, rawMatch: string): boolean {
+  // `text[-1]` is undefined rather than an error, so a match at position 0 falls out here.
+  return text[index - 1] === '<' && text[index + rawMatch.length] === '>';
+}
+
 interface UrlSegment {
   kind: 'url';
   text: string;
@@ -126,17 +147,27 @@ function splitTextByUrls(text: string): UrlOrTextSegment[] {
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     const start = m.index;
-    const matched = trimTrailingPunctuation(m[0]);
+    // ⚠ Inside brackets the whole match is the URL, with NO trailing-punctuation trim. That is
+    // the entire point of the convention: the author has stated where the address ends, so
+    // `<https://en.wikipedia.org/wiki/Foo.>` keeps its period instead of having it guessed away.
+    const bracketed = isBracketedUrl(text, start, m[0]);
+    const matched = bracketed ? m[0] : trimTrailingPunctuation(m[0]);
     if (!matched) {
       // The whole match was punctuation (shouldn't happen given the regex
       // requires a scheme/www prefix, but guard anyway).
       re.lastIndex = start + 1;
       continue;
     }
-    re.lastIndex = start + matched.length;
-    if (start > lastIdx) out.push({ kind: 'text', text: text.slice(lastIdx, start) });
+    // The brackets themselves are plumbing and are not rendered, so both the scan position and
+    // the preceding text segment step over them.
+    re.lastIndex = start + matched.length + (bracketed ? 1 : 0);
+    // ⚠ Emptiness checked rather than `start > lastIdx`. Dropping the `<` can leave nothing at
+    // all between the previous token and this one — a message that IS a bracketed link starts at
+    // index 1 — and an empty text segment renders as an extra node for the renderer to walk.
+    const before = text.slice(lastIdx, bracketed ? start - 1 : start);
+    if (before) out.push({ kind: 'text', text: before });
     out.push({ kind: 'url', text: matched, href: urlHref(matched) });
-    lastIdx = start + matched.length;
+    lastIdx = start + matched.length + (bracketed ? 1 : 0);
   }
   if (lastIdx < text.length) out.push({ kind: 'text', text: text.slice(lastIdx) });
   return out;
@@ -271,36 +302,43 @@ function colorNicksInText(
 // Fallback for the 16 mIRC colour slots, used when no caller-supplied palette
 // covers a given index. The chromatic slots match nick.colors defaults so a
 // renderer without a settings store (tests, MOTD pre-paint) still produces
-// theme-friendly colours; the four mono-ish slots fall back to theme vars.
-// Indices 16-98 (extended) and the \x04 hex variant aren't widely used and
-// clash badly with custom themes, so we don't render those — we just consume
-// the escape so the digits don't leak into the output.
-// The mono-ish slots track the theme so they stay legible when the user changes
-// look.color.bg / look.color.fg — a slot pinned to a literal near-white would
-// vanish the moment someone sets a light background.
+// theme-friendly colours. Indices 16-98 (extended) and the \x04 hex variant
+// aren't widely used and clash badly with custom themes, so we don't render
+// those — we just consume the escape so the digits don't leak into the output.
 //
-// ⚠ With ONE exception, and it is the whole rule: a slot must never resolve to
-// the SURFACE it is drawn on. Slot 1 was var(--bg), which is the background by
-// definition — black text rendered in precisely the colour behind it and
-// disappeared. var(--fg) and things derived from it are safe (they can never
-// equal the background); var(--bg) can never be anything else.
+// ⚠ EVERY slot is a literal, and none may become a theme reference again.
+//
+// The rule used to be narrower — "never var(--bg), because that IS the surface;
+// var(--fg) and its derivatives are safe since they can never equal the
+// background" — and that reasoning only held for the CANVAS. A run carries its
+// own background, which is a second surface it never considered:
+//
+//   \x0300,01  white on black  →  var(--fg) on #000000, unreadable in a light
+//                                 theme
+//   \x0301,00  black on white  →  slot 0 is the BACKGROUND here, so a
+//                                 foreground reference painted the box
+//
+// A slot that can't be named without knowing what it's drawn on isn't a colour.
+// The cost is that white is invisible on a light canvas when used bare, exactly
+// as black already was on a dark one — the sender's call, and what every other
+// client does.
 export const MIRC_PALETTE_FALLBACK: readonly string[] = [
-  'var(--fg)', //                                       0  white
-  '#000000', //                                         1  black — NOT var(--bg)
-  '#6799f3', //                                         2  navy
-  '#a9dc76', //                                         3  green
-  '#ff6188', //                                         4  red
-  '#ed6c89', //                                         5  maroon
-  '#ab9df2', //                                         6  purple
-  '#fc9867', //                                         7  orange
-  '#ffd866', //                                         8  yellow
-  '#b3db82', //                                         9  lime
-  '#78dce8', //                                         10 teal
-  '#a0f1ff', //                                         11 cyan
-  '#7ba4ff', //                                         12 blue
-  '#ff7494', //                                         13 magenta
-  'var(--fg-muted)', //                                 14 gray
-  'color-mix(in srgb, var(--fg) 70%, transparent)', //  15 light gray
+  '#ffffff', // 0  white
+  '#000000', // 1  black
+  '#6799f3', // 2  navy
+  '#a9dc76', // 3  green
+  '#ff6188', // 4  red
+  '#ed6c89', // 5  maroon
+  '#ab9df2', // 6  purple
+  '#fc9867', // 7  orange
+  '#ffd866', // 8  yellow
+  '#b3db82', // 9  lime
+  '#78dce8', // 10 teal
+  '#a0f1ff', // 11 cyan
+  '#7ba4ff', // 12 blue
+  '#ff7494', // 13 magenta
+  '#7f7f7f', // 14 gray       — mIRC's own grey
+  '#d2d2d2', // 15 light gray — mIRC's own light grey
 ];
 
 // Look up a mIRC colour slot in a caller-supplied palette, falling back to
@@ -440,6 +478,8 @@ export function parseIrcFormatting(text: string): IrcRun[] {
 export interface TextSegmentStyle {
   color?: string;
   backgroundColor?: string;
+  /** Vertical only — see `--mirc-bg-bleed`. Never a horizontal value. */
+  padding?: string;
   fontWeight?: string;
   fontStyle?: string;
   textDecoration?: string;
@@ -489,7 +529,14 @@ export function segmentInlineStyle(
   }
   if (seg.bg != null) {
     const bg = mircColor(seg.bg, mircPalette);
-    if (bg) style.backgroundColor = bg;
+    if (bg) {
+      style.backgroundColor = bg;
+      // Bleed the fill into the line's leading so stacked coloured rows form a
+      // solid field rather than a striped one — see --mirc-bg-bleed. Only when
+      // there IS a background: on a foreground-only run this would paint
+      // nothing and merely widen the hit area.
+      style.padding = 'var(--mirc-bg-bleed) 0';
+    }
   }
   if (seg.bold) style.fontWeight = 'bold';
   if (seg.italic) style.fontStyle = 'italic';
@@ -608,7 +655,13 @@ export function splitTextByTokens(
     // inside the run would stay visible and leak the hidden content. Keep the
     // chosen colour on the segment so SpoilerText can paint the box in the
     // sender's colour rather than a generic gray.
-    if (run.fg != null && run.bg != null && run.fg === run.bg) {
+    // ⚠ `<= 15`, not just fg === bg. The palette has sixteen slots, so anything above resolves
+    // to null (see mircColor) and paints no box — `\x0399,99text\x03` satisfied fg === bg while
+    // drawing nothing, so text rendered in the clear became a neutral grey spoiler nobody could
+    // usefully reveal. 99 is mIRC's "default", a common way to write a run, and it is also what
+    // applySpoilerMarkup now emits to close a spoiler before a digit: without this check that
+    // close would turn the whole rest of the line into a spoiler box.
+    if (run.fg != null && run.bg != null && run.fg === run.bg && run.fg <= 15) {
       out.push({ text: run.text, spoiler: true, fg: run.fg, ...fmt });
       continue;
     }

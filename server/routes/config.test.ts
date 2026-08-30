@@ -42,27 +42,27 @@ describe('GET /api/config', () => {
 });
 
 describe('feature flags', () => {
-  const withFlag = async (value: string | undefined) => {
-    const saved = process.env.LURKER_LINK_PREVIEWS;
-    if (value === undefined) delete process.env.LURKER_LINK_PREVIEWS;
-    else process.env.LURKER_LINK_PREVIEWS = value;
+  const withDecoder = async (value: string | undefined) => {
+    const saved = process.env.LURKER_PREVIEWS_URL;
+    if (value === undefined) delete process.env.LURKER_PREVIEWS_URL;
+    else process.env.LURKER_PREVIEWS_URL = value;
     try {
       return (await createAnonAgent(app).get('/api/config')).body as {
         features?: { linkPreviews?: boolean };
       };
     } finally {
-      if (saved === undefined) delete process.env.LURKER_LINK_PREVIEWS;
-      else process.env.LURKER_LINK_PREVIEWS = saved;
+      if (saved === undefined) delete process.env.LURKER_PREVIEWS_URL;
+      else process.env.LURKER_PREVIEWS_URL = saved;
     }
   };
 
-  it('reports link previews off by default', async () => {
+  it('reports link previews off when no decoder is configured', async () => {
     // Clients use this to HIDE the two settings rather than offer toggles with no server behind
-    // them — the routes aren't even mounted when the flag is off.
-    expect((await withFlag(undefined)).features?.linkPreviews).toBe(false);
+    // them — the routes aren't even mounted when the feature is off, and off IS "no decoder URL".
+    expect((await withDecoder(undefined)).features?.linkPreviews).toBe(false);
   });
 
-  it('reports them on once the operator opts in', async () => {
-    expect((await withFlag('on')).features?.linkPreviews).toBe(true);
+  it('reports them on once the operator points at a decoder', async () => {
+    expect((await withDecoder('http://lurker-previews:8030')).features?.linkPreviews).toBe(true);
   });
 });

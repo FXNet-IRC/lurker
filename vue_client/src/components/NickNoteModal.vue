@@ -9,7 +9,8 @@
       <div class="body">
         <textarea
           ref="inputEl"
-          v-model="draft"
+          :value="draft"
+          @input="onDraftInput"
           spellcheck="true"
           autocapitalize="sentences"
           rows="8"
@@ -37,6 +38,7 @@ import { computed, onMounted, ref } from 'vue';
 import AppModal from './AppModal.vue';
 import { useNickNotesStore } from '../stores/nickNotes.js';
 import { formatDateTime } from '../utils/timestamp.js';
+import { useImeSafeInput } from '../composables/useImeSafeInput.js';
 
 const props = defineProps<{
   nick: string;
@@ -50,6 +52,7 @@ const inputEl = ref<HTMLTextAreaElement | null>(null);
 const entry = computed(() => nickNotes.entryFor(props.networkId, props.nick));
 const initial = computed(() => entry.value?.note || '');
 const draft = ref(initial.value);
+const onDraftInput = useImeSafeInput(draft);
 const dirty = computed(() => draft.value !== initial.value);
 const hasExistingNote = computed(() => !!entry.value?.note);
 const formattedUpdatedAt = computed(() => formatDateTime(entry.value?.updatedAt ?? ''));

@@ -87,6 +87,91 @@
         I understand this will populate my empty account with the imported data.
       </label>
     </div>
+
+    <hr class="hl-sep" />
+
+    <!-- Retention (lurker-dev/RETENTION_PLAN.md). Preset selects rather than
+         raw number fields: deletion is permanent, and a preset list can't
+         fat-finger 50 where 5000 was meant. Presets above the instance
+         ceiling are hidden; a stored custom value renders as its own option
+         so the pane never shows something that isn't true. Custom values go
+         through /set, per-buffer overrides through /retention. -->
+    <h3 class="subhead">retention</h3>
+    <p v-if="ceilingNote" class="muted small">{{ ceilingNote }}</p>
+    <p v-if="retError" class="error inline">{{ retError }}</p>
+
+    <div class="ret-row">
+      <label for="ret-lines">History limit (lines per buffer)</label>
+      <p class="muted small">
+        Oldest lines beyond the limit are deleted permanently — bookmarked messages are never
+        deleted. Export first if you want an archive. Per-buffer: type /retention in any buffer.
+      </p>
+      <div class="editor-line">
+        <select
+          id="ret-lines"
+          :key="retTick"
+          :value="String(linesValue)"
+          @change="
+            onRetentionChange('data.retention.lines', ($event.target as HTMLSelectElement).value)
+          "
+        >
+          <option v-for="p in linePresets" :key="p.value" :value="String(p.value)">
+            {{ p.label }}
+          </option>
+        </select>
+        <span v-if="linesHint" class="muted small">{{ linesHint }}</span>
+      </div>
+    </div>
+
+    <div class="ret-row">
+      <label for="ret-hours">Event noise age limit</label>
+      <p class="muted small">
+        Joins, parts, quits, nick and mode changes, MOTDs older than this are deleted permanently,
+        regardless of the line limit.
+      </p>
+      <div class="editor-line">
+        <select
+          id="ret-hours"
+          :key="retTick"
+          :value="String(hoursValue)"
+          @change="
+            onRetentionChange(
+              'data.retention.event_hours',
+              ($event.target as HTMLSelectElement).value,
+            )
+          "
+        >
+          <option v-for="p in hourPresets" :key="p.value" :value="String(p.value)">
+            {{ p.label }}
+          </option>
+        </select>
+      </div>
+    </div>
+
+    <div class="ret-row">
+      <label for="ret-days">Delete closed buffers after</label>
+      <p class="muted small">
+        A buffer closed for longer than this is deleted entirely, history included. Buffers
+        containing a bookmarked message are never deleted.
+      </p>
+      <div class="editor-line">
+        <select
+          id="ret-days"
+          :key="retTick"
+          :value="String(daysValue)"
+          @change="
+            onRetentionChange(
+              'data.retention.closed_buffer_days',
+              ($event.target as HTMLSelectElement).value,
+            )
+          "
+        >
+          <option v-for="p in dayPresets" :key="p.value" :value="String(p.value)">
+            {{ p.label }}
+          </option>
+        </select>
+      </div>
+    </div>
   </section>
 </template>
 
@@ -96,6 +181,7 @@ import { useRouter } from 'vue-router';
 import { api, apiMultipart } from '../../api.js';
 import { resetSession } from '../../composables/useSessionReset.js';
 import { useDataExportStore } from '../../stores/dataExport.js';
+import { useSettingsStore } from '../../stores/settings.js';
 
 interface ExportPreview {
   settingsOnly: Record<string, number>;
@@ -265,6 +351,151 @@ function formatBytes(n: number): string {
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
+
+// ─── Retention ─────────────────────────────────────────────────────────────
+
+const settings = useSettingsStore();
+const limits = ref<{
+  maxLines: number | null;
+  maxEventHours: number | null;
+  maxClosedBufferDays: number | null;
+} | null>(null);
+onMounted(async () => {
+  try {
+    limits.value = await api('/api/retention/limits');
+  } catch {
+    /* no ceilings shown; the server still enforces them */
+  }
+});
+
+const ceilingNote = computed(() => {
+  const l = limits.value;
+  if (!l) return '';
+  const parts: string[] = [];
+  if (l.maxLines != null) parts.push(`${l.maxLines.toLocaleString()} lines per buffer`);
+  if (l.maxEventHours != null) parts.push(`${l.maxEventHours} hours of event noise`);
+  const sentences: string[] = [];
+  if (parts.length) sentences.push(`This server keeps at most ${parts.join(' and ')}.`);
+  if (l.maxClosedBufferDays != null) {
+    sentences.push(`Closed buffers are deleted after at most ${l.maxClosedBufferDays} days.`);
+  }
+  return sentences.join(' ');
+});
+
+// ~281 bytes/line all-in (row + indexes + search index), measured on the
+// reference database — mental math for the preset labels, not a promise.
+const BYTES_PER_LINE = 281;
+
+const LINE_PRESETS = [0, 1_000, 5_000, 10_000, 25_000, 50_000, 100_000];
+const HOUR_PRESETS = [0, 24, 72, 168, 720];
+const DAY_PRESETS = [0, 7, 30, 90, 365];
+
+const linesValue = computed(() => Number(settings.effective('data.retention.lines') ?? 0));
+const hoursValue = computed(() => Number(settings.effective('data.retention.event_hours') ?? 168));
+const daysValue = computed(() =>
+  Number(settings.effective('data.retention.closed_buffer_days') ?? 0),
+);
+
+// Every label must say what will actually HAPPEN, ceiling included: the
+// server clamps a stored 0 (and any over-ceiling value) TO the ceiling, so
+// "Unlimited" under a ceiling is a lie — the 0 option relabels to say the
+// ceiling applies, and an over-ceiling custom value says what it's capped to.
+function presetList(
+  presets: number[],
+  current: number,
+  ceiling: number | null,
+  label: (v: number) => string,
+  ceilingLabel: (ceiling: number) => string,
+): Array<{ value: number; label: string }> {
+  const name = (v: number) => {
+    if (ceiling != null && v === 0) return ceilingLabel(ceiling);
+    if (ceiling != null && v > ceiling) return `${label(v)} — capped at ${label(ceiling)}`;
+    return label(v);
+  };
+  const list = presets
+    .filter((v) => ceiling == null || v <= ceiling)
+    .map((v) => ({ value: v, label: name(v) }));
+  if (!list.some((p) => p.value === current)) {
+    list.push({ value: current, label: `${name(current)} (custom)` });
+    list.sort((a, b) => (a.value === 0 ? -1 : b.value === 0 ? 1 : a.value - b.value));
+  }
+  return list;
+}
+
+const linePresets = computed(() =>
+  presetList(
+    LINE_PRESETS,
+    linesValue.value,
+    limits.value?.maxLines ?? null,
+    (v) => (v === 0 ? 'Unlimited' : `${v.toLocaleString()} lines`),
+    (c) => `Server maximum (${c.toLocaleString()} lines)`,
+  ),
+);
+const hourPresets = computed(() =>
+  presetList(
+    HOUR_PRESETS,
+    hoursValue.value,
+    limits.value?.maxEventHours ?? null,
+    (v) =>
+      v === 0
+        ? 'Keep as long as messages'
+        : v === 24
+          ? '1 day'
+          : v === 72
+            ? '3 days'
+            : v === 168
+              ? '1 week'
+              : v === 720
+                ? '30 days'
+                : `${v} hours`,
+    (c) => `Server maximum (${c} hours)`,
+  ),
+);
+const dayPresets = computed(() =>
+  presetList(
+    DAY_PRESETS,
+    daysValue.value,
+    limits.value?.maxClosedBufferDays ?? null,
+    (v) =>
+      v === 0
+        ? 'Never'
+        : v === 7
+          ? '1 week'
+          : v === 30
+            ? '30 days'
+            : v === 90
+              ? '90 days'
+              : v === 365
+                ? '1 year'
+                : `${v} days`,
+    (c) => `Server maximum (${c} days)`,
+  ),
+);
+
+const linesHint = computed(() => {
+  if (linesValue.value <= 0) return '';
+  const mb = (linesValue.value * BYTES_PER_LINE) / 1_000_000;
+  return `≈ ${mb >= 10 ? Math.round(mb) : mb.toFixed(1)} MB per full buffer`;
+});
+
+const retError = ref('');
+// Bumped on a FAILED write: the bound value never changed, so Vue would skip
+// the DOM patch and the select would keep displaying the unsaved (and
+// destructive-looking) choice. The :key change forces the element to rebuild
+// at the stored value.
+const retTick = ref(0);
+
+async function onRetentionChange(key: string, raw: string) {
+  const n = Number(raw);
+  if (!Number.isInteger(n)) return;
+  retError.value = '';
+  try {
+    await settings.setValue(key, n);
+  } catch (e: any) {
+    retError.value = e.message || 'failed to save — the stored value is unchanged';
+    retTick.value++;
+  }
+}
 </script>
 
 <style src="./panes.css"></style>
@@ -308,5 +539,18 @@ function formatBytes(n: number): string {
 }
 .chosen-row .filename {
   color: var(--fg);
+}
+
+.ret-row {
+  padding: var(--space-3) 0;
+}
+.ret-row label {
+  color: var(--fg);
+}
+.ret-row .editor-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding-top: var(--space-2);
 }
 </style>

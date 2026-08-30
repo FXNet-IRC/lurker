@@ -108,6 +108,12 @@ function projectRow(
 // Rows read (and progress reported) per page. Big enough that per-page query
 // overhead is negligible, small enough that the synchronous chunk between
 // event-loop yields stays short.
+//
+// Overridable per call (`messagePageSize`) so a test can span many pages on a
+// few hundred rows instead of seeding several thousand to cross this one.
+// What the paging behaviour needs proving against is the NUMBER of yields, not
+// the row count — and buying those yields with rows makes a test whose cost
+// scales with this constant while its timeout does not (#820).
 const MESSAGE_PAGE = 2000;
 
 // Stream a user's messages as NDJSON, paginated by id (keyset), yielding to the
@@ -125,12 +131,22 @@ async function* messagesNdjsonGenerator(
   userId: number,
   total: number,
   onProgress?: ExportProgressFn,
+  pageSize: number = MESSAGE_PAGE,
 ): AsyncGenerator<string> {
   const def = EXPORT_TABLES.messages as ExportTableDefWithScope;
   const { where, params } = scopeFilter(def.scope, userId);
   const cols = def.columns.join(', ');
+  // Interpolated, like the default was, but from a caller-supplied value now, so
+  // it has to be coerced rather than trusted into the SQL. Finite as well as
+  // positive: Infinity survives a Math.max clamp and interpolates as
+  // `LIMIT Infinity`, and anything from 1e21 up stringifies in exponent form —
+  // both are syntax errors that would fail the whole export at prepare() rather
+  // than degrade to a sane page.
+  const requested = Math.floor(pageSize);
+  const limit =
+    Number.isFinite(requested) && requested >= 1 ? Math.min(requested, 1_000_000) : MESSAGE_PAGE;
   const pageStmt = db.prepare(
-    `SELECT ${cols} FROM messages ${where} AND id > ? ORDER BY id ASC LIMIT ${MESSAGE_PAGE}`,
+    `SELECT ${cols} FROM messages ${where} AND id > ? ORDER BY id ASC LIMIT ${limit}`,
   );
   let lastId = 0;
   let processed = 0;
@@ -218,7 +234,7 @@ function getSchemaVersion(db: Database): number {
 export async function buildExportZip(
   db: Database,
   userId: number,
-  { includeMessages = false } = {},
+  { includeMessages = false, messagePageSize = MESSAGE_PAGE } = {},
   destStream: Writable,
   onProgress?: ExportProgressFn,
 ): Promise<void> {
@@ -283,9 +299,10 @@ export async function buildExportZip(
     // it's cheap on the indexed selection and known before the stream drains.
     const total = countExportMessages(db, userId);
     counts.messages = total;
-    const messagesStream = Readable.from(messagesNdjsonGenerator(db, userId, total, onProgress), {
-      encoding: 'utf8',
-    });
+    const messagesStream = Readable.from(
+      messagesNdjsonGenerator(db, userId, total, onProgress, messagePageSize),
+      { encoding: 'utf8' },
+    );
     archive.append(messagesStream, { name: 'messages.ndjson' });
 
     // ---- bookmarks.json ----

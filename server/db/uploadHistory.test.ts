@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { mimeMatchesKind } from '../../shared/uploadKinds.js';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -86,6 +87,10 @@ describe('listUploads — search + kind filter (#547)', () => {
     ['vacation.png', 'image/webp'],
     ['screenshot-march.png', 'image/webp'],
     ['notes.txt', 'text/plain'],
+    // The text dialects (#788). `application/json` is the interesting one: IANA files
+    // JSON outside `text/`, so a bare prefix match drops it out of every filter.
+    ['README.md', 'text/markdown'],
+    ['data.json', 'application/json'],
     ['clip.mp4', 'video/mp4'],
     ['song.mp3', 'audio/mpeg'],
     ['SCREAMING-SHOT.PNG', 'image/webp'],
@@ -142,11 +147,38 @@ describe('listUploads — search + kind filter (#547)', () => {
     ['image', 5],
     ['video', 1],
     ['audio', 1],
-    ['text', 1],
+    // .txt + .md + .json — the JSON only arrives here because the clause names it.
+    ['text', 3],
   ] as const)('filters to kind=%s', (kind, count) => {
     const rows = mod.listUploads(carol.id, { kind });
     expect(rows.length).toBe(count);
-    expect(rows.every((r) => (r.mime || '').startsWith(`${kind}/`))).toBe(true);
+    expect(rows.every((r) => mimeMatchesKind(r.mime, kind))).toBe(true);
+  });
+
+  // ⚠ #788. The filter was a bare `mime LIKE 'text/%'`, so an uploaded `.json` was
+  // invisible under every filter the browser offers — including the one it obviously
+  // belongs to. Asserted by NAME, not by count, so widening the seed can't mask it.
+  it('finds a .json under text, whose mime sits outside the text/ prefix', () => {
+    expect(names(mod.listUploads(carol.id, { kind: 'text' }))).toEqual([
+      'data.json',
+      'README.md',
+      'notes.txt',
+    ]);
+  });
+
+  // The OR'd clause must not leak past its own kind: `application/json` belongs to
+  // text and nothing else.
+  it('does not leak an extra-mime row into a neighbouring kind', () => {
+    for (const kind of ['image', 'video', 'audio'] as const) {
+      expect(names(mod.listUploads(carol.id, { kind }))).not.toContain('data.json');
+    }
+  });
+
+  // The extras are OR'd with the prefix but must stay AND'd with everything else — an
+  // extra-mime row is not a way past the search term or the ownership scope.
+  it('still ANDs the search term against an extra-mime row', () => {
+    expect(names(mod.listUploads(carol.id, { q: 'data', kind: 'text' }))).toEqual(['data.json']);
+    expect(mod.listUploads(carol.id, { q: 'data', kind: 'audio' })).toEqual([]);
   });
 
   it('ANDs the search term with the kind', () => {

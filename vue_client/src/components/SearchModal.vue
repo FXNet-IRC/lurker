@@ -8,7 +8,8 @@
     <div class="search-row">
       <input
         ref="inputEl"
-        v-model="queryInput"
+        :value="queryInput"
+        @input="onQueryInput"
         class="filter"
         type="text"
         placeholder="search messages — from:nick in:#channel on:network"
@@ -41,6 +42,7 @@ import { useSearchStore } from '../stores/search.js';
 import type { SearchResult } from '../stores/search.js';
 import { useIgnoresStore } from '../stores/ignores.js';
 import type { HistoryMessage } from './HistoryMessageRow.vue';
+import { useImeSafeInput } from '../composables/useImeSafeInput.js';
 
 const emit = defineEmits<{
   close: [];
@@ -73,6 +75,7 @@ const listEl = ref<HTMLUListElement | null>(null);
 // Local mirror of the store's raw query so we can debounce dispatch without
 // debouncing the text field itself. Scoped opens seed the prefilled filter.
 const queryInput = ref(scoped ? `${props.scope} ` : store.query);
+const onQueryInput = useImeSafeInput(queryInput);
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 watch(queryInput, (val) => {
   store.setQuery(val);
@@ -105,11 +108,11 @@ onMounted(() => {
     store.$patch({
       query: queryInput.value,
       results: [],
-      hasMore: false,
       nextBefore: null,
       loading: false,
       error: '',
       searched: false,
+      lastUrl: null,
       scrollTop: 0,
     });
   }

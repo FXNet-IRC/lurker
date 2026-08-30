@@ -7,8 +7,11 @@ import {
   resolveBufferIdByNetwork,
   resolveOrMintForInsert,
 } from './bufferResolve.js';
+import { markBufferDirty, noteNoiseInsert } from './retention.js';
+import { EARLY_PRUNE_TYPES } from '../../shared/eventFilter.js';
 import { countsTowardPage } from '../../shared/eventFilter.js';
 import type { PageUnit } from '../../shared/eventFilter.js';
+import type { ModeChange } from '../../shared/modes.js';
 
 // Buffer identity is buffers.id as of schema 17: every predicate in this file
 // filters on `buffer_id`, and `target` is written at insert as an observation
@@ -179,6 +182,12 @@ export function insertMessage(row: MessageInput): {
     msgid: row.msgid || null,
   });
   const id = result.lastInsertRowid;
+  // Retention prunes lazily: the sweep only ever looks at buffers that grew.
+  markBufferDirty(bufferId);
+  // A noise row whose stored time lies in the past (server-time/replay) can
+  // land below the owner's noise-clock cursor; this rewinds it so the row is
+  // still swept. See noteNoiseInsert.
+  if (EARLY_PRUNE_TYPES.has(row.type)) noteNoiseInsert(bufferId, row.time);
   const altRow = altByIdStmt.get(id) as { alt: number } | undefined;
   // bufferId returned so the live publish path can stamp it onto the enriched
   // event without a second resolve — the wire's `irc` frames carry it.
@@ -320,6 +329,24 @@ function listMessagesById(
 // motivated the feature.
 export const RENDERABLE_MAX_SCAN = 2000;
 
+/**
+ * A scanned mode row's change list, for the `renderable` count.
+ *
+ * Only mode rows carry an `extra` here (the scan's CASE sees to that), so this
+ * is null for everything else. Malformed JSON reads as "no changes", which makes
+ * the row count — the fail-visible direction, and the same way rowToEvent
+ * tolerates it.
+ */
+function parseScannedModes(extra: string | null): ModeChange[] | null {
+  if (!extra) return null;
+  try {
+    const parsed = JSON.parse(extra) as { modes?: ModeChange[] };
+    return Array.isArray(parsed?.modes) ? parsed.modes : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 /** Cursor + sizing options shared by every paging entry point here. */
 interface PageOptions {
   before?: number;
@@ -372,16 +399,25 @@ function listMessagesCountedById(
 
   // Step 1: walk out from the cursor and stop at whichever comes first — the
   // `limit`-th COUNTING row, or `maxScan` rows.
+  // `extra` comes back only for mode rows: it is the one type whose countability
+  // depends on its contents (member-status churn folds, a ban doesn't), and
+  // pulling the column for every scanned row would cost bytes on a scan bounded
+  // at RENDERABLE_MAX_SCAN for no gain.
+  const cols = `id, type, CASE WHEN type = 'mode' THEN extra END AS extra`;
   const scanSql = forward
-    ? `SELECT id, type FROM messages WHERE buffer_id = ? AND id > ? ORDER BY id ASC LIMIT ?`
+    ? `SELECT ${cols} FROM messages WHERE buffer_id = ? AND id > ? ORDER BY id ASC LIMIT ?`
     : before
-      ? `SELECT id, type FROM messages WHERE buffer_id = ? AND id < ? ORDER BY id DESC LIMIT ?`
-      : `SELECT id, type FROM messages WHERE buffer_id = ? ORDER BY id DESC LIMIT ?`;
+      ? `SELECT ${cols} FROM messages WHERE buffer_id = ? AND id < ? ORDER BY id DESC LIMIT ?`
+      : `SELECT ${cols} FROM messages WHERE buffer_id = ? ORDER BY id DESC LIMIT ?`;
   const cursor = forward ? afterId : before;
   const scanParams: Array<number | string> = cursor
     ? [bufferId, cursor, maxScan]
     : [bufferId, maxScan];
-  const scanned = db.prepare(scanSql).all(...scanParams) as Array<{ id: number; type: string }>;
+  const scanned = db.prepare(scanSql).all(...scanParams) as Array<{
+    id: number;
+    type: string;
+    extra: string | null;
+  }>;
   if (scanned.length === 0) return [];
 
   // The last row to include. Landing ON the `limit`-th counting row (rather
@@ -390,7 +426,7 @@ function listMessagesCountedById(
   let boundary = scanned[scanned.length - 1].id;
   let counted = 0;
   for (const row of scanned) {
-    if (!countsTowardPage(row.type, unit)) continue;
+    if (!countsTowardPage({ type: row.type, modes: parseScannedModes(row.extra) }, unit)) continue;
     counted += 1;
     if (counted === limit) {
       boundary = row.id;
@@ -720,6 +756,45 @@ export function hasMessageForTarget(networkId: number, target: string): boolean 
   return !!db.prepare('SELECT 1 FROM messages WHERE buffer_id = ? LIMIT 1').get(bufferId);
 }
 
+// Whether a row with this server-assigned msgid already exists on the network.
+// Used by the engine-mode catch-up window (ircConnection.catchingUp): a line the
+// previous process persisted but had not yet acked when it died is delivered
+// again to its successor, and the msgid is the only thing that says so. Index
+// seek on idx_messages_msgid.
+const hasMsgidStmt = db.prepare(
+  'SELECT 1 FROM messages WHERE network_id = ? AND msgid = ? LIMIT 1',
+);
+export function hasMessageWithMsgid(networkId: number, msgid: string): boolean {
+  if (!networkId || !msgid) return false;
+  return !!hasMsgidStmt.get(networkId, msgid);
+}
+
+// The msgid-less version of the same question, for networks that don't tag
+// messages (Libera, OFTC, ZNC…): the same target, sender, kind and text within
+// a short window of the same time. Only ever consulted in the catch-up window,
+// where a repeat means a re-delivery, not a user saying the same thing twice.
+const hasLikeStmt = db.prepare(
+  `SELECT 1 FROM messages
+   WHERE network_id = ? AND target = ? AND type = ? AND nick IS ? AND text IS ?
+     AND time BETWEEN ? AND ? LIMIT 1`,
+);
+export function hasRecentMessageLike(
+  networkId: number,
+  target: string,
+  type: string,
+  nick: string | null,
+  text: string | null,
+  time: string,
+  toleranceMs = 5000,
+): boolean {
+  if (!networkId || !target) return false;
+  const t = Date.parse(time);
+  if (!Number.isFinite(t)) return false;
+  const lo = new Date(t - toleranceMs).toISOString();
+  const hi = new Date(t + toleranceMs).toISOString();
+  return !!hasLikeStmt.get(networkId, target, type, nick, text, lo, hi);
+}
+
 // Whether a target has a real (non-notice) conversation — at least one PRIVMSG or
 // ACTION. NOTICE-only buffers (services like NickServ/ChanServ, which now get a
 // buffer of their own, #439) are NOT conversations: presence-tracking keys off
@@ -983,6 +1058,7 @@ export function searchMessages(
     where.push('m.matched_rule_id IS NOT NULL');
   }
 
+  const hasText = !!text;
   if (text) {
     const match = toFtsMatch(text);
     if (!match) return [];
@@ -992,33 +1068,82 @@ export function searchMessages(
     where.push('messages_fts MATCH ?');
     params.push(match);
   }
-  if (networkId) {
-    where.push('m.network_id = ?');
-    params.push(networkId);
-  }
+
+  // `in:` resolves through the registry once per candidate network — folds
+  // are per-network (#707), so ONE folded string can't probe several
+  // networks: a Libera '#chat[dev]' is stored under its rfc1459 fold
+  // '#chat{dev}', which a legacy fold of the query would silently miss.
+  // The scoped case is the one-network instance of the same loop, so both
+  // shapes share one mechanism. An empty id list matches nothing.
+  let bufferIds: number[] | undefined;
   if (target) {
-    // `in:` resolves through the registry once per candidate network — folds
-    // are per-network (#707), so ONE folded string can't probe several
-    // networks: a Libera '#chat[dev]' is stored under its rfc1459 fold
-    // '#chat{dev}', which a legacy fold of the query would silently miss.
-    // The scoped case is the one-network instance of the same loop, so both
-    // shapes share one mechanism. An empty id list matches nothing.
     const nets = networkId
       ? [{ id: networkId }]
       : (userNetworkIdsStmt.all(userId) as { id: number }[]);
-    const ids: number[] = [];
+    bufferIds = [];
     for (const net of nets) {
       const found = resolveBuffer(userId, net.id, target);
-      if (found) ids.push(found.id);
+      if (found) bufferIds.push(found.id);
     }
-    if (ids.length === 0) where.push('0');
+  }
+  const nickFiltered = nickList.length > 0 || !!nick;
+
+  // Which predicate DRIVES a filter-only search is decided here, not left to
+  // the planner: this schema never runs ANALYZE (plans stay deterministic
+  // across installs), and a stats-less planner picks plausible indexes with
+  // scan-shaped worst cases. Fixed priority — text > from: > in: > on: —
+  // most selective in the worst case first. With free text the FTS join
+  // above drives and the structured filters stay plain per-row checks.
+  if (hasText) {
+    if (networkId) {
+      where.push('m.network_id = ?');
+      params.push(networkId);
+    }
+  } else if (nickFiltered) {
+    // Nick drives, via idx_messages_net_nick. The index needs a network_id
+    // IN prefix, and the access-control join alone can't provide one — so the
+    // caller's network set is pushed in as a subquery over their own rows.
+    // The planner materializes it once (LIST SUBQUERY) and still seeks
+    // (network_id=? AND nick=?). A subquery rather than an expanded id list
+    // (PR #798 review): the set is derived inside SQL, so a request-supplied
+    // networkId is ownership-checked by construction and no untrusted value
+    // can reach the predicate. Still redundant with the join by design — this
+    // exists purely so the planner can seek.
+    if (networkId) {
+      where.push('m.network_id IN (SELECT id FROM networks WHERE user_id = ? AND id = ?)');
+      params.push(userId, networkId);
+    } else {
+      where.push('m.network_id IN (SELECT id FROM networks WHERE user_id = ?)');
+      params.push(userId);
+    }
+  } else if (bufferIds === undefined && networkId) {
+    // on:-only — idx_messages_net drives. When buffer ids are present instead,
+    // NO network predicate is emitted at all: the ids above were already
+    // resolved per-network, and leaving `m.network_id = ?` in tempts the
+    // planner away from the buffer index into idx_messages_net, which for a
+    // quiet buffer on a busy network walks the whole network's history.
+    where.push('m.network_id = ?');
+    params.push(networkId);
+  }
+
+  if (bufferIds !== undefined) {
+    if (bufferIds.length === 0) where.push('0');
     else {
-      where.push(`m.buffer_id IN (${ids.map(() => '?').join(', ')})`);
-      params.push(...ids);
+      // The unary `+` (only when nick drives) hides the buffer term from index
+      // selection while keeping it as a row filter — without it the planner
+      // drives from:+in: through idx_messages_buf_unread, whose worst case (a
+      // nick that never spoke in a big buffer) walks the buffer's entire
+      // history with a table fetch per row. Nick-driven, the wrong-buffer
+      // rejects are index-only via the buffer_id payload column.
+      const col = !hasText && nickFiltered ? '+m.buffer_id' : 'm.buffer_id';
+      where.push(`${col} IN (${bufferIds.map(() => '?').join(', ')})`);
+      params.push(...bufferIds);
     }
   }
   // `nicks` OR-matches several senders (a friend's alts); `nick` is the single
-  // case. COLLATE NOCASE binds to the column so the IN comparison is case-fold.
+  // case. COLLATE NOCASE binds to the column so the IN comparison is case-fold
+  // — and matches the collation on idx_messages_net_nick's nick column, which
+  // an index without it would be invisible to.
   if (nickList.length > 0) {
     where.push(`m.nick COLLATE NOCASE IN (${nickList.map(() => '?').join(', ')})`);
     params.push(...nickList);
@@ -1031,10 +1156,15 @@ export function searchMessages(
     params.push(before);
   }
 
+  // With free text the ORDER BY targets the FTS table's rowid — the same value
+  // as m.id (the join equates them), but FTS5 can stream matches in rowid
+  // order natively, so the query stops at the LIMIT instead of materializing
+  // and sorting every message that ever contained the term (measured 2126ms →
+  // 1.6ms for a common word on a 2M-row database).
   const sql = `SELECT m.*, n.name AS network_name, ${BOOKMARKED_COL('m')}
                FROM ${from}
                WHERE ${where.join(' AND ')}
-               ORDER BY m.id DESC
+               ORDER BY ${hasText ? 'messages_fts.rowid' : 'm.id'} DESC
                LIMIT ?`;
   params.push(limit);
 

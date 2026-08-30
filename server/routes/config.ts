@@ -31,8 +31,9 @@ router.get('/', (_req: Request, res: Response) => {
     publicMode: isPublicModeEnabled(),
     protocolVersion: PROTOCOL_VERSION,
     minProtocolVersion: MIN_PROTOCOL_VERSION,
-    // Feature flags. `linkPreviews` is off unless the operator opted in
-    // (LURKER_LINK_PREVIEWS); clients use it to hide the two user settings entirely rather than
+    // Feature flags. `linkPreviews` is off unless the operator pointed the instance at a
+    // lurker-previews decoder (LURKER_PREVIEWS_URL, which is the whole gate — see
+    // previewsEnabled); clients use it to hide the two user settings entirely rather than
     // presenting toggles that can't do anything.
     features: {
       linkPreviews: previewsEnabled(),

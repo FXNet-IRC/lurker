@@ -26,10 +26,10 @@ MCP-aware client at your Lurker, and what tools are available.
 
 ## Scopes
 
-| scope        | what it grants                                                                                                        |
-| ------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `read`       | All read verbs. The token can list networks, browse buffers, fetch backlog, search history, and read your nick notes. |
-| `read-write` | Everything `read` does, plus sending messages, sending CTCP actions, and writing nick notes.                          |
+| scope        | what it grants                                                                                                                                                                                                                                                                                                            |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read`       | All read verbs. The token can list networks, browse buffers, fetch backlog, search history, and read your nick notes.                                                                                                                                                                                                     |
+| `read-write` | Everything `read` does, plus every write verb: sending messages, notices and CTCP actions, writing nick notes, joining and parting channels, changing your nick, away state and channel topics, connecting and disconnecting networks, and `send_raw` — arbitrary IRC commands (`MODE`, `KICK`, `OPER`, …) issued as you. |
 
 Scopes are coarse on purpose. Per-verb scopes are not implemented because
 the threat model assumes the operator is the only person holding tokens for
@@ -45,8 +45,8 @@ deliberately out of scope.
 
 ## Tools (MCP verbs)
 
-All eight tools come back through `tools/list` with full JSON Schemas for
-their inputs. A read-only token only sees the five read tools.
+All twenty-one tools come back through `tools/list` with full JSON Schemas
+for their inputs. A read-only token only sees the seven read tools.
 
 ### `list_networks` _(read)_
 
@@ -83,6 +83,19 @@ Write a free-form note. Pass an empty string to delete. Notes are capped at
 4096 chars. Writes fan out to any open browser tabs so the UI reflects the
 change immediately.
 
+### `set_relay_bot` _(read-write)_
+
+Mark or unmark a nick as a relay/bridge bot (#277). When marked, messages from
+that bot are re-attributed to the speaker embedded in its envelope, so
+`[Discord] <alice> hi` is shown as from `alice`.
+Pass `marked: false` to clear the mark.
+An optional `pattern` overrides the built-in envelope formats with a template
+using `{source}`, `{nick}` and `{message}`. A template missing `{nick}` or
+`{message}` does not fail the call — it is stored and then silently ignored at
+render time, so the verb returns `marked: true` for a pattern that does
+nothing. Returns the stored `{ networkId, nick, marked, pattern }`, echoing the
+canonical stored casing, and syncs the change to the user's open tabs.
+
 ### `send_message` _(read-write)_
 
 Send a PRIVMSG to a channel or peer. Returns
@@ -94,6 +107,80 @@ branch on the value instead of catching.
 
 Send a CTCP ACTION (`/me ...`). Same shape and error semantics as
 `send_message`.
+
+### `send_notice` _(read-write)_
+
+Send a NOTICE to a channel or peer. Same shape and error semantics as
+`send_message`, with NOTICE conventions — no auto-reply is expected, and bots
+conventionally use it for output that should not trigger further bots.
+
+### `send_raw` _(read-write)_
+
+Send a raw IRC protocol line verbatim on a network — the escape hatch for any
+command without a dedicated verb: `MODE #chan +o nick`, `KICK #chan bob :spam`,
+`INVITE bob #chan`, `OPER user pass`, and so on. No parsing, no trailing CRLF.
+**Powerful and unguarded — it runs as you.** Prefer a dedicated verb wherever
+one exists. A `PRIVMSG` to a channel with end-to-end encryption enabled is
+**rejected** (`e2e-channel-use-send-message`) rather than sent: this path has
+none of `send_message`'s encryption, and no local echo either, so a leak here
+would be silent at both ends.
+
+Server replies (WHOIS, LIST, …) arrive asynchronously in the network's server
+buffer, whose target is the literal `:server:<networkId>`. That buffer is
+deliberately absent from `list_buffers`, so the result carries a `serverBuffer`
+field with the exact string to hand to `recent_messages`.
+
+`not-connected` here means the socket is actually up, not merely that a
+connection object exists — a network in reconnect backoff would otherwise
+accept the call and drop the line. Every write verb below uses the same gate.
+
+### `join_channel` _(read-write)_
+
+Join a channel; optional `key` for +k channels. The channel buffer and its
+member list arrive asynchronously.
+
+### `part_channel` _(read-write)_
+
+Leave a channel, with an optional part `reason`.
+
+### `set_nick` _(read-write)_
+
+Change your nick on a network. Asynchronous and may be rejected (nick in use /
+invalid) — watch the server buffer for the outcome.
+
+### `set_away` _(read-write)_
+
+Set or clear your away status across every network (user-wide). Pass `message`
+to go away; omit it to come back. Returns `{ ok: true, away }`.
+
+### `list_members` _(read)_
+
+List the members currently in a joined channel, with their prefix modes
+(`o`/`h`/`v`/…) and away state. Sorted by nick and capped at `limit` (default
+200, max 1000) so a large channel can't flood the caller's context; `count` is
+always the true total and `truncated` flags a short page. Returns
+`not-in-channel` if you aren't in it.
+
+### `whois` _(read-write)_
+
+Send a WHOIS for a nick. The reply arrives asynchronously as numeric lines in
+the network's server buffer (`:server:<networkId>`, which `list_buffers` does
+not list) — read it afterward by passing the returned `serverBuffer` string to
+`recent_messages`.
+
+### `connect_network` / `disconnect_network` _(read-write)_
+
+Connect (optionally `force` a fresh reconnect) or disconnect a configured
+network. Connection is asynchronous — watch the server buffer for registration.
+`connect_network` returns `locked-down` when the instance admin does not allow
+that network's host, rather than tearing the connection down and failing.
+
+### `get_topic` _(read)_ / `set_topic` _(read-write)_
+
+Read or change a joined channel's topic. `set_topic` requires an explicit
+`topic`, and an empty string **clears** the topic — it always writes, so use
+`get_topic` to read. It needs the usual channel privileges (+o or a -t
+channel); the server may reject it.
 
 ## Wire format
 

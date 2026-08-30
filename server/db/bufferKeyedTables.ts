@@ -117,6 +117,12 @@ export const BUFFER_SCOPED_TABLES: readonly BufferScopedTable[] = [
     note: 'half-typed composer input; buffer_id-keyed since v18',
   },
   {
+    table: 'buffer_retention',
+    status: 'buffer_id',
+    scope: ['user_id'],
+    note: 'per-buffer retention line-cap override; born buffer_id-keyed',
+  },
+  {
     table: 'e2e_incoming_sessions',
     status: 'wire-context',
     targetColumn: 'channel',

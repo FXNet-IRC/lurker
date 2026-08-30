@@ -14,7 +14,8 @@
     <div class="controls">
       <input
         ref="filterEl"
-        v-model="filterInput"
+        :value="filterInput"
+        @input="onFilterInput"
         class="filter"
         type="text"
         placeholder="filter (name or topic)"
@@ -75,6 +76,7 @@ import { useNetworksStore } from '../stores/networks.js';
 import { useBuffersStore } from '../stores/buffers.js';
 import { socketSend } from '../composables/useSocket.js';
 import { formatRelative } from '../utils/timestamp.js';
+import { useImeSafeInput } from '../composables/useImeSafeInput.js';
 
 const PAGE_LIMIT = 200;
 const FILTER_DEBOUNCE_MS = 200;
@@ -89,6 +91,7 @@ const buffers = useBuffersStore();
 const filterEl = ref<HTMLInputElement | null>(null);
 const listEl = ref<HTMLElement | null>(null);
 const filterInput = ref('');
+const onFilterInput = useImeSafeInput(filterInput);
 let filterTimer: ReturnType<typeof setTimeout> | null = null;
 let prevInProgress = false;
 

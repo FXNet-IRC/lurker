@@ -38,7 +38,7 @@
         :max="opt.max"
         :value="value"
         :disabled="!!hint"
-        @change="$emit('commit', Number(($event.target as HTMLInputElement).value))"
+        @change="onIntChange"
       />
       <select
         v-else-if="opt.type === 'enum'"
@@ -100,6 +100,9 @@
         @change="$emit('commit', ($event.target as HTMLInputElement).value)"
       />
     </div>
+    <!-- A locally-caught invalid int (the minNonzero hole). The typed value is
+         NOT committed, so nothing round-trips just to be rejected. -->
+    <p v-if="intError" class="error inline">{{ intError }}</p>
     <!--
       Why this row is greyed out, and which setting to change to wake it up.
       The value behind it is untouched — see optionEnabled() — so flipping the
@@ -117,7 +120,7 @@
 import { ref } from 'vue';
 import type { SettingOption, SettingValue } from '../../../shared/settingsRegistry.js';
 
-withDefaults(
+const props = withDefaults(
   defineProps<{
     opt: SettingOption;
     value?: SettingValue;
@@ -144,12 +147,29 @@ withDefaults(
   },
 );
 
-defineEmits<{
+const emit = defineEmits<{
   commit: [value: SettingValue];
   reset: [];
 }>();
 
 const revealed = ref(false);
+
+// The one int constraint <input min/max> can't express: minNonzero leaves a
+// hole (valid: 0 or >= floor). Caught here so the hole never commits — the
+// server's validate() would reject it anyway, but a round-trip that exists
+// only to fail is worse than an inline line. Wording stays neutral (what 0
+// MEANS is the description's job) and matches the server's own error.
+const intError = ref('');
+function onIntChange(e: Event) {
+  const n = Number((e.target as HTMLInputElement).value);
+  const o = props.opt;
+  if (o.type === 'int' && typeof o.minNonzero === 'number' && n !== 0 && n < o.minNonzero) {
+    intError.value = `Must be 0 or at least ${o.minNonzero.toLocaleString()}.`;
+    return;
+  }
+  intError.value = '';
+  emit('commit', n);
+}
 
 function formatDefault(opt: SettingOption, v: SettingValue): string {
   if (Array.isArray(v)) return v.join(', ');

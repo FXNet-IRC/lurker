@@ -55,25 +55,30 @@ function reveal(e: Event): void {
   revealed.value = true;
 }
 
-// mIRC 01 is the canonical spoiler pair (`\x0301,01`) — it's what Lurker's own
-// applySpoilerMarkup emits, and what most clients/scripts use. It means "hide
-// this", not "paint this black", so it is NOT a colour intent to preserve: a
-// black box and black revealed text is nobody's styling choice, it's an artifact
-// of the invisibility convention.
+// Resolve the sender's chosen mIRC colour to a CSS value. Null only when there
+// is no colour at all to honour — an absent fg, i.e. an older snapshot from
+// before the field existed — and then we fall back to the neutral gray box.
 //
-// This guard was introduced when slot 1 resolved to var(--bg), which made the
-// box the exact colour of the page and the REVEALED text invisible too. The
-// palette no longer does that (slot 1 is a literal #000000), so removing this
-// would now produce a merely ugly black spoiler rather than an unreadable one —
-// still wrong, just less dramatically.
-const SPOILER_CONVENTION_COLOR = 1;
-
-// Resolve the sender's chosen mIRC colour to a CSS value. Null when there's no
-// colour to honour — an absent fg (older snapshots without the field) or the
-// convention colour above — and we fall back to the neutral gray box.
+// Slot 1 used to be excluded here, on the reasoning that `\x0301,01` is the
+// canonical spoiler convention and therefore means "hide this" rather than
+// "paint this black". True of a spoiler; false of ASCII art, which uses exactly
+// the same encoding to fill a solid black block. The wire bytes cannot tell the
+// two apart, and substituting gray guesses wrong on the art — visibly, since it
+// recolours part of a picture.
+//
+// So we honour whatever the sender named, and let the REVEAL carry the safety
+// (see bodyStyle).
+//
+// What makes that affordable is that the affordance is now the SENDER's problem
+// rather than the renderer's: applySpoilerMarkup emits grey on grey (14,14),
+// the one mono slot that reads as a box on both canvases (4.1:1 dark, 3.7:1
+// light), so every spoiler Lurker sends looks right without anyone here
+// second-guessing a colour. A spoiler that arrives as 01,01 from another client
+// is drawn honestly and is a poor affordance in dark mode — 1.3:1 — but it
+// still reveals on click, and that beats repainting somebody's ASCII art.
 const color = computed(() => {
   const fg = props.seg.fg;
-  if (fg == null || fg === SPOILER_CONVENTION_COLOR) return null;
+  if (fg == null) return null;
   return mircColor(fg, mircPalette.value);
 });
 
@@ -95,11 +100,17 @@ const wrapperStyle = computed<CSSProperties>(() => {
 });
 
 // The spoiler run still carries any bold/italic/underline/strike toggles that
-// were active — apply them so the revealed text matches how it was sent. Once
-// revealed, the text takes the chosen colour against the faded backdrop.
+// were active — apply them so the revealed text matches how it was sent.
+//
+// ⚠ Revealed text sets NO colour, deliberately: it inherits the ordinary
+// message colour and is therefore always readable. It used to take the sender's
+// colour, which reads nicely for a red spoiler and is unreadable for the two
+// that matter most — black revealed on the dark canvas, white on the light one,
+// both against a faint tint of themselves. A reveal that reveals nothing is the
+// one failure this component cannot have, and it is not worth a tinted word.
+// The faded backdrop still marks the run as having been hidden.
 const bodyStyle = computed<CSSProperties>(() => {
   const s: CSSProperties = {};
-  if (revealed.value && color.value) s.color = color.value;
   if (props.seg.bold) s.fontWeight = 'bold';
   if (props.seg.italic) s.fontStyle = 'italic';
   const decos: string[] = [];
@@ -112,8 +123,19 @@ const bodyStyle = computed<CSSProperties>(() => {
 
 <style scoped>
 .spoiler {
-  border-radius: var(--radius-sm);
-  padding: 0 var(--space-2);
+  /* ⚠ NO HORIZONTAL padding and NO border-radius, and don't add either back. An
+     fg==bg run is not always a spoiler — ASCII art uses the same encoding to
+     fill a solid block of colour — so this box has to be able to BE a block.
+     Horizontal padding widened the run past its own characters and sheared
+     everything after it off the monospace grid; the radius notched its corners,
+     which shows wherever two filled runs meet and on any square area an artist
+     drew.
+
+     The VERTICAL padding below is the opposite case and is load-bearing: on a
+     non-replaced inline element it paints without affecting line-box height, so
+     it closes the gap between stacked rows and the grid is untouched. The two
+     axes genuinely behave differently here — see --mirc-bg-bleed. */
+  padding: var(--mirc-bg-bleed) 0;
   /* Wrapper-style overrides this for coloured spoilers; the var(--fg-muted)
      fallback covers older snapshots whose segments lack fg. */
   background: var(--fg-muted);

@@ -1735,6 +1735,19 @@ class BouncerSession {
       this.numeric('412', ':No text to send');
       return;
     }
+    // Upstream in reconnect backoff: ircManager refuses the write rather than
+    // persisting a message that never reaches IRC (#809). Say so here, or the
+    // line vanishes with no feedback at all — and skip registerEcho below, whose
+    // keys would otherwise sit in the pending list until they time out.
+    // Asked through ircManager, not by re-testing conn.state here: the whole point
+    // of consolidating the writable test is that a second copy of it can drift
+    // from the one ircManager.send actually applies, and then we either
+    // double-refuse or go back to dropping lines silently. conn.state is read
+    // only to NAME the state in the notice.
+    if (!ircManager.writableConnection(this.userId, this.networkId)) {
+      this.notice(`Upstream '${this.network?.name}' is ${conn.state} — message not sent.`);
+      return;
+    }
     for (const target of targets) {
       const isAction = text.startsWith('\u0001ACTION ') || text.startsWith('\u0001ACTION\u0001');
       if (text.startsWith('\u0001') && !isAction) {
@@ -1964,9 +1977,25 @@ function dispatchIrcEvent(event: Record<string, unknown>): void {
   for (const session of set) session.deliverSelfEcho(type, target, text, time);
 }
 
-function dropSessionsForUser(userId: number, reason: string): void {
+/**
+ * Close every attached bouncer session for a user.
+ *
+ * Exported for account recovery (#855), which has to reach past the web client:
+ * a bouncer session authenticates once at login and then carries its userId in
+ * the session object — the same "checked once, never re-checked" shape as a
+ * WebSocket. Without this, an attached IRC client keeps receiving playback and
+ * sending as the member after the account has been recovered. A no-op when the
+ * bouncer isn't running, since `sessions` is then empty.
+ */
+export function dropSessionsForUser(userId: number, reason: string): void {
   for (const session of sessions) {
-    if (session.userId === userId && session.isRegistered()) session.closeWithError(reason);
+    // Deliberately NOT gated on isRegistered(). userId is assigned at PASS-time
+    // auth, but a session isn't "registered" until NICK/USER completes — and it
+    // gets a 60s grace to get there. Skipping those left a hole: authenticate,
+    // stall before NICK/USER, wait out the recovery, then finish registering and
+    // arrive attached to an account that was just recovered. The isRegistered()
+    // filter belongs to the count/dispatch callers, not to revocation.
+    if (session.userId === userId) session.closeWithError(reason);
   }
 }
 
