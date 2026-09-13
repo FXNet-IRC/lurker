@@ -198,6 +198,12 @@ Implementation notes worth knowing if you're writing against it:
   change arrives as the `QUIT`, `JOIN` and `MODE` a network sends in its place. Lurker
   never offers `draft/multiline`, so multiline messages arrive as separate lines.
   <br>`server/services/bouncerClientFilter.ts`
+- Each attached client has its own `MONITOR` list, as in soju. Lurker merges the lists
+  with its own watches (DM presence, nick regain) onto the network's one list, answers
+  `L` and `S` from the client's list, and sends `730` and `731` only to the clients
+  watching that nick. Everyone shares the network's limit, and a nick that doesn't fit
+  gets `734`.
+  <br>`server/services/bouncer.ts:1963`, `server/services/monitorList.ts`
 
 ---
 

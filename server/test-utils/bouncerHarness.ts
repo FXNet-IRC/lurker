@@ -24,6 +24,8 @@ import {
   attachedSessionCount,
   parseClientLine,
 } from '../services/bouncer.js';
+import { MonitorList } from '../services/monitorList.js';
+import type { MonitorSync } from '../services/monitorList.js';
 import { createUser, setPasswordHash } from '../db/users.js';
 import { hashPassword } from '../services/password.js';
 import { createToken } from '../db/apiTokens.js';
@@ -80,6 +82,12 @@ export class FakeUpstream {
   // client-only tag relay on it (mirrors IrcConnection.supportsMessageTags);
   // flip to false in a test to exercise the non-IRCv3 strip path.
   messageTags = true;
+  // MONITOR on this network: whether its ISUPPORT offers it, the limit, and
+  // the list the attached clients share, as on a real IrcConnection. Lurker's
+  // own nicks aren't modelled.
+  useMonitor = true;
+  monitorLimit = 100;
+  readonly monitor = new MonitorList((line) => this.raw(line));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   client: any;
 
@@ -112,9 +120,24 @@ export class FakeUpstream {
     return this.messageTags;
   }
 
+  // IrcConnection.syncMonitor, with no nicks of Lurker's own.
+  syncMonitor(): MonitorSync | null {
+    if (!this.useMonitor || this.state !== 'connected') return null;
+    return this.monitor.sync([], this.monitorLimit);
+  }
+
   // Simulate the upstream network sending a raw line down to attached clients.
+  // A MONITOR reply then updates the list, as IrcConnection's handlers do after
+  // irc-framework emits the raw line.
   pushUpstream(line: string): void {
     this.client.emit('raw', { from_server: true, line });
+    const msg = parseClientLine(line);
+    if (!msg) return;
+    const targets = msg.params[msg.command === '734' ? 2 : 1] ?? '';
+    const nicks = targets.split(',').map((t) => t.split('!')[0]);
+    if (msg.command === '730') this.monitor.noteStatus(nicks, true);
+    else if (msg.command === '731') this.monitor.noteStatus(nicks, false);
+    else if (msg.command === '734') this.monitor.noteRefused(nicks);
   }
 
   addChannel(name: string, opts: { topic?: string; members?: string[] } = {}): FakeChannel {

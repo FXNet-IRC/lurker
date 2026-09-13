@@ -56,6 +56,8 @@ import { isProxyProblem } from '../../shared/proxy.js';
 import type { ProxyConfig } from '../../shared/proxy.js';
 import { mayUseProxy } from './networkPolicy.js';
 import { ProxyTransport } from './proxyTransport.js';
+import { MonitorList } from './monitorList.js';
+import type { MonitorSync } from './monitorList.js';
 import { classifyModeChange, modeLetter } from '../../shared/modes.js';
 import type { ModeChange } from '../../shared/modes.js';
 import { registerIdent, unregisterIdent, isIdentdEnabled, isOidentdFileEnabled } from './identd.js';
@@ -525,6 +527,15 @@ function normalizeAccount(raw: unknown): string | null | undefined {
   return s;
 }
 
+// The watch limit a MONITOR ISUPPORT token gives. irc-framework stores a token
+// without a value as `true`, and the spec reads MONITOR with no value as no
+// limit. 0 means the network doesn't offer MONITOR.
+export function monitorLimitFromIsupport(token: unknown): number {
+  if (token === true || token === '') return Infinity;
+  const n = Number(token);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
 // Why a nick is on the presence watch list. Only 'dm' today; the reason set is
 // reference-counted (see IrcConnection.trackedPeers) so a future second reason
 // (e.g. favorites) shares the MONITOR watch + peer_presence_state row.
@@ -597,6 +608,9 @@ export class IrcConnection {
   useMonitor: boolean;
   monitorLimit: number;
   pendingMonitorSeed: boolean;
+  // The network's MONITOR list: Lurker's nicks plus those of the IRC clients
+  // attached through the bouncer (see monitorList.ts and syncMonitor).
+  readonly monitor: MonitorList;
   disposed: boolean;
   connectCommandTimer: ReturnType<typeof setTimeout> | null;
   lagMs: number | null;
@@ -845,6 +859,13 @@ export class IrcConnection {
     this.useMonitor = false;
     this.monitorLimit = 0;
     this.pendingMonitorSeed = false;
+    this.monitor = new MonitorList((line) => {
+      try {
+        this.client.raw(line);
+      } catch (_) {
+        /* ignore */
+      }
+    });
     this.disposed = false;
     // Pending timer for the next WAIT-delayed connect command. Cleared on
     // close/dispose so we never call client.raw() after the socket is gone.
@@ -1140,6 +1161,11 @@ export class IrcConnection {
         return;
       }
       const rawCommand = (msg?.command || '').toString();
+      // ERR_MONLISTFULL: the network refused these nicks, so they aren't on its
+      // list. irc-framework's 'irc error' for it doesn't say which.
+      if (rawCommand === '734') {
+        this.monitor.noteRefused(String(msg?.params?.[2] ?? '').split(','));
+      }
       // draft/multiline BATCH start: the logical message's msgid/@time ride
       // THIS line per the spec, and irc-framework drops them when it reduces
       // the batch to {id,type,params} — stash them for accumulateMultiline.
@@ -1511,6 +1537,7 @@ export class IrcConnection {
       this.useMonitor = false;
       this.monitorLimit = 0;
       this.pendingMonitorSeed = false;
+      this.monitor.reset();
       // Safety-net presence sweep. The primary one runs in 'socket close',
       // which fires on every disconnect (including auto-reconnect blips), so it
       // has almost always swept already by the time this terminal 'close'
@@ -1597,21 +1624,16 @@ export class IrcConnection {
       // (harmless — they're just booleans, and trackDmPeer's per-add path
       // also checks useMonitor before sending).
       const opts = this.client.network?.options || {};
-      const limit = Number(opts.MONITOR) || 0;
+      const limit = monitorLimitFromIsupport(opts.MONITOR);
       if (limit === 0 || this.useMonitor) return;
       this.useMonitor = true;
       this.monitorLimit = limit;
       if (!this.restoring) {
-        this.logNet(`MONITOR (IRCv3 presence) supported, watch limit ${limit}`);
+        const cap = limit === Infinity ? 'no watch limit' : `watch limit ${limit}`;
+        this.logNet(`MONITOR (IRCv3 presence) supported, ${cap}`);
       }
-      if (this.pendingRegainSetup && this.regainNick) {
-        this.pendingRegainSetup = false;
-        try {
-          this.client.addMonitor(this.regainNick);
-        } catch (_) {
-          /* ignore */
-        }
-      }
+      // The regain nick goes on the list with the seed (ownMonitorNicks).
+      this.pendingRegainSetup = false;
       if (this.pendingMonitorSeed) {
         this.pendingMonitorSeed = false;
         const seedCount = this.monitoredNicks().length;
@@ -1619,9 +1641,9 @@ export class IrcConnection {
           this.logNet(
             `Seeding MONITOR with ${seedCount} nick${seedCount === 1 ? '' : 's'} (DM peers)`,
           );
-          this.seedMonitorWatch();
         }
       }
+      this.seedMonitorWatch();
     });
 
     // RPL_MONONLINE — peers in our MONITOR watch list that are currently
@@ -1631,8 +1653,14 @@ export class IrcConnection {
     // there's no conflict to filter.
     c.on('users online', (event: Record<string, unknown>) => {
       const nicks: string[] = Array.isArray(event?.nicks) ? (event.nicks as string[]) : [];
-      if (nicks.length > 0) {
-        this.logNet(`Presence: ${nicks.join(', ')} online`);
+      this.monitor.noteStatus(
+        nicks.filter((n) => typeof n === 'string'),
+        true,
+      );
+      // The list also holds bouncer clients' nicks; log only Lurker's own.
+      const own = nicks.filter((n) => this.isOwnMonitorNick(n));
+      if (own.length > 0) {
+        this.logNet(`Presence: ${own.join(', ')} online`);
       }
       for (const nick of nicks) {
         if (typeof nick === 'string') this.markPeerEvent(nick, 'online');
@@ -1649,8 +1677,13 @@ export class IrcConnection {
     //      tracked-peer gate inside markPeerEvent filters out anything else.
     c.on('users offline', (event: Record<string, unknown>) => {
       const nicks: string[] = Array.isArray(event?.nicks) ? (event.nicks as string[]) : [];
-      if (nicks.length > 0) {
-        this.logNet(`Presence: ${nicks.join(', ')} offline`);
+      this.monitor.noteStatus(
+        nicks.filter((n) => typeof n === 'string'),
+        false,
+      );
+      const own = nicks.filter((n) => this.isOwnMonitorNick(n));
+      if (own.length > 0) {
+        this.logNet(`Presence: ${own.join(', ')} offline`);
       }
       if (this.regainNick) {
         const target = this.regainNick.toLowerCase();
@@ -2592,18 +2625,6 @@ export class IrcConnection {
         // silently). Either way the watch is now stale.
         if (this.regainNick) {
           const reclaimed = newLower === this.regainNick.toLowerCase();
-          // Only tear down a watch we could actually have placed. The regain
-          // `MONITOR +` is gated on `useMonitor` (set from ISUPPORT), so on a
-          // server without MONITOR — or before ISUPPORT lands — nothing was
-          // ever watched and a blind `MONITOR -` here just draws a 421
-          // "MONITOR Unknown command" (#384). Skipping it is a true no-op.
-          if (this.useMonitor) {
-            try {
-              this.client.removeMonitor(this.regainNick);
-            } catch (_) {
-              /* ignore */
-            }
-          }
           if (reclaimed) {
             this.publish({
               type: 'notice',
@@ -2615,6 +2636,10 @@ export class IrcConnection {
           }
           this.regainNick = null;
           this.pendingRegainSetup = false;
+          // Drop the regain watch. syncMonitor sends nothing on a server without
+          // MONITOR, where no watch was placed and a `MONITOR -` would only draw
+          // a 421 (#384). It keeps the nick listed if a bouncer client watches it.
+          this.syncMonitor();
         }
         this.currentNick = eventNewNick;
         this.publish({ type: 'own-nick', nick: eventNewNick });
@@ -3425,26 +3450,52 @@ export class IrcConnection {
     }
   }
 
-  // Bulk-seed the MONITOR watch list from the tracked DM peers set. Called
-  // once per connection from the 'server options' handler, after ISUPPORT
-  // confirms MONITOR is supported. Batches nicks into 'MONITOR + n1,n2,…'
-  // lines under the 512-byte IRC wire limit so a 100-peer seed doesn't
-  // trip "Excess Flood" on Libera (same pattern used for channel JOIN
-  // batching in ircManager.startNetwork). Any nicks beyond monitorLimit
-  // are kept in the in-memory set but skipped on the wire; we surface a
-  // notice so the user knows live presence is degraded for the overflow.
   // Deduped union of the nicks we want MONITORed — every tracked reason shares
   // the one per-connection MONITOR budget.
   monitoredNicks(): string[] {
     return Array.from(this.trackedPeers.keys());
   }
 
+  // Lurker's own nicks for the MONITOR list: the regain nick, then the tracked
+  // peers. Bouncer clients' nicks are added after these.
+  private ownMonitorNicks(): string[] {
+    const nicks = this.monitoredNicks();
+    return this.regainNick ? [this.regainNick, ...nicks] : nicks;
+  }
+
+  // Whether Lurker itself watches `nick`: a tracked peer or the regain nick.
+  private isOwnMonitorNick(nick: unknown): boolean {
+    if (typeof nick !== 'string') return false;
+    const lower = nick.toLowerCase();
+    return this.trackedPeers.has(lower) || this.regainNick?.toLowerCase() === lower;
+  }
+
+  // Bring the network's MONITOR list in line with Lurker's nicks and those of
+  // every attached bouncer client (see monitorList.ts). Sends nothing until
+  // ISUPPORT confirms MONITOR, or while the socket is down; the seed catches up.
+  syncMonitor(): MonitorSync | null {
+    if (!this.useMonitor || this.state !== 'connected' || this.disposed) return null;
+    return this.monitor.sync(this.ownMonitorNicks(), this.monitorLimit);
+  }
+
+  // Seed the MONITOR list once per connection, from the 'server options' handler
+  // after ISUPPORT confirms MONITOR. MonitorList packs the nicks into lines under
+  // the 512-byte limit, so a 100-peer seed doesn't trip "Excess Flood" on Libera.
+  // Nicks past monitorLimit stay tracked in memory but aren't watched; a notice
+  // tells the user live presence is degraded for them.
   seedMonitorWatch(): void {
-    const peers = this.monitoredNicks();
-    if (peers.length === 0) return;
-    const cap = this.monitorLimit > 0 ? this.monitorLimit : peers.length;
-    const watched = peers.slice(0, cap);
-    const overflow = peers.length - watched.length;
+    // A re-attach finds the socket's list as the last app process left it,
+    // nicks its bouncer clients watched included. Start from an empty one.
+    if (this.restoring) {
+      try {
+        this.client.raw('MONITOR C');
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    const result = this.syncMonitor();
+    if (!result) return;
+    const overflow = result.skipped.length;
     if (overflow > 0) {
       this.publish({
         type: 'notice',
@@ -3454,30 +3505,7 @@ export class IrcConnection {
         text: `MONITOR limit (${this.monitorLimit}) reached; live presence skipped for ${overflow} nick${overflow === 1 ? '' : 's'}.`,
       });
     }
-    // "MONITOR + " prefix is 11 bytes; leave headroom for trailing \r\n
-    // and the comma separators. Cap line content at 400 bytes (matches the
-    // channel-JOIN batcher).
-    const MAX = 400;
-    let chunk: string[] = [];
-    let len = 0;
-    const flush = () => {
-      if (chunk.length === 0) return;
-      const line = 'MONITOR + ' + chunk.join(',');
-      try {
-        this.client.raw(line);
-      } catch (_) {
-        /* ignore */
-      }
-      chunk = [];
-      len = 0;
-    };
-    for (const nick of watched) {
-      const add = chunk.length === 0 ? nick.length : nick.length + 1;
-      if (len + add > MAX) flush();
-      chunk.push(nick);
-      len += add;
-    }
-    flush();
+    if (result.added.length === 0) return;
     // Belt-and-suspenders: per IRCv3 spec the server SHOULD reply to each
     // MONITOR + with the current state of each added nick, but the wording
     // is "advised" not "required". MONITOR S explicitly asks for the
@@ -3723,20 +3751,30 @@ export class IrcConnection {
     }
     this.addPeerReason(lower, reason);
     if (!this.useMonitor || this.state !== 'connected') return true;
-    if (this.monitoredNicks().length > this.monitorLimit) {
-      // Over-limit add: keep the in-memory tracking but skip MONITOR. Surface
-      // once so the user knows live presence is degraded for this nick.
-      this.publish({
-        type: 'notice',
-        target: this.serverTarget(),
-        nick: 'lurker',
-        notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
-        text: `MONITOR limit (${this.monitorLimit}) reached; live presence skipped for ${nick}.`,
-      });
+    const listed = this.monitor.status(nick);
+    if (listed === true || listed === false) {
+      // A bouncer client already has the nick on the list, and the network
+      // won't answer a second add, so use its last answer.
+      this.markPeerEvent(nick, listed ? 'online' : 'offline');
       return true;
     }
+    // Listed by a bouncer client but not answered yet: the MONITOR S below asks.
+    if (listed === undefined) {
+      const result = this.syncMonitor();
+      if (result?.skipped.some((n) => n.toLowerCase() === lower)) {
+        // Over-limit add: keep the in-memory tracking but skip MONITOR. Surface
+        // once so the user knows live presence is degraded for this nick.
+        this.publish({
+          type: 'notice',
+          target: this.serverTarget(),
+          nick: 'lurker',
+          notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
+          text: `MONITOR limit (${this.monitorLimit}) reached; live presence skipped for ${nick}.`,
+        });
+        return true;
+      }
+    }
     try {
-      this.client.raw('MONITOR + ' + nick);
       // Same belt-and-suspenders as seedMonitorWatch: per IRCv3 the server only
       // SHOULD (not MUST) volunteer the nick's current state in reply to
       // MONITOR +, so a freshly-added watch can land with no state. That leaves
@@ -3754,15 +3792,9 @@ export class IrcConnection {
 
   // Tear down the shared MONITOR watch + peer_presence_state row for a nick we
   // no longer watch for any reason. Safe on an untracked nick (clears a stale
-  // row); the MONITOR - is a harmless no-op server-side if it was never watched.
+  // row). The sync keeps the nick listed while a bouncer client still watches it.
   private teardownPeerWatch(nick: string): void {
-    if (this.useMonitor && this.state === 'connected') {
-      try {
-        this.client.raw('MONITOR - ' + nick);
-      } catch (_) {
-        /* ignore */
-      }
-    }
+    this.syncMonitor();
     try {
       deletePeerPresence(this.network.id, nick);
     } catch (e) {

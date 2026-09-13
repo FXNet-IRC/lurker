@@ -29,7 +29,9 @@ import {
   sendRejectionText,
   outgoingAddr,
   resolveKeyModeChange,
+  monitorLimitFromIsupport,
 } from './ircConnection.js';
+import type { MonitorHolder } from './monitorList.js';
 import { createIdentdServer, unregisterIdent } from './identd.js';
 import connectScheduler from './connectScheduler.js';
 import { getRecent } from './systemLog.js';
@@ -736,12 +738,137 @@ describe('nick-regain MONITOR teardown gating (#384)', () => {
     conn.publish = vi.fn<(event: unknown) => void>();
     const raw = vi.fn<(...args: unknown[]) => void>();
     conn.client.raw = raw;
+    conn.syncMonitor(); // puts the regain watch on the list
+    raw.mockClear();
 
     conn.client.emit('nick', { nick: 'nick1', new_nick: 'nick' });
 
-    // removeMonitor() emits the line as args: ['MONITOR', '-', 'nick'].
     expect(raw.mock.calls.flat(Infinity).join(' ')).toContain('MONITOR - nick');
     expect(conn.regainNick).toBeNull();
+  });
+});
+
+describe('monitorLimitFromIsupport', () => {
+  it('reads a number as the limit and a MONITOR token with no value as no limit', () => {
+    expect(monitorLimitFromIsupport('100')).toBe(100);
+    // irc-framework stores `MONITOR` with no value as true.
+    expect(monitorLimitFromIsupport(true)).toBe(Infinity);
+    expect(monitorLimitFromIsupport('')).toBe(Infinity);
+    expect(monitorLimitFromIsupport(undefined)).toBe(0);
+  });
+});
+
+describe('MONITOR list shared with bouncer clients', () => {
+  function makeConn(): { conn: IrcConnection; raw: ReturnType<typeof vi.fn> } {
+    const conn = new IrcConnection({
+      network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
+        id: 1,
+        user_id: 1,
+        name: 'n',
+        host: 'irc.example.test',
+        port: 6697,
+        tls: 1,
+        trusted_certificates: 1,
+        nick: 'nick',
+        username: null,
+        realname: null,
+        server_password: null,
+        autoconnect: 1,
+        sasl_account: null,
+        sasl_password: null,
+        connect_commands: null,
+        position: 0,
+        casemapping: null,
+        created_at: new Date().toISOString(),
+      },
+      onEvent: () => {},
+    });
+    conn.state = 'connected';
+    conn.publish = vi.fn<(event: unknown) => void>();
+    const raw = vi.fn<(...args: string[]) => void>();
+    conn.client.raw = raw;
+    return { conn, raw };
+  }
+
+  function holderOf(...nicks: string[]): MonitorHolder {
+    return { monitorTargets: () => nicks, onMonitorDropped: () => {} };
+  }
+
+  function sent(raw: ReturnType<typeof vi.fn>): unknown[] {
+    return raw.mock.calls.map((c) => c[0]);
+  }
+
+  it('keeps a closed DM peer on the list while a bouncer client watches the nick', () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.monitor.addHolder(holderOf('pal'));
+    conn.trackDmPeer('pal');
+    raw.mockClear();
+
+    conn.untrackDmPeer('pal');
+
+    expect(raw).not.toHaveBeenCalled();
+  });
+
+  it("takes a new DM peer's state from the list when a bouncer client already watches it", () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.monitor.addHolder(holderOf('pal'));
+    conn.syncMonitor();
+    conn.monitor.noteStatus(['pal'], true);
+    const mark = vi.spyOn(conn, 'markPeerEvent').mockImplementation(() => {});
+    raw.mockClear();
+
+    conn.trackDmPeer('Pal');
+
+    expect(raw).not.toHaveBeenCalled();
+    expect(mark).toHaveBeenCalledWith('Pal', 'online');
+  });
+
+  it('asks for the state of a new DM peer a bouncer client listed before any answer came', () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.monitor.addHolder(holderOf('pal'));
+    conn.syncMonitor();
+    raw.mockClear();
+
+    conn.trackDmPeer('pal');
+
+    // No second MONITOR +, but the same MONITOR S a fresh add gets (#302).
+    expect(sent(raw)).toEqual(['MONITOR S']);
+  });
+
+  it("seeds bouncer clients' nicks after Lurker's own once ISUPPORT confirms MONITOR", () => {
+    const { conn, raw } = makeConn();
+    conn.trackDmPeer('dmpal');
+    conn.monitor.addHolder(holderOf('clientpal'));
+    conn.client.network.options.MONITOR = '100';
+
+    conn.client.emit('server options', {});
+
+    expect(sent(raw)).toEqual(['MONITOR + dmpal,clientpal', 'MONITOR S']);
+  });
+
+  it('clears the list the last app process left before seeding a re-attach', () => {
+    const { conn, raw } = makeConn();
+    conn.trackDmPeer('dmpal');
+    conn.restoring = true;
+    conn.client.network.options.MONITOR = '100';
+
+    conn.client.emit('server options', {});
+
+    expect(sent(raw)).toEqual(['MONITOR C', 'MONITOR + dmpal', 'MONITOR S']);
   });
 });
 
