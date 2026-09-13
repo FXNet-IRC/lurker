@@ -249,7 +249,7 @@ describe('MONITOR per client', () => {
     c.close();
   });
 
-  it("asks once for the state of a client's nicks the network hasn't answered for", async () => {
+  it("asks for the state of a client's nicks the network hasn't answered for, once a read", async () => {
     const acct = harnessMod.seedAccount({ nick: 'mon11' });
     const c1 = await attach(acct);
     // Two adds in one read: gamja sends a MONITOR + per nick.
@@ -257,14 +257,21 @@ describe('MONITOR per client', () => {
     await settle(c1);
     expect(statusRequests(acct)).toBe(1);
 
-    acct.upstream.pushUpstream(':irc.example.test 730 mon11 :quinn,rupert');
-    await settle(c1);
-    // Both have answers now, so another client's add asks for nothing.
+    // Another client adds a nick the network hasn't answered for yet.
     const c2 = await attach(acct);
     c2.send('MONITOR + quinn');
     await settle(c2);
-    expect(statusRequests(acct)).toBe(1);
+    expect(statusRequests(acct)).toBe(2);
+
+    // Once it has answered, an add asks for nothing.
+    acct.upstream.pushUpstream(':irc.example.test 730 mon11 :quinn,rupert');
+    await settle(c1);
+    const c3 = await attach(acct);
+    c3.send('MONITOR + rupert');
+    await settle(c3);
+    expect(statusRequests(acct)).toBe(2);
     c1.close();
     c2.close();
+    c3.close();
   });
 });

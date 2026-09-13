@@ -144,14 +144,24 @@ describe('MonitorList.status', () => {
 });
 
 describe('MonitorList.requestStatus', () => {
+  it('is asked for by a sync that adds nicks, and not by one that adds none', async () => {
+    const { list, sent } = makeList();
+    list.sync(['a'], Infinity);
+    await Promise.resolve();
+    list.sync(['a'], Infinity);
+    await Promise.resolve();
+    expect(sent).toEqual(['MONITOR + a', 'MONITOR S']);
+  });
+
   it('sends one MONITOR S at the end of the turn, however often it is asked', async () => {
     const { list, sent } = makeList();
     list.sync(['a'], Infinity);
-    list.requestStatus();
-    list.requestStatus();
-    expect(sent).toEqual(['MONITOR + a']);
     await Promise.resolve();
+    list.requestStatus();
+    list.requestStatus();
     expect(sent).toEqual(['MONITOR + a', 'MONITOR S']);
+    await Promise.resolve();
+    expect(sent).toEqual(['MONITOR + a', 'MONITOR S', 'MONITOR S']);
   });
 
   it('asks for nothing once the list has gone with its socket', async () => {

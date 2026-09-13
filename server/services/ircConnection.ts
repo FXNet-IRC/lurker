@@ -57,7 +57,7 @@ import type { ProxyConfig } from '../../shared/proxy.js';
 import { mayUseProxy } from './networkPolicy.js';
 import { ProxyTransport } from './proxyTransport.js';
 import { MonitorList } from './monitorList.js';
-import type { MonitorSync } from './monitorList.js';
+import type { MonitorHolder, MonitorSync } from './monitorList.js';
 import { classifyModeChange, modeLetter } from '../../shared/modes.js';
 import type { ModeChange } from '../../shared/modes.js';
 import { registerIdent, unregisterIdent, isIdentdEnabled, isOidentdFileEnabled } from './identd.js';
@@ -614,6 +614,24 @@ export class IrcConnection {
   // True once the MOTD (or ERR_NOMOTD) has ended the registration burst, so
   // every 005 has arrived and useMonitor is settled. Reset with the socket.
   isupportComplete: boolean;
+  // Nicks watched by MONITOR lines sent raw (connect commands, /quote), kept as
+  // a list of their own on the network's list, like a bouncer client's, so a
+  // raw MONITOR C can't wipe other watches (see takeRawMonitor). Folded nick →
+  // the nick as sent. Cleared with the socket, as the network's list is.
+  private readonly rawMonitored = new Map<string, string>();
+  private readonly rawMonitorHolder: MonitorHolder = {
+    monitorTargets: () => this.rawMonitored.values(),
+    onMonitorDropped: (nicks, limit) => {
+      for (const nick of nicks) this.rawMonitored.delete(nick.toLowerCase());
+      this.publish({
+        type: 'notice',
+        target: this.serverTarget(),
+        nick: 'lurker',
+        notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
+        text: `MONITOR limit (${limit}) reached; not watching ${nicks.join(', ')}.`,
+      });
+    },
+  };
   disposed: boolean;
   connectCommandTimer: ReturnType<typeof setTimeout> | null;
   lagMs: number | null;
@@ -1166,9 +1184,24 @@ export class IrcConnection {
       }
       const rawCommand = (msg?.command || '').toString();
       // ERR_MONLISTFULL: the network refused these nicks, so they aren't on its
-      // list. irc-framework's 'irc error' for it doesn't say which.
+      // list. irc-framework's 'irc error' for it doesn't say which. The line
+      // stays out of the server buffer, since it can name a bouncer client's
+      // nick and that client is sent the 734. Lurker's own nicks get a notice.
       if (rawCommand === '734') {
-        this.monitor.noteRefused(String(msg?.params?.[2] ?? '').split(','));
+        const refused = String(msg?.params?.[2] ?? '')
+          .split(',')
+          .filter(Boolean);
+        this.monitor.noteRefused(refused);
+        const own = refused.filter((n) => this.isOwnMonitorNick(n));
+        if (own.length > 0) {
+          this.publish({
+            type: 'notice',
+            target: this.serverTarget(),
+            nick: 'lurker',
+            notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
+            text: `MONITOR limit (${msg?.params?.[1] ?? '?'}) reached; live presence skipped for ${own.join(', ')}.`,
+          });
+        }
       }
       // draft/multiline BATCH start: the logical message's msgid/@time ride
       // THIS line per the spec, and irc-framework drops them when it reduces
@@ -1543,6 +1576,7 @@ export class IrcConnection {
       this.pendingMonitorSeed = false;
       this.monitor.reset();
       this.isupportComplete = false;
+      this.rawMonitored.clear();
       // Safety-net presence sweep. The primary one runs in 'socket close',
       // which fires on every disconnect (including auto-reconnect blips), so it
       // has almost always swept already by the time this terminal 'close'
@@ -3296,6 +3330,8 @@ export class IrcConnection {
       // server buffer of what the raw handler already logged verbatim there, so
       // it goes — whether or not the routing found a buffer to use (#434).
       if (isCommandResultErrorTag(tag)) return;
+      // ERR_MONLISTFULL is handled off the raw line, which says which nicks.
+      if (tag === 'monitor_list_full') return;
       // ERR_UNKNOWNCOMMAND (421) carries the rejected command name in
       // event.command (irc-framework parses it from the numeric's params).
       // Include it so the buffer line names the offending command —
@@ -3485,6 +3521,29 @@ export class IrcConnection {
     return this.monitor.sync(this.ownMonitorNicks(), this.monitorLimit);
   }
 
+  // Apply a raw MONITOR +, - or C (a connect command, or /quote) to the raw
+  // sender's own list and sync, the way a bouncer client's MONITOR works. Sent
+  // verbatim it would change the network's list behind MonitorList's back: a
+  // MONITOR C would clear every watch while the list still counted them. L and S
+  // go out as sent, and so does anything on a network known to lack MONITOR,
+  // which answers 421. True if the line was handled here.
+  private takeRawMonitor(line: string): boolean {
+    const m = /^MONITOR\s+([+\-C])(?:\s+:?(\S+))?\s*$/i.exec(line.trim());
+    if (!m || (this.isupportComplete && !this.useMonitor)) return false;
+    if (m[1].toUpperCase() === 'C') {
+      this.rawMonitored.clear();
+    } else {
+      for (const target of (m[2] ?? '').split(',').filter(Boolean)) {
+        const key = target.toLowerCase();
+        if (m[1] === '-') this.rawMonitored.delete(key);
+        else if (!this.rawMonitored.has(key)) this.rawMonitored.set(key, target);
+      }
+    }
+    this.monitor.addHolder(this.rawMonitorHolder);
+    this.syncMonitor();
+    return true;
+  }
+
   // Seed the MONITOR list once per connection, from the 'server options' handler
   // after ISUPPORT confirms MONITOR. MonitorList packs the nicks into lines under
   // the 512-byte limit, so a 100-peer seed doesn't trip "Excess Flood" on Libera.
@@ -3500,6 +3559,9 @@ export class IrcConnection {
         /* ignore */
       }
     }
+    // MonitorList.sync asks for the state of what it adds with a MONITOR S
+    // (#302): the server is only advised to volunteer it in reply to the +, and
+    // markPeerEvent's idempotency gate eats duplicate replies.
     const result = this.syncMonitor();
     if (!result) return;
     const overflow = result.skipped.length;
@@ -3511,18 +3573,6 @@ export class IrcConnection {
         notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
         text: `MONITOR limit (${result.limit}) reached; live presence skipped for ${overflow} nick${overflow === 1 ? '' : 's'}.`,
       });
-    }
-    if (result.added.length === 0) return;
-    // Belt-and-suspenders: per IRCv3 spec the server SHOULD reply to each
-    // MONITOR + with the current state of each added nick, but the wording
-    // is "advised" not "required". MONITOR S explicitly asks for the
-    // current state of every monitored nick, so it backfills anyone the
-    // initial + didn't volunteer state for. markPeerEvent's idempotency
-    // gate eats duplicate replies, so this is safe to send unconditionally.
-    try {
-      this.client.raw('MONITOR S');
-    } catch (_) {
-      /* ignore */
     }
   }
 
@@ -3765,7 +3815,6 @@ export class IrcConnection {
       this.markPeerEvent(nick, listed ? 'online' : 'offline');
       return true;
     }
-    // Listed by a bouncer client but not answered yet: the MONITOR S below asks.
     if (listed === undefined) {
       const result = this.syncMonitor();
       if (result?.skipped.some((n) => n.toLowerCase() === lower)) {
@@ -3778,22 +3827,15 @@ export class IrcConnection {
           notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
           text: `MONITOR limit (${result.limit}) reached; live presence skipped for ${nick}.`,
         });
-        return true;
       }
+      // The sync asked for the new nick's state along with its MONITOR +.
+      return true;
     }
-    try {
-      // Same belt-and-suspenders as seedMonitorWatch: per IRCv3 the server only
-      // SHOULD (not MUST) volunteer the nick's current state in reply to
-      // MONITOR +, so a freshly-added watch can land with no state. That leaves
-      // the peer at 'unknown' on the client, which presence dots render
-      // undimmed — i.e. indistinguishable from online — until a reconnect
-      // re-seeds. MONITOR S asks for every monitored nick's state explicitly;
-      // markPeerEvent's idempotency gate eats the duplicate replies for nicks we
-      // already had state for, so it's safe to send on every add. (#302)
-      this.client.raw('MONITOR S');
-    } catch (_) {
-      /* ignore */
-    }
+    // Listed by a bouncer client but not answered yet. Per IRCv3 the server only
+    // SHOULD volunteer a nick's state, and a peer left at 'unknown' renders like
+    // online until a reconnect re-seeds, so ask (#302). markPeerEvent's
+    // idempotency gate eats duplicate replies.
+    this.monitor.requestStatus();
     return true;
   }
 
@@ -6500,6 +6542,7 @@ export class IrcConnection {
     // Matching control chars is the whole point, so the lint rule is moot here.
     // eslint-disable-next-line no-control-regex
     const clean = line.replace(/[\u000d\u000a\u0000]/g, '');
+    if (this.takeRawMonitor(clean)) return;
     // Read it before it goes out, so a 401 bouncing back off it can be placed
     // in the channel it was aimed at (#434). Cheap and total: this is the one
     // path every slash command and member-menu action takes.
@@ -6826,7 +6869,7 @@ export class IrcConnection {
           return;
         }
         try {
-          this.client.raw(line);
+          if (!this.takeRawMonitor(line)) this.client.raw(line);
         } catch (_) {
           /* ignore */
         }
@@ -6991,11 +7034,14 @@ const SERVER_BUFFER_DENIED_NUMERICS = new Set<string>([
   // so the raw per-batch lines are a redundant flood in the server buffer.
   '353',
   '366',
-  // RPL_MON* — MONITOR presence, surfaced by the presence rail, not the buffer.
+  // RPL_MON* and ERR_MONLISTFULL — MONITOR presence, surfaced by the presence
+  // rail, not the buffer. A 734 can name a bouncer client's nick, and that
+  // client gets it; the 'raw' handler gives Lurker's own nicks a notice.
   '730',
   '731',
   '732',
   '733',
+  '734',
   // RPL_MOTDSTART/RPL_MOTD/RPL_ENDOFMOTD/ERR_NOMOTD — shown as a single block by
   // the 'motd' handler.
   '375',

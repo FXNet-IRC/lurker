@@ -177,6 +177,9 @@ export class MonitorList {
 
     for (const targets of packTargets(removed)) this.send(`MONITOR - ${targets}`);
     for (const targets of packTargets(added)) this.send(`MONITOR + ${targets}`);
+    // A network is only advised to answer an add with the nick's state, so ask
+    // (#302), whoever the added nicks belong to.
+    if (added.length > 0) this.requestStatus();
     for (const [holder, nicks] of dropped) holder.onMonitorDropped(nicks, room);
     return { added, skipped, limit: room };
   }
