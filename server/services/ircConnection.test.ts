@@ -849,6 +849,29 @@ describe('MONITOR list shared with bouncer clients', () => {
     expect(sent(raw)).toEqual(['MONITOR S']);
   });
 
+  it('stops re-adding a DM peer the network refused, even with no advertised limit', () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = Infinity; // a MONITOR token with no value
+    conn.trackDmPeer('alice');
+    conn.trackDmPeer('bob');
+    conn.client.emit('raw', {
+      from_server: true,
+      line: ':irc.example.test 734 nick 1 bob :Monitor list is full',
+    });
+    raw.mockClear();
+
+    conn.syncMonitor();
+    conn.trackDmPeer('carol');
+
+    expect(sent(raw)).toEqual([]);
+    expect(conn.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: 'MONITOR limit (1) reached; live presence skipped for carol.',
+      }),
+    );
+  });
+
   it("seeds bouncer clients' nicks after Lurker's own once ISUPPORT confirms MONITOR", () => {
     const { conn, raw } = makeConn();
     conn.trackDmPeer('dmpal');

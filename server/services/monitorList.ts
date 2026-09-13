@@ -23,6 +23,8 @@ export interface MonitorSync {
   added: string[];
   /** Lurker's own nicks that didn't fit under the limit. */
   skipped: string[];
+  /** The limit this sync kept to: the network's, or lower once it refused a nick. */
+  limit: number;
 }
 
 // Bytes of targets on one line: room for the command, CRLF and one more long
@@ -51,6 +53,10 @@ export class MonitorList {
   // (null until it gives one).
   private readonly listed = new Map<string, { nick: string; online: boolean | null }>();
   private readonly holders = new Set<MonitorHolder>();
+  // How many nicks the network really takes. Its ISUPPORT limit can overstate
+  // that: nicks Lurker didn't add share the list (a connect command's
+  // MONITOR +), and a server can cap a list it advertises as unlimited.
+  private cap = Infinity;
   private readonly send: (line: string) => void;
 
   constructor(send: (line: string) => void) {
@@ -82,21 +88,27 @@ export class MonitorList {
     }
   }
 
-  /** Forget nicks the network refused with a 734. */
+  /**
+   * Forget nicks the network refused with a 734. Its list is full at the size
+   * this one is now, so nothing more is added until a nick comes off; otherwise
+   * every sync would send the refused nicks again and draw another 734.
+   */
   noteRefused(nicks: string[]): void {
     for (const nick of nicks) this.listed.delete(fold(nick));
+    this.cap = this.listed.size;
   }
 
   /** The socket closed, and the network's list went with it. */
   reset(): void {
     this.listed.clear();
+    this.cap = Infinity;
   }
 
   /**
    * Bring the network's list in line with Lurker's nicks (`own`) and every
    * holder's. Nicks nobody wants are removed first, to make room. Listed nicks
    * stay listed, and new ones are added in order, Lurker's first, while there's
-   * room under `limit`.
+   * room under `limit`, or under the lower cap a 734 showed.
    */
   sync(own: Iterable<string>, limit: number): MonitorSync {
     const wanted = new Map<string, string>();
@@ -128,12 +140,13 @@ export class MonitorList {
       removed.push(entry.nick);
     }
 
+    const room = Math.min(limit, this.cap);
     const added: string[] = [];
     const skipped: string[] = [];
     const dropped = new Map<MonitorHolder, string[]>();
     for (const [key, nick] of wanted) {
       if (this.listed.has(key)) continue;
-      if (this.listed.size >= limit) {
+      if (this.listed.size >= room) {
         if (ownKeys.has(key)) skipped.push(nick);
         for (const [holder, asSent] of wantedBy.get(key) ?? []) {
           const nicks = dropped.get(holder);
@@ -148,8 +161,8 @@ export class MonitorList {
 
     for (const targets of packTargets(removed)) this.send(`MONITOR - ${targets}`);
     for (const targets of packTargets(added)) this.send(`MONITOR + ${targets}`);
-    for (const [holder, nicks] of dropped) holder.onMonitorDropped(nicks, limit);
-    return { added, skipped };
+    for (const [holder, nicks] of dropped) holder.onMonitorDropped(nicks, room);
+    return { added, skipped, limit: room };
   }
 }
 

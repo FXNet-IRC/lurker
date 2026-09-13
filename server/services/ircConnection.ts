@@ -3502,7 +3502,7 @@ export class IrcConnection {
         target: this.serverTarget(),
         nick: 'lurker',
         notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
-        text: `MONITOR limit (${this.monitorLimit}) reached; live presence skipped for ${overflow} nick${overflow === 1 ? '' : 's'}.`,
+        text: `MONITOR limit (${result.limit}) reached; live presence skipped for ${overflow} nick${overflow === 1 ? '' : 's'}.`,
       });
     }
     if (result.added.length === 0) return;
@@ -3769,7 +3769,7 @@ export class IrcConnection {
           target: this.serverTarget(),
           nick: 'lurker',
           notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
-          text: `MONITOR limit (${this.monitorLimit}) reached; live presence skipped for ${nick}.`,
+          text: `MONITOR limit (${result.limit}) reached; live presence skipped for ${nick}.`,
         });
         return true;
       }

@@ -68,7 +68,7 @@ describe('MonitorList.sync', () => {
     list.sync(['a', 'b'], 2);
     const result = list.sync(['a', 'c'], 2);
     expect(sent).toEqual(['MONITOR + a,b', 'MONITOR - b', 'MONITOR + c']);
-    expect(result).toEqual({ added: ['c'], skipped: [] });
+    expect(result).toEqual({ added: ['c'], skipped: [], limit: 2 });
   });
 
   it("adds Lurker's nicks first and tells a holder which of its nicks didn't fit", () => {
@@ -86,7 +86,7 @@ describe('MonitorList.sync', () => {
     const { list } = makeList();
     list.addHolder(new Holder('x', 'y'));
     list.sync([], 2);
-    expect(list.sync(['own'], 2)).toEqual({ added: [], skipped: ['own'] });
+    expect(list.sync(['own'], 2)).toEqual({ added: [], skipped: ['own'], limit: 2 });
   });
 
   it('starts again from nothing once the socket is gone', () => {
@@ -116,13 +116,30 @@ describe('MonitorList.status', () => {
     expect(list.status('stranger')).toBeUndefined();
   });
 
-  it('forgets a nick the network refused, so the next sync adds it again', () => {
+  it('stops adding once the network refuses a nick, until one comes off its list', () => {
     const { list, sent } = makeList();
-    list.sync(['frank'], Infinity);
-    list.noteRefused(['frank']);
-    expect(list.status('frank')).toBeUndefined();
-    list.sync(['frank'], Infinity);
-    expect(sent).toEqual(['MONITOR + frank', 'MONITOR + frank']);
+    list.sync(['a', 'b', 'c'], Infinity);
+    list.noteRefused(['c']);
+    expect(list.status('c')).toBeUndefined();
+
+    // The network is full at two, whatever it advertised.
+    expect(list.sync(['a', 'b', 'c'], Infinity)).toEqual({ added: [], skipped: ['c'], limit: 2 });
+    // b coming off makes room for c.
+    list.sync(['a', 'c'], Infinity);
+    expect(sent).toEqual(['MONITOR + a,b,c', 'MONITOR - b', 'MONITOR + c']);
+    // A new socket has only the advertised limit again.
+    list.reset();
+    expect(list.sync(['a', 'b', 'c'], Infinity).limit).toBe(Infinity);
+  });
+
+  it('tells a holder the lower limit once the network has refused a nick', () => {
+    const { list } = makeList();
+    const h = new Holder('x', 'y');
+    list.addHolder(h);
+    list.sync([], Infinity);
+    list.noteRefused(['y']);
+    list.sync([], Infinity);
+    expect(h.dropped).toEqual([{ nicks: ['y'], limit: 1 }]);
   });
 });
 
