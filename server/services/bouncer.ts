@@ -1966,9 +1966,11 @@ class BouncerSession implements MonitorHolder {
       this.numeric('461', 'MONITOR :Not enough parameters');
       return;
     }
-    // A network without MONITOR has no such command, as in soju. While the
-    // network is down that isn't known, so the list is kept for its return.
-    if (conn.state === 'connected' && !conn.useMonitor) {
+    // A network without MONITOR has no such command, as in soju. That's only
+    // known once its registration burst is over, since the 005 naming MONITOR
+    // comes after the 001 that marks it connected. Until then the list is kept
+    // for the seed.
+    if (conn.state === 'connected' && conn.isupportComplete && !conn.useMonitor) {
       this.numeric('421', 'MONITOR :Unknown command');
       return;
     }
@@ -1983,14 +1985,19 @@ class BouncerSession implements MonitorHolder {
         conn.monitor.addHolder(this);
         conn.syncMonitor();
         // The network won't answer for a nick it already watched, so answer
-        // from its last word. A nick it hasn't answered for yet gets its reply
-        // when it comes, and one past the limit already got a 734.
+        // from its last word. One past the limit already got a 734.
+        let unanswered = false;
         for (const target of targets) {
           if (!this.monitored.has(target.toLowerCase())) continue;
           const online = conn.monitor.status(target);
           if (online === true) this.write(`:${SERVER_NAME} 730 ${nick} :${target}`);
           else if (online === false) this.write(`:${SERVER_NAME} 731 ${nick} :${target}`);
+          else if (online === null) unanswered = true;
         }
+        // A network needn't answer a MONITOR + for a nick it already lists, such
+        // as one a connect command added. So ask about any nick still without
+        // an answer, as Lurker's own adds do (#302).
+        if (unanswered) conn.monitor.requestStatus();
         return;
       }
       case '-':

@@ -82,10 +82,11 @@ export class FakeUpstream {
   // client-only tag relay on it (mirrors IrcConnection.supportsMessageTags);
   // flip to false in a test to exercise the non-IRCv3 strip path.
   messageTags = true;
-  // MONITOR on this network: whether its ISUPPORT offers it, the limit, and
-  // the list the attached clients share, as on a real IrcConnection. Lurker's
-  // own nicks aren't modelled.
+  // MONITOR on this network: whether its ISUPPORT offers it, whether that
+  // ISUPPORT is complete, the limit, and the list the attached clients share,
+  // as on a real IrcConnection. Lurker's own nicks aren't modelled.
   useMonitor = true;
+  isupportComplete = true;
   monitorLimit = 100;
   readonly monitor = new MonitorList((line) => this.raw(line));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

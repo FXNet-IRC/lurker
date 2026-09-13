@@ -143,6 +143,27 @@ describe('MonitorList.status', () => {
   });
 });
 
+describe('MonitorList.requestStatus', () => {
+  it('sends one MONITOR S at the end of the turn, however often it is asked', async () => {
+    const { list, sent } = makeList();
+    list.sync(['a'], Infinity);
+    list.requestStatus();
+    list.requestStatus();
+    expect(sent).toEqual(['MONITOR + a']);
+    await Promise.resolve();
+    expect(sent).toEqual(['MONITOR + a', 'MONITOR S']);
+  });
+
+  it('asks for nothing once the list has gone with its socket', async () => {
+    const { list, sent } = makeList();
+    list.sync(['a'], Infinity);
+    list.requestStatus();
+    list.reset();
+    await Promise.resolve();
+    expect(sent).toEqual(['MONITOR + a']);
+  });
+});
+
 describe('packTargets', () => {
   it('starts a new comma list at the byte budget', () => {
     expect(packTargets(['aaaa', 'bbbb', 'cc'], 9)).toEqual(['aaaa,bbbb', 'cc']);

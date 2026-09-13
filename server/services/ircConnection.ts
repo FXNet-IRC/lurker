@@ -611,6 +611,9 @@ export class IrcConnection {
   // The network's MONITOR list: Lurker's nicks plus those of the IRC clients
   // attached through the bouncer (see monitorList.ts and syncMonitor).
   readonly monitor: MonitorList;
+  // True once the MOTD (or ERR_NOMOTD) has ended the registration burst, so
+  // every 005 has arrived and useMonitor is settled. Reset with the socket.
+  isupportComplete: boolean;
   disposed: boolean;
   connectCommandTimer: ReturnType<typeof setTimeout> | null;
   lagMs: number | null;
@@ -866,6 +869,7 @@ export class IrcConnection {
         /* ignore */
       }
     });
+    this.isupportComplete = false;
     this.disposed = false;
     // Pending timer for the next WAIT-delayed connect command. Cleared on
     // close/dispose so we never call client.raw() after the socket is gone.
@@ -1538,6 +1542,7 @@ export class IrcConnection {
       this.monitorLimit = 0;
       this.pendingMonitorSeed = false;
       this.monitor.reset();
+      this.isupportComplete = false;
       // Safety-net presence sweep. The primary one runs in 'socket close',
       // which fires on every disconnect (including auto-reconnect blips), so it
       // has almost always swept already by the time this terminal 'close'
@@ -1962,6 +1967,8 @@ export class IrcConnection {
     });
 
     c.on('motd', (event: Record<string, unknown>) => {
+      // The MOTD, or its absence, ends the registration burst after every 005.
+      this.isupportComplete = true;
       // irc-framework also fires 'motd' for ERR_NOMOTD (no MOTD configured)
       // with `error` instead of `motd`, and for servers with an empty MOTD
       // file `motd` is just ''. Skip the blank-line publish either way.

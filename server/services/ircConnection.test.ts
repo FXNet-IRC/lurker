@@ -872,6 +872,13 @@ describe('MONITOR list shared with bouncer clients', () => {
     );
   });
 
+  it('marks ISUPPORT complete when the MOTD ends the registration burst', () => {
+    const { conn } = makeConn();
+    expect(conn.isupportComplete).toBe(false);
+    conn.client.emit('motd', { error: 'MOTD File is missing' });
+    expect(conn.isupportComplete).toBe(true);
+  });
+
   it("seeds bouncer clients' nicks after Lurker's own once ISUPPORT confirms MONITOR", () => {
     const { conn, raw } = makeConn();
     conn.trackDmPeer('dmpal');

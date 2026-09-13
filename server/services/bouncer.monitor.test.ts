@@ -59,8 +59,13 @@ function paramsOf(lines: string[], numeric: string): string[][] {
     .map((l) => bouncerMod.parseClientLine(l)!.params);
 }
 
+// The MONITOR +, - and C lines sent to the network. MONITOR S is counted apart.
 function monitorSent(acct: Account): string[] {
-  return acct.upstream.rawSent.filter((l) => l.startsWith('MONITOR'));
+  return acct.upstream.rawSent.filter((l) => l.startsWith('MONITOR') && l !== 'MONITOR S');
+}
+
+function statusRequests(acct: Account): number {
+  return acct.upstream.rawSent.filter((l) => l === 'MONITOR S').length;
 }
 
 describe('MONITOR per client', () => {
@@ -224,5 +229,42 @@ describe('MONITOR per client', () => {
     expect(paramsOf(c.lines, '421')).toEqual([['mon9', 'MONITOR', 'Unknown command']]);
     expect(monitorSent(acct)).toEqual([]);
     c.close();
+  });
+
+  it("keeps a watch sent before the network's ISUPPORT is complete", async () => {
+    const acct = harnessMod.seedAccount({ nick: 'mon10' });
+    const c = await attach(acct);
+    // Registered, but the 005 naming MONITOR hasn't arrived yet.
+    acct.upstream.useMonitor = false;
+    acct.upstream.isupportComplete = false;
+    c.send('MONITOR + sybil');
+    await settle(c);
+    expect(paramsOf(c.lines, '421')).toEqual([]);
+
+    // The seed that follows ISUPPORT puts the nick on the list.
+    acct.upstream.useMonitor = true;
+    acct.upstream.isupportComplete = true;
+    acct.upstream.syncMonitor();
+    expect(monitorSent(acct)).toEqual(['MONITOR + sybil']);
+    c.close();
+  });
+
+  it("asks once for the state of a client's nicks the network hasn't answered for", async () => {
+    const acct = harnessMod.seedAccount({ nick: 'mon11' });
+    const c1 = await attach(acct);
+    // Two adds in one read: gamja sends a MONITOR + per nick.
+    c1.socket.write('MONITOR + quinn\r\nMONITOR + rupert\r\n');
+    await settle(c1);
+    expect(statusRequests(acct)).toBe(1);
+
+    acct.upstream.pushUpstream(':irc.example.test 730 mon11 :quinn,rupert');
+    await settle(c1);
+    // Both have answers now, so another client's add asks for nothing.
+    const c2 = await attach(acct);
+    c2.send('MONITOR + quinn');
+    await settle(c2);
+    expect(statusRequests(acct)).toBe(1);
+    c1.close();
+    c2.close();
   });
 });

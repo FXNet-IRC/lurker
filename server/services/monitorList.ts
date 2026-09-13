@@ -57,6 +57,8 @@ export class MonitorList {
   // that: nicks Lurker didn't add share the list (a connect command's
   // MONITOR +), and a server can cap a list it advertises as unlimited.
   private cap = Infinity;
+  // A MONITOR S is queued for the end of this turn (requestStatus).
+  private statusQueued = false;
   private readonly send: (line: string) => void;
 
   constructor(send: (line: string) => void) {
@@ -96,6 +98,20 @@ export class MonitorList {
   noteRefused(nicks: string[]): void {
     for (const nick of nicks) this.listed.delete(fold(nick));
     this.cap = this.listed.size;
+  }
+
+  /**
+   * Ask the network for the state of every listed nick: one MONITOR S at the
+   * end of this turn, however many callers ask in it. A client may send a
+   * MONITOR + per nick.
+   */
+  requestStatus(): void {
+    if (this.statusQueued) return;
+    this.statusQueued = true;
+    queueMicrotask(() => {
+      this.statusQueued = false;
+      if (this.listed.size > 0) this.send('MONITOR S');
+    });
   }
 
   /** The socket closed, and the network's list went with it. */
