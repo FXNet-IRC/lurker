@@ -621,16 +621,7 @@ export class IrcConnection {
   private readonly rawMonitored = new Map<string, string>();
   private readonly rawMonitorHolder: MonitorHolder = {
     monitorTargets: () => this.rawMonitored.values(),
-    onMonitorDropped: (nicks, limit) => {
-      for (const nick of nicks) this.rawMonitored.delete(nick.toLowerCase());
-      this.publish({
-        type: 'notice',
-        target: this.serverTarget(),
-        nick: 'lurker',
-        notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
-        text: `MONITOR limit (${limit}) reached; not watching ${nicks.join(', ')}.`,
-      });
-    },
+    onMonitorDropped: (nicks, limit) => this.dropRawMonitors(nicks, limit),
   };
   disposed: boolean;
   connectCommandTimer: ReturnType<typeof setTimeout> | null;
@@ -1192,6 +1183,7 @@ export class IrcConnection {
           .split(',')
           .filter(Boolean);
         this.monitor.noteRefused(refused);
+        const listLimit = msg?.params?.[1] ?? '?';
         const own = refused.filter((n) => this.isOwnMonitorNick(n));
         if (own.length > 0) {
           this.publish({
@@ -1199,9 +1191,13 @@ export class IrcConnection {
             target: this.serverTarget(),
             nick: 'lurker',
             notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
-            text: `MONITOR limit (${msg?.params?.[1] ?? '?'}) reached; live presence skipped for ${own.join(', ')}.`,
+            text: `MONITOR limit (${listLimit}) reached; live presence skipped for ${own.join(', ')}.`,
           });
         }
+        // A raw MONITOR + (connect command, /quote) failed for these, as a
+        // client's would.
+        const rawRefused = refused.filter((n) => this.rawMonitored.has(n.toLowerCase()));
+        if (rawRefused.length > 0) this.dropRawMonitors(rawRefused, listLimit);
       }
       // draft/multiline BATCH start: the logical message's msgid/@time ride
       // THIS line per the spec, and irc-framework drops them when it reduces
@@ -3528,6 +3524,14 @@ export class IrcConnection {
   // go out as sent, and so does anything on a network known to lack MONITOR,
   // which answers 421. True if the line was handled here.
   private takeRawMonitor(line: string): boolean {
+    if (!this.applyRawMonitor(line)) return false;
+    this.syncMonitor();
+    return true;
+  }
+
+  // takeRawMonitor's change to the raw sender's list, without the sync. False
+  // if the line isn't a MONITOR +, - or C, or has to go out as sent.
+  private applyRawMonitor(line: string): boolean {
     const m = /^MONITOR\s+([+\-C])(?:\s+:?(\S+))?\s*$/i.exec(line.trim());
     if (!m || (this.isupportComplete && !this.useMonitor)) return false;
     if (m[1].toUpperCase() === 'C') {
@@ -3540,8 +3544,21 @@ export class IrcConnection {
       }
     }
     this.monitor.addHolder(this.rawMonitorHolder);
-    this.syncMonitor();
     return true;
+  }
+
+  // A raw MONITOR + failed for these nicks, for lack of room or because the
+  // network refused them. Stop asking for them and say so, because the 734
+  // itself stays out of the server buffer.
+  private dropRawMonitors(nicks: string[], limit: number | string): void {
+    for (const nick of nicks) this.rawMonitored.delete(nick.toLowerCase());
+    this.publish({
+      type: 'notice',
+      target: this.serverTarget(),
+      nick: 'lurker',
+      notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
+      text: `MONITOR limit (${limit}) reached; not watching ${nicks.join(', ')}.`,
+    });
   }
 
   // Seed the MONITOR list once per connection, from the 'server options' handler
@@ -3551,8 +3568,15 @@ export class IrcConnection {
   // tells the user live presence is degraded for them.
   seedMonitorWatch(): void {
     // A re-attach finds the socket's list as the last app process left it,
-    // nicks its bouncer clients watched included. Start from an empty one.
+    // nicks its bouncer clients watched included. Start from an empty one. The
+    // connect commands don't run again on a re-attach (they ran when the socket
+    // registered), so apply their MONITOR lines from the network's config
+    // first, or the clear would drop those watches for good.
     if (this.restoring) {
+      const commands = this.network.connect_commands;
+      if (typeof commands === 'string') {
+        for (const line of commands.split(/\r?\n/)) this.applyRawMonitor(line);
+      }
       try {
         this.client.raw('MONITOR C');
       } catch (_) {

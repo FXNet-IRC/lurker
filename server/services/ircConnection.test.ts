@@ -960,6 +960,40 @@ describe('MONITOR list shared with bouncer clients', () => {
     expect(raw).not.toHaveBeenCalled();
   });
 
+  it('drops a raw MONITOR + the network refused, and says so', async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.trackDmPeer('pal');
+    conn.raw('MONITOR + scripted');
+    await Promise.resolve();
+    conn.client.emit('raw', {
+      from_server: true,
+      line: ':irc.example.test 734 nick 2 scripted :Monitor list is full',
+    });
+    expect(conn.publish).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'MONITOR limit (2) reached; not watching scripted.' }),
+    );
+    raw.mockClear();
+
+    conn.untrackDmPeer('pal'); // frees the slot scripted was refused at
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR - pal']);
+  });
+
+  it("brings a connect command's MONITOR watch back when seeding a re-attach", async () => {
+    const { conn, raw } = makeConn();
+    conn.network.connect_commands = 'MODE nick +i\nMONITOR + scripted';
+    conn.restoring = true;
+    conn.client.network.options.MONITOR = '100';
+
+    conn.client.emit('server options', {});
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR C', 'MONITOR + scripted', 'MONITOR S']);
+  });
+
   it('marks ISUPPORT complete when the MOTD ends the registration burst', () => {
     const { conn } = makeConn();
     expect(conn.isupportComplete).toBe(false);

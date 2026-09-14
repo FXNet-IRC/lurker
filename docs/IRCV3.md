@@ -201,8 +201,8 @@ Implementation notes worth knowing if you're writing against it:
 - Each attached client has its own `MONITOR` list, as in soju. Lurker merges the lists
   with its own watches (DM presence, nick regain) onto the network's one list, answers
   `L` and `S` from the client's list, and sends `730` and `731` only to the clients
-  watching that nick. Everyone shares the network's limit, and a nick that doesn't fit
-  gets `734`.
+  watching that nick. Everyone shares the network's limit, a client's list holds at most
+  1000 nicks, and a nick that doesn't fit gets `734`.
   <br>`server/services/bouncer.ts:1963`, `server/services/monitorList.ts`
 
 ---

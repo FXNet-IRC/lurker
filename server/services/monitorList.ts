@@ -49,9 +49,13 @@ export function packTargets(nicks: string[], maxBytes = MAX_TARGET_BYTES): strin
 }
 
 export class MonitorList {
-  // Folded nick → the nick as sent, and the network's last answer for it
-  // (null until it gives one).
-  private readonly listed = new Map<string, { nick: string; online: boolean | null }>();
+  // Folded nick → the nick as sent, the network's last answer for it (null
+  // until it gives one), and its slot: how many nicks were listed when it was
+  // added, which is how many of ours the network held when it took the add.
+  private readonly listed = new Map<
+    string,
+    { nick: string; online: boolean | null; slot: number }
+  >();
   private readonly holders = new Set<MonitorHolder>();
   // How many nicks the network really takes. Its ISUPPORT limit can overstate
   // that: nicks Lurker didn't add share the list (a connect command's
@@ -91,13 +95,21 @@ export class MonitorList {
   }
 
   /**
-   * Forget nicks the network refused with a 734. Its list is full at the size
-   * this one is now, so nothing more is added until a nick comes off; otherwise
-   * every sync would send the refused nicks again and draw another 734.
+   * Forget nicks the network refused with a 734. Its list was full at the
+   * refused nick's slot, so nothing more is added past that until a nick comes
+   * off; otherwise every sync would send the refused nicks again and draw
+   * another 734. The slot, not this list's size by the time the 734 arrives: a
+   * nick removed in the meantime would leave the cap too low.
    */
   noteRefused(nicks: string[]): void {
-    for (const nick of nicks) this.listed.delete(fold(nick));
-    this.cap = this.listed.size;
+    let slot = Infinity;
+    for (const nick of nicks) {
+      const entry = this.listed.get(fold(nick));
+      if (!entry) continue;
+      slot = Math.min(slot, entry.slot);
+      this.listed.delete(fold(nick));
+    }
+    if (slot !== Infinity) this.cap = slot;
   }
 
   /**
@@ -171,7 +183,7 @@ export class MonitorList {
         }
         continue;
       }
-      this.listed.set(key, { nick, online: null });
+      this.listed.set(key, { nick, online: null, slot: this.listed.size });
       added.push(nick);
     }
 

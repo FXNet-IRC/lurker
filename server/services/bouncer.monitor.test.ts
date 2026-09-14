@@ -274,4 +274,43 @@ describe('MONITOR per client', () => {
     c2.close();
     c3.close();
   });
+
+  it("caps a client's list while the network is down, and answers 734 past the cap", async () => {
+    process.env.LURKER_BOUNCER_MAX_MONITOR = '2';
+    try {
+      const acct = harnessMod.seedAccount({ nick: 'mon12' });
+      const c = await attach(acct);
+      acct.upstream.state = 'disconnected';
+      c.send('MONITOR + tara,uma');
+      c.send('MONITOR + vic');
+      await settle(c);
+      expect(paramsOf(c.lines, '734')).toEqual([['mon12', '2', 'vic', 'Monitor list is full']]);
+
+      c.send('MONITOR L');
+      await settle(c);
+      expect(paramsOf(c.lines, '732')).toEqual([
+        ['mon12', 'tara'],
+        ['mon12', 'uma'],
+      ]);
+      c.close();
+    } finally {
+      delete process.env.LURKER_BOUNCER_MAX_MONITOR;
+    }
+  });
+});
+
+describe('maxMonitorPerClient', () => {
+  it('is 1000 unless the environment sets a positive number', () => {
+    const key = 'LURKER_BOUNCER_MAX_MONITOR';
+    try {
+      delete process.env[key];
+      expect(bouncerMod.maxMonitorPerClient()).toBe(1000);
+      process.env[key] = '50';
+      expect(bouncerMod.maxMonitorPerClient()).toBe(50);
+      process.env[key] = 'none';
+      expect(bouncerMod.maxMonitorPerClient()).toBe(1000);
+    } finally {
+      delete process.env[key];
+    }
+  });
 });

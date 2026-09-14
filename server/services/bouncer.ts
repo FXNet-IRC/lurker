@@ -1978,10 +1978,15 @@ class BouncerSession implements MonitorHolder {
     switch (sub) {
       case '+': {
         const targets = (msg.params[1] || '').split(',').filter(Boolean);
+        const cap = maxMonitorPerClient();
+        const overCap: string[] = [];
         for (const target of targets) {
           const key = target.toLowerCase();
-          if (!this.monitored.has(key)) this.monitored.set(key, target);
+          if (this.monitored.has(key)) continue;
+          if (this.monitored.size >= cap) overCap.push(target);
+          else this.monitored.set(key, target);
         }
+        if (overCap.length > 0) this.onMonitorDropped(overCap, cap);
         conn.monitor.addHolder(this);
         conn.syncMonitor();
         // The network won't answer for a nick it already watched, so answer
@@ -2033,8 +2038,8 @@ class BouncerSession implements MonitorHolder {
     return this.monitored.values();
   }
 
-  // Nicks that didn't fit under the network's limit: the client's MONITOR +
-  // failed for them.
+  // Nicks that didn't fit, under the network's limit or maxMonitorPerClient:
+  // the client's MONITOR + failed for them.
   onMonitorDropped(nicks: string[], limit: number): void {
     const nick = this.currentNick() || this.clientNick || '*';
     for (const target of nicks) {
@@ -2417,6 +2422,15 @@ function playbackLimit(): number {
 export function maxTotalPlaybackLines(): number {
   const n = Number(process.env.LURKER_BOUNCER_MAX_PLAYBACK_TOTAL);
   if (!Number.isFinite(n) || n <= 0) return 10000;
+  return Math.floor(n);
+}
+
+// Ceiling on one client's MONITOR list, as soju has. While the network is up
+// its own limit trims the list sooner; this bounds it while the network is down
+// and the list waits for the seed.
+export function maxMonitorPerClient(): number {
+  const n = Number(process.env.LURKER_BOUNCER_MAX_MONITOR);
+  if (!Number.isFinite(n) || n <= 0) return 1000;
   return Math.floor(n);
 }
 

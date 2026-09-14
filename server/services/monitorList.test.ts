@@ -132,6 +132,16 @@ describe('MonitorList.status', () => {
     expect(list.sync(['a', 'b', 'c'], Infinity).limit).toBe(Infinity);
   });
 
+  it("caps at the refused nick's slot, whatever came off the list since", () => {
+    const { list } = makeList();
+    list.sync(['a'], Infinity);
+    list.sync(['a', 'b'], Infinity); // b goes on second, and will be refused
+    list.sync(['b'], Infinity); // a comes off before the 734 arrives
+    list.noteRefused(['b']);
+    // The network held one of ours when it refused b, and a has come off since.
+    expect(list.sync(['c'], Infinity).added).toEqual(['c']);
+  });
+
   it('tells a holder the lower limit once the network has refused a nick', () => {
     const { list } = makeList();
     const h = new Holder('x', 'y');
