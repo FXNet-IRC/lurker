@@ -427,6 +427,17 @@ describe('the AWAY Lurker sends', () => {
     expect(aways(a)).toEqual(['AWAY :out PRIVMSG #elsewhere :injected']);
     expect(fakeOf(a.nick).sent.filter((l) => commandOf(l) === 'PRIVMSG')).toEqual([]);
   });
+
+  it('sends nothing for an away with nothing left to say once the line is made safe', async () => {
+    const acct = await seedAccount();
+    // A NUL survives the trim, and becomes a space the line then loses. A bare
+    // AWAY in its place would clear the networks' away while the account is away.
+    ircManager.setAwayAll(acct.userId, String.fromCharCode(0));
+    await settle(acct, []);
+
+    expect(isAway(acct.userId)).toBe(true);
+    expect(acct.nets.map(aways)).toEqual([[], []]);
+  });
 });
 
 describe('draft/pre-away', () => {
@@ -449,10 +460,11 @@ describe('draft/pre-away', () => {
     });
     await settle(acct, [sync]);
 
-    // Its 306 came before the welcome.
+    // Its 306 came before the welcome, and the burst didn't repeat it.
     const reply = sync.lines.findIndex((l) => commandOf(l) === '306');
     expect(reply).toBeGreaterThan(-1);
     expect(reply).toBeLessThan(sync.lines.findIndex((l) => commandOf(l) === '001'));
+    expect(awayReplies(sync)).toHaveLength(1);
     // It isn't the user, so the auto-away it found stays, and no `*` goes out.
     expect(getUserAwayState(acct.userId)).toMatchObject({
       away_message: 'afk',
@@ -488,6 +500,8 @@ describe('draft/pre-away', () => {
     const acct = await seedAccount();
     const c = await attach(acct, 'neta', { before: ['AWAY :early'] });
     await settle(acct, [c]);
+    // One 306: its reply. The burst doesn't repeat it.
+    expect(awayReplies(c)).toHaveLength(1);
     expect(getUserAwayState(acct.userId)).toMatchObject({
       away_message: 'early',
       back_datetime: null,

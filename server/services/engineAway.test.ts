@@ -91,4 +91,49 @@ describe('away across an engine re-attach', () => {
       ircManager.off('event', listener);
     }
   }, 90000);
+
+  it('sends a change made during the restore’s replay once, when the restore completes', async () => {
+    const { ircd, until } = harness;
+    const nick = 'replayer';
+    const user = createUser('engine-away-replay');
+    const network = createNetwork(user.id, {
+      name: 'replay',
+      host: '127.0.0.1',
+      port: ircd.port,
+      tls: 0,
+      nick,
+      autoconnect: 0,
+    })!;
+    const conn = ircManager.startNetwork(user.id, network.id)!;
+    // The replayed 001 marks the socket connected while the restore is still
+    // replaying: change away right there.
+    let changedDuringReplay = false;
+    const hook = (event: Record<string, unknown>) => {
+      if (event.networkId !== network.id || event.type !== 'state') return;
+      if (event.state !== 'connected' || !conn.restoring || changedDuringReplay) return;
+      changedDuringReplay = true;
+      ircManager.setAwayAll(user.id, 'during the replay');
+    };
+    ircManager.on('event', hook);
+    try {
+      await until(() => conn.state === 'connected', 5000, 'connected');
+      const fake = () => ircd.clients.find((c) => c.nick === nick)!;
+      const aways = () => fake().sent.filter((line) => /^AWAY( |$)/.test(line));
+
+      EngineLink.shared().simulateLoss();
+      await until(() => conn.state !== 'connected', 5000, 'the link loss');
+      await until(
+        () => conn.state === 'connected' && !conn.restoring && !conn.catchingUp,
+        20000,
+        'live again',
+      );
+      conn.client.raw('PING replay-settle');
+      await until(() => fake().sent.includes('PING replay-settle'), 5000, 'settled');
+
+      expect(changedDuringReplay).toBe(true);
+      expect(aways()).toEqual(['AWAY :during the replay']);
+    } finally {
+      ircManager.off('event', hook);
+    }
+  }, 90000);
 });

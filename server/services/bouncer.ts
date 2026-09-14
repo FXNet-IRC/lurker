@@ -731,6 +731,9 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   // An AWAY sent before registration (draft/pre-away), applied once the account
   // is known. null for none; '' for a bare AWAY.
   private pendingAway: string | null = null;
+  // This client's AWAY before registration was answered then. That 305/306
+  // stands for the account's state too, so the attach burst doesn't repeat it.
+  private awayAnswered = false;
   // This client said `AWAY *`: it isn't the user, so it doesn't count as the
   // user being here (presence.ts).
   private notPresent = false;
@@ -1376,7 +1379,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // An account that's away says so, as ZNC does for a client that attaches
     // (IRCNetwork.cpp:708), but after the channels: halloy keeps its own away
     // state on each channel's member list.
-    if (accountIsAway(this.userId)) this.sendAwayReply(true);
+    if (!this.awayAnswered && accountIsAway(this.userId)) this.sendAwayReply(true);
 
     // Live relay attaches AFTER playback so replayed history and the live
     // stream don't interleave out of order.
@@ -1499,7 +1502,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // A -notify client gets the full network list up-front as a batch.
     if (this.caps.has(CAP_BOUNCER_NETWORKS_NOTIFY)) this.sendNetworkList();
     // Away is the account's, so a control connection is told too.
-    if (accountIsAway(this.userId)) this.sendAwayReply(true);
+    if (!this.awayAnswered && accountIsAway(this.userId)) this.sendAwayReply(true);
   }
 
   // --- BOUNCER command -------------------------------------------------------
@@ -2168,6 +2171,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     const message = (msg.params[0] || '').trim();
     if (!this.registered) {
       this.pendingAway = message;
+      this.awayAnswered = true;
     } else {
       const counted = this.countsAsPresent();
       this.setAway(message);

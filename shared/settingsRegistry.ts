@@ -1258,8 +1258,9 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     default: true,
     description:
       'Automatically set you AWAY on every connected network when no Lurker client ' +
-      'is in front of you and no IRC client is attached through the bouncer, and ' +
-      'clear AWAY when one comes back. Modeled on the WeeChat screen_away.py script.',
+      'is in front of you and no IRC client is attached through the bouncer (a ' +
+      'background connection that sent AWAY * does not count), and clear AWAY when ' +
+      'one comes back. Modeled on the WeeChat screen_away.py script.',
   },
   {
     key: 'away.auto.delay_seconds',

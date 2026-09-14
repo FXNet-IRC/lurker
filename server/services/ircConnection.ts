@@ -6712,7 +6712,9 @@ export class IrcConnection {
       const changed = next.active
         ? !!next.message && (!prev.active || prev.message !== next.message)
         : prev.active;
-      if (changed) this.sendAwayState();
+      // Not during a restore's replay, when this socket is marked connected
+      // early: the 'restored' phase sends the final state once.
+      if (changed && !this.restoring) this.sendAwayState();
     }
     this.publishAwayState();
   }
@@ -6725,7 +6727,10 @@ export class IrcConnection {
     // A newline would split the line in two, and nothing on this path strips it.
     // eslint-disable-next-line no-control-regex
     const text = (message ?? '').replace(/[\r\n\u0000]/g, ' ').trim();
-    this.replies.send('lurker', active && text ? `AWAY :${text}` : 'AWAY');
+    // Away, but nothing left to say. A bare AWAY would clear the network's away
+    // while the account is still away, so send nothing.
+    if (active && !text) return;
+    this.replies.send('lurker', active ? `AWAY :${text}` : 'AWAY');
   }
 
   disconnect(reason?: string, opts: { announceCancelledRetry?: boolean } = {}): void {
