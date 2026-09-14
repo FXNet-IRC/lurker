@@ -103,6 +103,8 @@ declare module 'irc-framework' {
     ircd: string;
     options: Record<string, string | undefined>;
     cap: CapState;
+    /** Whether ISUPPORT offers a token (`whox`, `monitor`, …). */
+    supports(feature: string): boolean;
   }
 
   /** The connected user state. */
@@ -122,6 +124,12 @@ declare module 'irc-framework' {
 
   export class Client extends EventEmitter {
     constructor(options?: ClientOptions);
+
+    /**
+     * The WHOX token counter who() takes its tokens from (client.js). A 354 is
+     * parsed only if its token came from next() and hasn't been validated yet.
+     */
+    whox_token: { next(): number; validate(token: number): boolean };
 
     /** Network-level information (ISUPPORT, CAP negotiation). */
     network: NetworkInfo;

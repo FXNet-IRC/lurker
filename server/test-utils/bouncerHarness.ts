@@ -92,6 +92,15 @@ export class FakeUpstream {
   // IrcConnection.lineArrivedAt: when the line being relayed arrived. Null
   // leaves the bouncer to stamp untimed lines itself; set it to pin that time.
   lineArrivedAt: Date | null = null;
+  // IrcConnection.replyOwner: who the line being relayed is for. Null sends it
+  // to every client, as a line no query asked for; set it to model a reply.
+  replyOwner: import('../services/replyRouter.js').ReplyOwner | null = null;
+  readonly replies = {
+    dropClient: (_client: import('../services/replyRouter.js').ReplyClient): void => {},
+  };
+  // IrcConnection.membersPending: channels whose NAMES haven't arrived, folded.
+  readonly pendingNames = new Set<string>();
+  membersPending = (name: string): boolean => this.pendingNames.has(name.toLowerCase());
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   client: any;
 

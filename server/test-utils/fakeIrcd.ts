@@ -59,6 +59,11 @@ export interface FakeIrcdOptions {
   // privilege, or one the server lists and then declines. A REQ is
   // all-or-nothing, so a batch containing one of these is NAKed whole.
   refuse?: string[];
+  // Answer WHO for real: advertise WHOX, and send a 352 for each member of the
+  // channel (or a 354, for `WHO <mask> %<fields>[,<token>]`) before the 315.
+  whox?: boolean;
+  // Follow a channel's 324 with its 329 (RPL_CREATIONTIME), as most ircds do.
+  creationTime?: boolean;
 }
 
 export interface FakeClient {
@@ -95,6 +100,10 @@ export const DEFAULT_CAPS = [
   'userhost-in-names',
   'echo-message',
 ];
+
+// The end of each list-mode query the fake answers, by mode letter. Its lists
+// are always empty.
+const LIST_ENDS: Record<string, string | undefined> = { b: '368', e: '349', I: '347' };
 
 // `sasl=PLAIN,EXTERNAL` → `sasl`.
 function capName(cap: string): string {
@@ -464,11 +473,26 @@ export class FakeIrcd extends EventEmitter {
         return;
       }
       case 'MODE': {
-        if (isChannelTarget(p[0]) && p.length === 1) return this.num(c, '324', p[0], '+nt');
+        if (isChannelTarget(p[0]) && p.length === 1) {
+          this.num(c, '324', p[0], '+nt');
+          if (this.opts.creationTime) this.num(c, '329', p[0], '1700000000');
+          return;
+        }
+        // A list query: `MODE #chan b`, or `+b` with no mask.
+        const listEnd =
+          isChannelTarget(p[0]) && p.length === 2 ? LIST_ENDS[p[1].replace(/^\+/, '')] : undefined;
+        if (listEnd) return this.num(c, listEnd, p[0], 'End of list');
         return;
       }
       case 'WHO':
-        return this.num(c, '315', p[0] ?? '*', 'End of WHO list');
+        return this.who(c, p[0] ?? '*', p[1]);
+      case 'LIST': {
+        this.num(c, '321', 'Channel', 'Users  Name');
+        for (const chan of this.channelNames()) {
+          this.num(c, '322', chan, String(this.members(chan).length), this.topics.get(chan) ?? '');
+        }
+        return this.num(c, '323', 'End of /LIST');
+      }
       case 'AWAY':
         return p[0]
           ? this.num(c, '306', 'You have been marked as being away')
@@ -601,6 +625,7 @@ export class FakeIrcd extends EventEmitter {
       'NICKLEN=32',
       'PREFIX=(ov)@+',
       'MONITOR=100',
+      ...(this.opts.whox ? ['WHOX'] : []),
       'are supported by this server',
     );
     if (this.opts.burstNickTo) {
@@ -625,6 +650,65 @@ export class FakeIrcd extends EventEmitter {
       this.num(c, '376', 'End of /MOTD command.');
     }
     this.emit('registered', c);
+  }
+
+  // WHO for a channel's members, or for one nick. A `%<fields>[,<token>]` second
+  // argument asks for WHOX: a 354 with the fields in the spec's fixed order.
+  // Without the `whox` option, just the 315.
+  private who(c: FakeClient, mask: string, options: string | undefined): void {
+    if (this.opts.whox) {
+      const onChannel = isChannelTarget(mask);
+      const found = onChannel ? this.members(mask) : [this.client(mask)];
+      const whox = options?.startsWith('%') ? options.slice(1).split(',') : null;
+      for (const m of found) {
+        if (!m) continue;
+        const user = `~${m.user ?? 'u'}`;
+        const realname = m.user ?? '';
+        if (!whox) {
+          this.num(
+            c,
+            '352',
+            onChannel ? mask : '*',
+            user,
+            'fake.host',
+            this.serverName,
+            m.nick!,
+            'H',
+            `0 ${realname}`,
+          );
+          continue;
+        }
+        const [fields = '', token = ''] = whox;
+        const value: Record<string, string> = {
+          t: token,
+          c: onChannel ? mask : '*',
+          u: user,
+          i: '255.255.255.255',
+          h: 'fake.host',
+          s: this.serverName,
+          n: m.nick!,
+          f: 'H',
+          d: '0',
+          l: '0',
+          a: m.account ?? '0',
+          o: 'n/a',
+          r: realname,
+        };
+        const params = [...'tcuihsnfdlaor'].filter((f) => fields.includes(f)).map((f) => value[f]);
+        this.num(c, '354', ...params);
+      }
+    }
+    this.num(c, '315', mask, 'End of WHO list');
+  }
+
+  // Every channel someone is in, folded.
+  private channelNames(): string[] {
+    const names = new Set<string>();
+    for (const c of this.clients) {
+      if (c.socket.destroyed) continue;
+      for (const chan of c.channels) names.add(chan);
+    }
+    return [...names];
   }
 
   private names(c: FakeClient, chan: string): void {

@@ -211,6 +211,14 @@ Implementation notes worth knowing if you're writing against it:
   the apps. A channel's marker comes after its `JOIN`, before `NAMES`; ask for a DM's
   with `MARKREAD <nick>`.
   <br>`server/services/bouncer.ts:1884`, `server/services/ircManager.ts:892`
+- A reply goes only to whoever asked: your client, another attached client, the web
+  app, or Lurker itself, which sends `MODE` and `WHO` when it joins a channel. A
+  network's replies don't say who asked, so each `WHO`, `WHOIS`, `WHOWAS`, `LIST`,
+  `NAMES`, `TOPIC`, `ISON`, `USERHOST` and mode query waits until the last one of its
+  kind is answered, as in soju and ZNC's `route_replies`. `MODE #channel` is answered
+  from Lurker's last reply until a mode it shows changes. A query the network never
+  answers ends after 30 seconds with its end numeric, marked `Command aborted`.
+  <br>`server/services/replyRouter.ts`
 
 ---
 
