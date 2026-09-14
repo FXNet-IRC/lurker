@@ -674,6 +674,10 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   // Channels whose NAMES the attach burst held back because the connection
   // hadn't heard them yet, folded. They go out once it has (onNamesHeard).
   private readonly namesPending = new Set<string>();
+  // Whether this client has been told the connection's channels, by its join
+  // burst or by the network live. One that attached while the network wasn't
+  // connected learns them from an engine re-attach's replay instead.
+  private hasChannels = false;
   // What the client may request right now: SUPPORTED_CAPS, plus whichever
   // pass-through caps apply (see handleCap and updateSupportedCaps).
   private readonly availableCaps = new Set<string>(SUPPORTED_CAPS);
@@ -1344,11 +1348,15 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.onRawUpstream = (event) => {
       if (this.closed || !event?.from_server || typeof event.line !== 'string') return;
       // An engine re-attach replays the session into the connection: the
-      // registration burst, LUSERS, MOTD and a JOIN for every channel. This
-      // client has all of that already, and irssi rebuilds any channel it gets
-      // a second self-JOIN for. The backlog after the replay is what the client
-      // missed, and comes through.
-      if (conn.restoring) return;
+      // registration burst, LUSERS, MOTD and a JOIN for every channel. A client
+      // that already has the channels gets none of it, since irssi rebuilds any
+      // channel it gets a second self-JOIN for. One that attached while the link
+      // was down learns its channels from the replay, as a client attached
+      // during a fresh connect learns them from the network's own JOINs. The
+      // backlog after the replay is what either missed, and comes through.
+      const replaying = !!conn.restoring;
+      if (replaying && this.hasChannels) return;
+      if (!replaying) this.hasChannels = true;
       // A reply goes only to whoever asked for it: this client, another one,
       // the user or Lurker (replyRouter.ts). The connection decided in its own
       // raw listener, which runs before this one.
@@ -1377,13 +1385,19 @@ class BouncerSession implements MonitorHolder, ReplyClient {
           this.namesPending.delete(foldTargetFor(this.networkId, names.params[1]));
         }
       }
-      // The spec wants MARKREAD after our JOIN and before the channel's 366. The
-      // network's NAMES are relayed as they come, so right after the JOIN is it.
-      if (this.caps.has(CAP_READ_MARKER)) {
-        // `out`, not event.line: irc-framework's raw line keeps its CRLF, which
-        // would end up on the channel name.
-        const channel = selfJoinChannel(out, this.currentNick());
-        if (channel) this.sendReadMarker(channel);
+      // `out`, not event.line: irc-framework's raw line keeps its CRLF, which
+      // would end up on the channel name.
+      const joined = selfJoinChannel(out, this.currentNick());
+      if (joined) {
+        // A replayed JOIN brings no NAMES: the restore asks for them itself, and
+        // their replies are Lurker's. They follow once the connection has them.
+        if (replaying && conn.membersPending(joined)) {
+          this.namesPending.add(foldTargetFor(this.networkId, joined));
+        }
+        // The spec wants MARKREAD after our JOIN and before the channel's 366.
+        // The network's NAMES are relayed as they come, so right after the JOIN
+        // is it.
+        if (this.caps.has(CAP_READ_MARKER)) this.sendReadMarker(joined);
       }
     };
     // irc-framework's Client is an eventemitter3, which has no listener-count
@@ -1774,6 +1788,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   // to what the client negotiated, as it trims the network's own lines.
   private sendJoinBurst(): void {
     const conn = this.conn!;
+    this.hasChannels = true;
     const nick = this.currentNick() || '*';
     const realname = conn.client.user?.gecos || this.network?.realname || nick;
     for (const ch of conn.channels.values()) {

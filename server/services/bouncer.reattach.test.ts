@@ -39,9 +39,10 @@ const sockets: Array<{ destroy(): void }> = [];
 beforeAll(async () => {
   harness = await startEngineHarness({
     secret: 'bouncer-reattach-secret',
-    // The link comes back after 1.5 s rather than 0.1 s, so what the network
-    // says in between is the engine's backlog, not live traffic.
-    env: { LURKER_ENGINE_RETRY_BASE_MS: '1500' },
+    // The link comes back after 2.5 s rather than 0.1 s, so what the network
+    // says in between is the engine's backlog, not live traffic, and a client
+    // has time to attach while the link is down.
+    env: { LURKER_ENGINE_RETRY_BASE_MS: '2500' },
   });
   ircd = harness.ircd;
   process.env.LURKER_BOUNCER_ENABLED = 'true';
@@ -70,7 +71,7 @@ afterAll(async () => {
 });
 
 describe('an engine re-attach', () => {
-  it('sends an attached client what it missed, and nothing of the replay', async () => {
+  it('keeps the replay from a client that stayed, and gives it to one that attached', async () => {
     const until = harness.until;
     const commandOf = bouncerHarness.commandOf;
     const bob = await rawClient(ircd.port, 'bob');
@@ -89,52 +90,83 @@ describe('an engine re-attach', () => {
       'names heard',
     );
 
-    const client = await listener.connect();
-    client.send('CAP LS 302');
-    await client.waitFor((l) => l.includes('CAP') && l.includes('LS'));
-    client.send('NICK client');
-    client.send('USER client 0 * :client');
-    client.send('CAP REQ :sasl');
-    await client.waitFor((l) => l.includes('ACK'));
-    client.send('AUTHENTICATE PLAIN');
-    await client.waitFor((l) => l === 'AUTHENTICATE +');
-    client.send(
-      `AUTHENTICATE ${Buffer.from(['', username, PASSWORD].join(NUL)).toString('base64')}`,
-    );
-    await client.waitForCommand('903');
-    client.send('CAP END');
-    await client.waitForCommand('422');
+    const attach = async () => {
+      const client = await listener.connect();
+      client.send('CAP LS 302');
+      await client.waitFor((l) => l.includes('CAP') && l.includes('LS'));
+      client.send('NICK client');
+      client.send('USER client 0 * :client');
+      client.send('CAP REQ :sasl');
+      await client.waitFor((l) => l.includes('ACK'));
+      client.send('AUTHENTICATE PLAIN');
+      await client.waitFor((l) => l === 'AUTHENTICATE +');
+      client.send(
+        `AUTHENTICATE ${Buffer.from(['', username, PASSWORD].join(NUL)).toString('base64')}`,
+      );
+      await client.waitForCommand('903');
+      client.send('CAP END');
+      await client.waitForCommand('422');
+      return client;
+    };
+    type Client = Awaited<ReturnType<typeof attach>>;
 
-    // Everything the network sent before now has reached the client.
+    // Everything the network sent before now has reached the clients.
     let sentinels = 0;
-    const sentinel = async () => {
+    const sentinel = async (clients: Client[]) => {
       const text = `sentinel${++sentinels}`;
       ircd.sendRaw(NICK, `:fake.test NOTICE ${NICK} :${text}`);
-      await client.waitFor((l) => l.endsWith(`:${text}`), 5000);
+      for (const client of clients) await client.waitFor((l) => l.endsWith(`:${text}`), 5000);
     };
-    await sentinel();
-    const mark = client.lines.length;
+    const stayed = await attach();
+    await sentinel([stayed]);
+    const mark = stayed.lines.length;
     const registrations = ircd.registrations.length;
 
     EngineLink.shared().simulateLoss();
     await until(() => conn.state !== 'connected', 5000, 'the link loss');
-    // Said while the app is away, so it reaches the client from the backlog.
+    // Said while the app is away, so it reaches the clients from the backlog.
     const engineId = engineConnectionId(userId, network.id);
     const buffered = () => harness.engine.info(engineId)?.bufferedLines ?? 0;
     const bufferedBefore = buffered();
     ircd.say('bob', '#one', 'while away');
     await until(() => buffered() > bufferedBefore, 5000, 'the engine buffered the gap');
+    // This one attaches while there's no network to tell it about.
+    const attachedMeanwhile = await attach();
+    expect(conn.state).not.toBe('connected');
     await until(() => conn.state === 'connected' && !conn.catchingUp, 10000, 'live again');
-    await sentinel();
+    await until(
+      () => !conn.membersPending('#one') && !conn.membersPending('#two'),
+      10000,
+      "the restore's NAMES",
+    );
+    await sentinel([stayed, attachedMeanwhile]);
 
-    const after = client.lines.slice(mark);
-    // A re-attach, not a reconnect, and the client stayed.
+    // A re-attach, not a reconnect, and both clients are still there.
     expect(ircd.registrations).toHaveLength(registrations);
-    expect(bouncer.attachedSessionCount(userId, network.id)).toBe(1);
-    // What the network said in the gap arrives, once.
-    expect(after.filter((l) => l.endsWith('PRIVMSG #one :while away'))).toHaveLength(1);
-    // Nothing the replay carried does.
-    const replayed = ['251', '375', '372', '376', 'JOIN', 'NICK'];
+    expect(bouncer.attachedSessionCount(userId, network.id)).toBe(2);
+    const whileAway = (lines: string[]) =>
+      lines.filter((l) => l.endsWith('PRIVMSG #one :while away'));
+    const channelsIn = (lines: string[], command: string) =>
+      lines
+        .filter((l) => commandOf(l) === command)
+        .map((l) => l.split(' ').find((word) => word.startsWith('#')))
+        .toSorted();
+
+    // The client that stayed gets what the network said in the gap, once, and
+    // nothing the replay carried.
+    const after = stayed.lines.slice(mark);
+    expect(whileAway(after)).toHaveLength(1);
+    const replayed = ['251', '375', '372', '376', 'JOIN', 'NICK', '353', '366'];
     expect(after.filter((l) => replayed.includes(commandOf(l)))).toEqual([]);
+
+    // The one that attached meanwhile learns its channels from the replay, and
+    // their members once the restore has them.
+    const lines = attachedMeanwhile.lines;
+    expect(channelsIn(lines, 'JOIN')).toEqual(['#one', '#two']);
+    expect(channelsIn(lines, '366')).toEqual(['#one', '#two']);
+    expect(
+      lines.some((l) => commandOf(l) === '353' && l.includes('#one') && l.includes('bob')),
+    ).toBe(true);
+    expect(whileAway(lines)).toHaveLength(1);
   }, 40000);
 });

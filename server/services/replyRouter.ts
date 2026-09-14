@@ -72,25 +72,44 @@ const QUERY_TIMEOUT_MS = 30_000;
 // on a quiet connection.
 const SETTLE_MS = 1_000;
 
-// WHOIS reply lines. Each names the nick asked about (ZNC's route_replies list).
-const WHOIS_REPLIES = new Set([
-  '276',
-  '301',
-  '307',
-  '311',
-  '312',
-  '313',
-  '317',
-  '319',
-  '320',
-  '330',
-  '335',
-  '338',
-  '378',
-  '379',
-  '671',
-  '760',
+// Replies to other commands that name a nick where a WHOIS line does. Any other
+// 3xx naming the nick asked about is part of its WHOIS: each ircd adds lines of
+// its own (UnrealIRCd's 310, InspIRCd's 343 and 344, solanum's 337), and a list
+// of them leaks whatever it misses.
+const NOT_WHOIS = new Set([
+  '302',
+  '303',
+  '305',
+  '306',
+  '314',
+  '315',
+  '321',
+  '322',
+  '323',
+  '324',
+  '329',
+  '331',
+  '332',
+  '333',
+  '341',
+  '346',
+  '347',
+  '348',
+  '349',
+  '352',
+  '353',
+  '354',
+  '366',
+  '367',
+  '368',
+  '369',
 ]);
+// WHOIS lines outside 3xx: certfp, TLS, metadata.
+const WHOIS_OTHER_REPLIES = new Set(['276', '671', '760']);
+
+function isWhoisReply(command: string): boolean {
+  return (/^3\d\d$/.test(command) && !NOT_WHOIS.has(command)) || WHOIS_OTHER_REPLIES.has(command);
+}
 // WHOWAS reply lines, each naming the nick.
 const WHOWAS_REPLIES = new Set(['312', '314', '330', '338', '406']);
 // A list-mode query's entries and its end, by mode letter.
@@ -436,7 +455,7 @@ export class ReplyRouter {
           // InspIRCd ends each nick of `WHOIS a,b` with its own 318.
           return names(1) ? 'body' : null;
         }
-        return WHOIS_REPLIES.has(command) && names(1) ? 'body' : null;
+        return isWhoisReply(command) && names(1) ? 'body' : null;
       case 'whowas':
         if (command === '369') return names(1) ? 'end' : null;
         return WHOWAS_REPLIES.has(command) && names(1) ? 'body' : null;

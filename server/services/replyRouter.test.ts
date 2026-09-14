@@ -338,6 +338,22 @@ describe('who a reply is for', () => {
     expect(hear(':irc.test 301 me bob :gone fishing')).toBe(a);
   });
 
+  it('takes any 3xx about the nick for its WHOIS, but no reply to another command', () => {
+    const { router, hear } = setup();
+    const a = new Client();
+    const b = new Client();
+    router.send(a, 'WHOIS bob');
+    router.send(b, 'WHO bob');
+    // UnrealIRCd's helpop, solanum's text, InspIRCd's oper name and country,
+    // certfp, TLS.
+    for (const numeric of ['310', '337', '343', '344', '276', '671']) {
+      expect(hear(`:irc.test ${numeric} me bob :about bob`)).toBe(a);
+    }
+    // The end of a WHO for the same nick, and an INVITE's reply naming it.
+    expect(hear(':irc.test 315 me bob :End of /WHO list.')).toBe(b);
+    expect(hear(':irc.test 341 me bob #c')).toBe('unasked');
+  });
+
   it('leaves NAMES for another channel alone', () => {
     const { router, hear } = setup();
     const a = new Client();

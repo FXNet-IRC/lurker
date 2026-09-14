@@ -1328,7 +1328,14 @@ export class IrcConnection {
       if (this.replyOwner === 'lurker') this.noteRestoreReply(rawCommand, msg?.params?.[1]);
       // The server buffer is the user's. A reply to Lurker's own query (the
       // MODE it sends on a join) or to a bouncer client's isn't history (#931).
-      if (!this.replyForUser()) return;
+      if (!this.replyForUser()) {
+        // The restore's own replies still retire their channel's quiet mark, so
+        // the user's own /topic or /mode a moment later renders.
+        if (this.replyOwner === 'lurker' && RESTORE_QUIET_NUMERICS.has(rawCommand)) {
+          this.isRestoreQuiet(rawCommand, rawCommand === '221' ? '*' : msg?.params?.[1]);
+        }
+        return;
+      }
       // NAMES replies are denied because a joined channel's nicklist is where
       // they show. One for a channel we are not in has no nicklist to land in
       // (see 'userlist'), so it renders verbatim like any other numeric.
