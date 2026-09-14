@@ -532,6 +532,7 @@ Modern IRCv3 clients (Halloy, gamja, Goguma, …) get more than the server-passw
 - **SASL** — log in with the same credential via SASL PLAIN instead of a server password.
 - **Network discovery** (`soju.im/bouncer-networks`) — the client lists and binds your networks itself, so you don't hardcode `username/networkname`; connect as just `username` and pick from the list. This is what the idle connection above is for.
 - **On-demand scrollback** (`draft/chathistory`) — the client fetches the history it wants itself, so Lurker skips the replay on attach.
+- **Read markers** (`draft/read-marker`) — what you read in one client shows as read in your other clients and in the web and iOS apps, and the other way round.
 
 These are negotiated automatically; plain clients that don't support them keep working over the server-password path.
 

@@ -159,6 +159,7 @@ we advertise only what we actually implement.
 | Log in with SASL instead of a server password                                                   | `sasl` (PLAIN)                                                |
 | Backlog replays at its original timestamps, not at attach time                                  | `server-time`                                                 |
 | Scrollback on demand — page back through Lurker's full stored history from your terminal client | `draft/chathistory`                                           |
+| What you've read in one client is read in the others, and in the web and iOS apps               | `draft/read-marker`                                           |
 | Your own sent messages echoed back, if your client wants them                                   | `echo-message`                                                |
 | Your outgoing DMs attributed to you correctly in replay                                         | `znc.in/self-message`                                         |
 | Pick your network from a list instead of hardcoding `username/networkname`                      | `soju.im/bouncer-networks`, `soju.im/bouncer-networks-notify` |
@@ -204,6 +205,12 @@ Implementation notes worth knowing if you're writing against it:
   watching that nick. Everyone shares the network's limit, a client's list holds at most
   1000 nicks, and a nick that doesn't fit gets `734`.
   <br>`server/services/bouncer.ts:1963`, `server/services/monitorList.ts`
+- Read markers are the account's, the same unread position the web and iOS apps show.
+  `MARKREAD` with a time moves it to the newest message at or before that time, and
+  every client on the network that negotiated `draft/read-marker` hears the move, as do
+  the apps. A channel's marker comes after its `JOIN`, before `NAMES`; ask for a DM's
+  with `MARKREAD <nick>`.
+  <br>`server/services/bouncer.ts:1884`, `server/services/ircManager.ts:892`
 
 ---
 
@@ -226,6 +233,7 @@ attaching to Lurker.
 | `draft/multiline`                       |   ✅   |    —    |
 | `+typing`                               |   ✅   |    —    |
 | `draft/chathistory`                     |   —    |   ✅    |
+| `draft/read-marker`                     |   —    |   ✅    |
 | `multi-prefix`                          |   ✅   |   ✅    |
 | `userhost-in-names`                     |   ✅   |   ✅    |
 | `away-notify`                           |   ✅   |   ✅    |
@@ -258,14 +266,13 @@ you, not by spec number.
 
 ### High value — natural fits for features Lurker already has
 
-| Capability                      | What it would give you                                                                                                                                                                                                                                                                                                                                                             |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `+draft/react`                  | Emoji reactions on messages. Lurker already stores the `msgid` that reactions anchor to, so the hard part is done.                                                                                                                                                                                                                                                                 |
-| `+draft/reply`                  | Threaded replies, anchored on the same stored `msgid`.                                                                                                                                                                                                                                                                                                                             |
-| `draft/read-marker`             | Read state shared with an attached IRC client. Lurker already tracks read position server-side per user and pushes it to every first-party client, so web and mobile agree — but that state is invisible over the bouncer, which replays a fixed-size burst per buffer rather than resuming from where you left off. This is the cap that would close that gap in both directions. |
-| `draft/chathistory` (as client) | Backfill missed history from an upstream bouncer or a network that stores it. Note the asymmetry: Lurker _serves_ chathistory downstream but doesn't consume it upstream, so gaps from a Lurker outage can't currently be filled in.                                                                                                                                               |
-| `standard-replies`              | Machine-readable `FAIL`/`WARN`/`NOTE` errors, so command failures render as real explanations instead of raw numerics.                                                                                                                                                                                                                                                             |
-| `draft/message-redaction`       | When someone deletes a message, it disappears from your view too, rather than persisting forever in Lurker's history.                                                                                                                                                                                                                                                              |
+| Capability                      | What it would give you                                                                                                                                                                                                               |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `+draft/react`                  | Emoji reactions on messages. Lurker already stores the `msgid` that reactions anchor to, so the hard part is done.                                                                                                                   |
+| `+draft/reply`                  | Threaded replies, anchored on the same stored `msgid`.                                                                                                                                                                               |
+| `draft/chathistory` (as client) | Backfill missed history from an upstream bouncer or a network that stores it. Note the asymmetry: Lurker _serves_ chathistory downstream but doesn't consume it upstream, so gaps from a Lurker outage can't currently be filled in. |
+| `standard-replies`              | Machine-readable `FAIL`/`WARN`/`NOTE` errors, so command failures render as real explanations instead of raw numerics.                                                                                                               |
+| `draft/message-redaction`       | When someone deletes a message, it disappears from your view too, rather than persisting forever in Lurker's history.                                                                                                                |
 
 ### Moderate value
 

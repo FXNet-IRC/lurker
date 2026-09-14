@@ -739,6 +739,43 @@ export function maxIdForBuffer(networkId: number, target: string): number {
   return row?.maxId || 0;
 }
 
+// The time of the newest row at or below a read pointer, or null when there is
+// none. MARKREAD carries a time where the pointer is an id (bouncer.ts), and the
+// pointer's own row may have been pruned since, so the row below it stands in.
+export function readMarkerTime(
+  networkId: number,
+  target: string,
+  lastReadId: number,
+): string | null {
+  if (!(lastReadId > 0)) return null;
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return null;
+  const row = db
+    .prepare('SELECT time FROM messages WHERE buffer_id = ? AND id <= ? ORDER BY id DESC LIMIT 1')
+    .get(bufferId, lastReadId) as { time: string } | undefined;
+  return row?.time ?? null;
+}
+
+// Where a MARKREAD's time puts the read pointer: the newest row above `afterId`
+// whose time is at or before `iso`, or 0 when there is none. It walks the
+// buffer's id index down from the tail and stops at the first row that old, so
+// marking the newest line reads one row, and it never reads below the pointer.
+export function newestIdAtOrBefore(
+  networkId: number,
+  target: string,
+  afterId: number,
+  iso: string,
+): number {
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return 0;
+  const row = db
+    .prepare(
+      'SELECT id FROM messages WHERE buffer_id = ? AND id > ? AND time <= ? ORDER BY id DESC LIMIT 1',
+    )
+    .get(bufferId, Math.max(0, afterId), iso) as { id: number } | undefined;
+  return row?.id ?? 0;
+}
+
 // Cheap "does the user have any history with this target?" check used by the
 // no_such_nick router: only route a DM-shaped error into a per-nick buffer if
 // the user has actually conversed with that nick. Stops typo /whois replies

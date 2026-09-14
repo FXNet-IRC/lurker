@@ -64,8 +64,14 @@ import {
   listBuffersForNetwork,
   loadHistoryWindow,
   listActiveTargetsInWindow,
+  readMarkerTime,
+  newestIdAtOrBefore,
 } from '../db/messages.js';
 import type { MessageEvent } from '../db/messages.js';
+import { getReadState } from '../db/bufferReads.js';
+import { resolveBuffer } from '../db/bufferResolve.js';
+import type { ReadMarkerMove } from './ircManager.js';
+import { broadcastReadState } from './wsHub.js';
 import { splitSay, splitAction } from './messageSplit.js';
 import { e2eManager } from './e2e/manager.js';
 import { contextKey, isChannelContext } from './e2e/context.js';
@@ -76,7 +82,7 @@ import {
   keyMatchesCert,
 } from '../utils/bouncerCert.js';
 import { isChannelTarget } from '../../shared/channels.js';
-import { ClientLineFilter, restrictTags } from './bouncerClientFilter.js';
+import { ClientLineFilter, parseLine, restrictTags } from './bouncerClientFilter.js';
 import type { MonitorHolder } from './monitorList.js';
 
 const SERVER_NAME = 'lurker.bouncer';
@@ -119,6 +125,9 @@ const SUPPORTED_CAPS = [
   // invite-notify: other people's INVITEs. A network that doesn't send them
   // just means fewer, which the spec allows; soju offers it regardless too.
   'invite-notify',
+  // draft/read-marker: MARKREAD reads and moves the account's read pointer, the
+  // one the web and iOS apps share (handleMarkRead). soju offers it everywhere too.
+  'draft/read-marker',
 ];
 
 // Caps offered only while the bound network has them, because the lines they
@@ -140,6 +149,7 @@ const PASSTHROUGH_CAPS = [
 const CAP_BOUNCER_NETWORKS = 'soju.im/bouncer-networks';
 const CAP_BOUNCER_NETWORKS_NOTIFY = 'soju.im/bouncer-networks-notify';
 const CAP_CHATHISTORY = 'draft/chathistory';
+const CAP_READ_MARKER = 'draft/read-marker';
 
 // Max messages a single CHATHISTORY request may return (advertised as the
 // CHATHISTORY ISUPPORT token). Requests over this are rejected, not clamped —
@@ -1323,13 +1333,25 @@ class BouncerSession implements MonitorHolder {
       // reflect our OWN PRIVMSG/NOTICE back. dispatchIrcEvent already synthesizes
       // the self-echo, so drop the reflected copy to avoid a duplicate line.
       if (this.isReflectedSelfLine(event.line)) return;
+      // The time the connection gave this line, so a line without server-time
+      // goes out with the time its stored row has (IrcConnection.lineArrivedAt).
+      const relayedAt = conn.lineArrivedAt ?? new Date();
       const monitorReplies = this.monitorRelay(event.line);
       if (monitorReplies) {
-        for (const line of monitorReplies) this.write(line, new Date());
+        for (const line of monitorReplies) this.write(line, relayedAt);
         return;
       }
       const out = filterRelayLine(event.line);
-      if (out) this.write(out, new Date());
+      if (!out) return;
+      this.write(out, relayedAt);
+      // The spec wants MARKREAD after our JOIN and before the channel's 366. The
+      // network's NAMES are relayed as they come, so right after the JOIN is it.
+      if (this.caps.has(CAP_READ_MARKER)) {
+        // `out`, not event.line: irc-framework's raw line keeps its CRLF, which
+        // would end up on the channel name.
+        const channel = selfJoinChannel(out, this.currentNick());
+        if (channel) this.sendReadMarker(channel);
+      }
     };
     // irc-framework's Client is an eventemitter3, which has no listener-count
     // cap — several attached clients can listen on one upstream client freely.
@@ -1728,6 +1750,8 @@ class BouncerSession implements MonitorHolder {
       const accountParam = typeof account === 'string' ? account : '*';
       this.write(`:${this.selfPrefix()} JOIN ${ch.name} ${accountParam} :${realname}`);
       if (ch.topic) this.write(`:${SERVER_NAME} 332 ${nick} ${ch.name} :${ch.topic}`);
+      // After the topic and before NAMES, where soju sends it (forwardChannel).
+      this.sendReadMarker(ch.name);
       const names = Array.from(ch.members.values()).map((m) => {
         const mask = m.user && m.host ? `!${m.user}@${m.host}` : '';
         return memberPrefixSymbols(m.modes || [], prefixes) + m.nick + mask;
@@ -1852,6 +1876,60 @@ class BouncerSession implements MonitorHolder {
     return live;
   }
 
+  // MARKREAD reads or moves the account's read pointer for a buffer, the one the
+  // web and iOS apps share, as soju's handler does (downstream.go:3271). The
+  // pointer is a message id, so a time moves it to the newest message at or
+  // before that time. A time that moves nothing, and a MARKREAD without one, get
+  // the stored marker back.
+  private handleMarkRead(msg: ParsedClientLine): void {
+    const target = msg.params[0] ?? '';
+    if (!target) {
+      this.write(`:${SERVER_NAME} FAIL MARKREAD NEED_MORE_PARAMS :Missing parameters`);
+      return;
+    }
+    if (this.isControl || !this.networkId) {
+      this.write(
+        `:${SERVER_NAME} FAIL MARKREAD INTERNAL_ERROR ${target} :Cannot set read markers on the bouncer connection`,
+      );
+      return;
+    }
+    const lastReadId = getReadState(this.userId, this.networkId, target);
+    const bound = msg.params[1];
+    if (bound !== undefined) {
+      const iso = readMarkerBoundTime(bound);
+      if (!iso) {
+        this.write(`:${SERVER_NAME} FAIL MARKREAD INVALID_PARAMS ${bound} :Invalid timestamp`);
+        return;
+      }
+      const id = newestIdAtOrBefore(this.networkId, target, lastReadId, iso);
+      const lastRead =
+        id > 0 ? ircManager.markRead(this.userId, this.networkId, target, id) : lastReadId;
+      if (lastRead > lastReadId) {
+        // Every client on the network, this one included, has heard the move
+        // through ircManager's 'read-marker' event. The apps hear it as read-state.
+        const buffer = resolveBuffer(this.userId, this.networkId, target);
+        if (buffer) {
+          broadcastReadState(this.userId, this.networkId, buffer.target, lastRead, buffer.id);
+        }
+        return;
+      }
+    }
+    this.write(
+      `:${SERVER_NAME} MARKREAD ${target} ${readMarkerParam(this.networkId, target, lastReadId)}`,
+    );
+  }
+
+  // MARKREAD for one buffer, to a client that negotiated read markers. `param` is
+  // `timestamp=…` or `*`, passed in when several clients get the same move;
+  // without it, the account's current marker is looked up.
+  sendReadMarker(target: string, param?: string): void {
+    if (this.closed || !this.caps.has(CAP_READ_MARKER)) return;
+    const marker =
+      param ??
+      readMarkerParam(this.networkId, target, getReadState(this.userId, this.networkId, target));
+    this.write(`:${SERVER_NAME} MARKREAD ${target} ${marker}`);
+  }
+
   private handleCommand(msg: ParsedClientLine): void {
     switch (msg.command) {
       case 'PING':
@@ -1886,6 +1964,11 @@ class BouncerSession implements MonitorHolder {
         // when the upstream is disconnected (a bouncer's whole point), bypassing
         // the liveConn() gate below.
         this.handleChatHistory(msg);
+        return;
+      case 'MARKREAD':
+        // The read pointer is Lurker's own state, so like CHATHISTORY this works
+        // with the network down.
+        this.handleMarkRead(msg);
         return;
     }
 
@@ -2319,6 +2402,50 @@ function echoKey(type: string, target: string, text: string): string {
 // ircManager event fan-in
 // ---------------------------------------------------------------------------
 
+// MARKREAD's marker for a read pointer: `timestamp=` and the time of the message
+// it names (or of the one below it, if that row is gone), or `*` for none.
+function readMarkerParam(networkId: number, target: string, lastReadId: number): string {
+  const time = readMarkerTime(networkId, target, lastReadId);
+  return time ? `timestamp=${toIrcTime(time)}` : '*';
+}
+
+// The time in a client's `timestamp=` MARKREAD bound, as Lurker stores times, or
+// null. The fraction is optional: HexDroid formats with Java's Instant.toString(),
+// which drops a `.000`.
+function readMarkerBoundTime(bound: string): string | null {
+  const match = /^timestamp=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)$/.exec(bound);
+  if (!match) return null;
+  const ms = Date.parse(match[1]);
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+}
+
+// The channel a relayed line has `nick` joining, or null for any other line.
+function selfJoinChannel(line: string, nick: string | null): string | null {
+  if (!nick || !/^JOIN /i.test(line.slice(lineHead(line).length))) return null;
+  const msg = parseLine(line);
+  const source = msg?.source?.split('!')[0];
+  if (!msg || !source || source.toLowerCase() !== nick.toLowerCase()) return null;
+  return msg.params[0] || null;
+}
+
+// A read pointer moved, in the apps or over IRC. Every client on that network
+// that negotiated read markers hears it, the one whose MARKREAD moved it included
+// (the spec's reply). The :server: and system buffers aren't IRC targets.
+function dispatchReadMarker(move: ReadMarkerMove): void {
+  const { networkId, target } = move;
+  if (networkId == null || target.startsWith(':')) return;
+  const set = registry.get(registryKey(move.userId, networkId));
+  if (!set) return;
+  // The apps mark read on every line into a focused buffer, so the time is only
+  // looked up once some client here can take it.
+  let param: string | undefined;
+  for (const session of set) {
+    if (!session.caps.has(CAP_READ_MARKER)) continue;
+    param ??= readMarkerParam(networkId, target, move.lastReadId);
+    session.sendReadMarker(target, param);
+  }
+}
+
 function dispatchIrcEvent(event: Record<string, unknown>): void {
   const userId = Number(event.userId);
   const networkId = Number(event.networkId);
@@ -2390,6 +2517,7 @@ let certReloadTimer: ReturnType<typeof setInterval> | null = null;
 // plaintext listener.
 let bouncerTlsState: { certPath: string; keyPath: string; fingerprint: string } | null = null;
 let onIrcEvent: ((event: Record<string, unknown>) => void) | null = null;
+let onReadMarker: ((move: ReadMarkerMove) => void) | null = null;
 let onUserDisposed: ((payload: { userId: number }) => void) | null = null;
 let onUserSuspended: ((payload: { userId: number }) => void) | null = null;
 
@@ -2628,6 +2756,8 @@ export async function startBouncer(
 
   onIrcEvent = (event) => dispatchIrcEvent(event as Record<string, unknown>);
   ircManager.on('event', onIrcEvent);
+  onReadMarker = (move) => dispatchReadMarker(move);
+  ircManager.on('read-marker', onReadMarker);
   onUserDisposed = ({ userId }) => dropSessionsForUser(userId, 'Account removed');
   onUserSuspended = ({ userId }) => dropSessionsForUser(userId, 'Account paused');
   ircManager.on('user-disposed', onUserDisposed);
@@ -2654,6 +2784,10 @@ export function stopBouncer(): void {
   if (onIrcEvent) {
     ircManager.off('event', onIrcEvent);
     onIrcEvent = null;
+  }
+  if (onReadMarker) {
+    ircManager.off('read-marker', onReadMarker);
+    onReadMarker = null;
   }
   if (onUserDisposed) {
     ircManager.off('user-disposed', onUserDisposed);

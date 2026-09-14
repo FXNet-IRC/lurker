@@ -89,6 +89,9 @@ export class FakeUpstream {
   isupportComplete = true;
   monitorLimit = 100;
   readonly monitor = new MonitorList((line) => this.raw(line));
+  // IrcConnection.lineArrivedAt: when the line being relayed arrived. Null
+  // leaves the bouncer to stamp untimed lines itself; set it to pin that time.
+  lineArrivedAt: Date | null = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   client: any;
 

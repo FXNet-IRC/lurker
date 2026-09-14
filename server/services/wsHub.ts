@@ -50,7 +50,6 @@ import {
 import {
   listReadStateForUser,
   getReadState,
-  setReadState,
   listClearedStateForUser,
   getClearedState,
   setClearedState,
@@ -1604,6 +1603,35 @@ export function fanOutToUser(userId: number, payload: WsPayload, opts: FanOutOpt
   fanOut(userId, payload, opts);
 }
 
+// Single path for "tell every tab of this user what the buffer's unread
+// counts are now." Used by mark-read echo, by the live IRC-event fan-out, and
+// by the bouncer when an attached IRC client's MARKREAD moves the pointer — the
+// client doesn't increment locally anymore, so this is the only source of badge
+// state.
+// `bufferId` is threaded from callers that already hold it (the live pipe's
+// decorated event, an id-addressed mark-read) — this runs per countable
+// event, so the resolve is a fallback, not a habit.
+export function broadcastReadState(
+  userId: number,
+  networkId: number | null,
+  target: string,
+  lastReadId: number,
+  bufferId?: number | null,
+): void {
+  const counts = computeUnreadFor(userId, networkId, target, lastReadId);
+  fanOut(userId, {
+    kind: 'read-state',
+    networkId,
+    target,
+    bufferId:
+      bufferId !== undefined ? bufferId : (resolveBuffer(userId, networkId, target)?.id ?? null),
+    lastReadId: counts.lastReadId,
+    unread: counts.unread,
+    highlights: counts.highlights,
+    highlightsCapped: counts.highlightsCapped,
+  });
+}
+
 /**
  * Close every open socket for a user, so a revoked session stops streaming.
  *
@@ -1952,34 +1980,6 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     } else {
       scheduleAutoAway(userId);
     }
-  }
-
-  // Single path for "tell every tab of this user what the buffer's unread
-  // counts are now." Used by mark-read echo and by the live IRC-event fan-out
-  // below — the client doesn't increment locally anymore, so this is the
-  // only source of badge state.
-  // `bufferId` is threaded from callers that already hold it (the live pipe's
-  // decorated event, an id-addressed mark-read) — this runs per countable
-  // event, so the resolve is a fallback, not a habit.
-  function broadcastReadState(
-    userId: number,
-    networkId: number | null,
-    target: string,
-    lastReadId: number,
-    bufferId?: number | null,
-  ): void {
-    const counts = computeUnreadFor(userId, networkId, target, lastReadId);
-    fanOut(userId, {
-      kind: 'read-state',
-      networkId,
-      target,
-      bufferId:
-        bufferId !== undefined ? bufferId : (resolveBuffer(userId, networkId, target)?.id ?? null),
-      lastReadId: counts.lastReadId,
-      unread: counts.unread,
-      highlights: counts.highlights,
-      highlightsCapped: counts.highlightsCapped,
-    });
   }
 
   // Push-suppression gates shared by message and presence pushes: a manual
@@ -3212,7 +3212,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
             ? null
             : Number(msg.networkId);
         if (networkId !== null && !networkId) break;
-        const lastReadId = setReadState(userId, networkId, target, requested);
+        const lastReadId = ircManager.markRead(userId, networkId, target, requested);
         broadcastReadState(userId, networkId, target, lastReadId, addr?.bufferId);
         break;
       }
@@ -3280,7 +3280,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
             if (!target || !Number.isFinite(maxId) || maxId <= 0) continue;
             const before = getReadState(userId, networkId, target);
             if (before >= maxId) continue;
-            const after = setReadState(userId, networkId, target, maxId);
+            const after = ircManager.markRead(userId, networkId, target, maxId);
             if (isHiddenClosedBuffer(closed, conn, networkId, target)) continue;
             broadcastReadState(userId, networkId, target, after);
           }
