@@ -694,6 +694,13 @@ export class IrcConnection {
   // grafts them onto the first fragment. Consumed on first fragment; cleared on
   // socket close with multilineBatches so an unopened batch can't leak.
   multilineBatchTags: Map<string, { time?: string; msgid?: string }>;
+  // When the server line being handled arrived. An event without server-time
+  // takes it as its time, and so does the bouncer's copy of the line, so the
+  // stored row and the relayed line agree: a MARKREAD from an attached client
+  // names the relayed line's time and has to find that row. soju stamps a line
+  // once the same way (upstream.go:679). Null outside a line's handlers, so an
+  // event a timer fires later gets the time it happened.
+  lineArrivedAt: Date | null;
   // Exact ciphertext lines we recently put on the wire for E2E sends, so the
   // echo-message reflection of our OWN ciphertext is recognized by content —
   // not by re-checking channel E2E state at echo time, which races /e2e off
@@ -910,6 +917,7 @@ export class IrcConnection {
     this.autoWhoTargets = new Set();
     this.multilineBatches = new Map();
     this.multilineBatchTags = new Map();
+    this.lineArrivedAt = null;
     this.sentCiphertext = [];
     this.lastAdoptedSelfMsgid = null;
     this.ctcpLimiter = new RateLimiter();
@@ -1003,7 +1011,7 @@ export class IrcConnection {
     if (this.restoring && this.shouldPersist(event)) return;
     if (this.catchingUp && this.shouldPersist(event) && this.alreadyPersisted(event)) return;
     event = this.normalizeChannelTarget(event);
-    const time = normalizeEventTime(event.time);
+    const time = normalizeEventTime(event.time ?? this.lineArrivedAt?.getTime());
     const enriched: EnrichedEvent = {
       ...event,
       userId: this.network.user_id,
@@ -1078,7 +1086,7 @@ export class IrcConnection {
       ...event,
       userId: this.network.user_id,
       networkId: this.network.id,
-      time: normalizeEventTime(event.time),
+      time: normalizeEventTime(event.time ?? this.lineArrivedAt?.getTime()),
     });
   }
 
@@ -1159,6 +1167,15 @@ export class IrcConnection {
     // they never replace the raw line here.
     c.on('raw', (event: { from_server: boolean; line: string }) => {
       if (!event?.from_server || typeof event.line !== 'string') return;
+      // One time for everything this line produces (see lineArrivedAt). This
+      // listener is registered before any bouncer client's, and irc-framework
+      // runs the line's handlers synchronously once its raw listeners return
+      // (connection.js emits raw, then message), so they all read this value
+      // before the microtask clears it.
+      this.lineArrivedAt = new Date();
+      queueMicrotask(() => {
+        this.lineArrivedAt = null;
+      });
       // A ban-classified ERROR is only believed if it's the link's LAST line
       // (#651). Every server line passes through here, and for the ban line
       // itself raw fires BEFORE the parsed 'irc error' sets the flag
@@ -4914,7 +4931,7 @@ export class IrcConnection {
     const target = event.target as string;
     const type = event.type;
     if (!target || !type) return false;
-    const time = normalizeEventTime(event.time);
+    const time = normalizeEventTime(event.time ?? this.lineArrivedAt?.getTime());
     return hasRecentMessageLike(
       this.network.id,
       target,
@@ -6412,6 +6429,12 @@ export class IrcConnection {
               ? { ...tags, msgid: batchTags.msgid }
               : tags,
         };
+      }
+      // Without server-time the message would be stored when the batch ends,
+      // but each fragment is relayed with the time it arrived. The first
+      // fragment's time lets a MARKREAD naming any of them reach the stored row.
+      if (event.time == null && this.lineArrivedAt) {
+        event = { ...event, time: this.lineArrivedAt.getTime() };
       }
       this.multilineBatches.set(id, { event, text: line });
       return;

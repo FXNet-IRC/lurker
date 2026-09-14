@@ -379,6 +379,9 @@ describe('isValidServerTime', () => {
     expect(isValidServerTime('2023-05-23T06:00:00.000+00:00')).toBe(false); // offset
     expect(isValidServerTime('not-a-time')).toBe(false);
     expect(isValidServerTime('2023-13-45T99:99:99.000Z')).toBe(false); // impossible
+    // Date.parse reads these as March 2 and the next midnight.
+    expect(isValidServerTime('2023-02-30T06:00:00.000Z')).toBe(false);
+    expect(isValidServerTime('2023-05-23T24:00:00.000Z')).toBe(false);
   });
 });
 

@@ -3083,6 +3083,23 @@ describe('IRCv3 draft/multiline (#381)', () => {
       });
     });
 
+    it('without server-time, takes the time the first fragment arrived', () => {
+      // The bouncer relays each fragment with the time it arrived, so a MARKREAD
+      // can name any of them. The stored message has to be no later than the first.
+      const { conn, publish } = makeReceiver();
+      const first = new Date('2024-01-01T10:00:00.100Z');
+      conn.lineArrivedAt = first;
+      conn.client.emit('message', fragment('bt', 'line one'));
+      conn.lineArrivedAt = new Date('2024-01-01T10:00:00.250Z');
+      conn.client.emit('message', fragment('bt', 'line two'));
+      conn.lineArrivedAt = new Date('2024-01-01T10:00:00.400Z');
+      conn.client.emit('batch end draft/multiline', { id: 'bt' });
+      expect(publish.mock.calls[0][0]).toMatchObject({
+        text: 'line one\nline two',
+        time: first.getTime(),
+      });
+    });
+
     it('honors draft/multiline-concat — continuations rejoin with NO newline', () => {
       const { conn, publish } = makeReceiver();
       conn.client.emit('message', fragment('b2', 'hello '));

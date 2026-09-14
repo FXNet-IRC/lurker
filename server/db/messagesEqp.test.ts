@@ -236,3 +236,36 @@ describe('noise-clock paths', () => {
     expect(row?.sql).toContain(`(${earlyPruneSql})`);
   });
 });
+
+// MARKREAD maps a read pointer (an id) to a time and back (bouncer.ts). Both
+// lookups run on a client's command, and messages.time is unindexed, so each
+// step has to be a seek on the per-buffer id index, never a walk or a sort.
+describe('read-marker paths', () => {
+  it('each bisection step is an index seek (newestIdAtOrBefore shape)', () => {
+    const detail = plan(
+      `SELECT id, time FROM messages
+       WHERE buffer_id = 1 AND id > 0 AND id <= 100
+       ORDER BY id DESC LIMIT 1`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
+    expect(detail).not.toMatch(/TEMP B-TREE/);
+  });
+
+  it('the walk after the bisection stays on the per-buffer index (newestIdAtOrBefore shape)', () => {
+    const detail = plan(
+      `SELECT id FROM messages
+       WHERE buffer_id = 1 AND id > 0 AND id <= 100 AND time <= '2026-01-01T00:00:00.000Z'
+       ORDER BY id DESC LIMIT 1`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
+    expect(detail).not.toMatch(/TEMP B-TREE/);
+  });
+
+  it("a read pointer's time is an index seek (readMarkerTime shape)", () => {
+    const detail = plan(
+      `SELECT time FROM messages WHERE buffer_id = 1 AND id <= 5 ORDER BY id DESC LIMIT 1`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
+    expect(detail).not.toMatch(/TEMP B-TREE/);
+  });
+});

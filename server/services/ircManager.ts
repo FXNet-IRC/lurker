@@ -27,6 +27,7 @@ import { DCC_ACTIVE_STATES, getDccTransfer, updateDccTransferState } from '../db
 import { findUserById } from '../db/users.js';
 import { isNetworkHostAllowed } from './networkPolicy.js';
 import { getUserAwayState, writeAwayMarker, writeBackMarker } from '../db/userAwayState.js';
+import { getReadState, setReadState } from '../db/bufferReads.js';
 import { listPinnedForUser } from '../db/pinnedBuffers.js';
 import { listCollapsedForUser } from '../db/nicklistCollapsed.js';
 import { listChannelNotifyForUser } from '../db/channelNotify.js';
@@ -51,6 +52,14 @@ import { e2eManager } from './e2e/manager.js';
 import { contextKey, isChannelContext } from './e2e/context.js';
 import { e2eDbg } from './e2e/debug.js';
 import db from '../db/index.js';
+
+// A buffer's read pointer moved forward: what markRead emits as 'read-marker'.
+export interface ReadMarkerMove {
+  userId: number;
+  networkId: number | null;
+  target: string;
+  lastReadId: number;
+}
 
 // RPE2E is wired for real IRC channels only in this phase (#382). DM
 // pseudochannels (`@ident@host`) need the peer's server-stamped handle resolved
@@ -872,6 +881,22 @@ class IrcManager extends EventEmitter {
     if (!conn) return false;
     conn.sendCtcpRequest(issuingTarget, target, type, args);
     return true;
+  }
+
+  // Canonical read-pointer writer, for everything a user's clients follow: the
+  // apps' mark-read and mark-all-read, and MARKREAD from an attached IRC client.
+  // setReadState only moves the pointer forward. When it did move, 'read-marker'
+  // says so, which is how the bouncer tells its clients about a move made
+  // anywhere. The apps' read-state frame stays with the caller. Returns the
+  // pointer after the write.
+  markRead(userId: number, networkId: number | null, target: string, messageId: number): number {
+    const before = getReadState(userId, networkId, target);
+    const after = setReadState(userId, networkId, target, messageId);
+    if (after > before) {
+      const move: ReadMarkerMove = { userId, networkId, target, lastReadId: after };
+      this.emit('read-marker', move);
+    }
+    return after;
   }
 
   // Canonical /away writer. Persists the user-level state in user_away_state,

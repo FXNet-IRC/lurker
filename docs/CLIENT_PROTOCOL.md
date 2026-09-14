@@ -1115,7 +1115,9 @@ loses the tab-close race). The unread divider is client policy: snapshot
 `lastReadId` when the buffer becomes active and pin it until switch-away.
 App badge = Σ `highlights` across buffers; recompute on every `read-state`
 (a push notification can only _revise_ the OS badge, your client must correct
-it when the user actually reads).
+it when the user actually reads). An IRC client attached through the bouncer
+moves the same pointer with `MARKREAD`, so `read-state` can arrive for a buffer
+no app has touched.
 
 ### 9.5 Presence is per-socket and explicit
 

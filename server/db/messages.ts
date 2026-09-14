@@ -739,6 +739,78 @@ export function maxIdForBuffer(networkId: number, target: string): number {
   return row?.maxId || 0;
 }
 
+// The time of the newest row at or below a read pointer, or null when there is
+// none. MARKREAD carries a time where the pointer is an id (bouncer.ts), and the
+// pointer's own row may have been pruned since, so the row below it stands in.
+export function readMarkerTime(
+  networkId: number,
+  target: string,
+  lastReadId: number,
+): string | null {
+  if (!(lastReadId > 0)) return null;
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return null;
+  const row = db
+    .prepare('SELECT time FROM messages WHERE buffer_id = ? AND id <= ? ORDER BY id DESC LIMIT 1')
+    .get(bufferId, lastReadId) as { time: string } | undefined;
+  return row?.time ?? null;
+}
+
+// How far a buffer's times may run out of order. Rows get ids in arrival order,
+// but their times come from the network's servers and from Lurker's own clock,
+// which can disagree. newestIdAtOrBefore is exact while no row's time is more
+// than this far behind an earlier row's.
+const READ_MARKER_SKEW_MS = 60_000;
+
+// Where a MARKREAD's time puts the read pointer: the newest row above `afterId`
+// whose time is at or before `iso`, or 0 when there is none.
+//
+// messages.time has no index, so walking the whole buffer down from its tail
+// reads a table row per step: for a buffer far behind its pointer, every unread
+// row, on the one shared connection. Instead:
+// - Bisect the buffer's ids for the last row at or before `iso` plus the skew,
+//   one index seek a step. No row above one later than that can be at or before
+//   `iso`, so nothing the bisection skips is the answer.
+// - Walk down from there to the first row at or before `iso`. That reads only
+//   rows within twice the skew of `iso`.
+export function newestIdAtOrBefore(
+  networkId: number,
+  target: string,
+  afterId: number,
+  iso: string,
+): number {
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return 0;
+  const tail = db
+    .prepare('SELECT MAX(id) AS maxId FROM messages WHERE buffer_id = ?')
+    .get(bufferId) as { maxId: number | null } | undefined;
+  const newestIn = db.prepare(
+    'SELECT id, time FROM messages WHERE buffer_id = ? AND id > ? AND id <= ? ORDER BY id DESC LIMIT 1',
+  );
+  // Past year 9999 an ISO string gains a `+` and sorts before every stored time.
+  const boundMs = Math.min(
+    Date.parse(iso) + READ_MARKER_SKEW_MS,
+    Date.UTC(9999, 11, 31, 23, 59, 59, 999),
+  );
+  const bound = new Date(boundMs).toISOString();
+  const floor = Math.max(0, afterId);
+  // Nothing above `hi` is at or before `iso`.
+  let lo = floor;
+  let hi = tail?.maxId ?? 0;
+  while (lo < hi) {
+    const mid = lo + Math.ceil((hi - lo) / 2);
+    const row = newestIn.get(bufferId, lo, mid) as { id: number; time: string } | undefined;
+    if (row && row.time > bound) hi = row.id - 1;
+    else lo = mid;
+  }
+  const row = db
+    .prepare(
+      'SELECT id FROM messages WHERE buffer_id = ? AND id > ? AND id <= ? AND time <= ? ORDER BY id DESC LIMIT 1',
+    )
+    .get(bufferId, floor, lo, iso) as { id: number } | undefined;
+  return row?.id ?? 0;
+}
+
 // Cheap "does the user have any history with this target?" check used by the
 // no_such_nick router: only route a DM-shaped error into a per-nick buffer if
 // the user has actually conversed with that nick. Stops typo /whois replies
