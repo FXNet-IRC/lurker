@@ -674,10 +674,14 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   // Channels whose NAMES the attach burst held back because the connection
   // hadn't heard them yet, folded. They go out once it has (onNamesHeard).
   private readonly namesPending = new Set<string>();
-  // Whether this client has been told the connection's channels, by its join
-  // burst or by the network live. One that attached while the network wasn't
-  // connected learns them from an engine re-attach's replay instead.
-  private hasChannels = false;
+  // Channels this client has been sent a JOIN for, folded: in its join burst, or
+  // relayed. An engine re-attach replays a JOIN for every channel, and only the
+  // ones not in here reach the client.
+  private readonly joinsSent = new Set<string>();
+  // Whether this client has had a welcome: its attach burst, or any live line
+  // from the network. The rest of an engine re-attach's replay (LUSERS, MOTD)
+  // reaches only a client that hasn't.
+  private welcomed = false;
   // What the client may request right now: SUPPORTED_CAPS, plus whichever
   // pass-through caps apply (see handleCap and updateSupportedCaps).
   private readonly availableCaps = new Set<string>(SUPPORTED_CAPS);
@@ -1348,15 +1352,11 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.onRawUpstream = (event) => {
       if (this.closed || !event?.from_server || typeof event.line !== 'string') return;
       // An engine re-attach replays the session into the connection: the
-      // registration burst, LUSERS, MOTD and a JOIN for every channel. A client
-      // that already has the channels gets none of it, since irssi rebuilds any
-      // channel it gets a second self-JOIN for. One that attached while the link
-      // was down learns its channels from the replay, as a client attached
-      // during a fresh connect learns them from the network's own JOINs. The
-      // backlog after the replay is what either missed, and comes through.
+      // registration burst, LUSERS, MOTD and a JOIN for every channel. What of it
+      // reaches this client is decided below. The backlog after the replay is
+      // what the client missed, and comes through.
       const replaying = !!conn.restoring;
-      if (replaying && this.hasChannels) return;
-      if (!replaying) this.hasChannels = true;
+      if (!replaying) this.welcomed = true;
       // A reply goes only to whoever asked for it: this client, another one,
       // the user or Lurker (replyRouter.ts). The connection decided in its own
       // raw listener, which runs before this one.
@@ -1376,6 +1376,21 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       }
       const out = filterRelayLine(event.line);
       if (!out) return;
+      // `out`, not event.line: irc-framework's raw line keeps its CRLF, which
+      // would end up on the channel name.
+      const joined = selfJoinChannel(out, this.currentNick());
+      // A replayed line reaches this client only if it's news.
+      // - A JOIN: only for a channel the client hasn't been sent a JOIN for.
+      //   irssi rebuilds any channel it gets a second self-JOIN for. A client
+      //   that attached while the link was down, or partway through the replay,
+      //   learns its channels this way.
+      // - The rest: only for a client that hasn't had a welcome.
+      if (replaying) {
+        const news = joined
+          ? !this.joinsSent.has(foldTargetFor(this.networkId, joined))
+          : !this.welcomed;
+        if (!news) return;
+      }
       this.write(out, relayedAt);
       // The network's own NAMES for a channel the burst held back: nothing more
       // to send for it.
@@ -1385,10 +1400,8 @@ class BouncerSession implements MonitorHolder, ReplyClient {
           this.namesPending.delete(foldTargetFor(this.networkId, names.params[1]));
         }
       }
-      // `out`, not event.line: irc-framework's raw line keeps its CRLF, which
-      // would end up on the channel name.
-      const joined = selfJoinChannel(out, this.currentNick());
       if (joined) {
+        this.joinsSent.add(foldTargetFor(this.networkId, joined));
         // A replayed JOIN brings no NAMES: the restore asks for them itself, and
         // their replies are Lurker's. They follow once the connection has them.
         if (replaying && conn.membersPending(joined)) {
@@ -1788,7 +1801,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   // to what the client negotiated, as it trims the network's own lines.
   private sendJoinBurst(): void {
     const conn = this.conn!;
-    this.hasChannels = true;
+    this.welcomed = true;
     const nick = this.currentNick() || '*';
     const realname = conn.client.user?.gecos || this.network?.realname || nick;
     for (const ch of conn.channels.values()) {
@@ -1796,6 +1809,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       const account = ch.members.get(nick.toLowerCase())?.account;
       const accountParam = typeof account === 'string' ? account : '*';
       this.write(`:${this.selfPrefix()} JOIN ${ch.name} ${accountParam} :${realname}`);
+      this.joinsSent.add(foldTargetFor(this.networkId, ch.name));
       if (ch.topic) this.write(`:${SERVER_NAME} 332 ${nick} ${ch.name} :${ch.topic}`);
       // After the topic and before NAMES, where soju sends it (forwardChannel).
       this.sendReadMarker(ch.name);
@@ -1814,7 +1828,9 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   // A channel's 353 lines and 366, in their fullest form like the rest of the
   // burst: every prefix, hostmasks where known.
   private sendNames(channel: string): void {
-    const ch = this.conn?.channels.get(channel.toLowerCase());
+    // Folded the network's way: a restored channel can come back spelled
+    // differently under RFC1459 casemapping.
+    const ch = this.conn?.channelState(channel);
     if (!ch) return;
     const nick = this.currentNick() || '*';
     const prefixes = this.isupportPrefixes();

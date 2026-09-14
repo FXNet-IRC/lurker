@@ -101,6 +101,10 @@ export class FakeUpstream {
   // IrcConnection.membersPending: channels whose NAMES haven't arrived, folded.
   readonly pendingNames = new Set<string>();
   membersPending = (name: string): boolean => this.pendingNames.has(name.toLowerCase());
+  // IrcConnection.channelState, folding with toLowerCase.
+  channelState = (name: string): FakeChannel | undefined => this.channels.get(name.toLowerCase());
+  // IrcConnection.restoring: true while an engine re-attach replays the session.
+  restoring = false;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   client: any;
 

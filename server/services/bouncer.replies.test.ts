@@ -496,4 +496,48 @@ describe('the attach burst', () => {
     await flush(acct, c);
     expect(namesFor(c, '#joining')).toHaveLength(2);
   });
+
+  it("gives a replayed line only to a client it's news to", async () => {
+    const acct = harnessMod.seedAccount();
+    const up = acct.upstream;
+    const nick = up.currentNick;
+    up.addChannel('#known', { members: ['bob'] });
+    // Its burst has #known.
+    const burst = await attachAccount(acct);
+    // Attached while the network was down (the engine link dropped), then saw a
+    // live line.
+    up.state = 'reconnecting';
+    const early = await attachAccount(acct);
+    await flush(acct, burst);
+    await flush(acct, early);
+    // A JOIN the network sent live reaches the two clients attached now, and
+    // welcomes neither again.
+    up.pushUpstream(`:${nick}!~u@fake.host JOIN #live`);
+    await flush(acct, burst);
+    await flush(acct, early);
+    // Attached while the network was down, and has seen nothing since.
+    const fresh = await attachAccount(acct);
+    up.state = 'connected';
+    const marks = [burst, early, fresh].map((c) => c.lines.length);
+    up.restoring = true;
+    up.pushUpstream(`:irc.test 375 ${nick} :- irc.test Message of the day -`);
+    for (const channel of ['#known', '#live', '#new']) {
+      up.pushUpstream(`:${nick}!~u@fake.host JOIN ${channel}`);
+    }
+    up.restoring = false;
+    for (const c of [burst, early, fresh]) await flush(acct, c);
+
+    const since = (c: Client, i: number) => c.lines.slice(marks[i]);
+    const joins = (lines: string[]) =>
+      lines.filter((l) => commandOf(l) === 'JOIN').map((l) => l.split(' ')[2]);
+    const motd = (lines: string[]) => lines.filter((l) => commandOf(l) === '375');
+    // Each gets a replayed JOIN only for a channel it hasn't been sent one for.
+    expect(joins(since(burst, 0))).toEqual(['#new']);
+    expect(joins(since(early, 1))).toEqual(['#known', '#new']);
+    expect(joins(since(fresh, 2))).toEqual(['#known', '#live', '#new']);
+    // The replayed MOTD only reaches the client that hasn't had a welcome.
+    expect(motd(since(burst, 0))).toEqual([]);
+    expect(motd(since(early, 1))).toEqual([]);
+    expect(motd(since(fresh, 2))).toHaveLength(1);
+  });
 });

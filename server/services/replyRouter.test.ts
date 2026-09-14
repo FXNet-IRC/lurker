@@ -72,7 +72,7 @@ describe('what waits its turn', () => {
     expect(hear(':irc.test 315 me #d :End of /WHO list.')).toBe(b);
   });
 
-  it.each(['LIST', 'ISON bob', 'USERHOST bob'])(
+  it.each(['LIST', 'ISON bob', 'USERHOST bob', 'MODE me'])(
     'holds a second %s too: its replies name nothing',
     (query) => {
       const { router, writes } = setup();
@@ -94,8 +94,6 @@ describe('what waits its turn', () => {
       'TOPIC #c',
       'MODE #c b',
       'MODE #c b',
-      'MODE me',
-      'MODE me',
     ];
     for (const query of queries) router.send(new Client(), query);
     expect(writes).toEqual(queries);
@@ -333,9 +331,55 @@ describe('who a reply is for', () => {
     const { router, hear } = setup();
     const a = new Client();
     router.send(a, 'WHOIS bob');
+    expect(hear(':irc.test 311 me bob ~u h * :Bob')).toBe(a);
     // A PRIVMSG to someone away draws a 301 too.
     expect(hear(':irc.test 301 me alice :gone fishing')).toBe('unasked');
     expect(hear(':irc.test 301 me bob :gone fishing')).toBe(a);
+  });
+
+  it("takes a 301 for a WHOIS only once the WHOIS's own lines have begun", () => {
+    const { router, hear } = setup();
+    const a = new Client();
+    router.send(a, 'WHOIS bob');
+    // A PRIVMSG to bob, who's away, is answered before the WHOIS is.
+    expect(hear(':irc.test 301 me bob :gone fishing')).toBe('unasked');
+    expect(hear(':irc.test 311 me bob ~u h * :Bob')).toBe(a);
+    expect(hear(':irc.test 301 me bob :gone fishing')).toBe(a);
+    expect(hear(':irc.test 318 me bob :End of /WHOIS list.')).toBe(a);
+  });
+
+  it('keeps WHOIS lines with no WHOIS on the wire from everyone', () => {
+    const { hear } = setup();
+    // A reply to a query that timed out, or to the previous process's.
+    for (const numeric of ['310', '337', '343', '671', '406']) {
+      expect(hear(`:irc.test ${numeric} me bob :about bob`)).toBe('nobody');
+    }
+    expect(hear(':irc.test 301 me bob :gone fishing')).toBe('unasked');
+  });
+
+  it("ends a WHOWAS on its 406, and doesn't give that to a WHOIS", () => {
+    const { router, writes, hear } = setup();
+    const a = new Client();
+    const b = new Client();
+    router.send(a, 'WHOIS bob');
+    router.send(b, 'WHOWAS bob');
+    expect(hear(':irc.test 406 me bob :There was no such nickname')).toBe(b);
+    expect(hear(':irc.test 369 me bob :End of WHOWAS')).toBe(b);
+    router.send(b, 'WHOWAS carol');
+    expect(hear(':irc.test 406 me carol :There was no such nickname')).toBe(b);
+    // A server that sends no 369 after it: the next line ends the wait.
+    expect(hear(':bob!~u@h PRIVMSG me :hi')).toBe('unasked');
+    expect(writes).toEqual(['WHOIS bob', 'WHOWAS bob', 'WHOWAS carol']);
+  });
+
+  it('ends a WHO on an error naming its mask', () => {
+    const { router, writes, hear } = setup();
+    const a = new Client();
+    router.send(a, 'WHO #gone');
+    router.send(new Client(), 'WHO #c');
+    expect(hear(':irc.test 403 me #gone :No such channel')).toBe(a);
+    expect(hear(':bob!~u@h PRIVMSG me :hi')).toBe('unasked');
+    expect(writes).toEqual(['WHO #gone', 'WHO #c']);
   });
 
   it('takes any 3xx about the nick for its WHOIS, but no reply to another command', () => {
@@ -517,6 +561,15 @@ describe('queries that can’t finish', () => {
     expect(a.aborted).toEqual(['318 bob', '315 #d']);
     expect(b.aborted).toEqual(['315 #c']);
     expect(hear(':irc.test 318 me bob :End of /WHOIS list.')).toBe('nobody');
+  });
+
+  it('ends a query still waiting on the line after its error when the socket goes', () => {
+    const { router, hear } = setup();
+    const a = new Client();
+    router.send(a, 'WHOIS bob');
+    hear(':irc.test 401 me bob :No such nick/channel');
+    router.reset();
+    expect(a.aborted).toEqual(['318 bob']);
   });
 
   it('ends a client query at once when nothing can be sent', () => {

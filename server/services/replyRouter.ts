@@ -111,7 +111,7 @@ function isWhoisReply(command: string): boolean {
   return (/^3\d\d$/.test(command) && !NOT_WHOIS.has(command)) || WHOIS_OTHER_REPLIES.has(command);
 }
 // WHOWAS reply lines, each naming the nick.
-const WHOWAS_REPLIES = new Set(['312', '314', '330', '338', '406']);
+const WHOWAS_REPLIES = new Set(['312', '314', '330', '338']);
 // A list-mode query's entries and its end, by mode letter.
 const LIST_MODE_NUMERICS: Record<string, { item: string; end: string } | undefined> = {
   b: { item: '367', end: '368' },
@@ -125,9 +125,15 @@ const TARGET_ERRORS = new Set(['401', '402', '403', '407', '442', '476', '479', 
 // Lines that only ever answer a query. With none of their kind on the wire,
 // nobody here asked. Every other line can come unasked: the NAMES and topic a
 // JOIN brings, a 324 some servers volunteer, a 301 for a PRIVMSG to someone away.
+// A WHOIS on the wire takes any 3xx naming its nick, but that can't decide a line
+// with no query, since MOTD, 328 and 396 come unasked. So the WHOIS lines some
+// ircds add are listed here by number.
 const QUERY_ONLY = new Set([
+  '276',
   '302',
   '303',
+  '307',
+  '310',
   '311',
   '312',
   '313',
@@ -136,9 +142,16 @@ const QUERY_ONLY = new Set([
   '317',
   '318',
   '319',
+  '320',
   '321',
   '322',
   '323',
+  '330',
+  '335',
+  '337',
+  '338',
+  '343',
+  '344',
   '346',
   '347',
   '348',
@@ -148,7 +161,11 @@ const QUERY_ONLY = new Set([
   '367',
   '368',
   '369',
+  '378',
+  '379',
+  '406',
   '416',
+  '671',
   '728',
   '729',
 ]);
@@ -167,8 +184,9 @@ type Form =
   | 'userhost';
 
 // The kinds whose replies name nothing to match them by. One of these waits for
-// the last of its kind to be answered.
-const WAITS = new Set<Form>(['who', 'list', 'ison', 'userhost']);
+// the last of its kind to be answered. A 221 names nothing either: without its
+// turn, a restore's unanswered MODE <nick> would take a client's reply.
+const WAITS = new Set<Form>(['who', 'list', 'ison', 'userhost', 'umode']);
 
 // The end numeric a server may send right after an error ends a query: 401 then
 // 318, 263 then 315. A list-mode query's is by letter.
@@ -202,6 +220,8 @@ interface Query extends Spec {
   build: () => string;
   heardAt: number;
   timer: ReturnType<typeof setTimeout> | null;
+  // Whether any of its reply has come. A 301 counts for a WHOIS only after that.
+  started: boolean;
 }
 
 interface Settle {
@@ -257,7 +277,14 @@ export class ReplyRouter {
       this.opts.write(line);
       return;
     }
-    this.dispatch({ ...found, asker, build: build ?? (() => line), heardAt: 0, timer: null });
+    this.dispatch({
+      ...found,
+      asker,
+      build: build ?? (() => line),
+      heardAt: 0,
+      timer: null,
+      started: false,
+    });
   }
 
   /** Who a line from the server is for. Call for every line, in order. */
@@ -283,7 +310,9 @@ export class ReplyRouter {
    * its end numeric.
    */
   reset(): void {
-    const ended = [...this.wire, ...this.waiting];
+    // The query waiting on the line after its error counts too: that 318 or 315
+    // never came.
+    const ended = [...(this.settle ? [this.settle.query] : []), ...this.wire, ...this.waiting];
     for (const query of this.wire) if (query.timer) clearTimeout(query.timer);
     if (this.settle?.timer) clearTimeout(this.settle.timer);
     this.wire = [];
@@ -388,6 +417,7 @@ export class ReplyRouter {
       const role = this.roleOf(query, command, params);
       if (!role) continue;
       query.heardAt = Date.now();
+      query.started = true;
       if (role === 'end') this.finish(query, this.trailerOf(query, command));
       return query.asker ?? 'nobody';
     }
@@ -455,7 +485,11 @@ export class ReplyRouter {
           // InspIRCd ends each nick of `WHOIS a,b` with its own 318.
           return names(1) ? 'body' : null;
         }
-        return isWhoisReply(command) && names(1) ? 'body' : null;
+        if (!isWhoisReply(command) || !names(1)) return null;
+        // A PRIVMSG to someone away draws a 301 too. A server writes a WHOIS's
+        // lines together, starting with its 311, so a 301 before any of them
+        // isn't the WHOIS's.
+        return command !== '301' || query.started ? 'body' : null;
       case 'whowas':
         if (command === '369') return names(1) ? 'end' : null;
         return WHOWAS_REPLIES.has(command) && names(1) ? 'body' : null;
@@ -489,6 +523,10 @@ export class ReplyRouter {
     if (command === 'FAIL') return (params[0] ?? '').toUpperCase() === query.command;
     if (TARGET_ERRORS.has(command)) return query.targets.has(this.opts.fold(params[1] ?? ''));
     if (command === '431') return query.form === 'whois' || query.form === 'whowas';
+    // WHOWAS's own error. A WHOIS for the same nick mustn't take it.
+    if (command === '406') {
+      return query.form === 'whowas' && query.targets.has(this.opts.fold(params[1] ?? ''));
+    }
     return false;
   }
 
@@ -559,7 +597,11 @@ export class ReplyRouter {
       new Set(names.filter(Boolean).map((name) => this.opts.fold(name)));
     switch (command) {
       case 'WHO':
-        return spec('who', command, { abort: { numeric: '315', params: [params[0] || '*'] } });
+        // A 403 or 401 naming the mask ends it, as in ZNC's route_replies.
+        return spec('who', command, {
+          targets: fold(params[0] ? [params[0]] : []),
+          abort: { numeric: '315', params: [params[0] || '*'] },
+        });
       case 'WHOIS': {
         // WHOIS [server] <nick>[,<nick>…]. A 402 names the server.
         const list = params[params.length - 1] ?? '';
