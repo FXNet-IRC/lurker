@@ -102,6 +102,13 @@ import {
   getChannelFlags,
 } from '../db/channelNotify.js';
 import { getUserAwayState } from '../db/userAwayState.js';
+import {
+  evaluatePresence,
+  clearAutoAway,
+  rescheduleAutoAway,
+  setPresenceSource,
+} from './presence.js';
+import { isValidTimeZone, wallClockParts } from '../utils/timeZone.js';
 import { ownsNetwork, listNetworksForUser } from '../db/networks.js';
 import * as chanlistDb from '../db/chanlist.js';
 import { getUserSettings } from '../db/settings.js';
@@ -357,67 +364,6 @@ function effectiveSetting(userId: number, key: string): unknown {
   const overrides = getUserSettings(userId) as Record<string, unknown>;
   if (key in overrides) return overrides[key];
   return (defaultsAsObject() as Record<string, unknown>)[key];
-}
-
-function isValidTimeZone(tz: unknown): tz is string {
-  if (!tz || typeof tz !== 'string') return false;
-  try {
-    // Called without `new` purely for validation — it throws RangeError on an
-    // unknown time zone, which the catch below turns into a false return.
-    Intl.DateTimeFormat('en-US', { timeZone: tz });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Wall-clock parts (year/month/day/hour/minute/second) of `date` in the given
-// IANA timezone, or in the server's local zone when `timeZone` is falsy/invalid.
-function wallClockParts(date: Date, timeZone: string | null): Record<string, string> {
-  const dtf = new Intl.DateTimeFormat('en-US', {
-    ...(timeZone ? { timeZone } : {}),
-    hour12: false,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
-  const out: Record<string, string> = {};
-  for (const p of dtf.formatToParts(date)) if (p.type !== 'literal') out[p.type] = p.value;
-  // Some locales render midnight as "24" instead of "00"; normalize so the
-  // offset math below doesn't blow up on Date.UTC.
-  if (out.hour === '24') out.hour = '00';
-  return out;
-}
-
-function tzOffsetMinutes(date: Date, timeZone: string | null): number {
-  if (!timeZone) return -date.getTimezoneOffset();
-  const p = wallClockParts(date, timeZone);
-  const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
-  return Math.round((asUTC - date.getTime()) / 60000);
-}
-
-const pad = (n: number) => String(n).padStart(2, '0');
-
-// "afk since 2026-05-09 15:30:00-0500" — mirrors screen_away.py's default
-// time_format. Renders in `timeZone` when provided, otherwise server local.
-function fmtAwayTimestamp(date: Date, timeZone: unknown): string {
-  const tz = isValidTimeZone(timeZone) ? timeZone : null;
-  const p = wallClockParts(date, tz);
-  const off = tzOffsetMinutes(date, tz);
-  const sign = off >= 0 ? '+' : '-';
-  const aoff = Math.abs(off);
-  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}${sign}${pad(Math.floor(aoff / 60))}${pad(aoff % 60)}`;
-}
-
-function buildAutoAwayMessage(userId: number, since: Date): string {
-  const base =
-    ((effectiveSetting(userId, 'away.auto.message') as string | undefined) || 'afk').trim() ||
-    'afk';
-  const tz = effectiveSetting(userId, 'system.timezone');
-  return `${base} since ${fmtAwayTimestamp(since, tz)}`;
 }
 
 // HH:MM (24h) into minutes-past-midnight, or null on a malformed value. The
@@ -1770,7 +1716,8 @@ export function sweepWsHeartbeat(sockets: Iterable<LurkerWebSocket>): number {
 // Read-only introspection of the live socket registry for the admin presence
 // diagnostic. For each user with at least one open socket it reports how many
 // sockets are open and how many currently claim presence.visible=true — the
-// exact quantity auto-away keys on — alongside the persisted away row. Lets an
+// exact quantity push keys on, and auto-away along with attached IRC clients
+// (presence.ts) — alongside the persisted away row. Lets an
 // operator watch a dead socket (e.g. a slept laptop) get reaped by the
 // heartbeat and the user flip to away, confirming the fix on a live cell.
 // Mutates nothing.
@@ -1885,9 +1832,6 @@ export function authenticateUpgrade(
 
 export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_MESSAGE_BYTES });
-  // Per-user pending auto-away timers. Set when a user goes from 1→0 sockets;
-  // cleared on 0→1 or when the timer fires.
-  const autoAwayTimers = new Map();
   // In-flight /LIST refreshes, keyed by network_id. We belt-and-suspender the
   // chanlist_meta.in_progress column with this in-memory set so a duplicate
   // `list-channels` from a second tab is rejected without first reading the
@@ -1907,37 +1851,6 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
   }, HEARTBEAT_MS);
   heartbeat.unref?.();
   wss.on('close', () => clearInterval(heartbeat));
-
-  function clearAutoAwayTimer(userId: number): void {
-    const t = autoAwayTimers.get(userId);
-    if (t) {
-      clearTimeout(t);
-      autoAwayTimers.delete(userId);
-    }
-  }
-
-  function scheduleAutoAway(userId: number): void {
-    if (autoAwayTimers.has(userId)) return;
-    const enabled = !!effectiveSetting(userId, 'away.auto.enabled');
-    if (!enabled) return;
-    const rawDelay = Number(effectiveSetting(userId, 'away.auto.delay_seconds'));
-    const delaySec = Number.isFinite(rawDelay) && rawDelay > 0 ? rawDelay : 30;
-    // The user went idle the moment we scheduled this timer, not when it fires
-    // `delaySec` later — backdate the away "since" to now so it reflects when
-    // they actually stepped away (#155).
-    const afkSince = new Date();
-    const t = setTimeout(() => {
-      autoAwayTimers.delete(userId);
-      // Re-check: a client may have become visible during the delay.
-      // "Visible" rather than "connected" so a backgrounded tab — which the
-      // push pipeline already treats as absent — counts as absent here too.
-      if (userHasVisibleClient(userId)) return;
-      const message = buildAutoAwayMessage(userId, afkSince);
-      ircManager.setAwayAll(userId, message, { autoSet: true, since: afkSince });
-    }, delaySec * 1000);
-    t.unref?.();
-    autoAwayTimers.set(userId, t);
-  }
 
   function addSocket(userId: number, ws: LurkerWebSocket): void {
     let set = socketsByUser.get(userId);
@@ -1970,17 +1883,11 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     return false;
   }
 
-  // Single source of truth for "is the user present?" — shared by auto-away
-  // and push so an idle/backgrounded tab can't keep one system thinking the
-  // user is here while the other treats them as gone.
-  function evaluatePresence(userId: number): void {
-    if (userHasVisibleClient(userId)) {
-      clearAutoAwayTimer(userId);
-      ircManager.clearAwayAll(userId, { autoSet: true });
-    } else {
-      scheduleAutoAway(userId);
-    }
-  }
+  // A visible socket is the user being here, for auto-away (presence.ts) and for
+  // push below. "Visible" rather than "connected", so a backgrounded tab counts
+  // as absent for both. Auto-away also counts attached IRC clients; push
+  // doesn't, since an IRC client has no visibility to report.
+  setPresenceSource('web', (userId) => (userHasVisibleClient(userId) ? 1 : 0));
 
   // Push-suppression gates shared by message and presence pushes: a manual
   // /away (when mute_when_away is on — auto-away is the case push matters most,
@@ -2309,14 +2216,11 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
           }
         : {}),
     });
-    // If the user toggled / shortened auto-away while disconnected, re-evaluate
-    // the pending timer with the new value.
+    // If the user toggled / shortened auto-away while nothing counts as them
+    // being here, restart the pending wait with the new value.
     const touchedAway =
       changes && ('away.auto.enabled' in changes || 'away.auto.delay_seconds' in changes);
-    if (touchedAway && (socketsByUser.get(userId)?.size || 0) === 0) {
-      clearAutoAwayTimer(userId);
-      scheduleAutoAway(userId);
-    }
+    if (touchedAway) rescheduleAutoAway(userId);
   });
 
   highlightRulesService.on('change', ({ userId }) => {
@@ -2379,7 +2283,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
       }
       socketsByUser.delete(userId);
     }
-    clearAutoAwayTimer(userId);
+    clearAutoAway(userId);
     systemLog.dropUser(userId);
   });
 
@@ -2392,7 +2296,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     if (set) {
       for (const ws of set) ws.accountPaused = true;
     }
-    clearAutoAwayTimer(userId);
+    clearAutoAway(userId);
     fanOut(userId, { kind: 'account-state', paused: true });
   });
 

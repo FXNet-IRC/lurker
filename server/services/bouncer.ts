@@ -45,6 +45,10 @@
 //   (replyRouter.ts, #931).
 // - Detaching (client QUIT / socket drop) never touches the upstream
 //   connection; Lurker stays online exactly like ZNC.
+// - Away is the account's, as in the web and iOS apps: a client's AWAY sets or
+//   clears it on every network, and every client hears the change as a 305 or
+//   306. `AWAY *` (draft/pre-away) marks a connection that isn't the user, and
+//   any other attached client holds auto-away off (presence.ts).
 
 import net from 'net';
 import tls from 'tls';
@@ -71,8 +75,10 @@ import {
 import type { MessageEvent } from '../db/messages.js';
 import { getReadState } from '../db/bufferReads.js';
 import { resolveBuffer } from '../db/bufferResolve.js';
-import type { ReadMarkerMove } from './ircManager.js';
+import type { AwayChange, ReadMarkerMove } from './ircManager.js';
 import { broadcastReadState } from './wsHub.js';
+import { evaluatePresence, setPresenceSource } from './presence.js';
+import { getUserAwayState } from '../db/userAwayState.js';
 import { splitSay, splitAction } from './messageSplit.js';
 import { e2eManager } from './e2e/manager.js';
 import { contextKey, isChannelContext } from './e2e/context.js';
@@ -130,6 +136,10 @@ const SUPPORTED_CAPS = [
   // draft/read-marker: MARKREAD reads and moves the account's read pointer, the
   // one the web and iOS apps share (handleMarkRead). soju offers it everywhere too.
   'draft/read-marker',
+  // draft/pre-away: AWAY before registration, and `AWAY *` for a connection that
+  // isn't the user, such as goguma's background sync (handleAway). soju offers it
+  // everywhere too.
+  'draft/pre-away',
 ];
 
 // Caps offered only while the bound network has them, because the lines they
@@ -718,6 +728,12 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   // without binding a network (no conn/networkId). It can only enumerate and
   // manage networks via BOUNCER, never send channel/user traffic.
   private isControl = false;
+  // An AWAY sent before registration (draft/pre-away), applied once the account
+  // is known. null for none; '' for a bare AWAY.
+  private pendingAway: string | null = null;
+  // This client said `AWAY *`: it isn't the user, so it doesn't count as the
+  // user being here (presence.ts).
+  private notPresent = false;
   // A pre-registration `BOUNCER BIND <id>` selector, consumed at completeAttach
   // (takes precedence over a username-embedded network name).
   private boundNetId: number | null = null;
@@ -877,6 +893,11 @@ class BouncerSession implements MonitorHolder, ReplyClient {
         break;
       case 'BOUNCER':
         this.handleBouncerPreReg(msg);
+        break;
+      case 'AWAY':
+        // draft/pre-away. Accepted with or without the cap, as soju does
+        // (downstream.go:936): goguma sends it ahead of CAP END.
+        this.handleAway(msg);
         break;
       case 'PING':
         // Answer keepalive PINGs during CAP/registration so strict clients
@@ -1228,7 +1249,11 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     attachToRegistry(this);
     // Before the burst, so everything in it already follows the settled caps.
     this.updateSupportedCaps(this.clientNick || '*');
+    // Before the burst too, so its 306 follows an AWAY sent before registration.
+    this.applyPendingAway();
     this.sendAttachBurst();
+    // An attached client is the user being here, unless it said `AWAY *`.
+    evaluatePresence(this.userId);
     systemLog.log({
       userId: this.userId,
       scope: 'bouncer',
@@ -1253,6 +1278,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.registered = true;
     this.clearRegTimer();
     this.updateSupportedCaps(this.clientNick || '*');
+    this.applyPendingAway();
     this.sendControlBurst(user, networks);
     // failRegistration used to console.warn the reason for the commonest
     // misconfiguration (bare username, several networks). It no longer fails,
@@ -1346,6 +1372,11 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // A -notify client gets the full network list up-front (soju sends this at
     // registration completion for bound and control connections alike).
     if (this.caps.has(CAP_BOUNCER_NETWORKS_NOTIFY)) this.sendNetworkList();
+
+    // An account that's away says so, as ZNC does for a client that attaches
+    // (IRCNetwork.cpp:708), but after the channels: halloy keeps its own away
+    // state on each channel's member list.
+    if (accountIsAway(this.userId)) this.sendAwayReply(true);
 
     // Live relay attaches AFTER playback so replayed history and the live
     // stream don't interleave out of order.
@@ -1467,6 +1498,8 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.write(`:${SERVER_NAME} 422 ${nick} :MOTD File is missing`);
     // A -notify client gets the full network list up-front as a batch.
     if (this.caps.has(CAP_BOUNCER_NETWORKS_NOTIFY)) this.sendNetworkList();
+    // Away is the account's, so a control connection is told too.
+    if (accountIsAway(this.userId)) this.sendAwayReply(true);
   }
 
   // --- BOUNCER command -------------------------------------------------------
@@ -2058,6 +2091,11 @@ class BouncerSession implements MonitorHolder, ReplyClient {
         // with the network down.
         this.handleMarkRead(msg);
         return;
+      case 'AWAY':
+        // Away is the account's too, so it works on a control connection and
+        // with the network down.
+        this.handleAway(msg);
+        return;
     }
 
     // A control connection has no upstream: it can only speak BOUNCER (handled
@@ -2107,14 +2145,6 @@ class BouncerSession implements MonitorHolder, ReplyClient {
         }
         return;
       }
-      case 'AWAY': {
-        const message = (msg.params[0] || '').trim();
-        // Route through the canonical user-level away writers so the web UI
-        // and every other network connection stay in sync.
-        if (message) ircManager.setAwayAll(this.userId, message);
-        else ircManager.clearAwayAll(this.userId);
-        return;
-      }
       case 'MONITOR':
         this.handleMonitor(conn, msg);
         return;
@@ -2124,6 +2154,54 @@ class BouncerSession implements MonitorHolder, ReplyClient {
         this.relayRaw(conn, msg);
         return;
     }
+  }
+
+  // --- AWAY ------------------------------------------------------------------
+
+  // A client's AWAY is the account's /away, on every network, as in the web and
+  // iOS apps: `AWAY :<message>` sets it and a bare `AWAY` clears it. `AWAY *`
+  // (draft/pre-away) says this connection isn't the user, as goguma's background
+  // sync says, so it stops counting for auto-away and the account is left alone.
+  // The client always gets its 305 or 306, before registration too: irssi takes
+  // its own away state from them alone, and goguma waits for one.
+  private handleAway(msg: ParsedClientLine): void {
+    const message = (msg.params[0] || '').trim();
+    if (!this.registered) {
+      this.pendingAway = message;
+    } else {
+      const counted = this.countsAsPresent();
+      this.setAway(message);
+      if (this.countsAsPresent() !== counted) evaluatePresence(this.userId);
+    }
+    this.sendAwayReply(message !== '');
+  }
+
+  // What a client's AWAY does: to this client's presence, and to the account.
+  private setAway(message: string): void {
+    this.notPresent = message === '*';
+    if (this.notPresent) return;
+    if (message) ircManager.setAwayAll(this.userId, message, { origin: this });
+    else ircManager.clearAwayAll(this.userId, { origin: this });
+  }
+
+  // An AWAY sent before registration, now that the account is known.
+  private applyPendingAway(): void {
+    const pending = this.pendingAway;
+    this.pendingAway = null;
+    if (pending !== null) this.setAway(pending);
+  }
+
+  // Whether this client counts as the user being here (presence.ts): attached to
+  // a network, and not `AWAY *`. A control connection doesn't count, as in soju;
+  // goguma keeps one open beside its networks.
+  countsAsPresent(): boolean {
+    return this.registered && !this.closed && !this.isControl && !this.notPresent;
+  }
+
+  // RPL_NOWAWAY or RPL_UNAWAY.
+  sendAwayReply(away: boolean): void {
+    if (away) this.numeric('306', ':You have been marked as being away');
+    else this.numeric('305', ':You are no longer marked as being away');
   }
 
   // --- MONITOR ---------------------------------------------------------------
@@ -2469,6 +2547,8 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // Its queries go too, and replies to one already on the wire go nowhere.
     this.conn?.replies.dropClient(this);
     sessions.delete(this);
+    // It may have been the last thing that counted as the user being here.
+    if (this.registered && !this.isControl) evaluatePresence(this.userId);
     if (this.registered && this.isControl) {
       systemLog.log({
         userId: this.userId,
@@ -2555,6 +2635,32 @@ function dispatchReadMarker(move: ReadMarkerMove): void {
   }
 }
 
+// Whether the account is away, as the apps show it.
+function accountIsAway(userId: number): boolean {
+  const row = getUserAwayState(userId);
+  return !!row?.away_datetime && !row.back_datetime;
+}
+
+// The account's away turned on or off: in the apps, by auto-away, or from a
+// client. Every client of the account hears it as a 305 or 306, so irssi and
+// halloy stay in step. A client whose AWAY made the change sends its own.
+function dispatchAway(change: AwayChange): void {
+  for (const session of sessions) {
+    if (session.userId !== change.userId || !session.isRegistered()) continue;
+    if (session === change.origin) continue;
+    session.sendAwayReply(change.active);
+  }
+}
+
+// How many of a user's clients count as the user being here (presence.ts).
+function presentClientCount(userId: number): number {
+  let n = 0;
+  for (const session of sessions) {
+    if (session.userId === userId && session.countsAsPresent()) n += 1;
+  }
+  return n;
+}
+
 function dispatchIrcEvent(event: Record<string, unknown>): void {
   const userId = Number(event.userId);
   const networkId = Number(event.networkId);
@@ -2635,6 +2741,7 @@ let certReloadTimer: ReturnType<typeof setInterval> | null = null;
 let bouncerTlsState: { certPath: string; keyPath: string; fingerprint: string } | null = null;
 let onIrcEvent: ((event: Record<string, unknown>) => void) | null = null;
 let onReadMarker: ((move: ReadMarkerMove) => void) | null = null;
+let onAway: ((change: AwayChange) => void) | null = null;
 let onUserDisposed: ((payload: { userId: number }) => void) | null = null;
 let onUserSuspended: ((payload: { userId: number }) => void) | null = null;
 
@@ -2875,6 +2982,10 @@ export async function startBouncer(
   ircManager.on('event', onIrcEvent);
   onReadMarker = (move) => dispatchReadMarker(move);
   ircManager.on('read-marker', onReadMarker);
+  onAway = (change) => dispatchAway(change);
+  ircManager.on('away', onAway);
+  // An attached client counts as the user being here, for auto-away.
+  setPresenceSource('irc', presentClientCount);
   onUserDisposed = ({ userId }) => dropSessionsForUser(userId, 'Account removed');
   onUserSuspended = ({ userId }) => dropSessionsForUser(userId, 'Account paused');
   ircManager.on('user-disposed', onUserDisposed);
@@ -2906,6 +3017,11 @@ export function stopBouncer(): void {
     ircManager.off('read-marker', onReadMarker);
     onReadMarker = null;
   }
+  if (onAway) {
+    ircManager.off('away', onAway);
+    onAway = null;
+  }
+  setPresenceSource('irc', null);
   if (onUserDisposed) {
     ircManager.off('user-disposed', onUserDisposed);
     onUserDisposed = null;

@@ -29,9 +29,9 @@ registerVerb({
     additionalProperties: false,
   },
   handler(ctx: VerbContext, input: Record<string, unknown>) {
-    // applyAwayState issues `client.raw('AWAY :' + message)` — client.raw, not
-    // IrcConnection.raw, so nothing strips CR/LF on the way out. This verb is
-    // user-wide, so an injected line would go to EVERY connected network at once.
+    // A multi-line message is refused rather than flattened: the AWAY it becomes
+    // goes to EVERY connected network at once, with any newline sent as a space
+    // (IrcConnection.sendAwayState), which isn't what was asked.
     const parsed = singleLine(input.message, { malformed: 'message-must-be-single-line' });
     if ('error' in parsed) return { ok: false, error: parsed.error };
     const message = parsed.value ?? '';

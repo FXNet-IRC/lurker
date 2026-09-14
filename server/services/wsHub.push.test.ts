@@ -479,3 +479,40 @@ describe('maybePush payload', () => {
     expect((await payload()).badge).toBeGreaterThan(0);
   });
 });
+
+// Auto-away counts attached IRC clients as well as visible sockets
+// (presence.ts). Push counts only the sockets.
+describe('presence', () => {
+  it('pushes while an IRC client is attached: it has no visibility to report', async () => {
+    const { setPresenceSource } = await import('./presence.js');
+    setPresenceSource('irc', () => 1);
+    try {
+      emitDm();
+      expect(await pushed()).toBe(true);
+    } finally {
+      setPresenceSource('irc', null);
+    }
+  });
+
+  it('clears auto-away for a visible socket, and starts it once that socket closes', async () => {
+    const { getUserAwayState } = await import('../db/userAwayState.js');
+    const { until } = await import('../test-utils/until.js');
+    const isAway = () => {
+      const row = getUserAwayState(userId);
+      return !!row?.away_datetime && !row.back_datetime;
+    };
+    setUserSetting(userId, 'away.auto.delay_seconds', 0.05);
+    try {
+      ircManager.setAwayAll(userId, 'afk', { autoSet: true });
+      // Waited for rather than read at once: setting away logs a system line,
+      // and that frame can land ahead of connectWithPresence's barrier reply.
+      const close = await connectWithPresence(true);
+      await until(() => !isAway(), 2000, 'auto-away cleared');
+      await close();
+      await until(isAway, 2000, 'auto-away');
+      expect(getUserAwayState(userId)?.auto_set).toBe(1);
+    } finally {
+      deleteUserSetting(userId, 'away.auto.delay_seconds');
+    }
+  });
+});

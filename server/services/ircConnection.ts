@@ -1576,15 +1576,10 @@ export class IrcConnection {
       // after, the socket-reconnect path runs clearAwayAll({autoSet:true}) and
       // clears it cleanly; if not, staying away across an IRC blip is the
       // correct behavior.
-      // Not on a restore: the socket already carries the away state (this
-      // process set it before it went away), and the 306 the re-assert draws
-      // would land as a server-buffer row on every restart.
+      // Not on a restore: that socket has been told before, and whatever changed
+      // while the link was down goes out when the restore completes ('restored').
       if (this.awayState.active && this.awayState.message && !this.restoring) {
-        try {
-          this.client.raw('AWAY :' + this.awayState.message);
-        } catch (_) {
-          /* ignore */
-        }
+        this.sendAwayState();
       }
       // IRCCloud-style "commands to run on connect" — newline-delimited raw
       // IRC lines fired after 001. `WAIT <seconds>` pauses before the next
@@ -4675,6 +4670,10 @@ export class IrcConnection {
           topic: false,
         });
         this.rawQuiet('MODE', this.currentNick);
+        // The account's away state, sent again. This socket missed any change
+        // made while the link was down, or while no process was attached, and
+        // nothing here knows what it was last told. The 305/306 is Lurker's.
+        this.sendAwayState();
         this.requestUnnegotiatedCaps();
         this.restoreQueue = [...this.channels.values()].map((ch) => ch.name);
         // Every queued channel is marked quiet now: the LAST process may have
@@ -6698,8 +6697,8 @@ export class IrcConnection {
   // Mirror the user-level self-presence state onto this connection. Called by
   // ircManager after it persists and is responsible for any guard logic — this
   // method is a dumb applier. Emits AWAY to the IRC server when the new state
-  // disagrees with what the network already thinks (active flip), and always
-  // publishes the away-state event so clients refresh their dividers.
+  // differs from the last (active flips, or a new message while away), and
+  // always publishes the away-state event so clients refresh their dividers.
   applyAwayState(next: AwayState): void {
     const prev = this.awayState;
     this.awayState = {
@@ -6710,21 +6709,23 @@ export class IrcConnection {
       backAt: next.backAt ?? null,
     };
     if (this.state === 'connected') {
-      if (next.active && next.message && !prev.active) {
-        try {
-          this.client.raw('AWAY :' + next.message);
-        } catch (_) {
-          /* ignore */
-        }
-      } else if (!next.active && prev.active) {
-        try {
-          this.client.raw('AWAY');
-        } catch (_) {
-          /* ignore */
-        }
-      }
+      const changed = next.active
+        ? !!next.message && (!prev.active || prev.message !== next.message)
+        : prev.active;
+      if (changed) this.sendAwayState();
     }
     this.publishAwayState();
+  }
+
+  // The account's away state, to the network: `AWAY :<message>`, or a bare
+  // `AWAY`. It goes through the router as Lurker's, so its 305/306 reach no
+  // bouncer client (each gets its own from the bouncer) and write no row.
+  private sendAwayState(): void {
+    const { active, message } = this.awayState;
+    // A newline would split the line in two, and nothing on this path strips it.
+    // eslint-disable-next-line no-control-regex
+    const text = (message ?? '').replace(/[\r\n\u0000]/g, ' ').trim();
+    this.replies.send('lurker', active && text ? `AWAY :${text}` : 'AWAY');
   }
 
   disconnect(reason?: string, opts: { announceCancelledRetry?: boolean } = {}): void {

@@ -3,9 +3,10 @@
 
 // Who each reply on a network connection is for. Three kinds of asker share the
 // connection: Lurker itself (the MODE and WHO it sends when it joins a channel,
-// a restore's NAMES, TOPIC and MODE), the user (the web and iOS apps, MCP,
-// connect commands), and each IRC client attached through the bouncer. A
-// server's replies don't say who asked, so each one used to reach all of them:
+// a restore's NAMES, TOPIC and MODE, the AWAY carrying the account's away state),
+// the user (the web and iOS apps, MCP, connect commands), and each IRC client
+// attached through the bouncer. A server's replies don't say who asked, so each
+// one used to reach all of them:
 // a client got the answers to Lurker's queries and to other clients', and the
 // web app showed a client's WHO as if the user had typed it (#931).
 //
@@ -132,6 +133,8 @@ const QUERY_ONLY = new Set([
   '276',
   '302',
   '303',
+  '305',
+  '306',
   '307',
   '310',
   '311',
@@ -181,7 +184,8 @@ type Form =
   | 'umode'
   | 'topic'
   | 'ison'
-  | 'userhost';
+  | 'userhost'
+  | 'away';
 
 // The kinds whose replies name nothing to match them by. One of these waits for
 // the last of its kind to be answered. A 221 names nothing either: without its
@@ -515,6 +519,8 @@ export class ReplyRouter {
         return command === '303' ? 'end' : null;
       case 'userhost':
         return command === '302' ? 'end' : null;
+      case 'away':
+        return command === '305' || command === '306' ? 'end' : null;
     }
   }
 
@@ -670,6 +676,10 @@ export class ReplyRouter {
         return spec('ison', command);
       case 'USERHOST':
         return spec('userhost', command);
+      case 'AWAY':
+        // A 305 or 306 names nothing, but only an AWAY draws one, so the oldest
+        // AWAY on the wire takes it and no AWAY waits.
+        return spec('away', command);
       default:
         return null;
     }

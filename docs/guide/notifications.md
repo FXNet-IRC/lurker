@@ -19,7 +19,8 @@ How Lurker keeps you informed across all your devices.
 
 ## Auto-away
 
-- Auto-away when your last client disconnects, and automatic return.
+- Auto-away when no client is in front of you and no IRC client is attached through
+  the bouncer, and automatic return.
 
 ## See also
 
