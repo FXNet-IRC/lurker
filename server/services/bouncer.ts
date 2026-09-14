@@ -1343,6 +1343,12 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // stream don't interleave out of order.
     this.onRawUpstream = (event) => {
       if (this.closed || !event?.from_server || typeof event.line !== 'string') return;
+      // An engine re-attach replays the session into the connection: the
+      // registration burst, LUSERS, MOTD and a JOIN for every channel. This
+      // client has all of that already, and irssi rebuilds any channel it gets
+      // a second self-JOIN for. The backlog after the replay is what the client
+      // missed, and comes through.
+      if (conn.restoring) return;
       // A reply goes only to whoever asked for it: this client, another one,
       // the user or Lurker (replyRouter.ts). The connection decided in its own
       // raw listener, which runs before this one.
