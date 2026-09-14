@@ -535,7 +535,16 @@ function toIrcTime(iso: string): string {
 // IRCv3 server-time layout used by CHATHISTORY `timestamp=` selectors:
 // exactly `YYYY-MM-DDThh:mm:ss.sssZ` (millisecond precision, literal Z).
 export function isValidServerTime(s: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(s) && !Number.isNaN(Date.parse(s));
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(s) && !Number.isNaN(serverTimeMs(s));
+}
+
+// The time a `YYYY-MM-DDThh:mm:ss…Z` string names, or NaN. Date.parse rolls an
+// impossible date over (2023-02-30 reads as March 2), so the result has to print
+// back as the same date and time.
+function serverTimeMs(s: string): number {
+  const ms = Date.parse(s);
+  if (Number.isNaN(ms)) return NaN;
+  return new Date(ms).toISOString().slice(0, 19) === s.slice(0, 19) ? ms : NaN;
 }
 
 // A CHATHISTORY selector: `*` (LATEST only) or `timestamp=<iso>`. We advertise
@@ -2414,8 +2423,7 @@ function readMarkerParam(networkId: number, target: string, lastReadId: number):
 // which drops a `.000`.
 function readMarkerBoundTime(bound: string): string | null {
   const match = /^timestamp=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)$/.exec(bound);
-  if (!match) return null;
-  const ms = Date.parse(match[1]);
+  const ms = match ? serverTimeMs(match[1]) : NaN;
   return Number.isNaN(ms) ? null : new Date(ms).toISOString();
 }
 

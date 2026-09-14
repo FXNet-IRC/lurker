@@ -756,14 +756,23 @@ export function readMarkerTime(
   return row?.time ?? null;
 }
 
+// How far a buffer's times may run out of order. Rows get ids in arrival order,
+// but their times come from the network's servers and from Lurker's own clock,
+// which can disagree. newestIdAtOrBefore is exact while no row's time is more
+// than this far behind an earlier row's.
+const READ_MARKER_SKEW_MS = 60_000;
+
 // Where a MARKREAD's time puts the read pointer: the newest row above `afterId`
 // whose time is at or before `iso`, or 0 when there is none.
 //
-// messages.time has no index, so walking the buffer down from its tail reads a
-// table row per step. For a buffer far behind its pointer that's every unread
-// row, on the one shared connection, whether the pointer moves or not. So this
-// bisects the buffer's ids instead, one index seek a step: ids are assigned in
-// arrival order, so a buffer's times rise with them.
+// messages.time has no index, so walking the whole buffer down from its tail
+// reads a table row per step: for a buffer far behind its pointer, every unread
+// row, on the one shared connection. Instead:
+// - Bisect the buffer's ids for the last row at or before `iso` plus the skew,
+//   one index seek a step. No row above one later than that can be at or before
+//   `iso`, so nothing the bisection skips is the answer.
+// - Walk down from there to the first row at or before `iso`. That reads only
+//   rows within twice the skew of `iso`.
 export function newestIdAtOrBefore(
   networkId: number,
   target: string,
@@ -778,21 +787,28 @@ export function newestIdAtOrBefore(
   const newestIn = db.prepare(
     'SELECT id, time FROM messages WHERE buffer_id = ? AND id > ? AND id <= ? ORDER BY id DESC LIMIT 1',
   );
-  // Every row up to `lo` is at or before `iso`; the answer is no higher than `hi`.
-  let lo = Math.max(0, afterId);
+  // Past year 9999 an ISO string gains a `+` and sorts before every stored time.
+  const boundMs = Math.min(
+    Date.parse(iso) + READ_MARKER_SKEW_MS,
+    Date.UTC(9999, 11, 31, 23, 59, 59, 999),
+  );
+  const bound = new Date(boundMs).toISOString();
+  const floor = Math.max(0, afterId);
+  // Nothing above `hi` is at or before `iso`.
+  let lo = floor;
   let hi = tail?.maxId ?? 0;
-  let found = 0;
   while (lo < hi) {
     const mid = lo + Math.ceil((hi - lo) / 2);
     const row = newestIn.get(bufferId, lo, mid) as { id: number; time: string } | undefined;
-    if (row && row.time > iso) {
-      hi = row.id - 1;
-    } else {
-      if (row) found = row.id;
-      lo = mid;
-    }
+    if (row && row.time > bound) hi = row.id - 1;
+    else lo = mid;
   }
-  return found;
+  const row = db
+    .prepare(
+      'SELECT id FROM messages WHERE buffer_id = ? AND id > ? AND id <= ? AND time <= ? ORDER BY id DESC LIMIT 1',
+    )
+    .get(bufferId, floor, lo, iso) as { id: number } | undefined;
+  return row?.id ?? 0;
 }
 
 // Cheap "does the user have any history with this target?" check used by the

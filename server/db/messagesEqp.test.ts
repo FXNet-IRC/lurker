@@ -251,6 +251,16 @@ describe('read-marker paths', () => {
     expect(detail).not.toMatch(/TEMP B-TREE/);
   });
 
+  it('the walk after the bisection stays on the per-buffer index (newestIdAtOrBefore shape)', () => {
+    const detail = plan(
+      `SELECT id FROM messages
+       WHERE buffer_id = 1 AND id > 0 AND id <= 100 AND time <= '2026-01-01T00:00:00.000Z'
+       ORDER BY id DESC LIMIT 1`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
+    expect(detail).not.toMatch(/TEMP B-TREE/);
+  });
+
   it("a read pointer's time is an index seek (readMarkerTime shape)", () => {
     const detail = plan(
       `SELECT time FROM messages WHERE buffer_id = 1 AND id <= 5 ORDER BY id DESC LIMIT 1`,

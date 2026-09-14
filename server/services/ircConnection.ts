@@ -6430,6 +6430,12 @@ export class IrcConnection {
               : tags,
         };
       }
+      // Without server-time the message would be stored when the batch ends,
+      // but each fragment is relayed with the time it arrived. The first
+      // fragment's time lets a MARKREAD naming any of them reach the stored row.
+      if (event.time == null && this.lineArrivedAt) {
+        event = { ...event, time: this.lineArrivedAt.getTime() };
+      }
       this.multilineBatches.set(id, { event, text: line });
       return;
     }

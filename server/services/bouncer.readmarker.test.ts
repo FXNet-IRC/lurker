@@ -316,10 +316,13 @@ describe('MARKREAD errors', () => {
     const c = await attach(acct);
     c.send('MARKREAD #bad *');
     c.send('MARKREAD #bad timestamp=yesterday');
+    // A date that doesn't exist, which Date.parse would read as March 2.
+    c.send('MARKREAD #bad timestamp=2023-02-30T06:00:00Z');
     await settle(c);
     expect(fails(c)).toEqual([
       ':lurker.bouncer FAIL MARKREAD INVALID_PARAMS * :Invalid timestamp',
       ':lurker.bouncer FAIL MARKREAD INVALID_PARAMS timestamp=yesterday :Invalid timestamp',
+      ':lurker.bouncer FAIL MARKREAD INVALID_PARAMS timestamp=2023-02-30T06:00:00Z :Invalid timestamp',
     ]);
     expect(bufferReads.getReadState(acct.user.id, acct.network.id, '#bad')).toBe(0);
   });
