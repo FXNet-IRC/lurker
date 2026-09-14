@@ -27,6 +27,7 @@ let typeCountsForUnread: typeof import('./messages.js').typeCountsForUnread;
 let countHighlightsNewer: typeof import('./messages.js').countHighlightsNewer;
 let listUserHighlights: typeof import('./messages.js').listUserHighlights;
 let maxIdForBuffer: typeof import('./messages.js').maxIdForBuffer;
+let newestIdAtOrBefore: typeof import('./messages.js').newestIdAtOrBefore;
 let hasConversationForTarget: typeof import('./messages.js').hasConversationForTarget;
 let listSpeakers: typeof import('./messages.js').listSpeakers;
 let listBufferTargets: typeof import('./messages.js').listBufferTargets;
@@ -51,6 +52,7 @@ beforeAll(async () => {
     countHighlightsNewer,
     listUserHighlights,
     maxIdForBuffer,
+    newestIdAtOrBefore,
     hasConversationForTarget,
     listSpeakers,
     listBufferTargets,
@@ -1175,6 +1177,76 @@ describe('maxIdForBuffer', () => {
     chat(net1.id, '#b', 'bob', 'b1');
     chat(net2.id, '#a', 'eve', 'e1');
     expect(maxIdForBuffer(net1.id, '#a')).toBe(a2.id);
+  });
+});
+
+type ReadRow = { id: number; time: string };
+
+// `n` rows in #read a second apart, with another buffer's rows landing between
+// them so #read's ids are sparse, as they are on a cell.
+function seedReadRows(networkId: number, n: number): ReadRow[] {
+  const rows: ReadRow[] = [];
+  for (let i = 0; i < n; i++) {
+    const time = new Date(Date.UTC(2024, 0, 1, 0, 0, i)).toISOString();
+    const { id } = insertMessage({
+      networkId,
+      target: '#read',
+      time,
+      type: 'message',
+      nick: 'bob',
+      text: `m${i}`,
+      self: false,
+    });
+    rows.push({ id: Number(id), time });
+    for (let j = 0; j < i % 4; j++) chat(networkId, '#other', 'eve', `o${i}.${j}`);
+  }
+  return rows;
+}
+
+// What walking every row above the pointer answers.
+function walkReadRows(rows: ReadRow[], afterId: number, iso: string): number {
+  let found = 0;
+  for (const row of rows) if (row.id > afterId && row.time <= iso) found = Math.max(found, row.id);
+  return found;
+}
+
+describe('newestIdAtOrBefore (MARKREAD)', () => {
+  it('agrees with a full walk for every time and pointer', () => {
+    const user = createUser('niab-walk');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'me',
+    })!;
+    const rows = seedReadRows(net.id, 40);
+    const times = [
+      '2023-12-31T23:59:59.000Z',
+      ...rows.map((r) => r.time),
+      ...rows.map((r) => new Date(Date.parse(r.time) + 500).toISOString()),
+    ];
+    const pointers = [0, rows[0].id, rows[17].id, rows[17].id + 1, rows[39].id];
+    for (const afterId of pointers) {
+      for (const iso of times) {
+        expect(
+          newestIdAtOrBefore(net.id, '#read', afterId, iso),
+          `after ${afterId}, at ${iso}`,
+        ).toBe(walkReadRows(rows, afterId, iso));
+      }
+    }
+  });
+
+  it('returns 0 for a buffer with no rows', () => {
+    const user = createUser('niab-empty');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'h',
+      port: 6697,
+      tls: true,
+      nick: 'me',
+    })!;
+    expect(newestIdAtOrBefore(net.id, '#read', 0, '2030-01-01T00:00:00.000Z')).toBe(0);
   });
 });
 

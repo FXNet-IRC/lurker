@@ -757,9 +757,13 @@ export function readMarkerTime(
 }
 
 // Where a MARKREAD's time puts the read pointer: the newest row above `afterId`
-// whose time is at or before `iso`, or 0 when there is none. It walks the
-// buffer's id index down from the tail and stops at the first row that old, so
-// marking the newest line reads one row, and it never reads below the pointer.
+// whose time is at or before `iso`, or 0 when there is none.
+//
+// messages.time has no index, so walking the buffer down from its tail reads a
+// table row per step. For a buffer far behind its pointer that's every unread
+// row, on the one shared connection, whether the pointer moves or not. So this
+// bisects the buffer's ids instead, one index seek a step: ids are assigned in
+// arrival order, so a buffer's times rise with them.
 export function newestIdAtOrBefore(
   networkId: number,
   target: string,
@@ -768,12 +772,27 @@ export function newestIdAtOrBefore(
 ): number {
   const bufferId = resolveBufferIdByNetwork(networkId, target);
   if (bufferId === undefined) return 0;
-  const row = db
-    .prepare(
-      'SELECT id FROM messages WHERE buffer_id = ? AND id > ? AND time <= ? ORDER BY id DESC LIMIT 1',
-    )
-    .get(bufferId, Math.max(0, afterId), iso) as { id: number } | undefined;
-  return row?.id ?? 0;
+  const tail = db
+    .prepare('SELECT MAX(id) AS maxId FROM messages WHERE buffer_id = ?')
+    .get(bufferId) as { maxId: number | null } | undefined;
+  const newestIn = db.prepare(
+    'SELECT id, time FROM messages WHERE buffer_id = ? AND id > ? AND id <= ? ORDER BY id DESC LIMIT 1',
+  );
+  // Every row up to `lo` is at or before `iso`; the answer is no higher than `hi`.
+  let lo = Math.max(0, afterId);
+  let hi = tail?.maxId ?? 0;
+  let found = 0;
+  while (lo < hi) {
+    const mid = lo + Math.ceil((hi - lo) / 2);
+    const row = newestIn.get(bufferId, lo, mid) as { id: number; time: string } | undefined;
+    if (row && row.time > iso) {
+      hi = row.id - 1;
+    } else {
+      if (row) found = row.id;
+      lo = mid;
+    }
+  }
+  return found;
 }
 
 // Cheap "does the user have any history with this target?" check used by the
