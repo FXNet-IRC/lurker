@@ -211,6 +211,20 @@ Implementation notes worth knowing if you're writing against it:
   the apps. A channel's marker comes after its `JOIN`, before `NAMES`; ask for a DM's
   with `MARKREAD <nick>`.
   <br>`server/services/bouncer.ts:1884`, `server/services/ircManager.ts:892`
+- A reply goes only to whoever asked: your client, another attached client, the web
+  app, or Lurker itself, which sends `MODE` and `WHO` when it joins a channel. A
+  network's replies don't say who asked, so Lurker matches them to its queries in the
+  order they went out.
+  - Replies that name their channel or nick (`WHOIS`, `WHOWAS`, `NAMES`, `TOPIC`,
+    channel modes) are matched by that name, so those queries go out at once.
+  - Replies to `WHO`, `LIST`, `ISON`, `USERHOST` and a `MODE` for your own nick name
+    nothing. Each of those waits until the last one of its kind is answered, as soju
+    does for `WHO` and `LIST`.
+  - `MODE #channel` is answered from Lurker's last reply until a mode it shows changes.
+  - A query the network never answers ends after 30 seconds. `WHO`, `WHOIS`, `WHOWAS`,
+    `LIST`, `NAMES` and list-mode queries then get their end numeric, marked
+    `Command aborted`; the others get nothing.
+    <br>`server/services/replyRouter.ts`
 
 ---
 

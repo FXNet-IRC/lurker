@@ -37,6 +37,9 @@ beforeAll(async () => {
       LURKER_RESTORE_STEP_DEADLINE_MS: '1500',
       // 0 → every restored channel (>= 1 member: us) is over the threshold.
       LURKER_RESTORE_WHO_MAX_MEMBERS: '0',
+      // 1 → the marks for the previous process's replies are gone at once, so
+      // the gate goes on the restore's own NAMES replies alone (replyRouter.ts).
+      LURKER_RESTORE_QUIET_MS: '1',
     },
   });
   ircd = harness.ircd;
@@ -104,7 +107,7 @@ describe('engine restore WHO size-gate', () => {
     }
 
     // A fresh interactive join still WHOs, at any size and threshold — the gate
-    // is restore-scoped (restoreQuiet marks only the restored channels).
+    // is restore-scoped (only the restore's own NAMES reply counts).
     const beforeFresh = sentBy('gate').length;
     conn2.join('#fresh');
     await until(() => conn2.isChannelJoined('#fresh'), 5000, 'fresh join');

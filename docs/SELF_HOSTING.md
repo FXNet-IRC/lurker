@@ -558,7 +558,7 @@ Repeated failed logins from an address are throttled automatically.
 
 Playback replays the last 50 lines per joined channel (plus your 20 most recently active DMs) on attach; tune with `LURKER_BOUNCER_PLAYBACK` (0 disables, max 1000). Clients that negotiate IRCv3 `server-time` get real timestamps on replayed lines. Clients that negotiate `draft/chathistory` get no playback, since they fetch their own.
 
-Known limitations (shared-connection bouncer semantics): replies to one attached client's WHOIS/LIST are visible to all attached clients on that network; Lurker-side ignore rules don't filter the live relay; and on end-to-end encrypted channels an attached client sees the wire ciphertext for incoming messages.
+A reply goes only to the client that asked for it: your WHOIS or LIST isn't seen by other attached clients or by the web app. Known limitations: Lurker-side ignore rules don't filter the live relay, and on end-to-end encrypted channels an attached client sees the wire ciphertext for incoming messages.
 
 ### IRC engine (upgrade without dropping IRC)
 

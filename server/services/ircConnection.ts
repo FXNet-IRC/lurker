@@ -58,6 +58,8 @@ import { mayUseProxy } from './networkPolicy.js';
 import { ProxyTransport } from './proxyTransport.js';
 import { MonitorList } from './monitorList.js';
 import type { MonitorHolder, MonitorSync } from './monitorList.js';
+import { ReplyRouter } from './replyRouter.js';
+import type { Asker, ReplyOwner } from './replyRouter.js';
 import { classifyModeChange, modeLetter } from '../../shared/modes.js';
 import type { ModeChange } from '../../shared/modes.js';
 import { registerIdent, unregisterIdent, isIdentdEnabled, isOidentdFileEnabled } from './identd.js';
@@ -174,6 +176,8 @@ const MAX_CONSECUTIVE_SASL_FAILURES = 3;
 // answer as a line of history on every app restart. Kept quiet per channel for a
 // short window after the restore — see RESTORE_QUIET_MS.
 const RESTORE_QUIET_NUMERICS = new Set(['221', '324', '329', '331', '332', '333']);
+// LURKER_RESTORE_QUIET_MS overrides it, read per restore, so a test can show
+// what the restore's own replies do without it.
 const RESTORE_QUIET_MS = 10_000;
 // The per-channel state requests after a restore go out one channel at a time,
 // and the next channel waits for this one's replies (drainRestoreQueue). This
@@ -677,11 +681,15 @@ export class IrcConnection {
   // notice / ctcp verbs never pass through raw(). `seq` orders the command
   // against outstanding CTCP requests, see takeCtcpIssuer.
   lastNickIntent = new Map<string, { channel: string | null; at: number; seq: number }>();
-  // Channels we auto-issued a WHO for on join (lowercase). The auto-WHO learns
-  // away/ident state and would flood the server buffer if echoed per-member, so
-  // the 'wholist' handler consumes these silently. Any wholist NOT in this set
-  // is a user-typed /who and gets rendered to the server buffer (#342).
-  autoWhoTargets: Set<string>;
+  // Who asked for each reply: Lurker, the user, or a bouncer client. Every query
+  // goes out through it, one of each kind on the wire at a time (replyRouter.ts).
+  readonly replies: ReplyRouter;
+  // Who the server line being handled is for, as the router saw it. Set in the
+  // raw listener and cleared by the same microtask as lineArrivedAt, so the
+  // line's handlers and every bouncer client's relay read one answer: a WHO the
+  // user typed renders, Lurker's own and a client's don't (#931). Null outside
+  // a line's handlers.
+  replyOwner: ReplyOwner | null;
   // In-flight inbound `draft/multiline` batches, keyed by batch reference. Each
   // entry holds the first fragment's event envelope plus the text accumulated
   // so far; flushed as one reassembled message on 'batch end draft/multiline'
@@ -914,7 +922,22 @@ export class IrcConnection {
     this.identifiedToServices = false;
     this.unsendableTargets = new Set();
     this.lastUserSendAt = new Map();
-    this.autoWhoTargets = new Set();
+    this.replies = new ReplyRouter({
+      write: (line) => {
+        try {
+          this.client.raw(line);
+        } catch (_) {
+          /* ignore */
+        }
+      },
+      canSend: () => this.state === 'connected',
+      fold: (name) => foldTargetFor(this.network.id, name),
+      isJoined: (channel) => this.isChannelJoined(channel),
+      ownNick: () => this.currentNick,
+      listModes: () => this.listModes(),
+      prefixModes: () => this.prefixModes(),
+    });
+    this.replyOwner = null;
     this.multilineBatches = new Map();
     this.multilineBatchTags = new Map();
     this.lineArrivedAt = null;
@@ -1175,6 +1198,7 @@ export class IrcConnection {
       this.lineArrivedAt = new Date();
       queueMicrotask(() => {
         this.lineArrivedAt = null;
+        this.replyOwner = null;
       });
       // A ban-classified ERROR is only believed if it's the link's LAST line
       // (#651). Every server line passes through here, and for the ban line
@@ -1191,6 +1215,13 @@ export class IrcConnection {
         return;
       }
       const rawCommand = (msg?.command || '').toString();
+      // Who this line is for, before anything reads it (see replyOwner).
+      this.replyOwner = this.replies.noteServerLine(
+        event.line.replace(/[\r\n]+$/, ''),
+        rawCommand,
+        msg?.params ?? [],
+        msg?.prefix?.split('!')[0],
+      );
       // ERR_MONLISTFULL: the network refused these nicks, so they aren't on its
       // list. irc-framework's 'irc error' for it doesn't say which. The line
       // stays out of the server buffer, since it can name a bouncer client's
@@ -1278,9 +1309,11 @@ export class IrcConnection {
       // toLowerCase. On an rfc1459 network (where [ \ ] ^ fold to { | } ~) a 482
       // naming #news{dev} while we're joined as #news[dev] would pass the
       // membership test and then publish a target no buffer is keyed by.
+      //
+      // One answering a query a bouncer client sent (`MODE #chan e`) is its own.
       const cmdError = commandResultError(rawCommand, msg?.params ?? []);
       const cmdErrorChannel = cmdError ? this.channelState(cmdError.channel) : undefined;
-      if (cmdError && cmdErrorChannel) {
+      if (cmdError && cmdErrorChannel && this.replyForUser()) {
         this.publish({
           type: 'error',
           target: cmdErrorChannel.name,
@@ -1290,8 +1323,19 @@ export class IrcConnection {
       }
       // A reply to the restore step in flight is what releases the next
       // channel's requests. Before the denylist: 366 is exactly the kind of
-      // line the server buffer never shows.
-      this.noteRestoreReply(rawCommand, msg?.params?.[1]);
+      // line the server buffer never shows. Only the restore's own: a bouncer
+      // client's NAMES for the same channel mustn't move the step on.
+      if (this.replyOwner === 'lurker') this.noteRestoreReply(rawCommand, msg?.params?.[1]);
+      // The server buffer is the user's. A reply to Lurker's own query (the
+      // MODE it sends on a join) or to a bouncer client's isn't history (#931).
+      if (!this.replyForUser()) {
+        // The restore's own replies still retire their channel's quiet mark, so
+        // the user's own /topic or /mode a moment later renders.
+        if (this.replyOwner === 'lurker' && RESTORE_QUIET_NUMERICS.has(rawCommand)) {
+          this.isRestoreQuiet(rawCommand, rawCommand === '221' ? '*' : msg?.params?.[1]);
+        }
+        return;
+      }
       // NAMES replies are denied because a joined channel's nicklist is where
       // they show. One for a channel we are not in has no nicklist to land in
       // (see 'userlist'), so it renders verbatim like any other numeric.
@@ -1556,7 +1600,9 @@ export class IrcConnection {
       unregisterIdent(this.identdId);
       this.identdId = null;
       this.userModes.clear();
-      this.autoWhoTargets.clear();
+      // Every query went with the socket. A bouncer client still waiting on one
+      // is sent its end numeric.
+      this.replies.reset();
       this.multilineBatches.clear();
       this.multilineBatchTags.clear();
       // Echo-correlation state is per-socket: no echo can arrive for a line
@@ -2467,12 +2513,9 @@ export class IrcConnection {
         // No system-buffer "Joined #x" line — the channel buffer already shows
         // the join event, so logging it here too is just noise (#355).
         // Most servers volunteer 324 on join, but a few don't. Request it so
-        // the channel's mode flags reach the status bar consistently.
-        try {
-          c.raw('MODE', eventChannel);
-        } catch (_) {
-          /* ignore */
-        }
+        // the channel's mode flags reach the status bar consistently. The reply
+        // is Lurker's own, so no bouncer client sees it (#931).
+        this.replies.send('lurker', `MODE ${eventChannel}`);
       }
     });
 
@@ -2946,34 +2989,32 @@ export class IrcConnection {
       this.namesHeard.add(foldTargetFor(this.network.id, eventChannel));
       this.publishNames(ch);
       // Issue a WHO so we learn the current away state for everyone in the
-      // channel. away-notify keeps it live after this initial sync. Mark it so
-      // the 'wholist' handler consumes the reply silently instead of echoing
-      // every member to the server buffer (#342).
+      // channel. away-notify keeps it live after this initial sync. The reply is
+      // Lurker's own, so the 'wholist' handler takes it in silently instead of
+      // echoing every member to the server buffer (#342). Only after the NAMES
+      // a JOIN brings or a restore asks for: by the time the user or a bouncer
+      // client asks for NAMES, the away state is already live.
       //
       // Exception: on a RESTORE, a very large channel's away-sync WHO is skipped
       // (RESTORE_WHO_MAX_MEMBERS) — its 352-per-member reply is the heaviest part
-      // of the reconnect burst. restoreQuiet marks exactly the channels
-      // drainRestoreQueue just requested, so this never touches a fresh
-      // interactive join (which WHOs in full, any size).
+      // of the reconnect burst. The restore's own NAMES is Lurker's, and
+      // restoreQuiet marks the channels whose NAMES the previous process asked
+      // for, so this never touches a fresh interactive join (which WHOs in
+      // full, any size).
+      const owner = this.replyOwner;
+      const syncAway = owner === null || owner === 'unasked' || owner === 'lurker';
       const rq = this.restoreQuiet.get(eventChannel.toLowerCase());
-      const inRestore = !!rq && Date.now() < rq.until;
+      const inRestore = owner === 'lurker' || (!!rq && Date.now() < rq.until);
       const whoMax = reconnectEnvInt('LURKER_RESTORE_WHO_MAX_MEMBERS', RESTORE_WHO_MAX_MEMBERS);
-      if (inRestore && ch.members.size > whoMax) {
+      if (syncAway && inRestore && ch.members.size > whoMax) {
         // Diagnostic only (docker logs), never a server-buffer row: on a big
         // multi-network restore this can fire per channel.
         console.log(
           `[irc] restore: skipped away-sync WHO for ${eventChannel} (${ch.members.size} members > ${whoMax}) ` +
             `on network ${this.network.id}; away-notify keeps it live`,
         );
-      } else {
-        try {
-          c.who(eventChannel);
-          // Mark only after a successful send: if c.who() throws, a stale flag
-          // would silently suppress a later user-typed /who for this channel.
-          this.autoWhoTargets.add(eventChannel.toLowerCase());
-        } catch (_) {
-          /* ignore */
-        }
+      } else if (syncAway) {
+        this.sendAwaySyncWho(eventChannel);
       }
       const ms = Date.now() - tHandler;
       if (IRC_HANDLER_WARN_MS > 0 && ms >= IRC_HANDLER_WARN_MS) {
@@ -2992,14 +3033,13 @@ export class IrcConnection {
       const users = (event.users as Record<string, unknown>[]) || [];
 
       // Render a user-typed /who to the server buffer. The auto-WHO we fire on
-      // join is flagged in autoWhoTargets and consumed silently (echoing one
-      // line per member would flood the buffer); anything else is the user
-      // asking, so surface it like any other server response (#342). This runs
+      // join is Lurker's own and taken in silently (echoing one line per member
+      // would flood the buffer), and a bouncer client's is the client's (#931);
+      // the user's surfaces like any other server response (#342). This runs
       // before the channel lookup below so /who <nick> and /who <unjoined-chan>
-      // — where we have no tracked channel — still render.
-      if (this.autoWhoTargets.has(targetKey)) {
-        this.autoWhoTargets.delete(targetKey);
-      } else {
+      // — where we have no tracked channel — still render. Whoever asked, the
+      // members' away state below is still news.
+      if (this.replyForUser()) {
         for (const u of users) {
           const text = formatWhoReplyLine(u);
           if (text) this.publish({ type: 'motd', target: this.serverTarget(), text });
@@ -3101,6 +3141,8 @@ export class IrcConnection {
     // is published here beyond the modal payload.
     c.on('whois', (event: Record<string, unknown>) => {
       if (!event || !event.nick) return;
+      // A bouncer client's /whois is its own, not the profile modal's (#931).
+      if (!this.replyForUser()) return;
       this.publishEphemeral({ type: 'whois_result', whois: event });
     });
 
@@ -3108,8 +3150,11 @@ export class IrcConnection {
     // again at RPL_LISTEND. Each batch lands in the per-network SQLite cache;
     // clients only see progress events (running count) — the actual rows are
     // fetched via the chanlist-search WS handler against the cache. Keeps a
-    // 6k-row libera.chat list off the wire and out of client memory.
+    // 6k-row libera.chat list off the wire and out of client memory. Only the
+    // user's LIST touches the cache: a bouncer client's used to wipe and
+    // rewrite it under the web app (#931).
     c.on('channel list start', () => {
+      if (!this.replyForUser()) return;
       const nid = this.network.id;
       try {
         chanlistDb.clearChannels(nid);
@@ -3121,6 +3166,7 @@ export class IrcConnection {
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     c.on('channel list', (channels: any) => {
+      if (!this.replyForUser()) return;
       const nid = this.network.id;
       try {
         chanlistDb.upsertChannels(nid, channels || []);
@@ -3132,6 +3178,7 @@ export class IrcConnection {
       }
     });
     c.on('channel list end', () => {
+      if (!this.replyForUser()) return;
       const nid = this.network.id;
       let total = 0;
       try {
@@ -3181,6 +3228,9 @@ export class IrcConnection {
       // below because it is the more specific signal: an explicit command,
       // aimed at a named channel, seconds ago — against "we have DM history
       // with this nick at some point in the past".
+      // A 401 answering a bouncer client's WHOIS is that client's; the raw
+      // handler kept it out of the server buffer too (#931).
+      if (tag === 'no_such_nick' && !this.replyForUser()) return;
       if (tag === 'no_such_nick' && eventNick) {
         // The command's `seq` rides along for the CTCP bucket below: a nick-only
         // command (/whois, /whowas) is not a SEND, so takeCtcpIssuer's "is the
@@ -3774,7 +3824,6 @@ export class IrcConnection {
         this.lastUserSendAt.delete(oldLower);
         this.lastUserSendAt.set(newLower, lastSend);
       }
-      if (this.autoWhoTargets.delete(oldLower)) this.autoWhoTargets.add(newLower);
       // lastNickIntent is deliberately NOT re-keyed, though it looks like it
       // belongs here. The maps above are keyed by the TARGET, which follows the
       // buffer through a rename; that one is keyed by the nick as we addressed
@@ -4621,23 +4670,23 @@ export class IrcConnection {
         // +i`), so they are not in the replay either; one line, asked at once
         // — it is the per-channel replies the cap bounds, not this.
         this.restoreQuiet.set('*', {
-          until: Date.now() + RESTORE_QUIET_MS,
+          until: Date.now() + reconnectEnvInt('LURKER_RESTORE_QUIET_MS', RESTORE_QUIET_MS),
           mode: true,
           topic: false,
         });
         this.rawQuiet('MODE', this.currentNick);
         this.requestUnnegotiatedCaps();
         this.restoreQueue = [...this.channels.values()].map((ch) => ch.name);
-        // Every queued channel is marked quiet now, not when its own step goes
-        // out: the LAST process may have let go with a step in flight, and
-        // that step's replies sit in the engine backlog, delivered right after
-        // this phase — the size gate on the WHO and the server-buffer filter
-        // must read them as the restore's. With the cap full, even the first
-        // channel's step can still be queued when they land. Each step re-marks
-        // its channel as it goes out, so a long wait cannot outlive the window.
+        // Every queued channel is marked quiet now: the LAST process may have
+        // let go with a step in flight, and that step's replies sit in the
+        // engine backlog, delivered right after this phase — the size gate on
+        // the WHO and the server-buffer filter must read them as the restore's.
+        // Nothing in this process asked for them, so the reply router can't
+        // tell. The replies to this process's own steps are Lurker's, which
+        // both read without a mark (replyRouter.ts).
         for (const name of this.restoreQueue) {
           this.restoreQuiet.set(name.toLowerCase(), {
-            until: Date.now() + RESTORE_QUIET_MS,
+            until: Date.now() + reconnectEnvInt('LURKER_RESTORE_QUIET_MS', RESTORE_QUIET_MS),
             mode: true,
             topic: true,
           });
@@ -4718,8 +4767,9 @@ export class IrcConnection {
   // backlog, which counts the moment it lands. Read from that one fact rather
   // than from the restore queue's position: a channel waiting its turn at the
   // restoreGate cap is in neither the queue nor the in-flight step, and a
-  // step the deadline ended without a reply has still not heard anything.
-  private membersPending(name: string): boolean {
+  // step the deadline ended without a reply has still not heard anything. The
+  // bouncer's attach burst holds such a channel's NAMES back until it has.
+  membersPending(name: string): boolean {
     return !this.namesHeard.has(foldTargetFor(this.network.id, name));
   }
 
@@ -4747,11 +4797,11 @@ export class IrcConnection {
   // channel every 400 ms was "Excess Flood" by the seventh channel on every
   // restart. Gated on replies, the server's queue never holds more than four
   // lines of ours on any ircd — these three plus the WHO the NAMES reply
-  // triggers ('userlist'), which irc-framework already serialises behind its
-  // 315 (`who_queue`) — and a server that throttles simply sets the pace. The
-  // WHO is deliberately NOT part of the gate: irc-framework's queue never
-  // recovers from a 315 that does not come, and a step waiting on it would
-  // turn that one lost reply into a deadline wait for every channel after it.
+  // triggers ('userlist'), which waits behind any WHO already on the wire
+  // (replyRouter.ts) — and a server that throttles simply sets the pace. The
+  // WHO is deliberately NOT part of the gate: a 315 that does not come holds
+  // the WHO queue for the router's whole timeout, and a step waiting on it
+  // would turn that one lost reply into a wait for every channel after it.
   //
   // Across connections each step is also a turn at the process-wide cap
   // (restoreGate, #842). A re-attach brings every held connection back in the
@@ -4765,7 +4815,7 @@ export class IrcConnection {
   // connection's whole walk at a time. Under the cap the step goes out
   // synchronously, so a small instance sees no change. The turn ends with the
   // step's replies, so the WHO those trigger is outside the cap too — one in
-  // flight per connection (the framework's queue), size-gated, but across
+  // flight per connection (the router's WHO queue), size-gated, but across
   // connections as parallel as before.
   private drainRestoreQueue(): void {
     this.endRestoreStep();
@@ -4796,11 +4846,6 @@ export class IrcConnection {
       return;
     }
     try {
-      this.restoreQuiet.set(name.toLowerCase(), {
-        until: Date.now() + RESTORE_QUIET_MS,
-        mode: true,
-        topic: true,
-      });
       // Keyed by the network's own fold: the replies echo the channel as the
       // server spells it, which on an rfc1459 network is not a toLowerCase
       // away.
@@ -4885,12 +4930,33 @@ export class IrcConnection {
     }
   }
 
+  // A restore's own request. Its reply is Lurker's, so it reaches neither the
+  // server buffer nor a bouncer client (replyRouter.ts).
   private rawQuiet(command: string, arg: string): void {
-    try {
-      this.client.raw(command, arg);
-    } catch (_) {
-      /* ignore */
-    }
+    this.replies.send('lurker', `${command} ${arg}`);
+  }
+
+  // The away-sync WHO, as irc-framework's who() sends it: WHOX where the network
+  // has it, with a token irc-framework parses the reply by (it drops a 354 whose
+  // token it didn't hand out). The token is taken when the WHO goes out, not
+  // when it's queued, so a client's WHOX carrying the same number can't use it
+  // up first. Not who() itself: its queue moves on at any WHO's end, a client's
+  // included, and stops for good at one that never comes.
+  private sendAwaySyncWho(channel: string): void {
+    this.replies.send('lurker', `WHO ${channel}`, () =>
+      this.client.network.supports('whox')
+        ? `WHO ${channel} %tcuhsnfdaor,${this.client.whox_token.next()}`
+        : `WHO ${channel}`,
+    );
+  }
+
+  // Whether the server line being handled is the user's to see: a reply to
+  // their own query, or a line nobody asked for. Not a reply to Lurker's own
+  // query, to a bouncer client's, or to one nobody here is waiting on (#931).
+  // True outside a line's handlers, where nothing says otherwise.
+  private replyForUser(): boolean {
+    const owner = this.replyOwner;
+    return owner === null || owner === 'user' || owner === 'unasked';
   }
 
   // Is this numeric the reply to a request the restore made for this channel
@@ -6579,7 +6645,7 @@ export class IrcConnection {
     // would let a kick nobody ever saw place an unrelated 401 on the new one.
     this.lastNickIntent.clear();
   }
-  raw(line: string): void {
+  raw(line: string, asker: Asker = 'user'): void {
     // Strip CR/LF/NUL before the line hits the socket. irc-framework's
     // writeLine appends its own \r\n and writes verbatim, so any embedded
     // newline in a caller-built line (a kick reason, topic, ban host, etc.)
@@ -6594,7 +6660,8 @@ export class IrcConnection {
     // in the channel it was aimed at (#434). Cheap and total: this is the one
     // path every slash command and member-menu action takes.
     this.noteOutgoingCommand(clean);
-    this.client.raw(clean);
+    // A query waits its turn, and its reply goes to `asker` (replyRouter.ts).
+    this.replies.send(asker, clean);
   }
   // Whether the network negotiated IRCv3 message-tags. Client-only tags
   // (+typing, +draft/react, …) and TAGMSG only mean anything to a server that
@@ -6916,7 +6983,7 @@ export class IrcConnection {
           return;
         }
         try {
-          if (!this.takeRawMonitor(line)) this.client.raw(line);
+          if (!this.takeRawMonitor(line)) this.replies.send('user', line);
         } catch (_) {
           /* ignore */
         }
