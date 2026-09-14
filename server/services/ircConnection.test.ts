@@ -29,7 +29,9 @@ import {
   sendRejectionText,
   outgoingAddr,
   resolveKeyModeChange,
+  monitorLimitFromIsupport,
 } from './ircConnection.js';
+import type { MonitorHolder } from './monitorList.js';
 import { createIdentdServer, unregisterIdent } from './identd.js';
 import connectScheduler from './connectScheduler.js';
 import { getRecent } from './systemLog.js';
@@ -637,7 +639,7 @@ describe('addPeerWatch live presence seed (#302)', () => {
   // only SHOULD (not MUST) volunteer current state in reply to MONITOR +, so
   // without the explicit status query a freshly-added offline peer lands with
   // no state and renders as if online until a reconnect re-seeds.
-  it('follows MONITOR + with MONITOR S when a peer is tracked on a live connection', () => {
+  it('follows MONITOR + with MONITOR S when a peer is tracked on a live connection', async () => {
     const conn = makeConn();
     conn.useMonitor = true;
     conn.monitorLimit = 100;
@@ -646,6 +648,7 @@ describe('addPeerWatch live presence seed (#302)', () => {
     conn.client.raw = raw;
 
     conn.trackDmPeer('offlinepal');
+    await Promise.resolve(); // the MONITOR S goes out at the end of the turn
 
     // Order matters: the nick must be added before MONITOR S, or the status
     // dump won't include it.
@@ -736,12 +739,290 @@ describe('nick-regain MONITOR teardown gating (#384)', () => {
     conn.publish = vi.fn<(event: unknown) => void>();
     const raw = vi.fn<(...args: unknown[]) => void>();
     conn.client.raw = raw;
+    conn.syncMonitor(); // puts the regain watch on the list
+    raw.mockClear();
 
     conn.client.emit('nick', { nick: 'nick1', new_nick: 'nick' });
 
-    // removeMonitor() emits the line as args: ['MONITOR', '-', 'nick'].
     expect(raw.mock.calls.flat(Infinity).join(' ')).toContain('MONITOR - nick');
     expect(conn.regainNick).toBeNull();
+  });
+});
+
+describe('monitorLimitFromIsupport', () => {
+  it('reads a number as the limit and a MONITOR token with no value as no limit', () => {
+    expect(monitorLimitFromIsupport('100')).toBe(100);
+    // irc-framework stores `MONITOR` with no value as true.
+    expect(monitorLimitFromIsupport(true)).toBe(Infinity);
+    expect(monitorLimitFromIsupport('')).toBe(Infinity);
+    expect(monitorLimitFromIsupport(undefined)).toBe(0);
+  });
+});
+
+describe('MONITOR list shared with bouncer clients', () => {
+  function makeConn(): { conn: IrcConnection; raw: ReturnType<typeof vi.fn> } {
+    const conn = new IrcConnection({
+      network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
+        id: 1,
+        user_id: 1,
+        name: 'n',
+        host: 'irc.example.test',
+        port: 6697,
+        tls: 1,
+        trusted_certificates: 1,
+        nick: 'nick',
+        username: null,
+        realname: null,
+        server_password: null,
+        autoconnect: 1,
+        sasl_account: null,
+        sasl_password: null,
+        connect_commands: null,
+        position: 0,
+        casemapping: null,
+        created_at: new Date().toISOString(),
+      },
+      onEvent: () => {},
+    });
+    conn.state = 'connected';
+    conn.publish = vi.fn<(event: unknown) => void>();
+    const raw = vi.fn<(...args: string[]) => void>();
+    conn.client.raw = raw;
+    return { conn, raw };
+  }
+
+  function holderOf(...nicks: string[]): MonitorHolder {
+    return { monitorTargets: () => nicks, onMonitorDropped: () => {} };
+  }
+
+  function sent(raw: ReturnType<typeof vi.fn>): unknown[] {
+    return raw.mock.calls.map((c) => c[0]);
+  }
+
+  it('keeps a closed DM peer on the list while a bouncer client watches the nick', async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.monitor.addHolder(holderOf('pal'));
+    conn.trackDmPeer('pal');
+    await Promise.resolve();
+    raw.mockClear();
+
+    conn.untrackDmPeer('pal');
+    await Promise.resolve();
+
+    expect(raw).not.toHaveBeenCalled();
+  });
+
+  it("takes a new DM peer's state from the list when a bouncer client already watches it", async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.monitor.addHolder(holderOf('pal'));
+    conn.syncMonitor();
+    conn.monitor.noteStatus(['pal'], true);
+    await Promise.resolve();
+    const mark = vi.spyOn(conn, 'markPeerEvent').mockImplementation(() => {});
+    raw.mockClear();
+
+    conn.trackDmPeer('Pal');
+    await Promise.resolve();
+
+    expect(raw).not.toHaveBeenCalled();
+    expect(mark).toHaveBeenCalledWith('Pal', 'online');
+  });
+
+  it('asks for the state of a new DM peer a bouncer client listed before any answer came', async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.monitor.addHolder(holderOf('pal'));
+    conn.syncMonitor();
+    await Promise.resolve();
+    raw.mockClear();
+
+    conn.trackDmPeer('pal');
+    await Promise.resolve();
+
+    // No second MONITOR +, but the same MONITOR S a fresh add gets (#302).
+    expect(sent(raw)).toEqual(['MONITOR S']);
+  });
+
+  it('stops re-adding a DM peer the network refused, even with no advertised limit', async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = Infinity; // a MONITOR token with no value
+    conn.trackDmPeer('alice');
+    conn.trackDmPeer('bob');
+    await Promise.resolve();
+    conn.client.emit('raw', {
+      from_server: true,
+      line: ':irc.example.test 734 nick 1 bob :Monitor list is full',
+    });
+    raw.mockClear();
+
+    conn.syncMonitor();
+    conn.trackDmPeer('carol');
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual([]);
+    expect(conn.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: 'MONITOR limit (1) reached; live presence skipped for carol.',
+      }),
+    );
+  });
+
+  it("keeps a 734 out of the server buffer and notes only Lurker's own refused nicks", () => {
+    const { conn } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.trackDmPeer('pal');
+    const refuse = (nicks: string) =>
+      conn.client.emit('raw', {
+        from_server: true,
+        line: `:irc.example.test 734 nick 2 ${nicks} :Monitor list is full`,
+      });
+
+    refuse('clientpal'); // a bouncer client's nick; that client is sent the 734
+    expect(conn.publish).not.toHaveBeenCalled();
+
+    refuse('pal');
+    conn.client.emit('irc error', { error: 'monitor_list_full', reason: 'Monitor list is full' });
+    expect(conn.publish).toHaveBeenCalledTimes(1);
+    expect(conn.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: 'MONITOR limit (2) reached; live presence skipped for pal.',
+      }),
+    );
+  });
+
+  it("applies a raw MONITOR C to the raw sender's own nicks, not Lurker's", async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.trackDmPeer('pal');
+    conn.raw('MONITOR + scripted');
+    await Promise.resolve();
+    expect(sent(raw)).toEqual(['MONITOR + pal', 'MONITOR + scripted', 'MONITOR S']);
+    raw.mockClear();
+
+    conn.raw('MONITOR C');
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR - scripted']);
+    expect(conn.monitor.status('pal')).toBeNull();
+  });
+
+  it('keeps a raw watch after a bouncer client that shared the nick lets go', async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.raw('MONITOR + scripted');
+    const client = holderOf('scripted');
+    conn.monitor.addHolder(client);
+    conn.syncMonitor();
+    await Promise.resolve();
+    raw.mockClear();
+
+    conn.monitor.removeHolder(client);
+    conn.syncMonitor();
+    await Promise.resolve();
+
+    expect(raw).not.toHaveBeenCalled();
+  });
+
+  it("keeps a connect command's MONITOR watch after a bouncer client that shared it lets go", async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.network.connect_commands = 'MONITOR + scripted';
+    conn.runConnectCommands();
+    const client = holderOf('scripted');
+    conn.monitor.addHolder(client);
+    conn.syncMonitor();
+    await Promise.resolve();
+    expect(sent(raw)).toEqual(['MONITOR + scripted', 'MONITOR S']);
+    raw.mockClear();
+
+    conn.monitor.removeHolder(client);
+    conn.syncMonitor();
+    await Promise.resolve();
+
+    expect(raw).not.toHaveBeenCalled();
+  });
+
+  it('drops a raw MONITOR + the network refused, and says so', async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.trackDmPeer('pal');
+    conn.raw('MONITOR + scripted');
+    await Promise.resolve();
+    conn.client.emit('raw', {
+      from_server: true,
+      line: ':irc.example.test 734 nick 2 scripted :Monitor list is full',
+    });
+    expect(conn.publish).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'MONITOR limit (2) reached; not watching scripted.' }),
+    );
+    raw.mockClear();
+
+    conn.untrackDmPeer('pal'); // frees the slot scripted was refused at
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR - pal']);
+  });
+
+  it("brings a connect command's MONITOR watch back when seeding a re-attach", async () => {
+    const { conn, raw } = makeConn();
+    conn.network.connect_commands = 'MODE nick +i\nMONITOR + scripted';
+    conn.restoring = true;
+    conn.client.network.options.MONITOR = '100';
+
+    conn.client.emit('server options', {});
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR C', 'MONITOR + scripted', 'MONITOR S']);
+  });
+
+  it('marks ISUPPORT complete when the MOTD ends the registration burst', () => {
+    const { conn } = makeConn();
+    expect(conn.isupportComplete).toBe(false);
+    conn.client.emit('motd', { error: 'MOTD File is missing' });
+    expect(conn.isupportComplete).toBe(true);
+  });
+
+  it("seeds bouncer clients' nicks after Lurker's own once ISUPPORT confirms MONITOR", async () => {
+    const { conn, raw } = makeConn();
+    conn.trackDmPeer('dmpal');
+    conn.monitor.addHolder(holderOf('clientpal'));
+    conn.client.network.options.MONITOR = '100';
+
+    conn.client.emit('server options', {});
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR + dmpal,clientpal', 'MONITOR S']);
+  });
+
+  it('clears the list the last app process left before seeding a re-attach', async () => {
+    const { conn, raw } = makeConn();
+    conn.trackDmPeer('dmpal');
+    conn.restoring = true;
+    conn.client.network.options.MONITOR = '100';
+
+    conn.client.emit('server options', {});
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR C', 'MONITOR + dmpal', 'MONITOR S']);
   });
 });
 

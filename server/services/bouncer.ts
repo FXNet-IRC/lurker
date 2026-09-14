@@ -77,6 +77,7 @@ import {
 } from '../utils/bouncerCert.js';
 import { isChannelTarget } from '../../shared/channels.js';
 import { ClientLineFilter, restrictTags } from './bouncerClientFilter.js';
+import type { MonitorHolder } from './monitorList.js';
 
 const SERVER_NAME = 'lurker.bouncer';
 
@@ -124,8 +125,8 @@ const SUPPORTED_CAPS = [
 // promise come from the network (soju's passthroughDownstreamCaps). Without the
 // cap, the client filter keeps those lines away from the client.
 // userhost-in-names is ZNC's addition; soju doesn't offer it. Not offered yet:
-// extended-monitor (a client's MONITOR is relayed raw, into Lurker's own list)
-// and labeled-response (needs per-request reply routing, #493).
+// extended-monitor (its AWAY/ACCOUNT/CHGHOST lines for a monitored nick would have
+// to reach only the clients watching it) and labeled-response (reply routing, #493).
 const PASSTHROUGH_CAPS = [
   'away-notify',
   'account-notify',
@@ -424,6 +425,21 @@ export function filterRelayLine(line: string): string | null {
   return line;
 }
 
+// The `@tags :prefix ` a server line starts with, either part optional, so the
+// rest of a relayed line can be rewritten.
+function lineHead(line: string): string {
+  let head = '';
+  let rest = line;
+  for (const sigil of ['@', ':']) {
+    if (!rest.startsWith(sigil)) continue;
+    const sp = rest.indexOf(' ');
+    if (sp === -1) return head;
+    head += rest.slice(0, sp + 1);
+    rest = rest.slice(sp + 1);
+  }
+  return head;
+}
+
 // Default IRC prefix ladder, used when the network's ISUPPORT PREFIX isn't
 // available (attached while upstream is still registering).
 const DEFAULT_PREFIXES: Array<{ mode: string; symbol: string }> = [
@@ -628,8 +644,12 @@ export function attachedSessionCount(userId?: number, networkId?: number): numbe
 // Session
 // ---------------------------------------------------------------------------
 
-class BouncerSession {
+class BouncerSession implements MonitorHolder {
   readonly caps = new Set<string>();
+  // This client's MONITOR list: folded nick → the nick as the client sent it.
+  // The network has one list, which merges this with Lurker's nicks and other
+  // clients' lists (monitorList.ts). soju keeps a list per client the same way.
+  private readonly monitored = new Map<string, string>();
   // What the client may request right now: SUPPORTED_CAPS, plus whichever
   // pass-through caps apply (see handleCap and updateSupportedCaps).
   private readonly availableCaps = new Set<string>(SUPPORTED_CAPS);
@@ -1303,6 +1323,11 @@ class BouncerSession {
       // reflect our OWN PRIVMSG/NOTICE back. dispatchIrcEvent already synthesizes
       // the self-echo, so drop the reflected copy to avoid a duplicate line.
       if (this.isReflectedSelfLine(event.line)) return;
+      const monitorReplies = this.monitorRelay(event.line);
+      if (monitorReplies) {
+        for (const line of monitorReplies) this.write(line, new Date());
+        return;
+      }
       const out = filterRelayLine(event.line);
       if (out) this.write(out, new Date());
     };
@@ -1919,12 +1944,139 @@ class BouncerSession {
         else ircManager.clearAwayAll(this.userId);
         return;
       }
+      case 'MONITOR':
+        this.handleMonitor(conn, msg);
+        return;
       default:
         // Everything else (MODE, TOPIC, WHOIS, WHO, NAMES, LIST, KICK, INVITE,
         // NICK, …) forwards verbatim; replies come back via the raw relay.
         this.relayRaw(conn, msg);
         return;
     }
+  }
+
+  // --- MONITOR ---------------------------------------------------------------
+
+  // A client's MONITOR changes its own list, not the network's, which Lurker and
+  // every attached client share. L and S answer from the client's list. This is
+  // soju's downstream MONITOR handler.
+  private handleMonitor(conn: IrcConnection, msg: ParsedClientLine): void {
+    const sub = (msg.params[0] || '').toUpperCase();
+    if (!sub) {
+      this.numeric('461', 'MONITOR :Not enough parameters');
+      return;
+    }
+    // A network without MONITOR has no such command, as in soju. That's only
+    // known once its registration burst is over, since the 005 naming MONITOR
+    // comes after the 001 that marks it connected. Until then the list is kept
+    // for the seed.
+    if (conn.state === 'connected' && conn.isupportComplete && !conn.useMonitor) {
+      this.numeric('421', 'MONITOR :Unknown command');
+      return;
+    }
+    const nick = this.currentNick() || this.clientNick || '*';
+    switch (sub) {
+      case '+': {
+        const targets = (msg.params[1] || '').split(',').filter(Boolean);
+        const cap = maxMonitorPerClient();
+        const overCap: string[] = [];
+        for (const target of targets) {
+          const key = target.toLowerCase();
+          if (this.monitored.has(key)) continue;
+          if (this.monitored.size >= cap) overCap.push(target);
+          else this.monitored.set(key, target);
+        }
+        if (overCap.length > 0) this.onMonitorDropped(overCap, cap);
+        conn.monitor.addHolder(this);
+        conn.syncMonitor();
+        // The network won't answer for a nick it already watched, so answer
+        // from its last word. One past the limit already got a 734.
+        let unanswered = false;
+        for (const target of targets) {
+          if (!this.monitored.has(target.toLowerCase())) continue;
+          const online = conn.monitor.status(target);
+          if (online === true) this.write(`:${SERVER_NAME} 730 ${nick} :${target}`);
+          else if (online === false) this.write(`:${SERVER_NAME} 731 ${nick} :${target}`);
+          else if (online === null) unanswered = true;
+        }
+        // A network needn't answer a MONITOR + for a nick it already lists, such
+        // as one a connect command added. So ask about any nick still without
+        // an answer, as Lurker's own adds do (#302).
+        if (unanswered) conn.monitor.requestStatus();
+        return;
+      }
+      case '-':
+        for (const target of (msg.params[1] || '').split(',')) {
+          this.monitored.delete(target.toLowerCase());
+        }
+        conn.syncMonitor();
+        return;
+      case 'C':
+        this.monitored.clear();
+        conn.syncMonitor();
+        return;
+      case 'L':
+        // One nick per line: halloy reads a 732 as a single nick.
+        for (const target of this.monitored.values()) {
+          this.write(`:${SERVER_NAME} 732 ${nick} :${target}`);
+        }
+        this.write(`:${SERVER_NAME} 733 ${nick} :End of MONITOR list`);
+        return;
+      case 'S':
+        // A nick the network hasn't answered for counts as offline, as in soju.
+        for (const target of this.monitored.values()) {
+          const code = conn.monitor.status(target) === true ? '730' : '731';
+          this.write(`:${SERVER_NAME} ${code} ${nick} :${target}`);
+        }
+        return;
+      default:
+        return;
+    }
+  }
+
+  monitorTargets(): Iterable<string> {
+    return this.monitored.values();
+  }
+
+  // Nicks that didn't fit, under the network's limit or maxMonitorPerClient:
+  // the client's MONITOR + failed for them.
+  onMonitorDropped(nicks: string[], limit: number): void {
+    const nick = this.currentNick() || this.clientNick || '*';
+    for (const target of nicks) {
+      this.monitored.delete(target.toLowerCase());
+      this.write(`:${SERVER_NAME} 734 ${nick} ${limit} ${target} :Monitor list is full`);
+    }
+  }
+
+  // The network's MONITOR replies, cut down to this client's nicks, one nick
+  // per line as soju sends them. null for any other line. A 732/733 answers a
+  // MONITOR L that no client sent upstream, so it's dropped.
+  private monitorRelay(line: string): string[] | null {
+    if (!/(^| )73[0-4] /.test(line)) return null;
+    const msg = parseClientLine(line);
+    if (!msg) return null;
+    const { command, params } = msg;
+    if (command === '732' || command === '733') return [];
+    if (command !== '730' && command !== '731' && command !== '734') return null;
+    const head = lineHead(line);
+    const out: string[] = [];
+    if (command === '734') {
+      // The network refused these nicks, so the client isn't watching them.
+      const [nick = '*', limit = '', targets = '', text = 'Monitor list is full'] = params;
+      for (const target of targets.split(',')) {
+        if (!this.monitored.delete(target.toLowerCase())) continue;
+        out.push(`${head}734 ${nick} ${limit} ${target} :${text}`);
+      }
+      return out;
+    }
+    const [nick = '*', targets = ''] = params;
+    for (const target of targets.split(',')) {
+      const name = target.split('!')[0];
+      if (name && this.monitored.has(name.toLowerCase())) {
+        out.push(`${head}${command} ${nick} :${target}`);
+      }
+    }
+    return out;
   }
 
   // Forward a parsed client line to the upstream, re-attaching its client-only
@@ -2120,6 +2272,9 @@ class BouncerSession {
     }
     this.onRawUpstream = null;
     this.onUpstreamCaps = null;
+    // Take this client's nicks off the network's list, except ones someone else
+    // still watches.
+    if (this.conn?.monitor.removeHolder(this)) this.conn.syncMonitor();
     sessions.delete(this);
     if (this.registered && this.isControl) {
       systemLog.log({
@@ -2267,6 +2422,15 @@ function playbackLimit(): number {
 export function maxTotalPlaybackLines(): number {
   const n = Number(process.env.LURKER_BOUNCER_MAX_PLAYBACK_TOTAL);
   if (!Number.isFinite(n) || n <= 0) return 10000;
+  return Math.floor(n);
+}
+
+// Ceiling on one client's MONITOR list, as soju has. While the network is up
+// its own limit trims the list sooner; this bounds it while the network is down
+// and the list waits for the seed.
+export function maxMonitorPerClient(): number {
+  const n = Number(process.env.LURKER_BOUNCER_MAX_MONITOR);
+  if (!Number.isFinite(n) || n <= 0) return 1000;
   return Math.floor(n);
 }
 
