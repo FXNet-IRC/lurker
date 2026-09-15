@@ -499,7 +499,7 @@ When set, the env var takes precedence and the file is ignored.
 
 ### Outbound contact info (User-Agent)
 
-When Lurker talks to external services (image hosts, link previews, etc.) and replies to CTCP VERSION on IRC, it identifies itself with a User-Agent string. Set `USER_AGENT_CONTACT` to a `mailto:` or URL so the operators of those services can reach _you_ if your instance misbehaves:
+When Lurker talks to external services (image hosts, link previews, etc.), it identifies itself with a User-Agent string. Set `USER_AGENT_CONTACT` to a `mailto:` or URL so the operators of those services can reach _you_ if your instance misbehaves:
 
 ```yaml
 environment:

@@ -1169,7 +1169,8 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
   // (project URL), ${time} (server time), ${clientinfo} (the types still
   // answered), ${nick} (your nick). Defaults reproduce the standard replies.
   // PING isn't templated — it only echoes the asker's token — but the master
-  // switch silences it too.
+  // switch silences it too. While an IRC client is attached through the bouncer,
+  // it answers each type whose setting is unchanged (#932, ctcp.ts).
   {
     key: 'ctcp.replies',
     label: 'Answer CTCP queries',
@@ -1180,8 +1181,10 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     description:
       'Master switch for replying to CTCP queries from other users (VERSION, ' +
       'TIME, SOURCE, CLIENTINFO, PING). Turn off to publish nothing — Lurker ' +
-      'stays completely silent to CTCP, like a client with CTCP disabled. The ' +
-      'per-type reply templates below apply only while this is on.',
+      'stays completely silent to CTCP, like a client with CTCP disabled, and ' +
+      'IRC clients attached through the bouncer are not sent the queries. The ' +
+      'per-type reply templates below apply only while this is on. While an IRC ' +
+      'client is attached, it answers each type whose reply you have not changed.',
   },
   {
     key: 'ctcp.msgbuffer',
@@ -1210,7 +1213,9 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     description:
       'Reply sent for a CTCP VERSION query. Placeholders: ${name}, ${version}, ' +
       '${source}, ${time}, ${clientinfo}, ${nick}. Leave EMPTY to not answer ' +
-      'VERSION at all — disclosing your exact client/version aids fingerprinting.',
+      'VERSION at all — disclosing your exact client/version aids fingerprinting. ' +
+      'While this is unchanged and an IRC client is attached through the bouncer, ' +
+      'that client answers instead, with "via Lurker <version>" added.',
   },
   {
     key: 'ctcp.time',

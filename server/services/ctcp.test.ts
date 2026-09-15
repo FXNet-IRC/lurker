@@ -5,13 +5,19 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildCtcpReply,
+  CTCP_ANSWER_SETTINGS,
   CTCP_DEFAULT_CONFIG,
+  ctcpAnsweredBySettings,
+  ctcpInText,
   type CtcpReplyConfig,
+  ctcpVersionVia,
   enabledCtcpTypes,
   expandCtcpTemplate,
+  formatCtcpForwardedLine,
   formatCtcpReplyLine,
   formatCtcpRequestLine,
   formatLatency,
+  isAnswerableCtcp,
   parseCtcp,
   pingReplyLatencyMs,
 } from './ctcp.js';
@@ -208,5 +214,96 @@ describe('formatCtcpRequestLine', () => {
     expect(formatCtcpRequestLine('bob', 'finger', null)).toBe(
       'bob requested CTCP FINGER (no reply)',
     );
+  });
+});
+
+describe('formatCtcpForwardedLine', () => {
+  it('says the probe went to the attached IRC client', () => {
+    expect(formatCtcpForwardedLine('bob', 'version')).toBe(
+      'bob requested CTCP VERSION (forwarded to your IRC client)',
+    );
+  });
+});
+
+// Who answers a request, with IRC clients attached through the bouncer (#932).
+const A = String.fromCharCode(1);
+const TYPES = ['VERSION', 'PING', 'TIME', 'SOURCE', 'CLIENTINFO'];
+
+describe('isAnswerableCtcp', () => {
+  it('is exactly the types buildCtcpReply answers by default', () => {
+    const types = [...TYPES, 'ACTION', 'DCC', 'USERINFO', 'FINGER', 'CONSTRUCTOR'];
+    expect(types.filter((type) => isAnswerableCtcp(type))).toEqual(
+      types.filter((type) => buildCtcpReply(type, '1', cfg(), VARS) !== null),
+    );
+  });
+
+  it('reads the type in any case', () => {
+    expect(isAnswerableCtcp('version')).toBe(true);
+    expect(isAnswerableCtcp('Ping')).toBe(true);
+  });
+});
+
+describe('ctcpAnsweredBySettings', () => {
+  it('keeps every type Lurker’s once replies are turned off', () => {
+    const changed = new Set(['ctcp.replies']);
+    expect(TYPES.filter((type) => !ctcpAnsweredBySettings(type, changed))).toEqual([]);
+  });
+
+  it('keeps only the type whose reply changed', () => {
+    const changed = new Set(['ctcp.version']);
+    expect(ctcpAnsweredBySettings('version', changed)).toBe(true);
+    expect(ctcpAnsweredBySettings('TIME', changed)).toBe(false);
+    expect(ctcpAnsweredBySettings('PING', changed)).toBe(false);
+  });
+
+  it('leaves every type to the clients with nothing changed', () => {
+    expect(TYPES.filter((type) => ctcpAnsweredBySettings(type, new Set()))).toEqual([]);
+    // Where the notices go doesn't decide who answers.
+    expect(ctcpAnsweredBySettings('VERSION', new Set(['ctcp.msgbuffer']))).toBe(false);
+  });
+
+  it('reads the master switch and every reply template', () => {
+    expect([...CTCP_ANSWER_SETTINGS].toSorted()).toEqual([
+      'ctcp.clientinfo',
+      'ctcp.replies',
+      'ctcp.source',
+      'ctcp.time',
+      'ctcp.version',
+    ]);
+  });
+});
+
+describe('ctcpInText', () => {
+  it('reads a request framed the way irc-framework frames one', () => {
+    expect(ctcpInText(`${A}VERSION${A}`)).toEqual({ type: 'VERSION', args: '' });
+    expect(ctcpInText(`${A}ping 123${A}`)).toEqual({ type: 'PING', args: '123' });
+  });
+
+  it('is null for plain text, or a CTCP missing either end', () => {
+    expect(ctcpInText('VERSION')).toBeNull();
+    expect(ctcpInText(`${A}VERSION`)).toBeNull();
+    expect(ctcpInText(`VERSION${A}`)).toBeNull();
+  });
+});
+
+describe('ctcpVersionVia', () => {
+  // ZNC's ClientTest.cpp OnUserCTCPReplyMessage: a client's "VERSION 123" goes
+  // out as "VERSION 123 via ZNC <tag>".
+  it('adds the bouncer to a VERSION reply, as ZNC does', () => {
+    expect(ctcpVersionVia(`${A}VERSION 123${A}`, 'Lurker 9.9.9')).toBe(
+      `${A}VERSION 123 via Lurker 9.9.9${A}`,
+    );
+  });
+
+  it('frames a reply missing its closing delimiter, and reads the type in any case', () => {
+    expect(ctcpVersionVia(`${A}version halloy 1`, 'Lurker 9')).toBe(
+      `${A}version halloy 1 via Lurker 9${A}`,
+    );
+  });
+
+  it('leaves any other reply, and plain text, as they were', () => {
+    for (const text of [`${A}PING 123${A}`, `${A}VERSIONS x${A}`, 'VERSION 123', A]) {
+      expect(ctcpVersionVia(text, 'Lurker 9')).toBe(text);
+    }
   });
 });

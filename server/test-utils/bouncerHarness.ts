@@ -95,6 +95,9 @@ export class FakeUpstream {
   // IrcConnection.replyOwner: who the line being relayed is for. Null sends it
   // to every client, as a line no query asked for; set it to model a reply.
   replyOwner: import('../services/replyRouter.js').ReplyOwner | null = null;
+  // IrcConnection.ctcpAnswerer: who answers the CTCP request being relayed. Null
+  // relays the line like any other; 'lurker' or 'nobody' keeps it from clients.
+  ctcpAnswerer: import('../services/ctcp.js').CtcpAnswerer | null = null;
   readonly replies = {
     dropClient: (_client: import('../services/replyRouter.js').ReplyClient): void => {},
   };
