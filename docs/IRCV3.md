@@ -75,9 +75,9 @@ only works if timestamps are trustworthy.
   server-assigned ID and authoritative timestamp, which is what keeps them ordered
   identically across every device you're signed in on.
   <br>`server/services/ircConnection.ts:1533`
-- **`msgid`** — every message gets the server's stable identifier, stored and
-  indexed. An IRC client attached to Lurker gets the same identifier for a message
-  from history as it got live. It's also groundwork for reactions and threaded
+- **`msgid`** — on networks that send one, each message's server-assigned ID is
+  stored and indexed. Messages on networks that don't send them, and messages from
+  before Lurker kept them, have none. It's groundwork for reactions and threaded
   replies, which are anchored on a message ID.
   <br>`server/services/ircConnection.ts:1528`
 
@@ -178,8 +178,10 @@ Implementation notes worth knowing if you're writing against it:
   `CHATHISTORY` ISUPPORT token. Over-limit requests are **rejected, not silently
   truncated** — matching soju, whose clients read the token and stay under it.
   History lines carry the network's own `msgid`, the one your client saw on the line
-  live, or none when the network didn't send one. Message references are `timestamp`
-  only, as with soju.
+  live. A line has none if Lurker never stored one for it (the network didn't send
+  one, or the message predates Lurker keeping them), or if it's a decrypted E2E
+  message, whose ID belongs to the encrypted line. Message references are
+  `timestamp` only, as with soju.
   <br>`server/services/bouncer.ts:146`, `:520`
 - A client that negotiates `draft/chathistory` gets no playback on attach, as with
   soju. It fetches the history it wants itself, so it doesn't see the same lines twice.
