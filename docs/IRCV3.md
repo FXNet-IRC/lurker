@@ -233,6 +233,14 @@ Implementation notes worth knowing if you're writing against it:
     `LIST`, `NAMES` and list-mode queries then get their end numeric, marked
     `Command aborted`; the others get nothing.
     <br>`server/services/replyRouter.ts`
+- A CTCP request such as `VERSION` gets one answer. While an IRC client is attached, it
+  gets the request and Lurker stays quiet, as with ZNC, and its `VERSION` reply goes out
+  with `via Lurker <version>` added. If that client doesn't answer (goguma and gamja
+  never do), nobody does. With no client attached, Lurker answers. Once you change a CTCP
+  reply in settings, that type stays Lurker's and no client sees the request: Lurker sends
+  your reply, or nothing if it's empty or CTCP replies are off. A connection that sent
+  `AWAY *` doesn't count as attached.
+  <br>`server/services/ctcp.ts`, `server/services/ircConnection.ts`
 
 ---
 

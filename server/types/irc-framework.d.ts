@@ -225,6 +225,10 @@ declare module 'irc-framework' {
     params: string[];
     tags?: Record<string, string>;
     prefix?: string;
+    /** The prefix's parts, which the parser splits out (irclineparser.js). */
+    nick?: string;
+    ident?: string;
+    hostname?: string;
   };
 
   // Default export in the package is an object with a `Client` property.

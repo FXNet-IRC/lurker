@@ -45,7 +45,7 @@ import type { RestoreSlot } from './restoreGate.js';
 import { envInt as reconnectEnvInt } from '../utils/envInt.js';
 import { decideStamp } from './insertDecisions.js';
 import * as systemLog from './systemLog.js';
-import { effectiveSetting, effectiveSettings } from './settingsService.js';
+import { changedSettings, effectiveSetting, effectiveSettings } from './settingsService.js';
 import { APP_NAME, APP_VERSION } from '../utils/userAgent.js';
 import { findUserById } from '../db/users.js';
 import { isNodeMode } from '../utils/edition.js';
@@ -76,14 +76,21 @@ import { e2eDbg } from './e2e/debug.js';
 import { RateLimiter } from './e2e/rateLimiter.js';
 import {
   buildCtcpReply,
+  CTCP_ANSWER_SETTINGS,
   CTCP_SOURCE,
+  ctcpAnsweredBySettings,
+  ctcpInText,
   enabledCtcpTypes,
+  formatCtcpForwardedLine,
   formatCtcpReplyLine,
   formatCtcpRequestLine,
   formatCtcpTime,
+  isAnswerableCtcp,
   parseCtcp,
+  type CtcpAnswerer,
   type CtcpReplyConfig,
 } from './ctcp.js';
+import { attachedIrcClients } from './attachedIrcClients.js';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -690,6 +697,17 @@ export class IrcConnection {
   // user typed renders, Lurker's own and a client's don't (#931). Null outside
   // a line's handlers.
   replyOwner: ReplyOwner | null;
+  // Who answers the CTCP request being handled, for a type Lurker can answer
+  // (ctcpAnswererFor, #932). Set in the raw listener, before any bouncer
+  // client's relay reads it, and cleared with replyOwner. Null for any other
+  // line and outside a line's handlers.
+  ctcpAnswerer: CtcpAnswerer | null;
+  // The raw listener's decisions for CTCP requests inside a batch, in arrival
+  // order per batch reference. irc-framework runs a batch's lines only when it
+  // ends, after ctcpAnswerer is cleared, so each request's handler takes its
+  // line's decision from here instead of deciding, and spending the peer's
+  // allowance, a second time. Capped, and cleared with the socket.
+  batchedCtcpAnswerers: Map<string, CtcpAnswerer[]>;
   // In-flight inbound `draft/multiline` batches, keyed by batch reference. Each
   // entry holds the first fragment's event envelope plus the text accumulated
   // so far; flushed as one reassembled message on 'batch end draft/multiline'
@@ -938,6 +956,8 @@ export class IrcConnection {
       prefixModes: () => this.prefixModes(),
     });
     this.replyOwner = null;
+    this.ctcpAnswerer = null;
+    this.batchedCtcpAnswerers = new Map();
     this.multilineBatches = new Map();
     this.multilineBatchTags = new Map();
     this.lineArrivedAt = null;
@@ -1199,6 +1219,7 @@ export class IrcConnection {
       queueMicrotask(() => {
         this.lineArrivedAt = null;
         this.replyOwner = null;
+        this.ctcpAnswerer = null;
       });
       // A ban-classified ERROR is only believed if it's the link's LAST line
       // (#651). Every server line passes through here, and for the ban line
@@ -1222,6 +1243,26 @@ export class IrcConnection {
         msg?.params ?? [],
         msg?.prefix?.split('!')[0],
       );
+      // Who answers a CTCP request, before any bouncer client's relay passes it
+      // on (see ctcpAnswerer).
+      this.ctcpAnswerer = rawCommand === 'PRIVMSG' && msg ? this.ctcpAnswererForLine(msg) : null;
+      // A batch's lines reach their handlers only when it ends, after the
+      // microtask, so a batched request's decision waits for its handler.
+      const batchRef = (msg?.tags as Record<string, string> | undefined)?.batch;
+      if (this.ctcpAnswerer && batchRef) {
+        let queue = this.batchedCtcpAnswerers.get(batchRef);
+        if (!queue) {
+          // Past the cap the oldest batch goes, most likely one the server never
+          // ended. Its requests are decided again if they ever run.
+          if (this.batchedCtcpAnswerers.size >= 100) {
+            const oldest = this.batchedCtcpAnswerers.keys().next().value;
+            if (oldest !== undefined) this.batchedCtcpAnswerers.delete(oldest);
+          }
+          queue = [];
+          this.batchedCtcpAnswerers.set(batchRef, queue);
+        }
+        queue.push(this.ctcpAnswerer);
+      }
       // ERR_MONLISTFULL: the network refused these nicks, so they aren't on its
       // list. irc-framework's 'irc error' for it doesn't say which. The line
       // stays out of the server buffer, since it can name a bouncer client's
@@ -1600,6 +1641,7 @@ export class IrcConnection {
       this.replies.reset();
       this.multilineBatches.clear();
       this.multilineBatchTags.clear();
+      this.batchedCtcpAnswerers.clear();
       // Echo-correlation state is per-socket: no echo can arrive for a line
       // sent on the dead socket.
       this.sentCiphertext.length = 0;
@@ -5321,7 +5363,18 @@ export class IrcConnection {
     // Parse + validate BEFORE the rate-limit check so a malformed/empty CTCP
     // can't burn a peer's budget and suppress its legitimate probes.
     if (!type) return;
-    if (!this.ctcpLimiter.allowIncoming(this.ctcpPeerKey(event))) return;
+    // Who answers a type Lurker can answer was decided in the raw listener,
+    // before any bouncer client's relay passed the request on. A batched
+    // request's decision waited for irc-framework to run its line at the
+    // batch's end. Only a request that came through no raw line is decided
+    // here, so the peer's allowance goes once.
+    const answerer = isAnswerableCtcp(type)
+      ? (this.ctcpAnswerer ??
+        this.takeBatchedCtcpAnswerer(event) ??
+        this.ctcpAnswererFor(type, event))
+      : null;
+    if (answerer === 'nobody') return;
+    if (answerer === null && !this.ctcpLimiter.allowIncoming(this.ctcpPeerKey(event))) return;
     // DCC rides CTCP but is never an auto-reply type. When DCC is enabled for
     // this user, hand the offer to the download manager instead of the generic
     // probe path; when disabled, fall through so it surfaces as an ordinary
@@ -5347,10 +5400,57 @@ export class IrcConnection {
       }
       return;
     }
+    if (answerer === 'clients') {
+      this.routeCtcpStatus(event, formatCtcpForwardedLine(nick, type));
+      return;
+    }
     const config = this.ctcpReplyConfig();
     const reply = buildCtcpReply(type, args, config, this.ctcpTemplateVars(config));
     if (reply !== null) this.client.ctcpResponse(nick, type, reply);
     this.routeCtcpStatus(event, formatCtcpRequestLine(nick, type, reply));
+  }
+
+  // Who answers a server line's CTCP request, for the raw listener: null for a
+  // line that isn't a request Lurker could answer, and for our own.
+  private ctcpAnswererForLine(msg: {
+    nick?: string;
+    ident?: string;
+    hostname?: string;
+    params?: string[];
+  }): CtcpAnswerer | null {
+    const ctcp = ctcpInText(String(msg.params?.[1] ?? ''));
+    if (!ctcp || !msg.nick || this.isSelfNick(msg.nick)) return null;
+    return this.ctcpAnswererFor(ctcp.type, msg);
+  }
+
+  // Who answers a CTCP request of `type` from this peer (#932), or null for a
+  // type Lurker has no answer for. One side answers, as in ZNC
+  // (IRCSock.cpp:550):
+  // - nobody, once the peer is over its limit;
+  // - Lurker, once the user changed that type's reply or turned replies off;
+  // - the IRC clients attached through the bouncer, while one counts as the
+  //   user on this network;
+  // - Lurker, otherwise.
+  // Each call takes one of the peer's allowance.
+  private ctcpAnswererFor(type: string, peer: Record<string, unknown>): CtcpAnswerer | null {
+    if (!isAnswerableCtcp(type)) return null;
+    if (!this.ctcpLimiter.allowIncoming(this.ctcpPeerKey(peer))) return 'nobody';
+    const userId = this.network.user_id;
+    if (ctcpAnsweredBySettings(type, changedSettings(userId, CTCP_ANSWER_SETTINGS))) {
+      return 'lurker';
+    }
+    return attachedIrcClients(userId, this.network.id) > 0 ? 'clients' : 'lurker';
+  }
+
+  // The raw listener's decision for a CTCP request inside a batch, which
+  // irc-framework runs only when the batch ends (batchedCtcpAnswerers).
+  private takeBatchedCtcpAnswerer(event: Record<string, unknown>): CtcpAnswerer | null {
+    const ref = (event.tags as Record<string, string> | undefined)?.batch;
+    const queue = ref ? this.batchedCtcpAnswerers.get(ref) : undefined;
+    if (!ref || !queue) return null;
+    const answerer = queue.shift() ?? null;
+    if (queue.length === 0) this.batchedCtcpAnswerers.delete(ref);
+    return answerer;
   }
 
   // Arm-on-trigger (#270): when the user sends an `XDCC SEND #n` to a bot (a DM

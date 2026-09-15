@@ -78,6 +78,9 @@ import { resolveBuffer } from '../db/bufferResolve.js';
 import type { AwayChange, ReadMarkerMove } from './ircManager.js';
 import { broadcastReadState } from './wsHub.js';
 import { evaluatePresence, setPresenceSource } from './presence.js';
+import { setAttachedIrcClientCounter } from './attachedIrcClients.js';
+import { changedSettings } from './settingsService.js';
+import { CTCP_ANSWER_SETTINGS, ctcpAnsweredBySettings, ctcpVersionVia } from './ctcp.js';
 import { getUserAwayState } from '../db/userAwayState.js';
 import { splitSay, splitAction } from './messageSplit.js';
 import { e2eManager } from './e2e/manager.js';
@@ -1396,6 +1399,9 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       // raw listener, which runs before this one.
       const owner = conn.replyOwner;
       if (owner != null && owner !== 'unasked' && owner !== this) return;
+      // One side answers a CTCP request (IrcConnection.ctcpAnswerer, #932). A
+      // request Lurker answers, or nobody does, never reaches a client.
+      if (conn.ctcpAnswerer === 'lurker' || conn.ctcpAnswerer === 'nobody') return;
       // Some upstreams (Ergo always-on, a chained bouncer, echo-message relays)
       // reflect our OWN PRIVMSG/NOTICE back. dispatchIrcEvent already synthesizes
       // the self-echo, so drop the reflected copy to avoid a duplicate line.
@@ -2345,6 +2351,19 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     conn.raw(rebuildLine(forward), this);
   }
 
+  // A client's CTCP on its way to the network. Its VERSION reply gets " via
+  // Lurker <version>", as ZNC adds itself (Client.cpp:1378). Not once the user
+  // changed the VERSION reply or turned replies off: the request never reached
+  // the client then (IrcConnection.ctcpAnswererFor), and the suffix would give
+  // away the version they chose not to send.
+  private outgoingCtcp(command: string, text: string): string {
+    if (command !== 'NOTICE') return text;
+    const withVia = ctcpVersionVia(text, `${APP_NAME} ${APP_VERSION}`);
+    if (withVia === text) return text;
+    const changed = changedSettings(this.userId, CTCP_ANSWER_SETTINGS);
+    return ctcpAnsweredBySettings('VERSION', changed) ? text : withVia;
+  }
+
   // The network's own lines answering this client's query, kept from an earlier
   // reply: a MODE #chan, answered as soju and ZNC answer it. Their tags were
   // another delivery's, so none survive.
@@ -2391,10 +2410,11 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     for (const target of targets) {
       const isAction = text.startsWith('\u0001ACTION ') || text.startsWith('\u0001ACTION\u0001');
       if (text.startsWith('\u0001') && !isAction) {
-        // Non-ACTION CTCP (VERSION, PING, replies…): forward on the wire
-        // untouched; these aren't conversation and don't persist. Spread msg so
-        // any client-only tags ride along (gated on upstream message-tags).
-        this.relayRaw(conn, { ...msg, params: [target, text] });
+        // Non-ACTION CTCP (VERSION, PING, replies…): forward on the wire; these
+        // aren't conversation and don't persist. A VERSION reply says Lurker
+        // carried it (outgoingCtcp). Spread msg so any client-only tags ride
+        // along (gated on upstream message-tags).
+        this.relayRaw(conn, { ...msg, params: [target, this.outgoingCtcp(msg.command, text)] });
         continue;
       }
       // /me actions and NOTICEs aren't encrypted yet, so ircManager refuses
@@ -2656,11 +2676,14 @@ function dispatchAway(change: AwayChange): void {
   }
 }
 
-// How many of a user's clients count as the user being here (presence.ts).
-function presentClientCount(userId: number): number {
+// How many of a user's clients count as the user being here: on any network,
+// for auto-away (presence.ts), or on one, which is then left its CTCP requests
+// (attachedIrcClients.ts).
+function presentClientCount(userId: number, networkId?: number): number {
   let n = 0;
   for (const session of sessions) {
-    if (session.userId === userId && session.countsAsPresent()) n += 1;
+    if (session.userId !== userId || !session.countsAsPresent()) continue;
+    if (networkId === undefined || session.networkId === networkId) n += 1;
   }
   return n;
 }
@@ -2988,8 +3011,10 @@ export async function startBouncer(
   ircManager.on('read-marker', onReadMarker);
   onAway = (change) => dispatchAway(change);
   ircManager.on('away', onAway);
-  // An attached client counts as the user being here, for auto-away.
+  // An attached client counts as the user being here, for auto-away, and is
+  // left the CTCP requests on its network.
   setPresenceSource('irc', presentClientCount);
+  setAttachedIrcClientCounter(presentClientCount);
   onUserDisposed = ({ userId }) => dropSessionsForUser(userId, 'Account removed');
   onUserSuspended = ({ userId }) => dropSessionsForUser(userId, 'Account paused');
   ircManager.on('user-disposed', onUserDisposed);
@@ -3026,6 +3051,7 @@ export function stopBouncer(): void {
     onAway = null;
   }
   setPresenceSource('irc', null);
+  setAttachedIrcClientCounter(null);
   if (onUserDisposed) {
     ircManager.off('user-disposed', onUserDisposed);
     onUserDisposed = null;
