@@ -274,7 +274,7 @@ describe('IrcConnection through the engine', () => {
     );
   }, 20000);
 
-  it('skips a msgid it already has during catch-up, and only then', async () => {
+  it('skips a msgid it already has, in catch-up and after', async () => {
     const conn = ircManager.getConnection(userId, network.id)!;
     expect(conn.state).toBe('connected');
     const feed = (msgid: string, text: string) =>
@@ -287,11 +287,11 @@ describe('IrcConnection through the engine', () => {
     feed('dup-1', 'seen twice in catch-up');
     feed('dup-1', 'seen twice in catch-up');
     expect(count('seen twice in catch-up')).toBe(1);
-    // Steady state: no lookup, a server never repeats a msgid anyway.
+    // Steady state too: a server can send a line twice with the same msgid.
     conn.catchingUp = false;
     feed('dup-2', 'steady state');
     feed('dup-2', 'steady state');
-    expect(count('steady state')).toBe(2);
+    expect(count('steady state')).toBe(1);
     // And catch-up never drops a line it has NOT seen.
     conn.catchingUp = true;
     feed('fresh-1', 'new in catch-up');

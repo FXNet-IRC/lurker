@@ -77,8 +77,9 @@ only works if timestamps are trustworthy.
   <br>`server/services/ircConnection.ts:1533`
 - **`msgid`** — on networks that send one, each message's server-assigned ID is
   stored and indexed. Messages on networks that don't send them, and messages from
-  before Lurker kept them, have none. It's groundwork for reactions and threaded
-  replies, which are anchored on a message ID.
+  before Lurker kept them, have none. A message the network sends twice under the
+  same ID, in the same channel or conversation, is stored once. It's groundwork for
+  reactions and threaded replies, which are anchored on a message ID.
   <br>`server/services/ircConnection.ts:1528`
 
 ### Multi-line messages stay one message

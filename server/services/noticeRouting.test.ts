@@ -79,11 +79,12 @@ function makeConn(): IrcConnection {
 }
 
 // Spy the persist + ephemeral seams on a fresh connection. publish returns the
-// enriched event (with the ignore verdict); the spy defaults to undefined, which
-// the mirror treats as "not ignored".
+// enriched event (with the ignore verdict); the spy returns a stored, not-ignored
+// event by default. An undefined return means nothing was stored, and the mirror
+// then stores nothing either.
 function harness() {
   const conn = makeConn();
-  const publish = vi.fn<(event: Record<string, unknown>) => unknown>();
+  const publish = vi.fn<(event: Record<string, unknown>) => unknown>(() => ({}));
   const publishEphemeral = vi.fn<(event: Record<string, unknown>) => unknown>();
   conn.publish = publish as unknown as typeof conn.publish;
   conn.publishEphemeral = publishEphemeral as unknown as typeof conn.publishEphemeral;
