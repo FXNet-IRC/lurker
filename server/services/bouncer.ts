@@ -563,10 +563,9 @@ function serverTimeMs(s: string): number {
 }
 
 // A CHATHISTORY selector: `*` (LATEST only) or `timestamp=<iso>`. We advertise
-// MSGREFTYPES=timestamp only — deliberately NOT msgid: our persisted history id
-// (messages.id) and the upstream's opaque msgid on live-relayed lines are
-// different namespaces, so honoring `msgid=` would break for a client paging
-// from a live-captured id. Timestamp works off any line's @time. (Matches soju.)
+// MSGREFTYPES=timestamp only, as soju does (its msgid support is a TODO). History
+// lines carry the network's msgid (networkMsgid), but not every message has one,
+// and resolving `msgid=` is #641. Timestamp works off any line's @time.
 type ChatBound = { star: true } | { iso: string };
 
 function isChannelName(target: string): boolean {
@@ -604,6 +603,17 @@ export function escapeTagValue(value: string): string {
     .replace(/ /g, '\\s')
     .replace(/\r/g, '\\r')
     .replace(/\n/g, '\\n');
+}
+
+// The msgid a line built from a stored message carries: the network's own
+// (#450), the one a client saw on that message live, or none. The chathistory
+// spec wants the msgid "as originally sent by the IRC server", and soju and ZNC
+// replay the network's or none. A Lurker id would be a second id for the same
+// message, which clients can't match. A decrypted E2E message gets none: its
+// msgid names the ciphertext line, which a client already got live under it.
+function networkMsgid(message: { msgid?: unknown; e2e?: unknown }): string | undefined {
+  if (message.e2e) return undefined;
+  return typeof message.msgid === 'string' && message.msgid !== '' ? message.msgid : undefined;
 }
 
 // Map an IrcConnection state to a bouncer-networks `state` attribute value.
@@ -1733,7 +1743,6 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.withBatch('chathistory', [target], (ref) => {
       const lines = this.playbackLines(rows, target, isChannelName(target), {
         batchRef: ref ?? undefined,
-        withMsgid: true,
       });
       for (const line of lines) this.write(line);
     });
@@ -1931,19 +1940,39 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   // Assemble the leading IRCv3 tag block for a replayed line, honoring the
   // client's negotiated caps. `batch` ties a line to an open BATCH; `time`
   // needs server-time; `msgid` needs message-tags.
-  private formatTags(opts: { time?: string; msgid?: number; batchRef?: string }): string {
+  private formatTags(opts: { time?: string; msgid?: string; batchRef?: string }): string {
     const tags: string[] = [];
     if (opts.batchRef) tags.push(`batch=${opts.batchRef}`);
     if (opts.time && this.caps.has('server-time')) tags.push(`time=${toIrcTime(opts.time)}`);
-    if (opts.msgid != null && this.caps.has('message-tags')) tags.push(`msgid=${opts.msgid}`);
+    if (opts.msgid && this.caps.has('message-tags')) {
+      tags.push(`msgid=${escapeTagValue(opts.msgid)}`);
+    }
     return tags.length > 0 ? `@${tags.join(';')} ` : '';
+  }
+
+  // A stored message as client lines, one per body line. As in the live
+  // multiline fallback (bouncerClientFilter.ts), blank lines are skipped and
+  // only the first line carries the msgid: halloy drops a later line that
+  // repeats an id as a duplicate.
+  private messageLines(
+    head: string,
+    bodies: string[],
+    tags: { time?: string; msgid?: string; batchRef?: string },
+  ): string[] {
+    const out: string[] = [];
+    for (const body of bodies) {
+      if (body === '') continue;
+      const block = this.formatTags(out.length === 0 ? tags : { ...tags, msgid: undefined });
+      out.push(`${block}${head} :${body}`);
+    }
+    return out;
   }
 
   private playbackLines(
     rows: MessageEvent[],
     bufferTarget: string,
     isChannel: boolean,
-    opts: { batchRef?: string; withMsgid?: boolean } = {},
+    opts: { batchRef?: string } = {},
   ): string[] {
     const out: string[] = [];
     const selfNick = this.currentNick() || this.clientNick || '*';
@@ -1980,14 +2009,13 @@ class BouncerSession implements MonitorHolder, ReplyClient {
         row.type === 'action'
           ? [`\u0001ACTION ${row.text.replace(/\n/g, ' ')}\u0001`]
           : row.text.split('\n');
-      for (const body of bodies) {
-        const tags = this.formatTags({
+      out.push(
+        ...this.messageLines(`:${prefix} ${cmd} ${target}`, bodies, {
           time: row.time,
-          msgid: opts.withMsgid ? (row.id as number) : undefined,
+          msgid: networkMsgid(row),
           batchRef: opts.batchRef,
-        });
-        out.push(`${tags}:${prefix} ${cmd} ${target} :${body}`);
-      }
+        }),
+      );
     }
     return out;
   }
@@ -2471,7 +2499,13 @@ class BouncerSession implements MonitorHolder, ReplyClient {
 
   // --- events from ircManager -------------------------------------------------
 
-  deliverSelfEcho(type: string, target: string, text: string, time: string | null): void {
+  deliverSelfEcho(
+    type: string,
+    target: string,
+    text: string,
+    time: string | null,
+    msgid?: string,
+  ): void {
     if (this.closed) return;
     this.prunePendingEcho();
     const key = echoKey(type, target, text);
@@ -2493,9 +2527,8 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // second command, so emit one client line per body line.
     const bodies =
       type === 'action' ? [`\u0001ACTION ${text.replace(/\n/g, ' ')}\u0001`] : text.split('\n');
-    for (const body of bodies) {
-      let line = `:${this.selfPrefix()} ${cmd} ${target} :${body}`;
-      if (this.caps.has('server-time') && time) line = `@time=${toIrcTime(time)} ${line}`;
+    const head = `:${this.selfPrefix()} ${cmd} ${target}`;
+    for (const line of this.messageLines(head, bodies, { time: time ?? undefined, msgid })) {
       this.write(line);
     }
   }
@@ -2730,7 +2763,10 @@ function dispatchIrcEvent(event: Record<string, unknown>): void {
   const text = typeof event.text === 'string' ? event.text : '';
   if (!text) return;
   const time = typeof event.time === 'string' ? event.time : null;
-  for (const session of set) session.deliverSelfEcho(type, target, text, time);
+  // The msgid the row took from the network's echo (echo-message), so the client
+  // has the id history will give it.
+  const msgid = networkMsgid(event);
+  for (const session of set) session.deliverSelfEcho(type, target, text, time, msgid);
 }
 
 /**
