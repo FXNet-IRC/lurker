@@ -828,11 +828,38 @@ export function hasMessageForTarget(networkId: number, target: string): boolean 
   return !!db.prepare('SELECT 1 FROM messages WHERE buffer_id = ? LIMIT 1').get(bufferId);
 }
 
-// Whether a row with this server-assigned msgid already exists on the network.
-// Used by the engine-mode catch-up window (ircConnection.catchingUp): a line the
-// previous process persisted but had not yet acked when it died is delivered
-// again to its successor, and the msgid is the only thing that says so. Index
-// seek on idx_messages_msgid.
+// Whether this message is already stored: the same msgid in the same buffer,
+// with the same kind, sender and text (IrcConnection.alreadyPersisted). A server
+// can send a message twice. The buffer, sender and text have to match too, so a
+// server that reuses a msgid for a different message loses nothing. A seek on
+// idx_messages_msgid: `+buffer_id` keeps the planner off the per-buffer index,
+// which would walk the buffer.
+const sameMessageStmt = db.prepare(
+  `SELECT 1 FROM messages
+   WHERE network_id = ? AND msgid = ?
+     AND +buffer_id = ? AND type = ? AND nick IS ? AND text IS ?
+   LIMIT 1`,
+);
+export function hasSameMessageWithMsgid(
+  networkId: number,
+  target: string,
+  msgid: string,
+  type: string,
+  nick: string | null,
+  text: string | null,
+): boolean {
+  if (!networkId || !target || !msgid) return false;
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return false;
+  return !!sameMessageStmt.get(networkId, msgid, bufferId, type, nick, text);
+}
+
+// Whether a msgid is stored anywhere on the network. The engine catch-up window
+// uses this, not the buffer-scoped match: the backlog handed to the next
+// process can hold, after a line the last process stored, a NICK that renamed
+// that line's DM buffer, or our own NICK, which routes a notice elsewhere. The
+// stored row is then no longer in the buffer its copy resolves to. A seek on
+// idx_messages_msgid.
 const hasMsgidStmt = db.prepare(
   'SELECT 1 FROM messages WHERE network_id = ? AND msgid = ? LIMIT 1',
 );
@@ -845,9 +872,11 @@ export function hasMessageWithMsgid(networkId: number, msgid: string): boolean {
 // messages (Libera, OFTC, ZNC…): the same target, sender, kind and text within
 // a short window of the same time. Only ever consulted in the catch-up window,
 // where a repeat means a re-delivery, not a user saying the same thing twice.
+// By buffer, not by name: the network's casemapping folds `#foo[bar]` and
+// `#foo{bar}` into one buffer, and each row keeps the spelling it arrived under.
 const hasLikeStmt = db.prepare(
   `SELECT 1 FROM messages
-   WHERE network_id = ? AND target = ? AND type = ? AND nick IS ? AND text IS ?
+   WHERE buffer_id = ? AND type = ? AND nick IS ? AND text IS ?
      AND time BETWEEN ? AND ? LIMIT 1`,
 );
 export function hasRecentMessageLike(
@@ -862,9 +891,11 @@ export function hasRecentMessageLike(
   if (!networkId || !target) return false;
   const t = Date.parse(time);
   if (!Number.isFinite(t)) return false;
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return false;
   const lo = new Date(t - toleranceMs).toISOString();
   const hi = new Date(t + toleranceMs).toISOString();
-  return !!hasLikeStmt.get(networkId, target, type, nick, text, lo, hi);
+  return !!hasLikeStmt.get(bufferId, type, nick, text, lo, hi);
 }
 
 // Whether a target has a real (non-notice) conversation — at least one PRIVMSG or

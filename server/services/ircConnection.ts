@@ -8,6 +8,7 @@ import {
   hasMessageForTarget,
   hasConversationForTarget,
   hasMessageWithMsgid,
+  hasSameMessageWithMsgid,
   hasRecentMessageLike,
 } from '../db/messages.js';
 import { renameBuffer as renameDmBuffer } from '../db/renameBuffer.js';
@@ -1052,9 +1053,9 @@ export class IrcConnection {
     // wanted, while the control events (state, channel-joined, own-nick) are
     // exactly what a re-attached process needs.
     if (this.restoring && this.shouldPersist(event)) return;
-    if (this.catchingUp && this.shouldPersist(event) && this.alreadyPersisted(event)) return;
     event = this.normalizeChannelTarget(event);
     const time = normalizeEventTime(event.time ?? this.lineArrivedAt?.getTime());
+    if (this.shouldPersist(event) && this.alreadyPersisted(event, time)) return;
     const enriched: EnrichedEvent = {
       ...event,
       userId: this.network.user_id,
@@ -2320,11 +2321,14 @@ export class IrcConnection {
       // duplicate doesn't double up search results. Skip ignored senders
       // (`fromIgnored`): the home copy is ignore-flagged and client-filtered, so
       // mirroring the raw text would bypass the ignore list (a harassment vector).
+      // Only a notice that was stored gets a mirror: a repeat of one already
+      // stored gets no second copy.
       if (
         isNotice &&
         !isServer &&
         target !== this.serverTarget() &&
-        !published?.fromIgnored &&
+        published &&
+        !published.fromIgnored &&
         isBufferClosed(this.network.user_id, this.network.id, target)
       ) {
         this.publish({
@@ -5028,25 +5032,28 @@ export class IrcConnection {
     return false;
   }
 
-  // Catch-up dedupe: has this line already been written by the process that
-  // was attached before us? By msgid where the network provides one; otherwise
-  // by the same target/kind/sender/text within a few seconds of the same time.
-  private alreadyPersisted(event: IrcEvent): boolean {
-    if (typeof event.msgid === 'string') {
-      return hasMessageWithMsgid(this.network.id, event.msgid);
-    }
+  // Whether this line is already stored.
+  // - By msgid, always. A server can send a message twice with the same msgid
+  //   and server-time: that's a match on msgid, buffer, kind, sender and text.
+  //   In the catch-up window the msgid counts anywhere on the network. The next
+  //   process after an engine hand-over is given lines the last one stored, and
+  //   a later line in that backlog can have moved the row: a NICK renames the
+  //   DM buffer, and our own NICK routes a notice elsewhere.
+  // - Without a msgid, only in the catch-up window: the same buffer, kind,
+  //   sender and text within a few seconds. Outside it that would drop real
+  //   lines, such as a pasted block of repeated lines stamped in the same
+  //   millisecond.
+  private alreadyPersisted(event: IrcEvent, time: string): boolean {
     const target = event.target as string;
     const type = event.type;
     if (!target || !type) return false;
-    const time = normalizeEventTime(event.time ?? this.lineArrivedAt?.getTime());
-    return hasRecentMessageLike(
-      this.network.id,
-      target,
-      type,
-      (event.nick as string | undefined) ?? null,
-      (event.text as string | undefined) ?? null,
-      time,
-    );
+    const nick = (event.nick as string | undefined) ?? null;
+    const text = (event.text as string | undefined) ?? null;
+    if (typeof event.msgid === 'string' && event.msgid !== '') {
+      if (this.catchingUp) return hasMessageWithMsgid(this.network.id, event.msgid);
+      return hasSameMessageWithMsgid(this.network.id, target, event.msgid, type, nick, text);
+    }
+    return this.catchingUp && hasRecentMessageLike(this.network.id, target, type, nick, text, time);
   }
 
   // Engine mode shutdown: leave the IRC socket in the engine for the next app
