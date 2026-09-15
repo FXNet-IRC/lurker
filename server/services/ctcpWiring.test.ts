@@ -479,6 +479,20 @@ describe('inbound CTCP request — IRC clients attached through the bouncer', ()
     expect(conn.batchedCtcpAnswerers.size).toBe(0);
   });
 
+  it('drops only the oldest batch once 100 are waiting', () => {
+    const { conn } = harness();
+    for (let i = 0; i <= 100; i++) {
+      conn.client.emit('raw', {
+        from_server: true,
+        line: `@batch=b${i} :bob!b${i}@h PRIVMSG alice :${A}VERSION${A}`,
+      });
+    }
+    expect(conn.batchedCtcpAnswerers.size).toBe(100);
+    expect(conn.batchedCtcpAnswerers.has('b0')).toBe(false);
+    expect(conn.batchedCtcpAnswerers.get('b1')).toEqual(['clients']);
+    expect(conn.batchedCtcpAnswerers.get('b100')).toEqual(['clients']);
+  });
+
   it('takes one of the peer’s allowance per request, however it was decided', () => {
     const { conn, ctcpLines } = harness();
     const line = `:bob!b@h PRIVMSG alice :${A}VERSION${A}`;

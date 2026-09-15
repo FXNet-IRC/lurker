@@ -236,9 +236,10 @@ Implementation notes worth knowing if you're writing against it:
 - A CTCP request such as `VERSION` gets one answer. While an IRC client is attached, it
   gets the request and Lurker stays quiet, as with ZNC, and its `VERSION` reply goes out
   with `via Lurker <version>` added. If that client doesn't answer (goguma and gamja
-  never do), nobody does. With no client attached, or once you change that reply or turn
-  CTCP replies off in settings, Lurker answers and no client sees the request. A
-  connection that sent `AWAY *` doesn't count as attached.
+  never do), nobody does. With no client attached, Lurker answers. Once you change a CTCP
+  reply in settings, that type stays Lurker's and no client sees the request: Lurker sends
+  your reply, or nothing if it's empty or CTCP replies are off. A connection that sent
+  `AWAY *` doesn't count as attached.
   <br>`server/services/ctcp.ts`, `server/services/ircConnection.ts`
 
 ---

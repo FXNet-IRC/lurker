@@ -1250,10 +1250,18 @@ export class IrcConnection {
       // microtask, so a batched request's decision waits for its handler.
       const batchRef = (msg?.tags as Record<string, string> | undefined)?.batch;
       if (this.ctcpAnswerer && batchRef) {
-        if (this.batchedCtcpAnswerers.size >= 100) this.batchedCtcpAnswerers.clear();
-        const queue = this.batchedCtcpAnswerers.get(batchRef) ?? [];
+        let queue = this.batchedCtcpAnswerers.get(batchRef);
+        if (!queue) {
+          // Past the cap the oldest batch goes, most likely one the server never
+          // ended. Its requests are decided again if they ever run.
+          if (this.batchedCtcpAnswerers.size >= 100) {
+            const oldest = this.batchedCtcpAnswerers.keys().next().value;
+            if (oldest !== undefined) this.batchedCtcpAnswerers.delete(oldest);
+          }
+          queue = [];
+          this.batchedCtcpAnswerers.set(batchRef, queue);
+        }
         queue.push(this.ctcpAnswerer);
-        this.batchedCtcpAnswerers.set(batchRef, queue);
       }
       // ERR_MONLISTFULL: the network refused these nicks, so they aren't on its
       // list. irc-framework's 'irc error' for it doesn't say which. The line
