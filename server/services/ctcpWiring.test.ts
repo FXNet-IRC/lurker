@@ -383,12 +383,12 @@ describe('inbound CTCP request — settings gating', () => {
 describe('inbound CTCP request — IRC clients attached through the bouncer', () => {
   const A = String.fromCharCode(1);
   const FORWARDED = 'requested CTCP VERSION (forwarded to your IRC client)';
-  // How many attached clients count on each network, as the bouncer reports.
-  let attached = new Map<number, number>();
+  // How many attached clients count on the connection, as the bouncer reports.
+  let attached = 1;
 
   beforeEach(() => {
-    attached = new Map([[1, 1]]);
-    setAttachedIrcClientCounter((_userId, networkId) => attached.get(networkId) ?? 0);
+    attached = 1;
+    setAttachedIrcClientCounter(() => attached);
   });
 
   afterEach(() => {
@@ -418,7 +418,7 @@ describe('inbound CTCP request — IRC clients attached through the bouncer', ()
   });
 
   it('answers while no client counts on this network', () => {
-    attached = new Map([[2, 1]]);
+    attached = 0;
     const { conn, ctcpResponse } = harness();
     conn.client.emit('ctcp request', request('VERSION'));
     expect(ctcpResponse).toHaveBeenCalledWith('bob', 'VERSION', DEFAULT_VERSION_REPLY);
@@ -452,12 +452,31 @@ describe('inbound CTCP request — IRC clients attached through the bouncer', ()
     conn.client.emit('raw', { from_server: true, line: `:bob!b@h PRIVMSG alice :${A}VERSION${A}` });
     expect(conn.ctcpAnswerer).toBe('clients');
     // The client detaches between the relay and the handler.
-    attached.clear();
+    attached = 0;
     conn.client.emit('ctcp request', request('VERSION'));
     expect(ctcpResponse).not.toHaveBeenCalled();
     expect(ctcpLines()[0].text).toBe(`bob ${FORWARDED}`);
     await Promise.resolve();
     expect(conn.ctcpAnswerer).toBeNull();
+  });
+
+  it('keeps a batched request’s decision until irc-framework runs its line', async () => {
+    const { conn, ctcpResponse, ctcpLines } = harness();
+    const line = `@batch=b1 :bob!b@h PRIVMSG alice :${A}VERSION${A}`;
+    for (let i = 0; i < 3; i++) conn.client.emit('raw', { from_server: true, line });
+    // The batch ends in a later tick, after the client detached.
+    await Promise.resolve();
+    attached = 0;
+    for (let i = 0; i < 3; i++) {
+      conn.client.emit('ctcp request', { ...request('VERSION'), tags: { batch: 'b1' } });
+    }
+    expect(ctcpResponse).not.toHaveBeenCalled();
+    expect(ctcpLines().map((l) => l.text)).toEqual([
+      `bob ${FORWARDED}`,
+      `bob ${FORWARDED}`,
+      `bob ${FORWARDED}`,
+    ]);
+    expect(conn.batchedCtcpAnswerers.size).toBe(0);
   });
 
   it('takes one of the peer’s allowance per request, however it was decided', () => {

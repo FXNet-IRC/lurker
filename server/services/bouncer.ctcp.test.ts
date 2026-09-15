@@ -299,6 +299,47 @@ describe('who answers a CTCP request', () => {
     expect(replies(p)).toEqual([expect.stringMatching(new RegExp(`^${net.nick} VERSION Lurker `))]);
   });
 
+  it('is Lurker once the network restarts under a client that has sent nothing since', async () => {
+    const acct = await seedAccount();
+    const [net] = acct.nets;
+    const c = await attach(acct, 'neta');
+    // A network edit, or Reconnect in the web app.
+    const conn = ircManager.restartNetwork(acct.userId, net.networkId, 'edited')!;
+    cleanups.push(() => conn.dispose());
+    await until(() => conn.state === 'connected', 5000, 'restarted');
+    const restarted = { ...net, nick: conn.currentNick, conn };
+    const p = await peer();
+
+    ask(p, restarted, 'VERSION');
+    await settle(p, restarted, acct);
+
+    // The bouncer dropped the client left on the old connection as soon as the
+    // new one started (onUpstreamState), so no client counts and Lurker answers.
+    expect(c.lines).toContain('ERROR :Upstream connection was reset — reconnect to reattach');
+    expect(requests(c)).toEqual([]);
+    expect(replies(p)).toEqual([
+      expect.stringMatching(new RegExp(`^${restarted.nick} VERSION Lurker `)),
+    ]);
+  });
+
+  it('answers each request in a batch, taking the allowance once for each', async () => {
+    const acct = await seedAccount();
+    const [net] = acct.nets;
+    const p = await peer();
+    const from = `:${p.nick}!~${p.nick}@peer.fake`;
+
+    // irc-framework runs a batch's lines only when the batch ends.
+    ircd.sendRaw(net.nick, ':fake.test BATCH +b1 example.test/batch');
+    for (let i = 0; i < 3; i++) {
+      ircd.sendRaw(net.nick, `@batch=b1 ${from} PRIVMSG ${net.nick} :${A}VERSION${A}`);
+    }
+    ircd.sendRaw(net.nick, ':fake.test BATCH -b1');
+    await settle(p, net, acct);
+
+    // Three a minute from one peer, and three asked.
+    expect(replies(p)).toHaveLength(3);
+  });
+
   it('leaves a type Lurker has no answer for as it was: the client gets it, nobody answers', async () => {
     const acct = await seedAccount();
     const [net] = acct.nets;
