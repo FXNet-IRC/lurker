@@ -75,10 +75,10 @@ only works if timestamps are trustworthy.
   server-assigned ID and authoritative timestamp, which is what keeps them ordered
   identically across every device you're signed in on.
   <br>`server/services/ircConnection.ts:1533`
-- **`msgid`** — every message gets the server's stable identifier, stored and
-  indexed. Nothing user-facing depends on it today: it's deliberate groundwork, since
-  reactions and threaded replies are both anchored on a message ID and can't be built
-  without one.
+- **`msgid`** — on networks that send one, each message's server-assigned ID is
+  stored and indexed. Messages on networks that don't send them, and messages from
+  before Lurker kept them, have none. It's groundwork for reactions and threaded
+  replies, which are anchored on a message ID.
   <br>`server/services/ircConnection.ts:1528`
 
 ### Multi-line messages stay one message
@@ -177,9 +177,11 @@ Implementation notes worth knowing if you're writing against it:
 - Scrollback is capped at 1000 messages per request, advertised via the
   `CHATHISTORY` ISUPPORT token. Over-limit requests are **rejected, not silently
   truncated** — matching soju, whose clients read the token and stay under it.
-  Message references are `timestamp` only, deliberately not `msgid`, because
-  Lurker's stored history IDs and an upstream network's message IDs are different
-  namespaces and mixing them would break paging across the boundary.
+  History lines carry the network's own `msgid`, the one your client saw on the line
+  live. A line has none if Lurker never stored one for it (the network didn't send
+  one, or the message predates Lurker keeping them), or if it's a decrypted E2E
+  message, whose ID belongs to the encrypted line. Message references are
+  `timestamp` only, as with soju.
   <br>`server/services/bouncer.ts:146`, `:520`
 - A client that negotiates `draft/chathistory` gets no playback on attach, as with
   soju. It fetches the history it wants itself, so it doesn't see the same lines twice.
@@ -300,7 +302,7 @@ you, not by spec number.
 | Capability                      | What it would give you                                                                                                                                                                                                               |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `+draft/react`                  | Emoji reactions on messages. Lurker already stores the `msgid` that reactions anchor to, so the hard part is done.                                                                                                                   |
-| `+draft/reply`                  | Threaded replies, anchored on the same stored `msgid`.                                                                                                                                                                               |
+| `+reply`                        | Threaded replies, anchored on the same stored `msgid`.                                                                                                                                                                               |
 | `draft/chathistory` (as client) | Backfill missed history from an upstream bouncer or a network that stores it. Note the asymmetry: Lurker _serves_ chathistory downstream but doesn't consume it upstream, so gaps from a Lurker outage can't currently be filled in. |
 | `standard-replies`              | Machine-readable `FAIL`/`WARN`/`NOTE` errors, so command failures render as real explanations instead of raw numerics.                                                                                                               |
 | `draft/message-redaction`       | When someone deletes a message, it disappears from your view too, rather than persisting forever in Lurker's history.                                                                                                                |

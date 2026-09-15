@@ -130,12 +130,35 @@ describe('attach playback', () => {
     expect(c.lines.some((l) => l.includes('PRIVMSG ap2 :msg1'))).toBe(true);
     c.close();
   });
+
+  it("carries the network's msgid to a client with message-tags", async () => {
+    const acct = harnessMod.seedAccount({ nick: 'ap3' });
+    acct.upstream.addChannel('#room', { members: ['ap3', 'bob'] });
+    insertMessage({
+      networkId: acct.network.id,
+      target: '#room',
+      time: '2023-05-23T06:00:01.000Z',
+      type: 'message',
+      nick: 'bob',
+      userhost: 'bob!u@h',
+      text: 'played back',
+      self: false,
+      msgid: 'upstream-pb-1',
+    });
+    const c = await harness.connect();
+    await attachBound(c, acct, 'sasl batch server-time message-tags');
+    c.send('PING sync');
+    await c.waitForCommand('PONG');
+    const line = c.lines.find((l) => l.includes('PRIVMSG #room :played back'));
+    expect(line).toContain(';msgid=upstream-pb-1 :bob!u@h');
+    c.close();
+  });
 });
 
 describe('CHATHISTORY LATEST', () => {
-  it('returns the newest messages oldest-first, in a chathistory batch with msgid+time', async () => {
+  it('returns the newest messages oldest-first, in a chathistory batch with time', async () => {
     const acct = harnessMod.seedAccount({ nick: 'ch2' });
-    const ids = seedMessages(acct.network.id, '#room', 3);
+    seedMessages(acct.network.id, '#room', 3);
     const c = await harness.connect();
     await attachBound(c, acct);
     c.send('CHATHISTORY LATEST #room * 100');
@@ -143,38 +166,95 @@ describe('CHATHISTORY LATEST', () => {
     const ref = open.split('BATCH +')[1].split(' ')[0];
     expect(open).toContain('chathistory #room');
     const m1 = await c.waitFor((l) => l.includes('PRIVMSG #room :msg1'));
-    expect(m1).toContain(`msgid=${ids[0]}`);
     expect(m1).toContain('time=2023-05-23T06:00:01.000Z');
     expect(m1).toContain(`batch=${ref}`);
-    await c.waitFor((l) => l.includes('msg3') && l.includes(`msgid=${ids[2]}`));
+    await c.waitFor((l) => l.includes('msg3'));
     await c.waitFor((l) => l.includes(`BATCH -${ref}`));
   });
+});
 
-  it('still emits the INTERNAL row id as msgid for a row that stored an upstream msgid', async () => {
-    // The stored IRCv3 msgid (#450) and the bouncer's playback msgid are
-    // different namespaces (MSGREFTYPES=timestamp, see SUPPORTED_CAPS notes) —
-    // storing the upstream tag must not leak it into chathistory playback.
-    const acct = harnessMod.seedAccount({ nick: 'ch2b' });
-    const rowId = Number(
-      insertMessage({
-        networkId: acct.network.id,
-        target: '#tagged',
-        time: '2023-05-23T06:00:01.000Z',
-        type: 'message',
-        nick: 'bob',
-        userhost: 'bob!u@h',
-        text: 'tagged msg',
-        self: false,
-        msgid: 'upstream-uuid-1',
-      }).id,
-    );
+describe('CHATHISTORY msgids', () => {
+  const BACKSLASH = String.fromCharCode(92);
+  const NEWLINE = String.fromCharCode(10);
+
+  // One stored message in #tagged, then the batch CHATHISTORY returns for it.
+  async function historyOf(
+    nick: string,
+    row: Partial<Parameters<typeof insertMessage>[0]>,
+    caps = HISTORY_CAPS,
+  ): Promise<string[]> {
+    const acct = harnessMod.seedAccount({ nick });
+    insertMessage({
+      networkId: acct.network.id,
+      target: '#tagged',
+      time: '2023-05-23T06:00:01.000Z',
+      type: 'message',
+      nick: 'bob',
+      userhost: 'bob!u@h',
+      text: 'tagged msg',
+      self: false,
+      ...row,
+    });
     const c = await harness.connect();
-    await attachBound(c, acct);
+    await attachBound(c, acct, caps);
     c.send('CHATHISTORY LATEST #tagged * 100');
-    const line = await c.waitFor((l) => l.includes('PRIVMSG #tagged :tagged msg'));
-    expect(line).toContain(`msgid=${rowId}`);
-    expect(line).not.toContain('upstream-uuid-1');
+    const open = await c.waitFor((l) => l.includes('BATCH +') && l.includes('chathistory'));
+    const ref = open.split('BATCH +')[1].split(' ')[0];
+    await c.waitFor((l) => l.includes(`BATCH -${ref}`));
     c.close();
+    return batchBodies(c.lines, ref);
+  }
+
+  it("carries the network's msgid, not Lurker's row id", async () => {
+    // The spec wants the msgid "as originally sent by the IRC server", the one a
+    // client saw on the line live. A row id was a second id for the same message.
+    const lines = await historyOf('mid1', { msgid: 'upstream-uuid-1' });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(';msgid=upstream-uuid-1 :bob!u@h PRIVMSG #tagged :tagged msg');
+  });
+
+  it('carries no msgid for a message the network gave none', async () => {
+    const lines = await historyOf('mid2', {});
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain('msgid=');
+  });
+
+  it('escapes the msgid as a tag value', async () => {
+    const lines = await historyOf('mid3', { msgid: `a;b c${BACKSLASH}d` });
+    const escaped = `a${BACKSLASH}:b${BACKSLASH}sc${BACKSLASH}${BACKSLASH}d`;
+    expect(lines[0]).toContain(`;msgid=${escaped} :bob!u@h PRIVMSG`);
+  });
+
+  it('puts the msgid on the first line of a multiline message, and sends no blank lines', async () => {
+    // As the live multiline fallback does: halloy drops a later line that
+    // repeats an id as a duplicate.
+    const text = ['one', 'two', '', 'three'].join(NEWLINE);
+    const lines = await historyOf('mid4', { msgid: 'ml-1', text });
+    expect(lines.map((l) => l.slice(l.indexOf(' :bob!u@h ')))).toEqual([
+      ' :bob!u@h PRIVMSG #tagged :one',
+      ' :bob!u@h PRIVMSG #tagged :two',
+      ' :bob!u@h PRIVMSG #tagged :three',
+    ]);
+    expect(lines[0]).toContain('msgid=ml-1');
+    expect(lines.slice(1).some((l) => l.includes('msgid='))).toBe(false);
+  });
+
+  it('carries no msgid for a decrypted E2E message', async () => {
+    // Its msgid names the ciphertext line, which the client got live under that
+    // id. halloy would take this readable copy as a duplicate of that one.
+    const lines = await historyOf('mid5', { msgid: 'cipher-1', extra: { e2e: true } });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain('msgid=');
+  });
+
+  it('carries no msgid to a client without message-tags', async () => {
+    const lines = await historyOf(
+      'mid6',
+      { msgid: 'upstream-uuid-6' },
+      'sasl batch server-time draft/chathistory',
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain('msgid=');
   });
 });
 
