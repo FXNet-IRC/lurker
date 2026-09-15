@@ -7,6 +7,7 @@ import {
   insertMessage,
   hasMessageForTarget,
   hasConversationForTarget,
+  hasMessageWithMsgid,
   hasSameMessageWithMsgid,
   hasRecentMessageLike,
 } from '../db/messages.js';
@@ -5033,9 +5034,12 @@ export class IrcConnection {
   }
 
   // Whether this line is already stored.
-  // - By msgid, always: the same msgid, buffer, kind, sender and text. A server
-  //   can send a message twice with the same msgid and server-time, and after an
-  //   engine hand-over the next process is given lines the last one stored.
+  // - By msgid, always. A server can send a message twice with the same msgid
+  //   and server-time: that's a match on msgid, buffer, kind, sender and text.
+  //   In the catch-up window the msgid counts anywhere on the network. The next
+  //   process after an engine hand-over is given lines the last one stored, and
+  //   a later line in that backlog can have moved the row: a NICK renames the
+  //   DM buffer, and our own NICK routes a notice elsewhere.
   // - Without a msgid, only in the catch-up window: the same target, kind,
   //   sender and text within a few seconds. Outside it that would drop real
   //   lines, such as a pasted block of repeated lines stamped in the same
@@ -5047,6 +5051,7 @@ export class IrcConnection {
     const nick = (event.nick as string | undefined) ?? null;
     const text = (event.text as string | undefined) ?? null;
     if (typeof event.msgid === 'string' && event.msgid !== '') {
+      if (this.catchingUp) return hasMessageWithMsgid(this.network.id, event.msgid);
       return hasSameMessageWithMsgid(this.network.id, target, event.msgid, type, nick, text);
     }
     return this.catchingUp && hasRecentMessageLike(this.network.id, target, type, nick, text, time);

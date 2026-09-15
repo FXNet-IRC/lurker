@@ -830,11 +830,10 @@ export function hasMessageForTarget(networkId: number, target: string): boolean 
 
 // Whether this message is already stored: the same msgid in the same buffer,
 // with the same kind, sender and text (IrcConnection.alreadyPersisted). A server
-// can send a message twice, and after an engine hand-over the next process is
-// given lines the last one stored. The buffer, sender and text have to match
-// too, so a server that reuses a msgid for a different message loses nothing.
-// A seek on idx_messages_msgid: `+buffer_id` keeps the planner off the
-// per-buffer index, which would walk the buffer.
+// can send a message twice. The buffer, sender and text have to match too, so a
+// server that reuses a msgid for a different message loses nothing. A seek on
+// idx_messages_msgid: `+buffer_id` keeps the planner off the per-buffer index,
+// which would walk the buffer.
 const sameMessageStmt = db.prepare(
   `SELECT 1 FROM messages
    WHERE network_id = ? AND msgid = ?
@@ -853,6 +852,20 @@ export function hasSameMessageWithMsgid(
   const bufferId = resolveBufferIdByNetwork(networkId, target);
   if (bufferId === undefined) return false;
   return !!sameMessageStmt.get(networkId, msgid, bufferId, type, nick, text);
+}
+
+// Whether a msgid is stored anywhere on the network. The engine catch-up window
+// uses this, not the buffer-scoped match: the backlog handed to the next
+// process can hold, after a line the last process stored, a NICK that renamed
+// that line's DM buffer, or our own NICK, which routes a notice elsewhere. The
+// stored row is then no longer in the buffer its copy resolves to. A seek on
+// idx_messages_msgid.
+const hasMsgidStmt = db.prepare(
+  'SELECT 1 FROM messages WHERE network_id = ? AND msgid = ? LIMIT 1',
+);
+export function hasMessageWithMsgid(networkId: number, msgid: string): boolean {
+  if (!networkId || !msgid) return false;
+  return !!hasMsgidStmt.get(networkId, msgid);
 }
 
 // The msgid-less version of the same question, for networks that don't tag

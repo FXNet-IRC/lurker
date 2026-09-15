@@ -62,6 +62,7 @@ function receive(conn: IrcConnection, fields: Record<string, unknown>): void {
 
 interface Row {
   target: string;
+  buffer: string;
   type: string;
   nick: string | null;
   mirrored: number;
@@ -69,7 +70,9 @@ interface Row {
 const rows = (text: string): Row[] =>
   db
     .prepare(
-      'SELECT target, type, nick, mirrored FROM messages WHERE network_id = ? AND text = ? ORDER BY id',
+      `SELECT m.target, b.target AS buffer, m.type, m.nick, m.mirrored
+       FROM messages m JOIN buffers b ON b.id = m.buffer_id
+       WHERE m.network_id = ? AND m.text = ? ORDER BY m.id`,
     )
     .all(network.id, text) as Row[];
 
@@ -139,6 +142,28 @@ describe('a message the network sends twice', () => {
     receive(conn, { target: '#Lobby', message: 'said once' });
     receive(conn, { target: '#LOBBY', message: 'said once' });
     expect(rows('said once')).toHaveLength(1);
+  });
+
+  it('in catch-up, matches a msgid whose DM buffer a later NICK renamed', () => {
+    // The backlog handed over after an engine restart can hold a line the last
+    // process stored and, after it, a NICK that renamed that DM buffer. The copy
+    // resolves to the old name, where the row no longer is.
+    const conn = makeConn();
+    const line = { nick: 'bob', target: 'alice', message: 'brb', tags: { msgid: 'moved-1' } };
+    receive(conn, line);
+    conn.client.emit('nick', {
+      nick: 'bob',
+      new_nick: 'bob_away',
+      ident: 'bob',
+      hostname: 'h',
+      time: TIME,
+    });
+    // The rename moves the buffer. The row's own `target` keeps the name it
+    // arrived under.
+    expect(rows('brb').map((r) => r.buffer)).toEqual(['bob_away']);
+    conn.catchingUp = true;
+    receive(conn, line);
+    expect(rows('brb')).toHaveLength(1);
   });
 
   it('gets no second mirror when it is a notice to a closed buffer', () => {
