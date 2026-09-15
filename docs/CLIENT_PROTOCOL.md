@@ -1125,8 +1125,10 @@ Every new socket starts `visible:false`. Assert `{type:'presence',
 visible:true}` when your UI is actually in front of the user, `false` when it
 leaves — **and re-assert after every reconnect**. Presence is what gates push
 (no push while any client is visible) and auto-away (no visible client for
-`away.auto.delay_seconds` → server sets away). An open socket is deliberately
-_not_ presence: a backgrounded phone keeps its socket and must still get push.
+`away.auto.delay_seconds` → server sets away). An IRC client attached through the
+bouncer also holds auto-away off, unless it sent `AWAY *`, but never push. An
+open socket is deliberately _not_ presence: a backgrounded phone keeps its socket
+and must still get push.
 On mobile, flush `presence:false` before suspension if the platform allows; the
 server's heartbeat reaper (~60 s) is the fallback.
 

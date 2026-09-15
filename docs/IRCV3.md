@@ -160,6 +160,7 @@ we advertise only what we actually implement.
 | Backlog replays at its original timestamps, not at attach time                                  | `server-time`                                                 |
 | Scrollback on demand — page back through Lurker's full stored history from your terminal client | `draft/chathistory`                                           |
 | What you've read in one client is read in the others, and in the web and iOS apps               | `draft/read-marker`                                           |
+| A client connecting in the background doesn't count as you being here                           | `draft/pre-away`                                              |
 | Your own sent messages echoed back, if your client wants them                                   | `echo-message`                                                |
 | Your outgoing DMs attributed to you correctly in replay                                         | `znc.in/self-message`                                         |
 | Pick your network from a list instead of hardcoding `username/networkname`                      | `soju.im/bouncer-networks`, `soju.im/bouncer-networks-notify` |
@@ -211,6 +212,13 @@ Implementation notes worth knowing if you're writing against it:
   the apps. A channel's marker comes after its `JOIN`, before `NAMES`; ask for a DM's
   with `MARKREAD <nick>`.
   <br>`server/services/bouncer.ts:1884`, `server/services/ircManager.ts:892`
+- Away is the account's, as it is in the web and iOS apps. `AWAY` from any client sets
+  or clears it on every network. That client gets its `305` or `306`, and so does every
+  other client, including one that attaches while you're away. `AWAY *` (from
+  `draft/pre-away`) marks a connection that isn't you, such as goguma's background sync:
+  it leaves your away alone. Any other attached client counts as you being here, so
+  auto-away waits until the last one goes.
+  <br>`server/services/bouncer.ts:2167`, `server/services/presence.ts:47`
 - A reply goes only to whoever asked: your client, another attached client, the web
   app, or Lurker itself, which sends `MODE` and `WHO` when it joins a channel. A
   network's replies don't say who asked, so Lurker matches them to its queries in the
@@ -248,6 +256,7 @@ attaching to Lurker.
 | `+typing`                               |   ✅   |    —    |
 | `draft/chathistory`                     |   —    |   ✅    |
 | `draft/read-marker`                     |   —    |   ✅    |
+| `draft/pre-away`                        |   —    |   ✅    |
 | `multi-prefix`                          |   ✅   |   ✅    |
 | `userhost-in-names`                     |   ✅   |   ✅    |
 | `away-notify`                           |   ✅   |   ✅    |

@@ -595,6 +595,30 @@ describe('queries that can’t finish', () => {
   });
 });
 
+describe('AWAY', () => {
+  it('gives each 305 or 306 to the oldest AWAY on the wire, and sends every AWAY at once', () => {
+    const { router, writes, hear } = setup();
+    router.send('lurker', 'AWAY :lunch');
+    router.send('user', 'AWAY');
+    expect(writes).toEqual(['AWAY :lunch', 'AWAY']);
+    expect(hear(':irc.test 306 me :You have been marked as being away')).toBe('lurker');
+    expect(hear(':irc.test 305 me :You are no longer marked as being away')).toBe('user');
+  });
+
+  it('keeps a 305 or 306 with no AWAY on the wire from everyone', () => {
+    const { hear } = setup();
+    expect(hear(':irc.test 306 me :You have been marked as being away')).toBe('nobody');
+    expect(hear(':irc.test 305 me :You are no longer marked as being away')).toBe('nobody');
+  });
+
+  it('doesn’t give a 306 to a WHOIS for our own nick', () => {
+    const { router, hear } = setup();
+    router.send(new Client(), 'WHOIS me');
+    router.send('lurker', 'AWAY :lunch');
+    expect(hear(':irc.test 306 me :You have been marked as being away')).toBe('lurker');
+  });
+});
+
 describe('MODE #chan from cache', () => {
   const MODE_IS = ':irc.test 324 me #c +ntk hunter2';
   const CREATED = ':irc.test 329 me #c 1700000000';

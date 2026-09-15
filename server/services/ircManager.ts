@@ -61,6 +61,14 @@ export interface ReadMarkerMove {
   lastReadId: number;
 }
 
+// The account's away turned on or off: what setAwayAll and clearAwayAll emit as
+// 'away'. `origin` is whatever asked for the change, if it passed itself.
+export interface AwayChange {
+  userId: number;
+  active: boolean;
+  origin?: unknown;
+}
+
 // RPE2E is wired for real IRC channels only in this phase (#382). DM
 // pseudochannels (`@ident@host`) need the peer's server-stamped handle resolved
 // at send time, which the outbound path doesn't have yet — they're a fast-follow.
@@ -902,22 +910,28 @@ class IrcManager extends EventEmitter {
   // Canonical /away writer. Persists the user-level state in user_away_state,
   // then fans the new state out to every IrcConnection so each one issues
   // AWAY on its IRC server and publishes an away-state event. Auto-away
-  // (autoSet=true) is gated by the persisted current state so it can never
-  // overwrite a manual /away. Returns the count of connections that received
-  // the update.
+  // (autoSet=true) never replaces an away already set, manual or auto: the
+  // first one's time is when the user left, and a second would send every
+  // network a new message. Returns the count of connections that received the
+  // update.
   // `since` backdates the away timestamp — auto-away passes the moment the user
   // went idle rather than when the timer fired (#155). Manual /away omits it and
   // gets "now".
+  // `origin` rides the 'away' event, so whatever asked can answer for itself: a
+  // bouncer client sends its own 306.
   setAwayAll(
     userId: number,
     message: string,
-    { autoSet = false, since }: { autoSet?: boolean; since?: Date } = {},
+    { autoSet = false, since, origin }: { autoSet?: boolean; since?: Date; origin?: unknown } = {},
   ): number {
     const trimmed = (message || '').trim();
     if (!trimmed) return 0;
     const current = getUserAwayState(userId) as AwayStateRow | null;
     const currentlyAway = !!(current && current.away_datetime && !current.back_datetime);
-    if (currentlyAway && !current!.auto_set && autoSet) return 0;
+    if (currentlyAway && autoSet) return 0;
+    // The same manual away again changes nothing. irssi sends its /away to every
+    // network, and through the bouncer each copy lands here.
+    if (currentlyAway && !current!.auto_set && current!.away_message === trimmed) return 0;
     const awayAt = (since ?? new Date()).toISOString();
     writeAwayMarker(userId, { awayDatetime: awayAt, awayMessage: trimmed, autoSet });
     const state = { active: true, message: trimmed, since: awayAt, autoSet, backAt: null };
@@ -927,13 +941,18 @@ class IrcManager extends EventEmitter {
       n += 1;
     }
     // Away is user-scoped (every connection), so the system buffer is its home.
-    // Past the no-op guards above, this only fires on a real transition — not on
+    // Past the no-op guards above, this only fires on a real change — not on
     // per-connection reconnect re-asserts (those call applyAwayState directly).
     systemLog.log({
       userId,
       scope: 'away',
       text: autoSet ? `Auto-away: ${trimmed}` : `You're now marked away: ${trimmed}`,
     });
+    // A new message while already away is a change, but not of state.
+    if (!currentlyAway) {
+      const change: AwayChange = { userId, active: true, origin };
+      this.emit('away', change);
+    }
     return n;
   }
 
@@ -942,8 +961,11 @@ class IrcManager extends EventEmitter {
   // the client can render the completed pair) and pushes the new state to
   // every connection. Auto-clear (autoSet=true) is a no-op when the current
   // away was manual; that's how scheduleAutoAway → socket-reconnect leaves a
-  // manual /away undisturbed.
-  clearAwayAll(userId: number, { autoSet = false } = {}): number {
+  // manual /away undisturbed. `origin` is as for setAwayAll.
+  clearAwayAll(
+    userId: number,
+    { autoSet = false, origin }: { autoSet?: boolean; origin?: unknown } = {},
+  ): number {
     const current = getUserAwayState(userId) as AwayStateRow | null;
     const currentlyAway = !!(current && current.away_datetime && !current.back_datetime);
     if (!currentlyAway) return 0;
@@ -967,6 +989,8 @@ class IrcManager extends EventEmitter {
       scope: 'away',
       text: autoSet ? 'Auto-away cleared — welcome back' : "You're no longer marked away",
     });
+    const change: AwayChange = { userId, active: false, origin };
+    this.emit('away', change);
     return n;
   }
 
