@@ -16,6 +16,7 @@ import { createUser } from '../db/users.js';
 import { createNetwork } from '../db/networks.js';
 import type { Network } from '../db/networks.js';
 import { ensureOpen as ensureBufferOpen, close as closeBufferRow } from '../db/buffers.js';
+import { refoldNetworkBuffers } from '../db/refoldBuffers.js';
 
 let userId: number;
 let network: Network;
@@ -67,14 +68,14 @@ interface Row {
   nick: string | null;
   mirrored: number;
 }
-const rows = (text: string): Row[] =>
+const rows = (text: string, networkId = network.id): Row[] =>
   db
     .prepare(
       `SELECT m.target, b.target AS buffer, m.type, m.nick, m.mirrored
        FROM messages m JOIN buffers b ON b.id = m.buffer_id
        WHERE m.network_id = ? AND m.text = ? ORDER BY m.id`,
     )
-    .all(network.id, text) as Row[];
+    .all(networkId, text) as Row[];
 
 describe('a message the network sends twice', () => {
   it('is stored once when both copies have the same msgid', () => {
@@ -142,6 +143,24 @@ describe('a message the network sends twice', () => {
     receive(conn, { target: '#Lobby', message: 'said once' });
     receive(conn, { target: '#LOBBY', message: 'said once' });
     expect(rows('said once')).toHaveLength(1);
+  });
+
+  it('in catch-up, matches a line without a msgid whose channel name folds the same', () => {
+    // Under rfc1459, #foo[bar] and #foo{bar} are one channel and one buffer.
+    // Each row keeps the spelling its line came with.
+    const rfc = createNetwork(userId, {
+      name: 'rfc',
+      host: 'irc.example.test',
+      port: 6697,
+      tls: true,
+      nick: 'alice',
+    })!;
+    refoldNetworkBuffers(userId, rfc.id, 'rfc1459');
+    const conn = new IrcConnection({ network: rfc, onEvent: () => {} });
+    conn.catchingUp = true;
+    receive(conn, { target: '#foo[bar]', message: 'folded once' });
+    receive(conn, { target: '#foo{bar}', message: 'folded once' });
+    expect(rows('folded once', rfc.id)).toHaveLength(1);
   });
 
   it('in catch-up, matches a msgid whose DM buffer a later NICK renamed', () => {

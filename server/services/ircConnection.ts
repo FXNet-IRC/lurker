@@ -1055,7 +1055,6 @@ export class IrcConnection {
     if (this.restoring && this.shouldPersist(event)) return;
     event = this.normalizeChannelTarget(event);
     const time = normalizeEventTime(event.time ?? this.lineArrivedAt?.getTime());
-    // After the channel's case is settled, so a repeat matches the row it repeats.
     if (this.shouldPersist(event) && this.alreadyPersisted(event, time)) return;
     const enriched: EnrichedEvent = {
       ...event,
@@ -5040,7 +5039,7 @@ export class IrcConnection {
   //   process after an engine hand-over is given lines the last one stored, and
   //   a later line in that backlog can have moved the row: a NICK renames the
   //   DM buffer, and our own NICK routes a notice elsewhere.
-  // - Without a msgid, only in the catch-up window: the same target, kind,
+  // - Without a msgid, only in the catch-up window: the same buffer, kind,
   //   sender and text within a few seconds. Outside it that would drop real
   //   lines, such as a pasted block of repeated lines stamped in the same
   //   millisecond.

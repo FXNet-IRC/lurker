@@ -68,6 +68,15 @@ describe('repeat probe', () => {
     );
     expect(detail).toMatch(/USING INDEX idx_messages_msgid/);
   });
+
+  it('a line without a msgid is looked for on the per-buffer index (hasRecentMessageLike shape)', () => {
+    const detail = plan(
+      `SELECT 1 FROM messages
+       WHERE buffer_id = 1 AND type = 'message' AND nick IS 'n' AND text IS 't'
+         AND time BETWEEN 'a' AND 'b' LIMIT 1`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
+  });
 });
 
 describe('highlight-count path', () => {

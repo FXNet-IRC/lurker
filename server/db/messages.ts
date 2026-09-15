@@ -872,9 +872,11 @@ export function hasMessageWithMsgid(networkId: number, msgid: string): boolean {
 // messages (Libera, OFTC, ZNC…): the same target, sender, kind and text within
 // a short window of the same time. Only ever consulted in the catch-up window,
 // where a repeat means a re-delivery, not a user saying the same thing twice.
+// By buffer, not by name: the network's casemapping folds `#foo[bar]` and
+// `#foo{bar}` into one buffer, and each row keeps the spelling it arrived under.
 const hasLikeStmt = db.prepare(
   `SELECT 1 FROM messages
-   WHERE network_id = ? AND target = ? AND type = ? AND nick IS ? AND text IS ?
+   WHERE buffer_id = ? AND type = ? AND nick IS ? AND text IS ?
      AND time BETWEEN ? AND ? LIMIT 1`,
 );
 export function hasRecentMessageLike(
@@ -889,9 +891,11 @@ export function hasRecentMessageLike(
   if (!networkId || !target) return false;
   const t = Date.parse(time);
   if (!Number.isFinite(t)) return false;
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return false;
   const lo = new Date(t - toleranceMs).toISOString();
   const hi = new Date(t + toleranceMs).toISOString();
-  return !!hasLikeStmt.get(networkId, target, type, nick, text, lo, hi);
+  return !!hasLikeStmt.get(bufferId, type, nick, text, lo, hi);
 }
 
 // Whether a target has a real (non-notice) conversation — at least one PRIVMSG or
