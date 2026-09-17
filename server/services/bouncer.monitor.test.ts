@@ -336,18 +336,19 @@ describe('extended-monitor', () => {
     const watching = await attachWithCaps(acct, ['away-notify', 'chghost', 'extended-monitor']);
     const hexdroid = await attachWithCaps(acct, ['away-notify', 'draft/extended-monitor']);
     const irssi = await attachWithCaps(acct, ['away-notify', 'chghost']);
-    watching.send('MONITOR + Alice');
-    irssi.send('MONITOR + alice');
+    // The network names her Alice; the clients asked for her in other cases.
+    watching.send('MONITOR + alice');
+    irssi.send('MONITOR + ALICE');
     await settle(watching);
     await settle(irssi);
 
     const marks = [watching, hexdroid, irssi].map((c) => c.lines.length);
-    acct.upstream.pushUpstream(':alice!a@h AWAY :lunch');
-    acct.upstream.pushUpstream(':alice!a@h CHGHOST a2 h2');
+    acct.upstream.pushUpstream(':Alice!a@h AWAY :lunch');
+    acct.upstream.pushUpstream(':Alice!a@h CHGHOST a2 h2');
     for (const c of [watching, hexdroid, irssi]) await settle(c);
     const got = (c: Client, i: number) =>
       c.lines.slice(marks[i]).filter((l) => ['AWAY', 'CHGHOST'].includes(harnessMod.commandOf(l)));
-    expect(got(watching, 0)).toEqual([':alice!a@h AWAY :lunch', ':alice!a@h CHGHOST a2 h2']);
+    expect(got(watching, 0)).toEqual([':Alice!a@h AWAY :lunch', ':Alice!a@h CHGHOST a2 h2']);
     // Doesn't watch alice.
     expect(got(hexdroid, 1)).toEqual([]);
     // Watches alice, but without extended-monitor: not even the CHGHOST fallback.
@@ -356,11 +357,11 @@ describe('extended-monitor', () => {
     // Once alice shares a channel, everyone with the cap hears it.
     acct.upstream.addChannel('#chan', { members: ['alice'] });
     const again = [watching, hexdroid, irssi].map((c) => c.lines.length);
-    acct.upstream.pushUpstream(':alice!a@h AWAY');
+    acct.upstream.pushUpstream(':Alice!a@h AWAY');
     for (const c of [watching, hexdroid, irssi]) await settle(c);
     for (const [i, c] of [watching, hexdroid, irssi].entries()) {
       expect(c.lines.slice(again[i]).filter((l) => harnessMod.commandOf(l) === 'AWAY')).toEqual([
-        ':alice!a@h AWAY',
+        ':Alice!a@h AWAY',
       ]);
     }
   });
