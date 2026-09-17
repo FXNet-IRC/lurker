@@ -116,6 +116,11 @@ const MEDIA_MIMES = new Map<string, string>([
   ['audio/mpeg', 'mp3'],
 ]);
 
+/** The media MIMEs accepted, for a route that has to list them (FILEHOST's Accept-Post). */
+export function acceptedMediaMimes(): string[] {
+  return [...MEDIA_MIMES.keys()];
+}
+
 /** Human list for the 415 — the error message is how a user discovers the policy. */
 export const ACCEPTED_SUMMARY = 'images, text, and audio/video (mp4, mov, m4v, m4a, 3gp, 3g2, mp3)';
 

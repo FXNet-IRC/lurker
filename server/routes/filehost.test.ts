@@ -1,0 +1,297 @@
+// Copyright (c) 2026 Brad Root
+// SPDX-License-Identifier: MPL-2.0
+
+// soju.im/FILEHOST, through the real app (buildApp) so the mount order is under
+// test: ahead of cors() and express.json. The seeded `local` uploader writes to
+// a temp dir, and the file comes back through the public /uploads route at the
+// Location we answered with.
+
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import sharp from 'sharp';
+import type { Express } from 'express';
+import { setupTestDb, testRequest, TEST_SESSION_SECRET } from '../test-utils/testApp.js';
+import type { User } from '../db/users.js';
+
+const ctx = setupTestDb('routes-filehost');
+
+const PASSWORD = 'hunter2hunter2';
+const BASE = 'https://irc.example.test';
+
+let app: Express;
+let storageDir: string;
+let clientDist: string;
+let png: Buffer;
+let users: typeof import('../db/users.js');
+let settings: typeof import('../db/settings.js');
+let localRowId: number;
+let filehost: typeof import('./filehost.js');
+let resetAuthRateLimits: () => void;
+
+let seq = 0;
+async function seedUser(): Promise<User> {
+  const { hashPassword } = await import('../services/password.js');
+  const user = users.createUser(`filehost_${++seq}`);
+  users.setPasswordHash(user.id, hashPassword(PASSWORD));
+  settings.setUserSetting(user.id, 'uploads.uploader_id', localRowId);
+  return user;
+}
+
+function basic(username: string, secret: string): string {
+  return `Basic ${Buffer.from(`${username}:${secret}`).toString('base64')}`;
+}
+
+beforeAll(async () => {
+  storageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lurker-filehost-'));
+  process.env.LOCAL_UPLOADS_DIR = storageDir;
+  process.env.PUBLIC_BASE_URL = BASE;
+  clientDist = fs.mkdtempSync(path.join(os.tmpdir(), 'lurker-filehost-dist-'));
+  fs.writeFileSync(path.join(clientDist, 'index.html'), '<!doctype html>\n');
+  users = await import('../db/users.js');
+  settings = await import('../db/settings.js');
+  filehost = await import('./filehost.js');
+  ({ resetAuthRateLimits } = await import('../middleware/rateLimit.js'));
+  const { listInstanceUploaders } = await import('../db/uploaderConfig.js');
+  const localRow = listInstanceUploaders().find((r) => r.driver === 'local');
+  if (!localRow) throw new Error('expected the seeded self-host local uploader row');
+  localRowId = localRow.id;
+  const { buildApp } = await import('../app.js');
+  app = buildApp(TEST_SESSION_SECRET, { clientDist });
+  png = await sharp({
+    create: { width: 16, height: 16, channels: 3, background: { r: 10, g: 200, b: 90 } },
+  })
+    .png()
+    .toBuffer();
+});
+
+afterAll(() => {
+  delete process.env.LOCAL_UPLOADS_DIR;
+  delete process.env.PUBLIC_BASE_URL;
+  fs.rmSync(storageDir, { recursive: true, force: true });
+  fs.rmSync(clientDist, { recursive: true, force: true });
+  ctx.cleanup();
+});
+
+beforeEach(() => resetAuthRateLimits());
+
+function upload(authorization: string | null, body: Buffer = png, headers = {}) {
+  const req = testRequest(app)
+    .post('/api/filehost')
+    .set('Content-Type', 'image/png')
+    .set('Content-Disposition', 'attachment; filename="photo.png"');
+  if (authorization) req.set('Authorization', authorization);
+  for (const [k, v] of Object.entries(headers)) req.set(k, v as string);
+  return req.send(body);
+}
+
+describe('OPTIONS', () => {
+  it('answers itself, with Accept-Post and CORS for any origin', async () => {
+    const res = await testRequest(app)
+      .options('/api/filehost')
+      .set('Origin', 'https://gamja.example.net')
+      .set('Access-Control-Request-Method', 'POST');
+    expect(res.status).toBe(204);
+    expect(res.headers['allow']).toBe('OPTIONS, POST');
+    expect(res.headers['accept-post']).toContain('image/*');
+    expect(res.headers['accept-post']).toContain('video/mp4');
+    expect(res.headers['access-control-allow-origin']).toBe('https://gamja.example.net');
+    expect(res.headers['access-control-allow-credentials']).toBe('true');
+    expect(res.headers['access-control-allow-headers']).toBe(
+      'Authorization, Content-Type, Content-Disposition',
+    );
+    expect(res.headers['access-control-expose-headers']).toBe('Location');
+  });
+});
+
+describe('POST', () => {
+  it('stores the file and answers 201 with its Location, which serves it', async () => {
+    const user = await seedUser();
+    const res = await upload(basic(user.username, PASSWORD), png, {
+      Origin: 'https://gamja.example.net',
+    });
+    expect(res.status).toBe(201);
+    const location = res.headers['location'];
+    expect(location).toMatch(new RegExp(`^${BASE}/uploads/[0-9a-f]{12}\\.webp$`));
+    expect(res.text).toBe(location);
+    expect(res.headers['access-control-allow-origin']).toBe('https://gamja.example.net');
+    expect(res.headers['access-control-expose-headers']).toBe('Location');
+
+    const served = await testRequest(app).get(new URL(location).pathname);
+    expect(served.status).toBe(200);
+    expect(served.headers['content-type']).toBe('image/webp');
+    const head = await testRequest(app).head(new URL(location).pathname);
+    expect(head.status).toBe(200);
+
+    // It's in the uploads list, as a web upload would be.
+    const { listUploads } = await import('../db/uploadHistory.js');
+    const rows = listUploads(user.id, {});
+    expect(rows.map((r) => r.url)).toContain(location);
+    expect(rows.find((r) => r.url === location)?.filename).toBe('photo.png');
+  });
+
+  it('takes a read-write API token and a username carrying /network and @client', async () => {
+    const user = await seedUser();
+    const { createToken } = await import('../db/apiTokens.js');
+    const { token } = createToken({ userId: user.id, name: 'irc', scope: 'read-write' });
+    const res = await upload(basic(`${user.username}/libera@phone`, token));
+    expect(res.status).toBe(201);
+  });
+
+  it('refuses a read-only API token', async () => {
+    const user = await seedUser();
+    const { createToken } = await import('../db/apiTokens.js');
+    const { token } = createToken({ userId: user.id, name: 'ro', scope: 'read' });
+    const res = await upload(basic(user.username, token));
+    expect(res.status).toBe(401);
+  });
+
+  it('takes an OAuth token as Bearer, or as the password for its own user only', async () => {
+    const user = await seedUser();
+    const other = await seedUser();
+    const oauth = await import('../db/oauth.js');
+    const oauthApp = oauth.createApp({
+      clientName: 'gamja',
+      clientUri: null,
+      redirectUris: ['urn:ietf:wg:oauth:2.0:oob'],
+    });
+    const token = oauth.createToken(oauthApp.id, user.id);
+    expect((await upload(`Bearer ${token}`)).status).toBe(201);
+    expect((await upload(basic(user.username, token))).status).toBe(201);
+    expect((await upload(basic(other.username, token))).status).toBe(401);
+  });
+
+  it('answers bad or missing credentials with 401, a Basic challenge and text', async () => {
+    const user = await seedUser();
+    for (const authorization of [basic(user.username, 'wrong-password'), null]) {
+      const res = await upload(authorization);
+      expect(res.status).toBe(401);
+      expect(res.headers['www-authenticate']).toBe('Basic realm="Lurker", charset="UTF-8"');
+      expect(res.headers['content-type']).toMatch(/^text\/plain/);
+    }
+  });
+
+  it('ignores a session cookie', async () => {
+    const user = await seedUser();
+    const { createAuthedAgent } = await import('../test-utils/testApp.js');
+    const agent = await createAuthedAgent(app, user.id);
+    const res = await agent.post('/api/filehost').set('Content-Type', 'image/png').send(png);
+    expect(res.status).toBe(401);
+  });
+
+  it('throttles repeated failed logins', async () => {
+    const user = await seedUser();
+    const { LOGIN_FAILURE_MAX } = await import('../middleware/rateLimit.js');
+    for (let i = 0; i < LOGIN_FAILURE_MAX; i++) {
+      expect((await upload(basic(user.username, 'nope'))).status).toBe(401);
+    }
+    const res = await upload(basic(user.username, PASSWORD));
+    expect(res.status).toBe(429);
+    expect(res.headers['retry-after']).toBeTruthy();
+  });
+
+  it('refuses a paused account', async () => {
+    const user = await seedUser();
+    users.setUserPaused(user.id, true);
+    expect((await upload(basic(user.username, PASSWORD))).status).toBe(403);
+  });
+
+  // Refused before the body is read, and the connection closed so the client
+  // stops sending. A client may fail to write the rest (EPIPE) before it reads
+  // the 413, which supertest treats as an error, so these go over raw http.
+  it('refuses a file over the cap before reading it, and while reading it', async () => {
+    const user = await seedUser();
+    settings.setUserSetting(user.id, 'uploads.image.max_upload_mb', 1);
+    const server = http.createServer(app).listen(0);
+    const { port } = server.address() as AddressInfo;
+    const send = (headers: Record<string, string>) =>
+      new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = http.request(
+          {
+            port,
+            method: 'POST',
+            path: '/api/filehost',
+            headers: {
+              Authorization: basic(user.username, PASSWORD),
+              'Content-Type': 'image/png',
+              ...headers,
+            },
+          },
+          (res) => {
+            let body = '';
+            res.setEncoding('utf8');
+            res.on('data', (chunk: string) => (body += chunk));
+            res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+          },
+        );
+        req.on('error', () => {});
+        setTimeout(() => reject(new Error('no response')), 5000).unref();
+        for (let i = 0; i < 4; i++) req.write(Buffer.alloc(512 * 1024, 1));
+        req.end();
+      });
+    try {
+      const declared = await send({ 'Content-Length': String(2 * 1024 * 1024) });
+      expect(declared.status).toBe(413);
+      expect(declared.body).toMatch(/file exceeds/);
+      // Chunked, with no Content-Length to refuse on.
+      const chunked = await send({ 'Transfer-Encoding': 'chunked' });
+      expect(chunked.status).toBe(413);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('refuses what the upload rules do, with the reason as text', async () => {
+    const user = await seedUser();
+    const pdf = Buffer.from('%PDF-1.4\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n');
+    const res = await upload(basic(user.username, PASSWORD), pdf, {
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': 'attachment; filename="doc.pdf"',
+    });
+    expect(res.status).toBe(415);
+    expect(res.headers['content-type']).toMatch(/^text\/plain/);
+    expect(res.text).toMatch(/images, text/);
+  });
+
+  it('keeps a JSON file away from the JSON body parser', async () => {
+    const user = await seedUser();
+    const res = await upload(basic(user.username, PASSWORD), Buffer.from('{"a": 1}\n'), {
+      'Content-Type': 'application/json',
+      'Content-Disposition': 'attachment; filename="data.json"',
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it('refuses an empty body', async () => {
+    const user = await seedUser();
+    const res = await upload(basic(user.username, PASSWORD), Buffer.alloc(0));
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('dispositionFilename', () => {
+  it.each([
+    ['attachment; filename="photo.png"', 'photo.png'],
+    ['attachment; filename=photo.png', 'photo.png'],
+    ['attachment; filename="say \\"hi\\".txt"', 'say "hi".txt'],
+    // gamja leaves ( ) and ' unescaped in filename*.
+    ["attachment; filename*=UTF-8''a%20(1).png", 'a (1).png'],
+    // goguma encodes a space as + there.
+    ["attachment; filename*=UTF-8''my+file.jpg", 'my file.jpg'],
+    // halloy sends both; filename* wins.
+    [`attachment; filename="caf_.png"; filename*=UTF-8''caf%C3%A9.png`, 'café.png'],
+    ['attachment; filename="../../etc/passwd"', 'passwd'],
+    ['attachment; filename="C:\\\\Users\\\\me\\\\shot.png"', 'shot.png'],
+    ["attachment; filename*=UTF-8''bad%E0%A4.png", 'bad%E0%A4.png'],
+    ['attachment', ''],
+  ])('%s → %s', (header, expected) => {
+    expect(filehost.dispositionFilename(header)).toBe(expected);
+  });
+
+  it('has no name without a header', () => {
+    expect(filehost.dispositionFilename(undefined)).toBe('');
+  });
+});

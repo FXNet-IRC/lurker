@@ -9,6 +9,9 @@
 // its status; anything else is a bug and propagates.
 
 import fs from 'node:fs';
+import path from 'node:path';
+import { resolveDataDir } from '../utils/dataDir.js';
+import { randomId } from './uploadProviders/objectKey.js';
 import { bufferSource, fileSource, type UploadSource } from './uploadProviders/source.js';
 import {
   effectiveSettings,
@@ -30,6 +33,22 @@ import {
 } from './uploadProviders/resolve.js';
 import { insertUpload } from '../db/uploadHistory.js';
 import { reportUploadSoon } from './moderationReport.js';
+
+// Uploads land in a temp file, never in the heap. multer's memoryStorage used to
+// hold the whole file, and the drivers then copied it again (and fetch copied it a
+// third time) — a 200 MB upload cost ~1 GB of RSS. See services/uploadProviders/
+// source.ts for the measurements. Everything downstream takes an UploadSource.
+// 0o700: an in-flight upload is the user's private data and must not be readable
+// by other local users on a shared host. Matches routes/exports.ts's staged-import
+// posture.
+export const UPLOAD_TMP_DIR = path.join(resolveDataDir(), 'tmp', 'uploads');
+fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true, mode: 0o700 });
+
+/** A fresh temp file name for an upload. The `up-` prefix is what
+ *  sweepTempUploads (routes/uploads.ts) clears after a crash. */
+export function uploadTempName(): string {
+  return `up-${randomId()}`;
+}
 
 /** A failure to answer with `status`; `extra` rides along in a JSON body. */
 export class UploadRequestError extends Error {

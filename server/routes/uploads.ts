@@ -7,8 +7,6 @@ import { Router } from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import { requireAuth } from '../middleware/auth.js';
-import { resolveDataDir } from '../utils/dataDir.js';
-import { randomId } from '../services/uploadProviders/objectKey.js';
 import { effectiveUploadCapBytes, formatCapMb } from '../services/uploadLimits.js';
 import { thumbnailFormat } from '../services/thumbnailFormat.js';
 import { driverIds } from '../services/uploadProviders/index.js';
@@ -27,6 +25,8 @@ import {
   processUpload,
   providerErrorStatus,
   UploadRequestError,
+  UPLOAD_TMP_DIR,
+  uploadTempName,
 } from '../services/uploadService.js';
 
 const router = Router();
@@ -52,19 +52,12 @@ function requestBaseUrl(req: Request): string {
   return publicBaseUrl(req);
 }
 
-// Uploads land in a temp file, never in the heap. multer's memoryStorage used to
-// hold the whole file, and the drivers then copied it again (and fetch copied it a
-// third time) — a 200 MB upload cost ~1 GB of RSS. See services/uploadProviders/
-// source.ts for the measurements. Everything downstream takes an UploadSource.
-// 0o700: an in-flight upload is the user's private data and must not be readable
-// by other local users on a shared host. Matches routes/exports.ts's staged-import
-// posture.
-const TMP_DIR = path.join(resolveDataDir(), 'tmp', 'uploads');
-fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 });
+// Uploads land in a temp file, never in the heap (see UPLOAD_TMP_DIR).
+const TMP_DIR = UPLOAD_TMP_DIR;
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, TMP_DIR),
-  filename: (_req, _file, cb) => cb(null, `up-${randomId()}`),
+  filename: (_req, _file, cb) => cb(null, uploadTempName()),
 });
 
 /** Best-effort removal of an upload's temp file. Tolerates ENOENT: the `local`
