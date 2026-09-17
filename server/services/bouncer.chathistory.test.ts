@@ -498,6 +498,26 @@ describe('draft/event-playback', () => {
     ]);
   });
 
+  it('leaves off an empty reason, but keeps a cleared topic', async () => {
+    const { lines } = await history(
+      'ep10',
+      '#ev',
+      [
+        { type: 'part', nick: 'alice', userhost: 'alice!a@h', text: null },
+        { type: 'quit', nick: 'carol', userhost: 'carol!c@h', text: '' },
+        { type: 'kick', nick: 'op', userhost: 'op!o@h', text: null, extra: { kicked: 'eve' } },
+        { type: 'topic', nick: 'op', text: '' },
+      ],
+      'CHATHISTORY LATEST #ev * 100',
+    );
+    expect(lines.map((l) => l.slice(l.indexOf(' :') + 1))).toEqual([
+      ':alice!a@h PART #ev',
+      ':carol!c@h QUIT',
+      ':op!o@h KICK #ev eve',
+      ':op TOPIC #ev :',
+    ]);
+  });
+
   it('replays only messages to a client that did not ask', async () => {
     const { lines } = await history(
       'ep2',

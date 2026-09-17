@@ -2106,20 +2106,24 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     const source = row.userhost?.includes('!') ? row.userhost : nick;
     const head = `${this.formatTags(tags)}:${source}`;
     const text = row.text ?? '';
+    // A reason is optional on PART, QUIT and KICK, so an empty one is left off
+    // rather than sent as an empty trailing parameter. TOPIC keeps its: an empty
+    // topic is a cleared one.
+    const reason = text ? ` :${text}` : '';
     switch (row.type) {
       case 'join':
         return `${head} JOIN ${bufferTarget}`;
       case 'part':
-        return text ? `${head} PART ${bufferTarget} :${text}` : `${head} PART ${bufferTarget}`;
+        return `${head} PART ${bufferTarget}${reason}`;
       case 'quit':
-        return `${head} QUIT :${text}`;
+        return `${head} QUIT${reason}`;
       case 'nick':
         return typeof row.newNick === 'string' && row.newNick
           ? `${head} NICK ${row.newNick}`
           : null;
       case 'kick':
         return typeof row.kicked === 'string' && row.kicked
-          ? `${head} KICK ${bufferTarget} ${row.kicked} :${text}`
+          ? `${head} KICK ${bufferTarget} ${row.kicked}${reason}`
           : null;
       case 'mode':
         return text ? `${head} MODE ${bufferTarget} ${text}` : null;
