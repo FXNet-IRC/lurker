@@ -323,6 +323,11 @@ describe('a state change', () => {
   });
 });
 
+// The accounts ircManager holds a connection error for.
+function accountsWithErrors(): Map<number, unknown> {
+  return (ircManager as unknown as { connectionErrors: Map<number, unknown> }).connectionErrors;
+}
+
 describe('error', () => {
   it('comes from the state event that carries it, and goes with a connect', async () => {
     const acct = harnessMod.seedAccount({ networkName: 'alpha' });
@@ -342,6 +347,8 @@ describe('error', () => {
       `:lurker.bouncer BOUNCER NETWORK ${acct.network.id} state=connected;error=`,
     ]);
     expect(ircManager.connectionError(acct.user.id, acct.network.id)).toBeNull();
+    // Nothing is left behind for an account whose errors have all cleared.
+    expect(accountsWithErrors().has(acct.user.id)).toBe(false);
   });
 });
 
@@ -419,6 +426,7 @@ describe('error, on real connections', () => {
 
     await agent.delete(`/api/networks/${network.id}`);
     expect(ircManager.connectionError(acct.user.id, network.id)).toBeNull();
+    expect(accountsWithErrors().has(acct.user.id)).toBe(false);
   });
 
   it("forgets a deleted account's errors", async () => {

@@ -201,14 +201,22 @@ class IrcManager extends EventEmitter {
       }
       errors.set(networkId, event.error);
     } else if (event.state === 'connected') {
-      this.connectionErrors.get(userId)?.delete(networkId);
+      this.forgetConnectionError(userId, networkId);
     }
+  }
+
+  // Drops the account's entry with its last error, so an account whose errors
+  // have all cleared holds nothing.
+  private forgetConnectionError(userId: number, networkId: number): void {
+    const errors = this.connectionErrors.get(userId);
+    if (!errors?.delete(networkId)) return;
+    if (errors.size === 0) this.connectionErrors.delete(userId);
   }
 
   // A network row was created, edited or deleted. The bouncer tells its
   // bouncer-networks-notify clients; call it once the row is written (or gone).
   networkChanged(userId: number, networkId: number): void {
-    if (!getNetwork(networkId, userId)) this.connectionErrors.get(userId)?.delete(networkId);
+    if (!getNetwork(networkId, userId)) this.forgetConnectionError(userId, networkId);
     this.emit('network-changed', { userId, networkId });
   }
 
