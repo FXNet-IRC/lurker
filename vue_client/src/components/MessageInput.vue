@@ -3200,7 +3200,7 @@ function settingExposed(opt: SettingOption): boolean {
     // half-hidden feature — and `requiresFeature` keys have no server behind them at all.
     optionVisible(opt, {
       isNode: config.isNode,
-      features: { linkPreviews: config.linkPreviews },
+      features: config.features,
     })
   );
 }

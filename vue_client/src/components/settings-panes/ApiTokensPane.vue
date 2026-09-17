@@ -79,6 +79,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
+import { useRoute } from 'vue-router';
 import { api } from '../../api.js';
 import { formatRelative } from '../../utils/timestamp.js';
 import { blockImeEnter, useImeSafeInput } from '../../composables/useImeSafeInput.js';
@@ -100,7 +101,11 @@ interface RevealedToken {
 const tokens = ref<ApiToken[]>([]);
 const newName = ref('');
 const onNameInput = useImeSafeInput(newName);
-const newAllowWrite = ref(false);
+// Settings → Bouncer links here for a token to log an IRC client in with, and
+// the bouncer refuses a read-only one — so that link asks for the box to start
+// ticked (?scope=read-write) rather than sending people to a form whose default
+// makes a token that can't work.
+const newAllowWrite = ref(useRoute().query.scope === 'read-write');
 const revealed = ref<RevealedToken | null>(null);
 const copied = ref(false);
 const busy = ref(false);

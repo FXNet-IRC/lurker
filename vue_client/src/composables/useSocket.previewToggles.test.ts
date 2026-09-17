@@ -56,7 +56,7 @@ const RouteView = defineComponent({
 
 function seed({ inlineMedia = false, linkPreviews = false } = {}) {
   setActivePinia(createPinia());
-  useConfigStore().features = { linkPreviews: true };
+  useConfigStore().features = { linkPreviews: true, bouncer: false };
   const settings = useSettingsStore();
   settings.values = {
     'chat.inline_media.enabled': inlineMedia,

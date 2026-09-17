@@ -29,6 +29,21 @@ describe('categoryVisible', () => {
   // Instance administration now lives entirely in the /admin panel, so Settings
   // holds nothing an admin sees and a regular user doesn't — the whole adminOnly
   // dimension (and the "users" category that was its only user) is gone.
+  // The Bouncer pane explains how to attach an IRC client to this instance. An
+  // instance that runs no bouncer has nothing to explain, so the category goes
+  // rather than rendering an inert page.
+  it('hides a category whose feature the instance does not run', () => {
+    expect(categoryVisible(cat('bouncer'), standalone)).toBe(false);
+    expect(categoryVisible(cat('bouncer'), { ...standalone, features: { bouncer: false } })).toBe(
+      false,
+    );
+    expect(categoryVisible(cat('bouncer'), { ...standalone, features: { bouncer: true } })).toBe(
+      true,
+    );
+    // Self-hosted only: a hosted cell runs no bouncer even with the flag.
+    expect(categoryVisible(cat('bouncer'), { ...node, features: { bouncer: true } })).toBe(false);
+  });
+
   it('no longer carries an admin-only category', () => {
     expect(CATEGORIES.some((c) => c.id === 'users')).toBe(false);
   });

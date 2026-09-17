@@ -96,6 +96,12 @@ import {
 } from '../utils/bouncerCert.js';
 import { isChannelTarget } from '../../shared/channels.js';
 import {
+  bouncerBindHost,
+  bouncerPort,
+  bouncerTlsDisabled,
+  setBouncerTlsState,
+} from '../utils/bouncerConfig.js';
+import {
   ClientLineFilter,
   EXTENDED_MONITOR_CAPS,
   parseLine,
@@ -187,6 +193,15 @@ function capLsList(caps: Iterable<string>, version: number): string {
     .map((c) => (c === 'sasl' && version >= 302 ? `sasl=${SASL_MECHANISMS.join(',')}` : c))
     .join(' ');
 }
+
+export {
+  isBouncerEnabled,
+  bouncerPort,
+  bouncerBindHost,
+  bouncerPublicAddress,
+  bouncerTerminatesTls,
+  bouncerTlsInfo,
+} from '../utils/bouncerConfig.js';
 
 // Upstream wire commands never relayed to attached clients: connection
 // plumbing that belongs to Lurker's own registration/keepalive (we answer the
@@ -3054,30 +3069,19 @@ let certReloadTimer: ReturnType<typeof setInterval> | null = null;
 // Paths + current fingerprint of the live TLS cert, so the reload poll can
 // detect a renewed cert on disk and swap it in without a restart. null =
 // plaintext listener.
-let bouncerTlsState: { certPath: string; keyPath: string; fingerprint: string } | null = null;
+let bouncerTlsState: {
+  certPath: string;
+  keyPath: string;
+  fingerprint: string;
+  source: 'configured' | 'self-signed';
+} | null = null;
+
 let onIrcEvent: ((event: Record<string, unknown>) => void) | null = null;
 let onReadMarker: ((move: ReadMarkerMove) => void) | null = null;
 let onAway: ((change: AwayChange) => void) | null = null;
 let onUserDisposed: ((payload: { userId: number }) => void) | null = null;
 let onUserSuspended: ((payload: { userId: number }) => void) | null = null;
 let onNetworkChanged: ((payload: { userId: number; networkId: number }) => void) | null = null;
-
-export function isBouncerEnabled(): boolean {
-  return /^(1|true|yes|on)$/i.test((process.env.LURKER_BOUNCER_ENABLED || '').trim());
-}
-
-export function bouncerPort(): number {
-  const p = Number(process.env.LURKER_BOUNCER_PORT);
-  return Number.isInteger(p) && p > 0 ? p : 6667;
-}
-
-// Optional bind address (LURKER_BOUNCER_BIND). Unset binds every interface —
-// pair the default with TLS or a private network; plain-text IRC carries the
-// login credential.
-export function bouncerBindHost(): string | undefined {
-  const host = (process.env.LURKER_BOUNCER_BIND || '').trim();
-  return host || undefined;
-}
 
 function playbackLimit(): number {
   const n = Number(process.env.LURKER_BOUNCER_PLAYBACK);
@@ -3116,12 +3120,6 @@ export function maxSessionsTotal(): number {
   const n = Number(process.env.LURKER_BOUNCER_MAX_SESSIONS);
   if (!Number.isFinite(n) || n <= 0) return 512;
   return Math.floor(n);
-}
-
-// Plaintext IRC ships the login credential in the clear, so TLS is the default.
-// Only an explicit LURKER_BOUNCER_TLS=off (0/false/no/off) turns it off.
-function bouncerTlsDisabled(): boolean {
-  return /^(0|false|no|off)$/i.test((process.env.LURKER_BOUNCER_TLS || '').trim());
 }
 
 function isLoopbackBind(host: string | undefined): boolean {
@@ -3220,6 +3218,9 @@ export function reloadBouncerTls(): 'reloaded' | 'unchanged' | 'skipped' | 'erro
     }
     (server as tls.Server).setSecureContext({ cert, key });
     bouncerTlsState.fingerprint = fingerprint;
+    // Settings → Bouncer shows this for a member to check against, so a renewal
+    // has to move it: a stale one has them pinning a certificate that's gone.
+    setBouncerTlsState({ selfSigned: bouncerTlsState.source === 'self-signed', fingerprint });
     console.log(`[bouncer] reloaded TLS certificate (SHA-256 ${fingerprint})`);
     systemLog.log({
       scope: 'bouncer',
@@ -3263,12 +3264,18 @@ export async function startBouncer(
       certPath: tlsInfo.certPath,
       keyPath: tlsInfo.keyPath,
       fingerprint: tlsInfo.fingerprint,
+      source: tlsInfo.source,
     };
+    setBouncerTlsState({
+      selfSigned: tlsInfo.source === 'self-signed',
+      fingerprint: tlsInfo.fingerprint,
+    });
     certReloadTimer = setInterval(() => reloadBouncerTls(), CERT_RELOAD_INTERVAL_MS);
     certReloadTimer.unref?.();
   } else {
     server = net.createServer(onConnection);
     bouncerTlsState = null;
+    setBouncerTlsState(null);
   }
   server.on('error', (err) => {
     console.warn(`[bouncer] listener error: ${(err as Error).message}`);
@@ -3330,6 +3337,7 @@ export function stopBouncer(): void {
     certReloadTimer = null;
   }
   bouncerTlsState = null;
+  setBouncerTlsState(null);
   if (onIrcEvent) {
     ircManager.off('event', onIrcEvent);
     onIrcEvent = null;

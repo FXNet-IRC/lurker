@@ -27,7 +27,7 @@ import pushRouter from './routes/push.js';
 import adminRouter from './routes/admin.js';
 import uploadsRouter from './routes/uploads.js';
 import filehostRouter from './routes/filehost.js';
-import { isBouncerEnabled } from './services/bouncer.js';
+import { isBouncerEnabled } from './utils/bouncerConfig.js';
 import uploadersRouter from './routes/uploaders.js';
 import localUploadsRouter from './routes/localUploads.js';
 import dccRouter from './routes/dcc.js';
@@ -36,6 +36,7 @@ import { exportsRouter, importRouter } from './routes/exports.js';
 import apiTokensRouter from './routes/apiTokens.js';
 import configRouter from './routes/config.js';
 import aboutRouter from './routes/about.js';
+import bouncerRouter from './routes/bouncer.js';
 import linkPreviewRouter from './routes/linkPreview.js';
 import nodeRouter from './routes/node.js';
 import { oauthRouter, wellKnownRouter } from './routes/oauth.js';
@@ -144,6 +145,8 @@ export function buildApp(sessionSecret: string, options: BuildAppOptions = {}): 
   app.use('/api/imports', importRouter);
   app.use('/api/config', configRouter);
   app.use('/api/about', aboutRouter);
+  // Only where there's a bouncer to describe (the hosted edition runs none).
+  if (!isNodeMode() && isBouncerEnabled()) app.use('/api/bouncer', bouncerRouter);
   // ⚠ Not mounted at all when the feature is off, so both endpoints 404 rather than existing
   // and refusing. The in-route and resolver guards stay as defence in depth — this is the outer
   // one, and it's what makes "off" mean the surface isn't there.

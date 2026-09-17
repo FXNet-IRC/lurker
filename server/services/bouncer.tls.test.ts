@@ -44,6 +44,19 @@ describe('self-signed TLS default', () => {
     await c.waitForCommand('001');
     expect(harnessMod.attachedFor(acct)).toBe(1);
   });
+
+  // Settings → Bouncer tells a member what their client will be shown, so the
+  // listener publishes it as it comes up — before any renewal republishes it.
+  it('publishes the certificate it serves, as it starts', async () => {
+    const c = await harness.connect();
+    const served = (c.socket as tls.TLSSocket).getPeerCertificate().fingerprint256;
+    c.close();
+    const shown = (await import('../utils/bouncerConfig.js')).bouncerTlsInfo();
+    expect(shown?.selfSigned).toBe(true);
+    expect(shown?.fingerprint.replaceAll(':', '').toUpperCase()).toBe(
+      served.replaceAll(':', '').toUpperCase(),
+    );
+  });
 });
 
 describe('reloadBouncerTls', () => {
@@ -67,6 +80,13 @@ describe('reloadBouncerTls', () => {
 
     const after = (await handshakeFingerprint(harness.port)).toString();
     expect(after).not.toBe(before); // the new connection presents the renewed cert
+    // And what Settings → Bouncer shows a member to check against moved with it:
+    // a stale fingerprint has them pinning a certificate that's gone.
+    const shown = (await import('../utils/bouncerConfig.js')).bouncerTlsInfo();
+    expect(shown?.selfSigned).toBe(true);
+    expect(shown?.fingerprint.replaceAll(':', '').toUpperCase()).toBe(
+      after.replaceAll(':', '').toUpperCase(),
+    );
   });
 
   it('does NOT install a cert whose key has not landed yet (partial renewal)', async () => {
@@ -98,3 +118,13 @@ function handshakeFingerprint(port: number): Promise<string> {
     socket.on('error', reject);
   });
 }
+
+// Last, because it stops the listener the tests above share.
+describe('stopBouncer', () => {
+  it('retires the certificate Settings was showing', async () => {
+    const config = await import('../utils/bouncerConfig.js');
+    expect(config.bouncerTlsInfo()).not.toBeNull();
+    harness.stop();
+    expect(config.bouncerTlsInfo()).toBeNull();
+  });
+});

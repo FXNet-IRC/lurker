@@ -19,6 +19,7 @@ import type {
   SettingOption,
   SettingCategory,
   SettingDependency,
+  FeatureFlag,
 } from '../../../shared/settingsRegistry.js';
 
 export { REGISTRY, getOption, defaultsAsObject, CATEGORIES, GROUPS, THEMED_KEYS, themedDefaults };
@@ -31,6 +32,7 @@ export function getDefault(key: string): SettingValue | undefined {
 /** Edition context that decides which settings surfaces are visible. */
 export interface VisibilityContext {
   isNode: boolean;
+  features?: Partial<Record<FeatureFlag, boolean>>;
 }
 
 /**
@@ -44,6 +46,9 @@ export interface VisibilityContext {
  */
 export function categoryVisible(cat: SettingCategory, ctx: VisibilityContext): boolean {
   if (cat.selfHostedOnly && ctx.isNode) return false;
+  // As for an individual option: a feature the instance doesn't run has no
+  // server behind it, and an absent flag reads as off.
+  if (cat.requiresFeature && ctx.features?.[cat.requiresFeature] !== true) return false;
   return true;
 }
 
@@ -51,7 +56,7 @@ export function categoryVisible(cat: SettingCategory, ctx: VisibilityContext): b
  *  feature flags. */
 export function optionVisible(
   opt: SettingOption,
-  ctx: Pick<VisibilityContext, 'isNode'> & { features?: Partial<Record<'linkPreviews', boolean>> },
+  ctx: Pick<VisibilityContext, 'isNode' | 'features'>,
 ): boolean {
   if (opt.selfHostedOnly && ctx.isNode) return false;
   // A feature the instance hasn't enabled has no server behind it, so its settings are hidden

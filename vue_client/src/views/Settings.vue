@@ -65,6 +65,7 @@ import AuthorizedAppsPane from '../components/settings-panes/AuthorizedAppsPane.
 import UploadsPane from '../components/settings-panes/UploadsPane.vue';
 import DataPane from '../components/settings-panes/DataPane.vue';
 import AboutPane from '../components/settings-panes/AboutPane.vue';
+import BouncerPane from '../components/settings-panes/BouncerPane.vue';
 
 useSocket();
 
@@ -101,6 +102,7 @@ const BESPOKE_PANES: Record<string, Component> = {
   highlights: HighlightsPane,
   ignores: IgnoresPane,
   networks: NetworksPane,
+  bouncer: BouncerPane,
   account: AccountPane,
   'api-tokens': ApiTokensPane,
   'authorized-apps': AuthorizedAppsPane,
@@ -110,7 +112,9 @@ const BESPOKE_PANES: Record<string, Component> = {
 };
 
 const visibleCategories = computed(() =>
-  CATEGORIES.filter((c) => categoryVisible(c, { isNode: config.isNode })),
+  CATEGORIES.filter((c) =>
+    categoryVisible(c, { isNode: config.isNode, features: config.features }),
+  ),
 );
 
 const firstCategoryId = computed(() => visibleCategories.value[0]?.id || 'appearance');
