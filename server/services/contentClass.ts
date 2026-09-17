@@ -116,9 +116,10 @@ const MEDIA_MIMES = new Map<string, string>([
   ['audio/mpeg', 'mp3'],
 ]);
 
-/** The media MIMEs accepted, for a route that has to list them (FILEHOST's Accept-Post). */
-export function acceptedMediaMimes(): string[] {
-  return [...MEDIA_MIMES.keys()];
+/** What's accepted as MIME ranges, for a route that has to list them (FILEHOST's Accept-Post). */
+export function acceptedMimeRanges(): string[] {
+  const dialects = [...TEXT_DIALECT_BY_MIME.keys()].filter((mime) => !mime.startsWith('text/'));
+  return ['image/*', 'text/*', ...dialects, ...MEDIA_MIMES.keys()];
 }
 
 /** Human list for the 415 — the error message is how a user discovers the policy. */

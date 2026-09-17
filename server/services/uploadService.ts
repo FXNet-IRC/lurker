@@ -107,6 +107,10 @@ function absolutizeUrl(url: string, storesRemotely: boolean, baseUrl: () => stri
 }
 
 export async function processUpload(input: UploadInput): Promise<UploadOutput> {
+  // No control characters in the name: it goes into a provider's multipart
+  // header and the uploads list, and a `filename*` can percent-encode a CR or LF.
+  const originalName = (input.originalName || '').replace(/\p{Cc}/gu, '');
+
   // Resolve the configured uploader. Every isNodeMode() branch the old route
   // made (which provider, whose credentials, which caps, SVG policy, thumbnail
   // strategy) is now derived from the resolved uploader's driver + policy.
@@ -156,7 +160,7 @@ export async function processUpload(input: UploadInput): Promise<UploadOutput> {
     // The filename rides along only so a `.md`/`.json` keeps its name on platforms
     // that register no MIME for it (#788). It cannot widen the accepted set, and it
     // is not where the served extension comes from — see contentClass.ts.
-    classified = await classifyUpload(input.tempPath, input.claimedMime, input.originalName);
+    classified = await classifyUpload(input.tempPath, input.claimedMime, originalName);
   } catch (err) {
     if (err instanceof UnsupportedTypeError) throw new UploadRequestError(415, err.message);
     throw err;
@@ -246,7 +250,6 @@ export async function processUpload(input: UploadInput): Promise<UploadOutput> {
     outHeight = optimized.height;
   }
 
-  const originalName = input.originalName || '';
   const baseName = originalName.replace(/\.[^.]+$/, '') || `upload-${Date.now()}`;
   const filename = `${baseName}.${outExt}`;
 

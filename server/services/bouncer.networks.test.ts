@@ -425,6 +425,25 @@ describe('soju.im/FILEHOST in ISUPPORT', () => {
     });
   });
 
+  // A network's later 005 isn't relayed at all (RELAY_DROP); IrcConnection adds
+  // it to registrationLines, whose replay strips the token.
+  it("doesn't relay a network's own FILEHOST sent after registration", async () => {
+    const acct = harnessMod.seedAccount({ nick: 'fhlive' });
+    const c = await harness.connect();
+    c.send(`PASS ${acct.user.username}:${acct.password}`);
+    c.send('NICK client');
+    c.send('USER client 0 * :client');
+    await c.waitForCommand('422');
+    const from = c.lines.length;
+    acct.upstream.pushUpstream(
+      `:irc.example.net 005 fhlive soju.im/FILEHOST=https://upstream.example/up :are supported by this server`,
+    );
+    acct.upstream.pushUpstream(':bot!b@h PRIVMSG #chan :sentinel');
+    await c.waitFor((l) => l.endsWith(':sentinel'));
+    expect(c.lines.slice(from).join('\n')).not.toContain('upstream.example');
+    c.close();
+  });
+
   it('is not advertised to an account with no usable uploader', async () => {
     const { default: db } = await import('../db/index.js');
     const defaults = db

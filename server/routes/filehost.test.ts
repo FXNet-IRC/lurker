@@ -101,6 +101,7 @@ describe('OPTIONS', () => {
     expect(res.headers['allow']).toBe('OPTIONS, POST');
     expect(res.headers['accept-post']).toContain('image/*');
     expect(res.headers['accept-post']).toContain('video/mp4');
+    expect(res.headers['accept-post']).toContain('application/json');
     expect(res.headers['access-control-allow-origin']).toBe('https://gamja.example.net');
     expect(res.headers['access-control-allow-credentials']).toBe('true');
     expect(res.headers['access-control-allow-headers']).toBe(
@@ -167,12 +168,13 @@ describe('POST', () => {
     expect((await upload(basic(other.username, token))).status).toBe(401);
   });
 
-  it('answers bad or missing credentials with 401, a Basic challenge and text', async () => {
+  // Never a Basic challenge: a browser would prompt for a password and keep it.
+  it('answers bad or missing credentials with 401, a Bearer challenge and text', async () => {
     const user = await seedUser();
     for (const authorization of [basic(user.username, 'wrong-password'), null]) {
       const res = await upload(authorization);
       expect(res.status).toBe(401);
-      expect(res.headers['www-authenticate']).toBe('Basic realm="Lurker", charset="UTF-8"');
+      expect(res.headers['www-authenticate']).toBe('Bearer realm="Lurker"');
       expect(res.headers['content-type']).toMatch(/^text\/plain/);
     }
   });
@@ -307,6 +309,62 @@ describe('POST', () => {
       server.closeAllConnections();
       server.close();
     }
+  });
+
+  // A client that resets the connection partway through a body, while it's being
+  // received and while a refused one is being drained. The temp file goes, and
+  // the server carries on.
+  it('survives a client that resets partway through a body', async () => {
+    const user = await seedUser();
+    const { UPLOAD_TMP_DIR } = await import('../services/uploadService.js');
+    const temps = () => fs.readdirSync(UPLOAD_TMP_DIR).filter((f) => f.startsWith('up-'));
+    const until = async (done: () => boolean) => {
+      for (let i = 0; i < 200 && !done(); i++) await new Promise((r) => setTimeout(r, 10));
+      expect(done()).toBe(true);
+    };
+    const server = http.createServer(app).listen(0);
+    const { port } = server.address() as AddressInfo;
+    const open = (authorization: string | null) => {
+      const socket = net.connect(port, '127.0.0.1');
+      socket.on('error', () => {});
+      let response = '';
+      socket.on('data', (data) => (response += data.toString('latin1')));
+      socket.write(
+        `POST /api/filehost HTTP/1.1\r\nHost: localhost\r\n` +
+          (authorization ? `Authorization: ${authorization}\r\n` : '') +
+          `Content-Type: image/png\r\nContent-Length: ${8 * 1024 * 1024}\r\n\r\n`,
+      );
+      socket.write(Buffer.alloc(256 * 1024, 1));
+      return { socket, response: () => response };
+    };
+    try {
+      const before = temps().length;
+      const receiving = open(basic(user.username, PASSWORD));
+      await until(() => temps().length > before);
+      receiving.socket.resetAndDestroy();
+      await until(() => temps().length === before);
+
+      const refused = open(null);
+      await until(() => refused.response().startsWith('HTTP/1.1 401 '));
+      refused.socket.resetAndDestroy();
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect((await upload(basic(user.username, PASSWORD))).status).toBe(201);
+    } finally {
+      server.closeAllConnections();
+      server.close();
+    }
+  });
+
+  it('keeps control characters out of the stored name', async () => {
+    const user = await seedUser();
+    const res = await upload(basic(user.username, PASSWORD), png, {
+      'Content-Disposition': "attachment; filename*=UTF-8''shot%0D%0AX-Injected%3A%201%07.png",
+    });
+    expect(res.status).toBe(201);
+    const { listUploads } = await import('../db/uploadHistory.js');
+    const row = listUploads(user.id, {}).find((r) => r.url === res.headers['location']);
+    expect(row?.filename).toBe('shotX-Injected: 1.png');
   });
 
   it('refuses what the upload rules do, with the reason as text', async () => {

@@ -18,7 +18,9 @@
 //   - Success is 201 with a Location, which goguma and halloy require exactly,
 //     and errors are text/plain, which is what goguma will show.
 //   - CORS is open to any origin: with no cookie accepted, a page can only upload
-//     with credentials it sets itself. gamja needs Location exposed.
+//     with credentials it sets itself. gamja needs Location exposed, and sends
+//     credentialed requests, so Allow-Credentials stays. That's why a failed
+//     login never asks a browser for a password (see handleUpload).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -32,7 +34,7 @@ import { clientIp, loginFailureThrottle } from '../middleware/rateLimit.js';
 import { verifyBouncerLogin } from '../services/bouncerLogin.js';
 import { unmarshalLogin } from '../services/bouncer.js';
 import { effectiveUploadCapBytes, formatCapMb } from '../services/uploadLimits.js';
-import { acceptedMediaMimes } from '../services/contentClass.js';
+import { acceptedMimeRanges } from '../services/contentClass.js';
 import {
   processUpload,
   UploadRequestError,
@@ -43,7 +45,7 @@ import { publicBaseUrl } from '../utils/publicOrigin.js';
 
 const router = Router();
 
-const ACCEPT_POST = ['image/*', 'text/*', ...acceptedMediaMimes()].join(', ');
+const ACCEPT_POST = acceptedMimeRanges().join(', ');
 
 function sendText(res: Response, status: number, text: string): void {
   res.status(status).type('text/plain').send(text);
@@ -212,7 +214,11 @@ async function handleUpload(req: Request, res: Response): Promise<void> {
   const user = filehostUser(req.headers.authorization);
   if (!user) {
     if (key !== null && req.headers.authorization) loginFailureThrottle.recordFailure(key);
-    res.set('WWW-Authenticate', 'Basic realm="Lurker", charset="UTF-8"');
+    // A Bearer challenge, though Basic works too: a browser answers a Basic one
+    // with a password prompt and then keeps the password for this origin. With
+    // CORS open to credentialed requests, any page could then upload as that
+    // user. No IRC client reads the challenge.
+    res.set('WWW-Authenticate', 'Bearer realm="Lurker"');
     refuse(req, res, 401, 'invalid or missing credentials');
     return;
   }
