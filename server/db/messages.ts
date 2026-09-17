@@ -592,10 +592,13 @@ export interface HistoryEvents {
 // the start of history to halloy and gamja.
 //
 // Events naming our current nick stay out: a JOIN, PART, QUIT or NICK from it,
-// or a KICK of it. goguma applies every replayed line to its live state, so an
-// old PART of ours marks the channel as left and an old NICK of ours renames us
-// (client_controller.dart:577-663); HexDroid rejoins on an old JOIN of ours. An
-// event under a nick we no longer use reads as someone else's there.
+// or a KICK of it. goguma applies every replayed line to its live state
+// (client_controller.dart:577-721), and those are the ones it takes as ours: an
+// old PART marks the channel as left, an old NICK renames us. HexDroid rejoins
+// on an old JOIN of ours. An event under a nick we no longer use reads as
+// someone else's there. The rest still reach goguma's state as they do from
+// soju: an old TOPIC or MODE, or someone else's JOIN, PART or QUIT, until its
+// next NAMES or TOPIC. The operator accepted that (plan: draft/event-playback).
 function historyFilter(
   alias: string,
   events: HistoryEvents | null | undefined,
@@ -661,6 +664,29 @@ export function loadHistoryWindow(
     .all(...params) as MessageRow[];
   const events = rows.map(rowToEvent);
   return newestFirst ? events.toReversed() : events;
+}
+
+// The newest `limit` conversation rows in a buffer, oldest first: the rows a
+// chathistory window counts, for the bouncer's attach playback, so a buffer's
+// joins and parts don't use up its share. In id order, down
+// idx_messages_buf_unread, which carries `type`: it reads the rows it returns and
+// the events it passes on the way. A window in time order reads and sorts every
+// row in the buffer, once per buffer on every attach.
+export function listRecentMessages(
+  networkId: number,
+  target: string,
+  limit: number,
+): MessageEvent[] {
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return [];
+  const rows = db
+    .prepare(
+      `SELECT *, ${BOOKMARKED_COL('messages')} FROM messages
+        WHERE buffer_id = ? AND ${chathistoryMsgFilter()}
+        ORDER BY id DESC LIMIT ?`,
+    )
+    .all(bufferId, limit) as MessageRow[];
+  return rows.map(rowToEvent).toReversed();
 }
 
 // Buffers with real message activity inside a time window (exclusive), newest

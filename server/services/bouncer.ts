@@ -67,6 +67,7 @@ import { closedFoldedSetForNetwork, foldTargetFor } from '../db/buffers.js';
 import {
   HISTORY_EVENT_TYPES,
   listBuffersForNetwork,
+  listRecentMessages,
   loadHistoryWindow,
   listActiveTargetsInWindow,
   readMarkerTime,
@@ -2048,10 +2049,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     let budget = maxTotalPlaybackLines();
     for (const { target, isChannel } of targets) {
       if (budget <= 0) break;
-      // Messages only, so a buffer's joins and parts don't use up its share.
-      const rows = loadHistoryWindow(this.networkId, target, null, null, limit, {
-        newestFirst: true,
-      });
+      const rows = listRecentMessages(this.networkId, target, limit);
       for (const line of this.playbackLines(rows, target, isChannel)) {
         this.write(line);
         if (--budget <= 0) break;

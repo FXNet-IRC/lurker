@@ -52,6 +52,20 @@ describe('page and probe paths', () => {
     expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
   });
 
+  // The bouncer's attach playback, per buffer on every attach. A time-ordered
+  // window here read and sorted the whole buffer (/code-review of
+  // draft/event-playback).
+  it('recent messages walk the per-buffer index without a sort (listRecentMessages shape)', () => {
+    const detail = plan(
+      `SELECT * FROM messages
+        WHERE buffer_id = 1 AND type IN ('message', 'action', 'notice') AND mirrored = 0
+          AND text IS NOT NULL AND text != ''
+        ORDER BY id DESC LIMIT 50`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
+    expect(detail).not.toMatch(/TEMP B-TREE/);
+  });
+
   it('the edge probe is an index seek (hasOlderThan shape)', () => {
     const detail = plan(`SELECT 1 FROM messages WHERE buffer_id = 1 AND id < 5 LIMIT 1`);
     expect(detail).toMatch(/USING COVERING INDEX idx_messages_buf_unread/);
