@@ -57,7 +57,7 @@ import { StringDecoder } from 'node:string_decoder';
 import ircManager from './ircManager.js';
 import type { IrcConnection } from './ircConnection.js';
 import * as systemLog from './systemLog.js';
-import { findUserByUsername, getPasswordHash } from '../db/users.js';
+import { findUserById, findUserByUsername, getPasswordHash } from '../db/users.js';
 import type { User } from '../db/users.js';
 import { verifyPassword, hashPassword } from './password.js';
 import { hashToken, findActiveByHash, touchLastUsed } from '../db/apiTokens.js';
@@ -739,6 +739,8 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   // The highest CAP LS version the client sent; 301 until it sends 302.
   private capVersion = 301;
   userId = 0;
+  // The API token this session authenticated with, or null for the password.
+  apiTokenId: number | null = null;
   networkId = 0;
   lastActivityAt = Date.now();
 
@@ -752,11 +754,12 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   private readonly clientFilter: ClientLineFilter;
   private capNegotiating = false;
   // SASL PLAIN state: the requested mechanism (null until AUTHENTICATE <mech>),
-  // an accumulator for base64 payloads that arrive in 400-byte chunks, and the
-  // user/network resolved by a successful exchange (consumed at CAP END).
+  // an accumulator for base64 payloads that arrive in 400-byte chunks, and
+  // whether an exchange succeeded, with the network it named (consumed at CAP
+  // END). The account it authenticated is `userId`.
   private saslMechanism: string | null = null;
   private saslBuffer = '';
-  private saslUser: User | null = null;
+  private saslAuthenticated = false;
   private saslNetwork: string | null = null;
   private passRaw: string | null = null;
   private clientNick: string | null = null;
@@ -1120,18 +1123,24 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       noteAuthFailure(this.remoteIp);
       return fail();
     }
-    const user = this.verifyUser(login.username, passwd);
-    if (!user) {
+    const verified = this.verifyUser(login.username, passwd);
+    if (!verified) {
       noteAuthFailure(this.remoteIp);
       return fail();
     }
+    const { user } = verified;
     // Reject a paused account here rather than after signaling 903, so the
     // client isn't told auth succeeded and then killed at CAP END.
     if (user.is_paused) {
       this.write(`:${SERVER_NAME} 904 ${nick} :Account is paused`);
       return;
     }
-    this.saslUser = user;
+    // The session is the account's from here, not from CAP END, which can be a
+    // minute away: a pause, recovery or deletion in between closes it, and so
+    // does revoking the token it used (#914).
+    this.userId = user.id;
+    this.apiTokenId = verified.apiTokenId;
+    this.saslAuthenticated = true;
     this.saslNetwork = login.network;
     this.write(
       `:${SERVER_NAME} 900 ${nick} ${nick}!${user.username}@${SERVER_NAME} ${user.username} :You are now logged in as ${user.username}`,
@@ -1154,13 +1163,13 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   }
 
   // Called at CAP END / registration completion. Auth may already be resolved
-  // via SASL (this.saslUser); otherwise fall back to the ZNC-style PASS floor.
+  // via SASL (this.saslAuthenticated); otherwise fall back to the ZNC-style PASS floor.
   private authenticate(): void {
-    if (this.saslUser) {
+    if (this.saslAuthenticated) {
       // SASL PLAIN already authenticated; the network selector rides the SASL
       // authcid, falling back to the USER field (`USER user/network …`).
       const networkSel = this.saslNetwork ?? unmarshalLogin(this.clientUser || '').network;
-      this.completeAttach(this.saslUser, networkSel);
+      this.completeAttach(this.userId, networkSel);
       return;
     }
     if (authThrottled(this.remoteIp)) {
@@ -1176,13 +1185,15 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       this.failRegistration('Invalid credentials format: PASS <username>[/<network>]:<secret>');
       return;
     }
-    const user = this.verifyUser(creds.username, creds.secret);
-    if (!user) {
+    const verified = this.verifyUser(creds.username, creds.secret);
+    if (!verified) {
       noteAuthFailure(this.remoteIp);
       this.failRegistration('Invalid username or password/token');
       return;
     }
-    this.completeAttach(user, creds.network);
+    this.userId = verified.user.id;
+    this.apiTokenId = verified.apiTokenId;
+    this.completeAttach(verified.user.id, creds.network);
   }
 
   private clearRegTimer(): void {
@@ -1194,8 +1205,15 @@ class BouncerSession implements MonitorHolder, ReplyClient {
 
   // Called at CAP END / registration completion. Resolves the target network
   // (BIND id > username selector > capless single-network default), or drops
-  // into control mode for any client that named no network.
-  private completeAttach(user: User, networkSel: string | null): void {
+  // into control mode for any client that named no network. The account is
+  // read as it is now: a SASL login may be a minute old (soju reads its live
+  // user at attach too).
+  private completeAttach(userId: number, networkSel: string | null): void {
+    const user = findUserById(userId);
+    if (!user) {
+      this.failRegistration('Account removed');
+      return;
+    }
     if (user.is_paused) {
       this.failRegistration('Account is paused');
       return;
@@ -1350,7 +1368,12 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     });
   }
 
-  private verifyUser(username: string, secret: string): User | null {
+  // The account a password or read-write API token opens, with the token's id
+  // (null for the password), so revoking the token can close this session.
+  private verifyUser(
+    username: string,
+    secret: string,
+  ): { user: User; apiTokenId: number | null } | null {
     // findUserByUsername folds case itself now, so the old explicit
     // lowercase retry (IRC clients routinely lowercase the SASL username) is
     // no longer needed.
@@ -1361,11 +1384,11 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // username exists — verifyPassword(_, null) would otherwise return instantly.
     const passwordOk = verifyPassword(secret, storedHash ?? timingEqualizerHash());
     if (!user) return null;
-    if (passwordOk && storedHash) return user;
+    if (passwordOk && storedHash) return { user, apiTokenId: null };
     const token = findActiveByHash(hashToken(secret));
     if (token && token.userId === user.id && token.scope === 'read-write') {
       touchLastUsed(token.id);
-      return user;
+      return { user, apiTokenId: token.id };
     }
     return null;
   }
@@ -1576,7 +1599,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     }
     // Binding needs an authenticated account. In our flow that means either SASL
     // already succeeded or a PASS is present to verify at CAP END.
-    if (!this.saslUser && !this.passRaw) {
+    if (!this.saslAuthenticated && !this.passRaw) {
       this.write(
         `:${SERVER_NAME} FAIL BOUNCER ACCOUNT_REQUIRED BIND :Authentication needed to bind to bouncer network`,
       );
@@ -2848,13 +2871,25 @@ function dispatchIrcEvent(event: Record<string, unknown>): void {
  */
 export function dropSessionsForUser(userId: number, reason: string): void {
   for (const session of sessions) {
-    // Deliberately NOT gated on isRegistered(). userId is assigned at PASS-time
-    // auth, but a session isn't "registered" until NICK/USER completes — and it
-    // gets a 60s grace to get there. Skipping those left a hole: authenticate,
-    // stall before NICK/USER, wait out the recovery, then finish registering and
-    // arrive attached to an account that was just recovered. The isRegistered()
-    // filter belongs to the count/dispatch callers, not to revocation.
+    // Deliberately NOT gated on isRegistered(). A SASL login sets userId when it
+    // succeeds, but the session isn't registered until CAP END, and it gets a
+    // 60s grace to get there. Skipping those left a hole: authenticate, stall,
+    // wait out the recovery, then finish registering and arrive attached to an
+    // account that was just recovered (#914). The isRegistered() filter belongs
+    // to the count/dispatch callers, not to revocation.
     if (session.userId === userId) session.closeWithError(reason);
+  }
+}
+
+/**
+ * Close every bouncer session that authenticated with an API token, registered
+ * or not: the api-tokens revoke route calls this, so a revoked token stops
+ * working on the connections it already opened (#914). The account's other
+ * sessions, on its password or another token, stay up.
+ */
+export function dropSessionsForApiToken(tokenId: number, reason: string): void {
+  for (const session of sessions) {
+    if (session.apiTokenId === tokenId) session.closeWithError(reason);
   }
 }
 

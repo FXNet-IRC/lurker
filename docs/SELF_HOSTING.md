@@ -525,7 +525,7 @@ Point your IRC client at the host/port with a **server password** of:
 
 Logging in as just `username` when you have several networks is not an error — you land on an idle connection that isn't attached to anything, and Lurker sends a notice naming the networks you can pick from. Reconnect with `username/networkname` to attach one. An account with no networks yet lands on that same idle connection with a notice telling you to add one in the web UI first; networks are created there, not from an IRC client.
 
-The secret can be your Lurker account password, but a **read-write API token** (web UI → **Settings → API tokens**) is the better choice — IRC clients store the server password in plaintext config files, and a token can be revoked without changing your password.
+The secret can be your Lurker account password, but a **read-write API token** (web UI → **Settings → API tokens**) is the better choice — IRC clients store the server password in plaintext config files, and a token can be revoked without changing your password. Revoking it also disconnects any IRC client still logged in with it.
 
 Modern IRCv3 clients (Halloy, gamja, Goguma, …) get more than the server-password floor above:
 
