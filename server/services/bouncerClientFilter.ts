@@ -112,18 +112,21 @@ const FILEHOST_TOKEN = /^-?(?:\S*\/)?FILEHOST(?:=|$)/i;
  * A network's 005 line without any FILEHOST token, or null when that was all it
  * advertised. A client uploads there with the credentials it gave the bouncer,
  * so a network's own URL (an upstream soju's, say) would get the Lurker account
- * password. The tokens are the params between the nick and the last, which is
- * how clients read them. Any other line comes back unchanged.
+ * password. Every param after the nick is checked, the last too: goguma and
+ * gamja skip it as the human-readable text, but halloy reads it as a token, and
+ * a server may send no text. Any other line comes back unchanged.
  */
 export function withoutUpstreamFilehost(line: string): string | null {
   const msg = parseLine(line);
-  if (!msg || msg.command !== '005' || msg.params.length < 3) return line;
-  const last = msg.params.length - 1;
-  const tokens = msg.params.slice(1, last);
-  const kept = tokens.filter((token) => !FILEHOST_TOKEN.test(token));
-  if (kept.length === tokens.length) return line;
-  if (kept.length === 0) return null;
-  msg.params = [msg.params[0], ...kept, msg.params[last]];
+  if (!msg || msg.command !== '005' || msg.params.length < 2) return line;
+  const params = msg.params.slice(1);
+  const kept = params.filter((param) => !FILEHOST_TOKEN.test(param));
+  if (kept.length === params.length) return line;
+  // Whether the line still ends in its text: it had one, and that wasn't the token.
+  const text = msg.trailing && !FILEHOST_TOKEN.test(params[params.length - 1]);
+  if (kept.length === (text ? 1 : 0)) return null;
+  msg.params = [msg.params[0], ...kept];
+  msg.trailing = text;
   return formatLine(msg);
 }
 

@@ -583,8 +583,17 @@ type ChatBound = { star: true } | { iso: string };
 // nor for an account with no usable uploader, whose uploads would only fail.
 function filehostToken(userId: number): string | null {
   if (isNodeMode()) return null;
-  const base = (process.env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '');
-  if (!/^https:\/\/[^/\s]+/i.test(base)) return null;
+  let url: URL;
+  try {
+    url = new URL((process.env.PUBLIC_BASE_URL || '').trim());
+  } catch {
+    return null;
+  }
+  // An https origin, maybe with a path, and nothing a path can't follow.
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
+    return null;
+  }
+  const base = `${url.origin}${url.pathname.replace(/\/+$/, '')}`;
   const user = findUserById(userId);
   if (!user) return null;
   try {

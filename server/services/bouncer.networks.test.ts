@@ -394,10 +394,22 @@ describe('soju.im/FILEHOST in ISUPPORT', () => {
     });
   });
 
-  it('is not advertised without PUBLIC_BASE_URL, or with a plain http one', async () => {
+  it('is not advertised without a usable https PUBLIC_BASE_URL', async () => {
     await withBaseUrl(undefined, async () => {
       expect(await isupportFor(true)).not.toContain('FILEHOST');
     });
+    const advertised: string[] = [];
+    for (const base of [
+      'https://irc.example.test?x=1',
+      'https://irc.example.test#top',
+      'https://admin:secret@irc.example.test',
+      'https://irc.example.test:99999',
+    ]) {
+      await withBaseUrl(base, async () => {
+        if ((await isupportFor(true)).includes('FILEHOST')) advertised.push(base);
+      });
+    }
+    expect(advertised).toEqual([]);
     await withBaseUrl('http://irc.example.test', async () => {
       expect(await isupportFor(true)).not.toContain('FILEHOST');
       expect(await isupportFor(false)).not.toContain('FILEHOST');
@@ -412,10 +424,18 @@ describe('soju.im/FILEHOST in ISUPPORT', () => {
       `:irc.example.net 005 ${nick} CHANTYPES=# soju.im/FILEHOST=https://upstream.example/up draft/FILEHOSTING=1 :are supported by this server`,
       `:irc.example.net 005 ${nick} FILEHOST=https://upstream.example/x :are supported by this server`,
       `:irc.example.net 005 ${nick} -vendor.example/filehost :are supported by this server`,
+      // With no text after the tokens, which halloy would read the last of.
+      `:irc.example.net 005 ${nick} AWAYLEN=200 soju.im/FILEHOST=https://upstream.example/y`,
+      `:irc.example.net 005 ${nick} SAFELIST :soju.im/FILEHOST=https://upstream.example/z`,
+      `:irc.example.net 005 ${nick} soju.im/FILEHOST=https://upstream.example/w`,
     ];
     await withBaseUrl(undefined, async () => {
       expect(await isupportFor(true, registration)).toBe(
-        ':irc.example.net 005 client CHANTYPES=# draft/FILEHOSTING=1 :are supported by this server',
+        [
+          ':irc.example.net 005 client CHANTYPES=# draft/FILEHOSTING=1 :are supported by this server',
+          ':irc.example.net 005 client AWAYLEN=200',
+          ':irc.example.net 005 client SAFELIST',
+        ].join('\n'),
       );
     });
     await withBaseUrl('https://irc.example.test', async () => {
