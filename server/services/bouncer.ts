@@ -1458,8 +1458,12 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.write(`:${SERVER_NAME} 422 ${liveNick} :MOTD File is missing`);
 
     if (conn.state !== 'connected') {
+      // Why it's down, for a client that attached after it went: soju sends the
+      // same on attach (user.go:823).
+      const why = ircManager.connectionError(this.userId, this.networkId) || '';
       this.notice(
-        `Network '${this.network?.name}' is ${conn.state}; channels will appear once it registers.`,
+        `Network '${this.network?.name}' is ${conn.state}; channels will appear once it registers.` +
+          (why ? ` ${why}` : ''),
       );
     } else {
       this.sendJoinBurst();
@@ -2709,7 +2713,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     }
   }
 
-  onUpstreamState(state: string): void {
+  onUpstreamState(state: string, error: string): void {
     if (this.closed) return;
     // Batches the old upstream connection left open will never close.
     this.clientFilter.resetBatches();
@@ -2718,12 +2722,26 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // A connect brings the network's caps; a disconnect takes them away.
     this.updateSupportedCaps(this.currentNick() || '*');
     // A connection says its state again without a change: 'socket close' and
-    // 'close' both say disconnected, and a stopped retry says why.
-    if (state === this.noticedState) return;
-    this.noticedState = state;
-    if (state === 'connected') this.notice(`Upstream reconnected to '${this.network?.name}'.`);
-    else if (state === 'reconnecting' || state === 'disconnected') {
-      this.notice(`Upstream ${state} ('${this.network?.name}') — Lurker will keep retrying.`);
+    // 'close' both say disconnected. The same state with a NEW reason is news,
+    // though — a stopped retry re-asserts 'disconnected' to say why it stopped —
+    // so the reason is part of what's already been said (soju dedupes on the
+    // error text alone, user.go:741).
+    const said = error ? `${state} ${error}` : state;
+    if (said === this.noticedState) return;
+    this.noticedState = said;
+    const name = this.network?.name;
+    if (state === 'connected') this.notice(`Upstream connected to '${name}'.`);
+    else if (state === 'reconnecting') this.notice(`Upstream reconnecting to '${name}'.`);
+    else if (state === 'disconnected') {
+      // Never a promise to keep retrying: a ban, three failed SASL attempts, a
+      // policy stop and a manual disconnect all end here, and a retry that IS
+      // coming announces itself as 'reconnecting'. soju makes no such promise
+      // either, and says why (user.go:753). The reason is a sentence of its own.
+      this.notice(
+        error
+          ? `Upstream disconnected from '${name}': ${error}`
+          : `Upstream disconnected from '${name}'.`,
+      );
     }
   }
 
@@ -2914,6 +2932,11 @@ function dispatchIrcEvent(event: Record<string, unknown>): void {
   const networkId = Number(event.networkId);
   if (!userId || !networkId) return;
   const type = String(event.type || '');
+  // The app's link to the engine dropped, or came back, while the engine kept
+  // the IRC socket open (IrcConnection's `engineLink`). The network itself never
+  // moved, so no client hears anything: a notice, a CAP DEL/NEW pair and a
+  // BOUNCER NETWORK update would all say something untrue.
+  if (type === 'state' && event.engineLink) return;
   // A -notify client (bound OR control) tracks state for ALL of the user's
   // networks — including ones no bound session is attached to — so this goes to
   // every one of the user's sessions, before the per-network early-return below.
@@ -2922,8 +2945,9 @@ function dispatchIrcEvent(event: Record<string, unknown>): void {
   if (!set || set.size === 0) return;
   if (type === 'state') {
     const state = String(event.state || '');
+    const error = typeof event.error === 'string' ? event.error : '';
     // Deleting from a Set mid-iteration is safe; handlers only ever remove.
-    for (const session of set) session.onUpstreamState(state);
+    for (const session of set) session.onUpstreamState(state, error);
     return;
   }
   // The connection heard a channel's NAMES: a client whose attach burst held

@@ -255,6 +255,13 @@ describe('IrcConnection through the engine', () => {
     expect(conn.state).toBe('connected');
     await new Promise((r) => setTimeout(r, 50));
     expect(stateEvents(managerEvents)).not.toContain('disconnected');
+    // Every state on the way back says it was the engine link that moved, not
+    // the network, so an attached IRC client is told nothing (bouncer.ts). The
+    // 'connected' at the end needs no flag: it re-asserts the state the client
+    // was already in.
+    const midway = managerEvents.filter((e) => e.type === 'state' && e.state !== 'connected');
+    expect(midway.length).toBeGreaterThan(0);
+    expect(midway.every((e) => e.engineLink === true)).toBe(true);
     expect(
       rows()
         .slice(rowsBefore)

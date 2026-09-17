@@ -197,7 +197,7 @@ describe('an edit in the web app', () => {
     harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'reconnecting');
 
     const notice = await c.waitFor((l) => l.includes('Upstream reconnecting'));
-    expect(notice).toContain("('renamed')");
+    expect(notice).toContain("to 'renamed'.");
   });
 });
 
@@ -299,9 +299,51 @@ describe('a state change', () => {
     await synced(c);
 
     const notices = c.lines.slice(mark).filter((l) => l.includes('Upstream '));
-    expect(notices).toHaveLength(2);
-    expect(notices[0]).toContain('Upstream disconnected');
-    expect(notices[1]).toContain('Upstream reconnecting');
+    // The bare disconnect, the same state saying why it won't come back, and
+    // the retry. The two bare repeats say nothing new.
+    expect(notices).toHaveLength(3);
+    expect(notices[0]).toContain("Upstream disconnected from 'alpha'.");
+    expect(notices[1]).toContain(
+      "Upstream disconnected from 'alpha': Not reconnecting automatically: banned by the server (G-Lined).",
+    );
+    expect(notices[2]).toContain("Upstream reconnecting to 'alpha'.");
+    // Never a promise to retry: three of those five states won't.
+    expect(notices.join('\n')).not.toContain('keep retrying');
+  });
+
+  // The app's link to the engine dropped while the engine kept the IRC socket
+  // open. Nothing about the network changed, so the client hears nothing: the
+  // caps it negotiated would otherwise be taken away and re-offered.
+  it('says nothing, and takes no caps away, when only the engine link moved', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const c = await attach(acct, `${NOTIFY_CAPS} away-notify`, acct.network.id);
+
+    const mark = c.lines.length;
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'reconnecting', {
+      engineLink: true,
+    });
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'connecting', { engineLink: true });
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'connected', { engineLink: true });
+    await synced(c);
+
+    const after = c.lines.slice(mark);
+    expect(after.filter((l) => l.includes('Upstream '))).toEqual([]);
+    expect(after.filter((l) => l.includes(' CAP '))).toEqual([]);
+    expect(networkLines(c, mark)).toEqual([]);
+  });
+
+  // soju sends the same on attach (user.go:823).
+  it('tells a client that attaches while the network is down why it is', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    acct.upstream.state = 'disconnected';
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: 'Not reconnecting automatically: banned by the server (G-Lined).',
+    });
+    const c = await attachPlain(acct, 'alpha');
+    await synced(c);
+
+    const notice = c.lines.find((l) => l.includes("Network 'alpha' is"));
+    expect(notice).toContain('banned by the server (G-Lined)');
   });
 
   it('is sent once, however often the connection repeats it', async () => {

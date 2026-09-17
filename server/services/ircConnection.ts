@@ -557,6 +557,14 @@ interface PeerWatch {
   reasons: Set<TrackReason>;
 }
 
+// A registration line without its tags, so a repeat is spotted whatever
+// per-delivery tags (time, msgid, batch) it happened to arrive with.
+function burstPayload(line: string): string {
+  if (!line.startsWith('@')) return line;
+  const sp = line.indexOf(' ');
+  return sp === -1 ? line : line.slice(sp + 1);
+}
+
 export class IrcConnection {
   network: Network;
   onEvent: (event: EnrichedEvent) => void;
@@ -763,6 +771,8 @@ export class IrcConnection {
   // (nick-rewritten) to IRC clients that attach mid-session, so they see the
   // network's real ISUPPORT tokens instead of a synthesized approximation.
   registrationLines: string[];
+  // The burst's lines without their tags, to spot a server repeating one.
+  private registrationSeen = new Set<string>();
   // Auto-reconnect controller (we own the policy; irc-framework's auto_reconnect
   // is disabled in connect()). See scheduleReconnectIfWarranted.
   //
@@ -969,6 +979,7 @@ export class IrcConnection {
     this.ctcpLimiter = new RateLimiter();
     this.ctcpOutstanding = new Map();
     this.registrationLines = [];
+    this.registrationSeen = new Set();
     this.reconnectTimer = null;
     this.reconnectAttempt = 0;
     this.intentionalDisconnect = false;
@@ -1332,15 +1343,25 @@ export class IrcConnection {
         }
       }
       const burstLine = event.line.replace(/[\r\n]+$/, '');
-      if (rawCommand === '001') this.registrationLines = [burstLine];
-      else if (
+      if (rawCommand === '001') {
+        this.registrationLines = [burstLine];
+        this.registrationSeen = new Set([burstPayload(burstLine)]);
+      } else if (
         this.registrationLines.length > 0 &&
         (rawCommand === '002' ||
           rawCommand === '003' ||
           rawCommand === '004' ||
           rawCommand === '005')
       ) {
-        this.registrationLines.push(burstLine);
+        // A line the burst already holds tells a client nothing, and servers do
+        // repeat one: solanum sends its whole ISUPPORT again after every VERSION
+        // (show_isupport in m_version.c), and each attach would replay the pile.
+        // A token that CHANGED still arrives as a line of its own.
+        const payload = burstPayload(burstLine);
+        if (!this.registrationSeen.has(payload)) {
+          this.registrationSeen.add(payload);
+          this.registrationLines.push(burstLine);
+        }
       }
       // Command-result errors (a failed kick / invite / mode / topic) name the
       // channel they concern, so surface them in that buffer instead of leaving
@@ -1877,7 +1898,9 @@ export class IrcConnection {
         } else if (engineCode === ENGINE_CLOSE.DETACHED) {
           this.setState('disconnected', {}, { log: DETACHED_LOG });
         } else {
-          this.setState('reconnecting');
+          // `engineLink`: the IRC socket is up, only our link to it is gone, so
+          // a bouncer client hears nothing about it (services/bouncer.ts).
+          this.setState('reconnecting', { engineLink: true });
         }
         return;
       }
@@ -1928,7 +1951,12 @@ export class IrcConnection {
     // "Connecting…" in the system buffer would describe a connect that isn't
     // happening; the manager already said "Attaching…" and the engine hook
     // says "Re-attached" when it lands.
-    c.on('connecting', () => this.setState('connecting', {}, { log: !this.engineHoldsUs() }));
+    c.on('connecting', () => {
+      // Re-attaching to a connection the engine still holds isn't the network
+      // connecting: the same flag, and the same silence for bouncer clients.
+      const held = this.engineHoldsUs();
+      this.setState('connecting', held ? { engineLink: true } : {}, { log: !held });
+    });
 
     // Diagnostic: irc-framework fires 'ping timeout' when it hasn't seen data
     // from the server for `ping_timeout` seconds (120s default) — then it QUITs
