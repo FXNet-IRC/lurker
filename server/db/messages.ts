@@ -8,6 +8,9 @@ import {
   resolveOrMintForInsert,
 } from './bufferResolve.js';
 import { markBufferDirty, noteNoiseInsert } from './retention.js';
+import { networkCasemapping } from './buffers.js';
+import { foldTargetWith } from './casemapping.js';
+import type { Casemapping } from './casemapping.js';
 import { EARLY_PRUNE_TYPES } from '../../shared/eventFilter.js';
 import { countsTowardPage } from '../../shared/eventFilter.js';
 import type { PageUnit } from '../../shared/eventFilter.js';
@@ -574,7 +577,65 @@ const chathistoryMsgFilter = (alias = '') => {
   const p = alias ? `${alias}.` : '';
   return `${p}type IN ('message', 'action', 'notice') AND ${p}mirrored = 0 AND ${p}text IS NOT NULL AND ${p}text != ''`;
 };
-const CHATHISTORY_MSG_FILTER = chathistoryMsgFilter();
+
+// The event rows a draft/event-playback client also gets in history, as soju
+// replays them: joins, parts, quits, nick changes, kicks, and mode and topic
+// changes. Not chghost or invite rows: soju keeps neither, and the spec's list
+// names neither.
+export const HISTORY_EVENT_TYPES = ['join', 'part', 'quit', 'nick', 'kick', 'mode', 'topic'];
+
+// Who a history window is for. `me` is our current nick on the network.
+export interface HistoryEvents {
+  me: string | null;
+}
+
+// foldTargetWith as an SQL function, so a nick stored in a row folds exactly as
+// the network folds nicks (#707): ASCII, rfc1459's [ ] \\ ^ pairs, or Unicode
+// for rfc7613 and an undeclared mapping. SQLite's own lower() is ASCII-only.
+const FOLD_NICK_FN = 'lurker_fold_nick';
+db.function(FOLD_NICK_FN, { deterministic: true }, (mapping: unknown, nick: unknown) =>
+  typeof nick === 'string'
+    ? foldTargetWith(typeof mapping === 'string' ? (mapping as Casemapping) : null, nick)
+    : null,
+);
+
+// The rows a window holds: messages, and for a draft/event-playback client the
+// event rows too, every one counting toward the limit as soju's do. Filtered
+// here rather than at playback, because a batch shorter than its limit reads as
+// the start of history to halloy and gamja.
+//
+// Events naming our current nick stay out: a JOIN, PART, QUIT or NICK from it,
+// or a KICK of it, compared under the network's CASEMAPPING as clients compare
+// (goguma's isMyNick), so `foo{bar}` is `foo[bar]` on rfc1459 and `Älice` is
+// `älice` on rfc7613. goguma applies every replayed line to its live state
+// (client_controller.dart:577-721), and those are the ones it takes as ours: an
+// old PART marks the channel as left, an old NICK renames us. HexDroid rejoins
+// on an old JOIN of ours. An event under a nick we no longer use reads as
+// someone else's there. The rest still reach goguma's state as they do from
+// soju: an old TOPIC or MODE, or someone else's JOIN, PART or QUIT, until its
+// next NAMES or TOPIC. The operator accepted that (plan: draft/event-playback).
+function historyFilter(
+  alias: string,
+  events: HistoryEvents | null | undefined,
+  mapping: Casemapping | null,
+): { sql: string; params: Array<string | null> } {
+  const messages = chathistoryMsgFilter(alias);
+  if (!events) return { sql: messages, params: [] };
+  const p = alias ? `${alias}.` : '';
+  const types = HISTORY_EVENT_TYPES.map((t) => `'${t}'`).join(', ');
+  let eventSql = `${p}type IN (${types})`;
+  const params: Array<string | null> = [];
+  if (events.me) {
+    // COALESCE, or a row with no nick would compare NULL and drop out too.
+    const nick = `${FOLD_NICK_FN}(?, COALESCE(${p}nick, ''))`;
+    const kicked = `${FOLD_NICK_FN}(?, COALESCE(CASE WHEN json_valid(${p}extra) THEN json_extract(${p}extra, '$.kicked') END, ''))`;
+    eventSql += ` AND NOT (${p}type IN ('join', 'part', 'quit', 'nick') AND ${nick} = ?)`;
+    eventSql += ` AND NOT (${p}type = 'kick' AND ${kicked} = ?)`;
+    const me = foldTargetWith(mapping, events.me);
+    params.push(mapping, me, mapping, me);
+  }
+  return { sql: `((${messages}) OR (${eventSql}))`, params };
+}
 
 // Windowed history fetch for CHATHISTORY. `lower`/`upper` are exclusive ISO time
 // bounds (null = unbounded on that side). `newestFirst` takes the `limit` from
@@ -594,12 +655,16 @@ export function loadHistoryWindow(
   lower: string | null,
   upper: string | null,
   limit: number,
-  { newestFirst = false }: { newestFirst?: boolean } = {},
+  {
+    newestFirst = false,
+    events: forEvents,
+  }: { newestFirst?: boolean; events?: HistoryEvents | null } = {},
 ): MessageEvent[] {
   const bufferId = resolveBufferIdByNetwork(networkId, target);
   if (bufferId === undefined) return [];
-  const conds = ['buffer_id = ?', CHATHISTORY_MSG_FILTER];
-  const params: (string | number)[] = [bufferId];
+  const filter = historyFilter('', forEvents, forEvents?.me ? networkCasemapping(networkId) : null);
+  const conds = ['buffer_id = ?', filter.sql];
+  const params: (string | number | null)[] = [bufferId, ...filter.params];
   if (lower !== null) {
     conds.push('time > ?');
     params.push(lower);
@@ -620,17 +685,43 @@ export function loadHistoryWindow(
   return newestFirst ? events.toReversed() : events;
 }
 
+// The newest `limit` conversation rows in a buffer, oldest first: the rows a
+// chathistory window counts, for the bouncer's attach playback, so a buffer's
+// joins and parts don't use up its share. In id order, down
+// idx_messages_buf_unread, which carries `type`: it reads the rows it returns and
+// the events it passes on the way. A window in time order reads and sorts every
+// row in the buffer, once per buffer on every attach.
+export function listRecentMessages(
+  networkId: number,
+  target: string,
+  limit: number,
+): MessageEvent[] {
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return [];
+  const rows = db
+    .prepare(
+      `SELECT *, ${BOOKMARKED_COL('messages')} FROM messages
+        WHERE buffer_id = ? AND ${chathistoryMsgFilter()}
+        ORDER BY id DESC LIMIT ?`,
+    )
+    .all(bufferId, limit) as MessageRow[];
+  return rows.map(rowToEvent).toReversed();
+}
+
 // Buffers with real message activity inside a time window (exclusive), newest
 // first, for CHATHISTORY TARGETS. Excludes :server: pseudo-buffers and applies
-// the same message filter (a buffer whose only in-window rows are JOINs isn't
-// "active"). The two bounds may arrive in either order; we normalize.
+// the same filter as a window: a buffer whose only in-window rows are JOINs isn't
+// "active", except to a draft/event-playback client (soju). The two bounds may
+// arrive in either order; we normalize.
 export function listActiveTargetsInWindow(
   networkId: number,
   isoA: string,
   isoB: string,
   limit: number,
+  { events }: { events?: HistoryEvents | null } = {},
 ): BufferSummary[] {
   const [lo, hi] = isoA <= isoB ? [isoA, isoB] : [isoB, isoA];
+  const filter = historyFilter('m', events, events?.me ? networkCasemapping(networkId) : null);
   // Grouped by buffer_id and named from the registry row, so the summary
   // carries the canonical casing rather than whichever casing the window's
   // rows happened to arrive under. Sentinels are excluded by kind — the
@@ -642,13 +733,13 @@ export function listActiveTargetsInWindow(
          JOIN buffers b ON b.id = m.buffer_id
         WHERE b.network_id = ?
           AND b.kind NOT IN ('server', 'system')
-          AND ${chathistoryMsgFilter('m')}
+          AND ${filter.sql}
           AND m.time > ? AND m.time < ?
         GROUP BY b.id
         ORDER BY lastMessageAt DESC
         LIMIT ?`,
     )
-    .all(networkId, lo, hi, limit) as BufferSummary[];
+    .all(networkId, ...filter.params, lo, hi, limit) as BufferSummary[];
 }
 
 export function listRecentForBuffers(
