@@ -347,3 +347,73 @@ describe('selector-less registration (soju parity)', () => {
     expect(harnessMod.attachedFor(acct)).toBe(0); // control mode, not a blind bind
   });
 });
+
+// soju.im/FILEHOST (routes/filehost.ts): goguma and gamja read it on a bound
+// connection, halloy on the unbound one, so both carry it.
+describe('soju.im/FILEHOST in ISUPPORT', () => {
+  const TOKEN = 'soju.im/FILEHOST=https://irc.example.test/api/filehost';
+
+  // The 005 lines a client gets up to its 422.
+  async function isupportFor(bound: boolean): Promise<string> {
+    const acct = harnessMod.seedAccount({ nick: `fh${Math.random().toString(36).slice(2, 7)}` });
+    const c = await harness.connect();
+    if (bound) {
+      c.send(`PASS ${acct.user.username}:${acct.password}`);
+      c.send('NICK client');
+      c.send('USER client 0 * :client');
+    } else {
+      harnessMod.seedNetwork(acct.user, { networkName: 'second' });
+      await negotiate(c, acct, 'sasl soju.im/bouncer-networks');
+      c.send('CAP END');
+    }
+    await c.waitForCommand('422');
+    c.close();
+    return c.lines.filter((l) => harnessMod.commandOf(l) === '005').join('\n');
+  }
+
+  async function withBaseUrl<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+    const prev = process.env.PUBLIC_BASE_URL;
+    if (value === undefined) delete process.env.PUBLIC_BASE_URL;
+    else process.env.PUBLIC_BASE_URL = value;
+    try {
+      return await fn();
+    } finally {
+      if (prev === undefined) delete process.env.PUBLIC_BASE_URL;
+      else process.env.PUBLIC_BASE_URL = prev;
+    }
+  }
+
+  it('is advertised on bound and control connections with an https PUBLIC_BASE_URL', async () => {
+    await withBaseUrl('https://irc.example.test/', async () => {
+      expect(await isupportFor(true)).toContain(TOKEN);
+      expect(await isupportFor(false)).toContain(TOKEN);
+    });
+  });
+
+  it('is not advertised without PUBLIC_BASE_URL, or with a plain http one', async () => {
+    await withBaseUrl(undefined, async () => {
+      expect(await isupportFor(true)).not.toContain('FILEHOST');
+    });
+    await withBaseUrl('http://irc.example.test', async () => {
+      expect(await isupportFor(true)).not.toContain('FILEHOST');
+      expect(await isupportFor(false)).not.toContain('FILEHOST');
+    });
+  });
+
+  it('is not advertised to an account with no usable uploader', async () => {
+    const { default: db } = await import('../db/index.js');
+    const defaults = db
+      .prepare(`SELECT id FROM uploader_config WHERE scope = 'instance' AND is_default = 1`)
+      .all() as Array<{ id: number }>;
+    db.prepare(`UPDATE uploader_config SET is_default = 0 WHERE scope = 'instance'`).run();
+    try {
+      await withBaseUrl('https://irc.example.test', async () => {
+        expect(await isupportFor(true)).not.toContain('FILEHOST');
+      });
+    } finally {
+      for (const { id } of defaults) {
+        db.prepare('UPDATE uploader_config SET is_default = 1 WHERE id = ?').run(id);
+      }
+    }
+  });
+});

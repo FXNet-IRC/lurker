@@ -207,7 +207,7 @@ describe('POST', () => {
     settings.setUserSetting(user.id, 'uploads.image.max_upload_mb', 1);
     const server = http.createServer(app).listen(0);
     const { port } = server.address() as AddressInfo;
-    const send = (headers: Record<string, string>) =>
+    const send = (headers: Record<string, string>, chunks = 4) =>
       new Promise<{ status: number; body: string }>((resolve, reject) => {
         const req = http.request(
           {
@@ -229,13 +229,18 @@ describe('POST', () => {
         );
         req.on('error', () => {});
         setTimeout(() => reject(new Error('no response')), 5000).unref();
-        for (let i = 0; i < 4; i++) req.write(Buffer.alloc(512 * 1024, 1));
-        req.end();
+        // Node holds the headers back until the first write; send them regardless.
+        req.flushHeaders();
+        for (let i = 0; i < chunks; i++) req.write(Buffer.alloc(512 * 1024, 1));
+        if (chunks > 0) req.end();
       });
     try {
       const declared = await send({ 'Content-Length': String(2 * 1024 * 1024) });
       expect(declared.status).toBe(413);
       expect(declared.body).toMatch(/file exceeds/);
+      // Refused on the declared length alone, before a byte of the body arrives.
+      const unsent = await send({ 'Content-Length': String(2 * 1024 * 1024) }, 0);
+      expect(unsent.status).toBe(413);
       // Chunked, with no Content-Length to refuse on.
       const chunked = await send({ 'Transfer-Encoding': 'chunked' });
       expect(chunked.status).toBe(413);

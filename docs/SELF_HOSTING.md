@@ -231,7 +231,7 @@ environment:
   - LOCAL_UPLOADS_DIR=/data/uploads
 ```
 
-The link Lurker pastes into IRC has to be an **absolute** URL, or nobody else can open it. Lurker works the origin out from the incoming request, which is right for most reverse-proxy setups. If your links come out with the wrong hostname or scheme, pin it explicitly:
+The link Lurker pastes into IRC has to be an **absolute** URL, or nobody else can open it. Lurker works the origin out from the incoming request, which is right for most reverse-proxy setups. If your links come out with the wrong hostname or scheme, pin it explicitly. The [bouncer](#irc-bouncer-attach-from-other-irc-clients) needs it set to offer file uploads to IRC clients, since it has no web request to work the origin out from:
 
 ```yaml
 environment:
@@ -533,6 +533,7 @@ Modern IRCv3 clients (Halloy, gamja, Goguma, …) get more than the server-passw
 - **Network discovery** (`soju.im/bouncer-networks`) — the client lists and binds your networks itself, so you don't hardcode `username/networkname`; connect as just `username` and pick from the list. This is what the idle connection above is for.
 - **On-demand scrollback** (`draft/chathistory`) — the client fetches the history it wants itself, so Lurker skips the replay on attach.
 - **Read markers** (`draft/read-marker`) — what you read in one client shows as read in your other clients and in the web and iOS apps, and the other way round.
+- **File uploads** (`soju.im/FILEHOST`) — attach a file in Goguma, gamja or Halloy and it goes through your uploader, same as a paste in the web app. This needs [`PUBLIC_BASE_URL`](#file-uploads-on-your-own-disk) set to your instance's **https** address; without it the bouncer doesn't offer uploads.
 
 These are negotiated automatically; plain clients that don't support them keep working over the server-password path.
 

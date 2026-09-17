@@ -168,6 +168,7 @@ we advertise only what we actually implement.
 | Pick your network from a list instead of hardcoding `username/networkname`                      | `soju.im/bouncer-networks`, `soju.im/bouncer-networks-notify` |
 | Message metadata passed through from upstream                                                   | `message-tags`                                                |
 | Network list delivered as one grouped burst                                                     | `batch`                                                       |
+| Attach a file in your client and get a link to send, when `PUBLIC_BASE_URL` is set              | `soju.im/FILEHOST`                                            |
 | People's away, account and host changes, when your network sends them                           | `away-notify`, `account-notify`, `chghost`                    |
 | The same for people you `MONITOR` but share no channel with                                     | `extended-monitor`, `draft/extended-monitor`                  |
 | Accounts on JOINs and on each message, when your network sends them                             | `extended-join`, `account-tag`                                |
@@ -267,6 +268,16 @@ Implementation notes worth knowing if you're writing against it:
   attached to a network that's deleted is disconnected. Networks are managed in Lurker
   itself, so `ADDNETWORK`, `CHANGENETWORK` and `DELNETWORK` are refused.
   <br>`server/services/bouncer.ts:1669`
+- `soju.im/FILEHOST` points your client at `<PUBLIC_BASE_URL>/api/filehost`. It's only
+  advertised when `PUBLIC_BASE_URL` is set to an https URL and your account has an
+  uploader. Your client uploads there with the credentials it logged in with: HTTP Basic
+  with your password or a read-write API token (a `/network` or `@client` in the username
+  is ignored), or an OAuth token as the password or as a Bearer token. The file goes
+  through the same uploader and rules as an upload from the web app: images, text and
+  audio/video only, images re-encoded, and it shows in your uploads list. The answer is
+  `201 Created` with a `Location`; errors are plain text. Failed logins count toward the
+  same limit as the web sign-in.
+  <br>`server/routes/filehost.ts`, `server/services/bouncer.ts:583`
 
 ---
 
@@ -304,6 +315,7 @@ attaching to Lurker.
 | `whox`                                  |   ✅   |    —    |
 | `znc.in/self-message`                   |   —    |   ✅    |
 | `soju.im/bouncer-networks` (+`-notify`) |   —    |   ✅    |
+| `soju.im/FILEHOST`                      |   —    |   ✅    |
 
 ### Negotiated but not yet used
 
