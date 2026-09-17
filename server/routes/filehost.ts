@@ -54,11 +54,12 @@ function sendText(res: Response, status: number, text: string): void {
 const LINGER_BYTES = 4 * 1024 * 1024;
 const LINGER_MS = 10_000;
 
-// An answer sent before the body is read. Closing the connection at once makes
-// the client's next write fail, and a client that fails to write can report a
-// reset instead of this answer, so the rest is read and discarded for a while
-// first, as Go's server does. Past LINGER_BYTES or LINGER_MS the connection
-// closes: a file far over the cap isn't taken in full just to say no.
+// An answer sent before the body is read. The connection stays open while the
+// rest arrives and is thrown away, so the client finishes writing and reads the
+// answer: closing at once made its next write fail, and a client that fails to
+// write can report a reset instead of the 413. Node would read an unread body
+// to the end on its own; past LINGER_BYTES or LINGER_MS this closes it, so a
+// file far over the cap isn't taken in full just to say no.
 function refuse(req: Request, res: Response, status: number, text: string): void {
   sendText(res, status, text);
   if (req.complete) return;

@@ -8,6 +8,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import http from 'node:http';
+import net from 'node:net';
 import type { AddressInfo } from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -207,7 +208,7 @@ describe('POST', () => {
     settings.setUserSetting(user.id, 'uploads.image.max_upload_mb', 1);
     const server = http.createServer(app).listen(0);
     const { port } = server.address() as AddressInfo;
-    const send = (headers: Record<string, string>, chunks = 4) =>
+    const send = (headers: Record<string, string>, chunks = 4, end = true) =>
       new Promise<{ status: number; body: string }>((resolve, reject) => {
         const req = http.request(
           {
@@ -232,7 +233,7 @@ describe('POST', () => {
         // Node holds the headers back until the first write; send them regardless.
         req.flushHeaders();
         for (let i = 0; i < chunks; i++) req.write(Buffer.alloc(512 * 1024, 1));
-        if (chunks > 0) req.end();
+        if (chunks > 0 && end) req.end();
       });
     try {
       const declared = await send({ 'Content-Length': String(2 * 1024 * 1024) });
@@ -241,10 +242,56 @@ describe('POST', () => {
       // Refused on the declared length alone, before a byte of the body arrives.
       const unsent = await send({ 'Content-Length': String(2 * 1024 * 1024) }, 0);
       expect(unsent.status).toBe(413);
-      // Chunked, with no Content-Length to refuse on.
-      const chunked = await send({ 'Transfer-Encoding': 'chunked' });
+      // Chunked, with no Content-Length to refuse on, and never finished: only
+      // stopping once the body passes the cap answers it.
+      const chunked = await send({ 'Transfer-Encoding': 'chunked' }, 4, false);
       expect(chunked.status).toBe(413);
     } finally {
+      server.close();
+    }
+  });
+
+  // Over a raw socket: Node's http client stops writing a body once it has read
+  // the whole response, which would hide whether the server kept reading.
+  it('closes the connection once a refused body runs well past the cap', async () => {
+    const user = await seedUser();
+    settings.setUserSetting(user.id, 'uploads.image.max_upload_mb', 1);
+    const server = http.createServer(app).listen(0);
+    const { port } = server.address() as AddressInfo;
+    try {
+      const outcome = await new Promise<{ response: string; closedAfter: number }>(
+        (resolve, reject) => {
+          const socket = net.connect(port, '127.0.0.1');
+          let response = '';
+          let sent = 0;
+          const chunk = Buffer.alloc(256 * 1024, 1);
+          const pump = () => {
+            while (sent < 64 * 1024 * 1024) {
+              sent += chunk.length;
+              if (!socket.write(chunk)) return socket.once('drain', pump);
+            }
+          };
+          socket.on('data', (data) => {
+            const first = response === '';
+            response += data.toString('latin1');
+            // Keep sending the body after the answer, well past what's thrown away.
+            if (first) pump();
+          });
+          socket.on('error', () => {});
+          socket.on('close', () => resolve({ response, closedAfter: sent }));
+          setTimeout(() => reject(new Error('never closed')), 8000).unref();
+          socket.write(
+            `POST /api/filehost HTTP/1.1\r\nHost: localhost\r\n` +
+              `Authorization: ${basic(user.username, PASSWORD)}\r\n` +
+              `Content-Type: image/png\r\nContent-Length: ${64 * 1024 * 1024}\r\n\r\n`,
+          );
+        },
+      );
+      expect(outcome.response).toMatch(/^HTTP\/1\.1 413 /);
+      // Closed long before the declared 64 MB was sent.
+      expect(outcome.closedAfter).toBeLessThan(32 * 1024 * 1024);
+    } finally {
+      server.closeAllConnections();
       server.close();
     }
   });
