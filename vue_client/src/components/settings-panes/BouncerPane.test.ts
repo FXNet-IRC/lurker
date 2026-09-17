@@ -53,6 +53,7 @@ describe('BouncerPane', () => {
     expect(text).toContain('TLS');
     // Plain username for every network, username/network for one.
     expect(text).toContain('brad');
+    expect(text).toContain('one network');
     expect(text).toContain('brad/libera');
     expect(text).toContain('oftc');
     // Nothing about pinning an address: the operator already did.
@@ -80,5 +81,6 @@ describe('BouncerPane', () => {
     const w = await mountWith({ host: null, port: 6667, tls: true, pinned: false }, []);
     expect(w.text()).toContain('brad');
     expect(w.text()).not.toContain('brad/');
+    expect(w.text()).not.toContain('one network');
   });
 });

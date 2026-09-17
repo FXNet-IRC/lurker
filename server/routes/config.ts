@@ -4,7 +4,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getEdition, isNodeMode } from '../utils/edition.js';
-import { isBouncerEnabled } from '../services/bouncer.js';
+import { isBouncerEnabled } from '../utils/bouncerConfig.js';
 import { PROTOCOL_VERSION, MIN_PROTOCOL_VERSION } from '../protocol.js';
 import { previewsEnabled } from '../utils/previews.js';
 
