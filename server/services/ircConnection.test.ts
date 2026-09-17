@@ -2680,6 +2680,20 @@ describe('auto-reconnect controller', () => {
       expect(conn.connect).toHaveBeenCalledTimes(1);
     });
 
+    it('says why on the state it settles to', () => {
+      vi.useFakeTimers();
+      const { conn, events } = makeGatedConn('rc-gate-error', () => ({
+        ok: false,
+        reason: 'this account is paused',
+      }));
+      conn.client.emit('close', true);
+      vi.runAllTimers();
+      expect(events.filter((e) => e.type === 'state').at(-1)).toMatchObject({
+        state: 'disconnected',
+        error: 'Not reconnecting automatically: this account is paused.',
+      });
+    });
+
     it('refuses to reconnect a paused account', () => {
       vi.useFakeTimers();
       const { conn, events } = makeGatedConn('rc-gate-paused', () => ({
@@ -2775,6 +2789,48 @@ describe('auto-reconnect controller', () => {
         (e) => e.type === 'error' && /Not reconnecting automatically/i.test(String(e.text)),
       ),
     ).toBe(true);
+  });
+
+  // Why an attempt failed rides the state event that ends it. ircManager keeps
+  // it for bouncer clients (BOUNCER NETWORK's `error`) until the next connect.
+  describe("the error on a failed attempt's state", () => {
+    const lastState = (events: Record<string, unknown>[]) =>
+      events.filter((e) => e.type === 'state').at(-1);
+
+    it('names a socket error', () => {
+      const { conn, events } = makeConn('rc-error-socket');
+      conn.client.emit('socket close', {
+        code: 'ECONNREFUSED',
+        message: 'connect ECONNREFUSED 192.0.2.1:6697',
+      });
+      expect(lastState(events)).toEqual(
+        expect.objectContaining({
+          state: 'disconnected',
+          error:
+            'Connection failed (irc.example.test:6697): ECONNREFUSED: connect ECONNREFUSED 192.0.2.1:6697',
+        }),
+      );
+    });
+
+    it('has none for a close without one', () => {
+      const { conn, events } = makeConn('rc-error-clean');
+      conn.client.emit('socket close', {});
+      expect(lastState(events)).toMatchObject({ state: 'disconnected' });
+      expect(lastState(events)).not.toHaveProperty('error');
+    });
+
+    it('names a ban once reconnecting stops for it', () => {
+      vi.useFakeTimers();
+      const { conn, events } = makeConn('rc-error-ban');
+      conn.client.emit('irc error', { error: 'irc', reason: 'Closing Link: nick[u@h] (G-Lined)' });
+      conn.client.emit('socket close', {});
+      conn.client.emit('close', true);
+      vi.runAllTimers();
+      expect(lastState(events)).toMatchObject({ state: 'disconnected' });
+      expect(String(lastState(events)?.error)).toMatch(
+        /^Not reconnecting automatically: banned by the server/,
+      );
+    });
   });
 
   // #651: a ban-shaped ERROR that did NOT close its own socket must not lie in

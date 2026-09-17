@@ -1137,6 +1137,9 @@ export class IrcConnection {
   // `opts.log`: false skips the system-buffer line for this transition (the
   // state event still goes to clients); a string replaces its text. Neither
   // reaches the wire.
+  // `extra.error`: why a connection attempt failed, in the words of the error
+  // row the server buffer gets. ircManager keeps the last one for bouncer
+  // clients (BOUNCER NETWORK's `error` attribute) until the next connect.
   setState(
     state: string,
     extra: Record<string, unknown> = {},
@@ -1876,7 +1879,15 @@ export class IrcConnection {
         }
         return;
       }
-      this.setState('disconnected');
+      const errorText =
+        err && (err.message || err.code)
+          ? formatSocketCloseErrorMessage(
+              err,
+              `${this.network.host}:${this.network.port}`,
+              this.network.trusted_certificates !== 0,
+            )
+          : null;
+      this.setState('disconnected', errorText ? { error: errorText } : {});
       // The IRC socket itself is gone (the engine-link cases returned above),
       // and the channels we were in went with it.
       this.forgetJoinedChannels();
@@ -1899,19 +1910,13 @@ export class IrcConnection {
       // 'raw socket connected' handler above and gets a fresh handle).
       unregisterIdent(this.identdId);
       this.identdId = null;
-      if (err && (err.message || err.code)) {
-        const where = `${this.network.host}:${this.network.port}`;
-        const text = formatSocketCloseErrorMessage(
-          err,
-          where,
-          this.network.trusted_certificates !== 0,
-        );
+      if (errorText) {
         this.publish({
           type: 'error',
           target: this.serverTarget(),
-          text,
+          text: errorText,
         });
-        this.logNet(text, 'error');
+        this.logNet(errorText, 'error');
       }
     });
     // The 'reconnecting' state + notice are now emitted by our own controller
@@ -4423,13 +4428,10 @@ export class IrcConnection {
       // identity: they arrive as an unrecognised stranger, +R channels refuse
       // them, and under EXTERNAL the registration fails with a SASL error that
       // points at the wrong thing entirely.
-      this.publish({
-        type: 'error',
-        target: this.serverTarget(),
-        text: `Not connecting: ${blocked}.`,
-      });
+      const text = `Not connecting: ${blocked}.`;
+      this.publish({ type: 'error', target: this.serverTarget(), text });
       this.logNet(`Connect blocked: ${blocked}`, 'warn');
-      this.setState('disconnected');
+      this.setState('disconnected', { error: text });
       // Nothing here will retry — no socket opened, so no 'close' to schedule
       // one from — and every one of these reasons is fixed by editing the
       // network. Ask to be dropped, or the manager's map keeps a connection
@@ -6948,13 +6950,10 @@ export class IrcConnection {
    */
   private stopReconnecting(reason: string): void {
     this.clearReconnectTimer();
-    this.publish({
-      type: 'error',
-      target: this.serverTarget(),
-      text: `Not reconnecting automatically: ${reason}.`,
-    });
+    const text = `Not reconnecting automatically: ${reason}.`;
+    this.publish({ type: 'error', target: this.serverTarget(), text });
     this.logNet(`Auto-reconnect blocked: ${reason}`, 'warn');
-    this.setState('disconnected');
+    this.setState('disconnected', { error: text });
   }
 
   private scheduleReconnectIfWarranted(): void {
@@ -6963,12 +6962,11 @@ export class IrcConnection {
     if (this.terminalDisconnect) {
       // Won't self-heal — surface why and stop. A manual reconnect (which
       // rebuilds the connection from scratch) clears this and tries again.
-      this.publish({
-        type: 'error',
-        target: this.serverTarget(),
-        text: `Not reconnecting automatically: ${this.terminalDisconnect}. Fix the issue and reconnect manually.`,
-      });
+      const text = `Not reconnecting automatically: ${this.terminalDisconnect}. Fix the issue and reconnect manually.`;
+      this.publish({ type: 'error', target: this.serverTarget(), text });
       this.logNet(`Auto-reconnect stopped: ${this.terminalDisconnect}`, 'error');
+      // 'socket close' already said disconnected; this says why it stays that way.
+      this.setState('disconnected', { error: text });
       return;
     }
     const attempt = this.reconnectAttempt;
