@@ -323,7 +323,9 @@ describe('a state change', () => {
       engineLink: true,
     });
     harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'connecting', { engineLink: true });
-    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'connected', { engineLink: true });
+    // As production does: the 'connected' at the end of a re-attach carries no
+    // flag (ircConnection's registered handler), and the dedupe covers it.
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'connected');
     await synced(c);
 
     const after = c.lines.slice(mark);
@@ -421,6 +423,25 @@ describe('a state change', () => {
 
     const notice = c.lines.find((l) => l.includes("Network 'alpha' is"));
     expect(notice).toContain('the proxy refused the connection');
+  });
+
+  // The same host refusing the same certificate twice says the same words, so
+  // the reason can't be told apart by its text.
+  it('says why when the restart failed exactly as the attempt before it did', async () => {
+    const same = 'Not connecting: the certificate is not trusted.';
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    acct.upstream.state = 'disconnected';
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', { error: same });
+    vi.spyOn(ircManager, 'restartNetwork').mockImplementation((userId, networkId) => {
+      const conn = ircManager.getConnection(userId, networkId)!;
+      harnessMod.emitNetworkState(userId, networkId, 'disconnected', { error: same });
+      return conn as never;
+    });
+    const c = await attachPlain(acct, 'alpha');
+    await synced(c);
+
+    const notice = c.lines.find((l) => l.includes("Network 'alpha' is"));
+    expect(notice).toContain('the certificate is not trusted');
   });
 
   // Attaching to a network that gave up restarts it (ZNC's shape), so the

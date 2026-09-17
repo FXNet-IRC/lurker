@@ -171,7 +171,11 @@ class IrcManager extends EventEmitter {
   // read off the event stream.
   // Held here rather than on the connection, because a connect refused over the
   // network's settings drops its connection from the map as it reports why.
-  private connectionErrors = new Map<number, Map<number, string>>();
+  // `seq` counts the times a reason was recorded, so a caller can tell a fresh
+  // failure from the one it already knew — the same host refusing the same
+  // certificate twice reads identically.
+  private connectionErrors = new Map<number, Map<number, { text: string; seq: number }>>();
+  private connectionErrorSeq = 0;
 
   constructor() {
     super();
@@ -182,7 +186,12 @@ class IrcManager extends EventEmitter {
   }
 
   connectionError(userId: number, networkId: number): string | null {
-    return this.connectionErrors.get(userId)?.get(networkId) ?? null;
+    return this.connectionErrors.get(userId)?.get(networkId)?.text ?? null;
+  }
+
+  /** Which recording the current reason is, or 0 for none. Only identity matters. */
+  connectionErrorSeqFor(userId: number, networkId: number): number {
+    return this.connectionErrors.get(userId)?.get(networkId)?.seq ?? 0;
   }
 
   private noteConnectionError(event: {
@@ -199,7 +208,8 @@ class IrcManager extends EventEmitter {
         errors = new Map();
         this.connectionErrors.set(userId, errors);
       }
-      errors.set(networkId, event.error);
+      this.connectionErrorSeq += 1;
+      errors.set(networkId, { text: event.error, seq: this.connectionErrorSeq });
     } else if (event.state === 'connected') {
       this.forgetConnectionError(userId, networkId);
     }

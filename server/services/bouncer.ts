@@ -1362,10 +1362,12 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // client attaches. A conn object stuck in 'disconnected' (e.g. its boot-
     // time connect was refused and retries ran out) is restarted — safe here
     // because this session hasn't attached any listeners to it yet.
-    // What the last attempt said before this attach touched anything. A restart
-    // below supersedes it — but a restart that fails on the spot (a proxy or
-    // certificate refusal is synchronous) records a NEW reason, which stands.
-    const errorBefore = ircManager.connectionError(user.id, network.id);
+    // Which reason the last attempt left before this attach touched anything. A
+    // restart below supersedes it — but a restart that fails on the spot (a
+    // proxy or certificate refusal is synchronous) records a NEW one, which
+    // stands. The recording, not its text: the same host refusing the same
+    // certificate twice says the same words.
+    const errorBefore = ircManager.connectionErrorSeqFor(user.id, network.id);
     let conn = ircManager.getConnection(user.id, network.id);
     let restarted = false;
     if (!conn) {
@@ -1375,7 +1377,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       conn = ircManager.restartNetwork(user.id, network.id, 'bouncer client attached');
       restarted = true;
     }
-    const superseded = restarted ? errorBefore : null;
+    const superseded = restarted ? errorBefore : 0;
     if (!conn) {
       this.failRegistration('Network is unavailable');
       return;
@@ -1442,7 +1444,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
 
   // --- attach burst ----------------------------------------------------------
 
-  private sendAttachBurst(superseded: string | null = null): void {
+  private sendAttachBurst(superseded = 0): void {
     const conn = this.conn!;
     const requested = this.clientNick || conn.currentNick || 'user';
     const liveNick = conn.currentNick || requested;
@@ -1494,7 +1496,8 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       // contradict the retry under way — while a reason that restart just
       // recorded is about what's happening now, and is said.
       const current = ircManager.connectionError(this.userId, this.networkId) || '';
-      const why = current === superseded ? '' : current;
+      const stale = ircManager.connectionErrorSeqFor(this.userId, this.networkId) === superseded;
+      const why = stale ? '' : current;
       this.notice(
         `Network '${this.network?.name}' is ${conn.state}; channels will appear once it registers.` +
           (why ? ` ${why}` : ''),
