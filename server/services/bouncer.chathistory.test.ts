@@ -618,15 +618,15 @@ describe('draft/event-playback', () => {
       'JOIN :zed!z@h',
     ]);
     const unicode: Row[] = [
-      { type: 'join', nick: 'äLICE', userhost: 'äLICE!a@h' },
-      { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'out', extra: { kicked: 'äLiCe' } },
+      { type: 'join', nick: 'ÄLICE', userhost: 'ÄLICE!a@h' },
+      { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'out', extra: { kicked: 'ÄLiCe' } },
       { type: 'join', nick: 'zed', userhost: 'zed!z@h' },
     ];
     // rfc7613 folds Unicode: Ä is the capital of ä.
-    expect(await replayed('Älice', 'rfc7613', unicode)).toEqual(['JOIN :zed!z@h']);
+    expect(await replayed('älice', 'rfc7613', unicode)).toEqual(['JOIN :zed!z@h']);
     // ascii folds only A-Z.
-    expect(await replayed('Älice', 'ascii', unicode)).toEqual([
-      'JOIN :äLICE!a@h',
+    expect(await replayed('älice', 'ascii', unicode)).toEqual([
+      'JOIN :ÄLICE!a@h',
       'KICK :op!o@h',
       'JOIN :zed!z@h',
     ]);
