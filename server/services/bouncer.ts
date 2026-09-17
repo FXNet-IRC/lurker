@@ -783,6 +783,8 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   private boundNetId: number | null = null;
   // A per-session counter for BATCH reference tags (LISTNETWORKS / initial dump).
   private batchSeq = 0;
+  // The bound network's state this client was last told about in a notice.
+  private noticedState: string | null = null;
   // The attributes this client was last sent for each network: in the network
   // list or a notification. A notification is a change to what the client
   // holds, and clients attach at different times, so this is what each
@@ -1294,6 +1296,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.networkId = network.id;
     this.network = network;
     this.conn = conn;
+    this.noticedState = conn.state;
     this.registered = true;
     this.clearRegTimer();
     attachToRegistry(this);
@@ -2601,6 +2604,10 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     if (!this.liveConn() || this.closed) return;
     // A connect brings the network's caps; a disconnect takes them away.
     this.updateSupportedCaps(this.currentNick() || '*');
+    // A connection says its state again without a change: 'socket close' and
+    // 'close' both say disconnected, and a stopped retry says why.
+    if (state === this.noticedState) return;
+    this.noticedState = state;
     if (state === 'connected') this.notice(`Upstream reconnected to '${this.network?.name}'.`);
     else if (state === 'reconnecting' || state === 'disconnected') {
       this.notice(`Upstream ${state} ('${this.network?.name}') — Lurker will keep retrying.`);

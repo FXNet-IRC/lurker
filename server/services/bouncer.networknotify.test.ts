@@ -282,6 +282,28 @@ describe('a network list', () => {
 });
 
 describe('a state change', () => {
+  it('reaches a client bound to the network as one notice, however often it is repeated', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const c = await attachPlain(acct, 'alpha');
+
+    const mark = c.lines.length;
+    // The state it attached in.
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'connected');
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected');
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected');
+    // What a stopped retry adds: the same state, saying why.
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: 'Not reconnecting automatically: banned by the server (G-Lined).',
+    });
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'reconnecting');
+    await synced(c);
+
+    const notices = c.lines.slice(mark).filter((l) => l.includes('Upstream '));
+    expect(notices).toHaveLength(2);
+    expect(notices[0]).toContain('Upstream disconnected');
+    expect(notices[1]).toContain('Upstream reconnecting');
+  });
+
   it('is sent once, however often the connection repeats it', async () => {
     const acct = harnessMod.seedAccount({ networkName: 'alpha' });
     const c = await attach(acct, NOTIFY_CAPS);
