@@ -186,10 +186,10 @@ Implementation notes worth knowing if you're writing against it:
   one, or the message predates Lurker keeping them), or if it's a decrypted E2E
   message, whose ID belongs to the encrypted line. Message references are
   `timestamp` only, as with soju.
-  <br>`server/services/bouncer.ts:146`, `:520`
+  <br>`server/services/bouncer.ts:177`, `:570`
 - A client that negotiates `draft/chathistory` gets no playback on attach, as with
   soju. It fetches the history it wants itself, so it doesn't see the same lines twice.
-  <br>`server/services/bouncer.ts:1717`
+  <br>`server/services/bouncer.ts:2016`
 - With `draft/event-playback`, history also has joins, parts, quits, nick changes,
   kicks, and mode and topic changes, and they count toward the limit, as with soju.
   Events that name your current nick are left out: your own join, part, quit or nick
@@ -198,17 +198,17 @@ Implementation notes worth knowing if you're writing against it:
   invites aren't replayed, a JOIN is sent without extended-join's account and
   realname, and by default join, part, quit, nick and mode lines are kept for 7 days.
   Playback on attach stays messages only.
-  <br>`server/db/messages.ts:599`, `server/services/bouncer.ts:2098`
+  <br>`server/db/messages.ts:617`, `server/services/bouncer.ts:2089`
 - Tags that only a server may set — `time`, `account`, `msgid`, `label`, `batch` —
   are stripped from anything an attached client sends, so a downstream client can't
   forge them.
-  <br>`server/services/bouncer.ts:278`
+  <br>`server/services/bouncer.ts:302`
 - Caps whose lines come from the network (`away-notify`, `account-notify`,
   `account-tag`, `chghost`, `extended-join`, `multi-prefix`, `userhost-in-names`) are
   offered only while the network you bind has them, as soju does. `CAP LS 302` lists
   them before you pick a network, then `CAP DEL` takes back any that network lacks, and
   `CAP NEW` offers them again when it reconnects.
-  <br>`server/services/bouncer.ts:905`
+  <br>`server/services/bouncer.ts:157`
 - What the network sends is trimmed to the caps your client negotiated, as soju and ZNC
   do: no `AWAY` without `away-notify`, a bare `JOIN` without `extended-join`, one prefix
   per nick in NAMES and WHO without `multi-prefix`, and so on. Without `chghost`, a host
@@ -220,26 +220,26 @@ Implementation notes worth knowing if you're writing against it:
   `L` and `S` from the client's list, and sends `730` and `731` only to the clients
   watching that nick. Everyone shares the network's limit, a client's list holds at most
   1000 nicks, and a nick that doesn't fit gets `734`.
-  <br>`server/services/bouncer.ts:1963`, `server/services/monitorList.ts`
+  <br>`server/services/bouncer.ts:2416`, `server/services/monitorList.ts`
 - Someone's away, account, host and realname changes reach a client that shares a
   channel with them. With `extended-monitor`, they also reach a client whose own
   `MONITOR` list has them, but not other clients: the network sends them for every nick
   on its one list, including Lurker's DM contacts and other clients' watches (soju
   sends them to every client). Both names are offered while the network has either.
-  <br>`server/services/bouncerClientFilter.ts:378`
+  <br>`server/services/bouncerClientFilter.ts:401`
 - Read markers are the account's, the same unread position the web and iOS apps show.
   `MARKREAD` with a time moves it to the newest message at or before that time, and
   every client on the network that negotiated `draft/read-marker` hears the move, as do
   the apps. A channel's marker comes after its `JOIN`, before `NAMES`; ask for a DM's
   with `MARKREAD <nick>`.
-  <br>`server/services/bouncer.ts:1884`, `server/services/ircManager.ts:892`
+  <br>`server/services/bouncer.ts:2208`, `server/services/ircManager.ts:948`
 - Away is the account's, as it is in the web and iOS apps. `AWAY` from any client sets
   or clears it on every network. That client gets its `305` or `306`, and so does every
   other client, including one that attaches while you're away. `AWAY *` (from
   `draft/pre-away`) marks a connection that isn't you, such as goguma's background sync:
   it leaves your away alone. Any other attached client counts as you being here, so
   auto-away waits until the last one goes.
-  <br>`server/services/bouncer.ts:2167`, `server/services/presence.ts:47`
+  <br>`server/services/bouncer.ts:2370`, `server/services/presence.ts:47`
 - A reply goes only to whoever asked: your client, another attached client, the web
   app, or Lurker itself, which sends `MODE` and `WHO` when it joins a channel. A
   network's replies don't say who asked, so Lurker matches them to its queries in the
@@ -267,7 +267,7 @@ Implementation notes worth knowing if you're writing against it:
   that failed to connect says why in its `error` attribute until it connects. A client
   attached to a network that's deleted is disconnected. Networks are managed in Lurker
   itself, so `ADDNETWORK`, `CHANGENETWORK` and `DELNETWORK` are refused.
-  <br>`server/services/bouncer.ts:1669`
+  <br>`server/services/bouncer.ts:1631`
 - `soju.im/FILEHOST` points your client at `<PUBLIC_BASE_URL>/api/filehost`. It's only
   advertised when `PUBLIC_BASE_URL` is set to an https URL and your account has an
   uploader. Your client uploads there with the credentials it logged in with: HTTP Basic
@@ -276,8 +276,9 @@ Implementation notes worth knowing if you're writing against it:
   through the same uploader and rules as an upload from the web app: images, text and
   audio/video only, images re-encoded, and it shows in your uploads list. The answer is
   `201 Created` with a `Location`; errors are plain text. Failed logins count toward the
-  same limit as the web sign-in.
-  <br>`server/routes/filehost.ts`, `server/services/bouncer.ts:583`
+  same limit as the web sign-in. A network's own `FILEHOST` token is never passed on, so
+  your client can't send your Lurker password to the network's upload server.
+  <br>`server/routes/filehost.ts`, `server/services/bouncer.ts:584`
 
 ---
 
