@@ -299,6 +299,73 @@ describe('MONITOR per client', () => {
   });
 });
 
+// A client with these caps, logged in with PASS.
+async function attachWithCaps(acct: Account, caps: string[]): Promise<Client> {
+  const c = await harness.connect();
+  c.send('CAP LS 302');
+  c.send(`CAP REQ :${caps.join(' ')}`);
+  c.send(`PASS ${acct.user.username}:${acct.password}`);
+  c.send('NICK client');
+  c.send('USER client 0 * :client');
+  c.send('CAP END');
+  await settle(c);
+  return c;
+}
+
+describe('extended-monitor', () => {
+  it('offers both names while the network has either, and takes both back without it', async () => {
+    const acct = harnessMod.seedAccount({ nick: 'emoffer' });
+    acct.upstream.client.network.cap.enabled = ['away-notify', 'draft/extended-monitor'];
+    const ratified = await attachWithCaps(acct, ['extended-monitor']);
+    const draft = await attachWithCaps(acct, ['draft/extended-monitor']);
+    expect(ratified.lines.some((l) => l.includes(' ACK :extended-monitor'))).toBe(true);
+    expect(draft.lines.some((l) => l.includes(' ACK :draft/extended-monitor'))).toBe(true);
+
+    acct.upstream.client.network.cap.enabled = ['away-notify'];
+    const bare = await attachWithCaps(acct, ['away-notify']);
+    const del = bare.lines.find((l) => harnessMod.commandOf(l) === 'CAP' && l.includes(' DEL '));
+    expect(del).toContain('extended-monitor');
+    expect(del).toContain('draft/extended-monitor');
+  });
+
+  // Lurker's own DM peers and every client's nicks share the network's list, so
+  // the network sends presence lines for all of them. Each goes only to the
+  // clients that share a channel with the nick or watch it with extended-monitor.
+  it("sends a nick's presence lines only to the clients watching it, or sharing a channel", async () => {
+    const acct = harnessMod.seedAccount({ nick: 'emwatch' });
+    const watching = await attachWithCaps(acct, ['away-notify', 'chghost', 'extended-monitor']);
+    const hexdroid = await attachWithCaps(acct, ['away-notify', 'draft/extended-monitor']);
+    const irssi = await attachWithCaps(acct, ['away-notify', 'chghost']);
+    watching.send('MONITOR + Alice');
+    irssi.send('MONITOR + alice');
+    await settle(watching);
+    await settle(irssi);
+
+    const marks = [watching, hexdroid, irssi].map((c) => c.lines.length);
+    acct.upstream.pushUpstream(':alice!a@h AWAY :lunch');
+    acct.upstream.pushUpstream(':alice!a@h CHGHOST a2 h2');
+    for (const c of [watching, hexdroid, irssi]) await settle(c);
+    const got = (c: Client, i: number) =>
+      c.lines.slice(marks[i]).filter((l) => ['AWAY', 'CHGHOST'].includes(harnessMod.commandOf(l)));
+    expect(got(watching, 0)).toEqual([':alice!a@h AWAY :lunch', ':alice!a@h CHGHOST a2 h2']);
+    // Doesn't watch alice.
+    expect(got(hexdroid, 1)).toEqual([]);
+    // Watches alice, but without extended-monitor: not even the CHGHOST fallback.
+    expect(got(irssi, 2)).toEqual([]);
+
+    // Once alice shares a channel, everyone with the cap hears it.
+    acct.upstream.addChannel('#chan', { members: ['alice'] });
+    const again = [watching, hexdroid, irssi].map((c) => c.lines.length);
+    acct.upstream.pushUpstream(':alice!a@h AWAY');
+    for (const c of [watching, hexdroid, irssi]) await settle(c);
+    for (const [i, c] of [watching, hexdroid, irssi].entries()) {
+      expect(c.lines.slice(again[i]).filter((l) => harnessMod.commandOf(l) === 'AWAY')).toEqual([
+        ':alice!a@h AWAY',
+      ]);
+    }
+  });
+});
+
 describe('maxMonitorPerClient', () => {
   it('is 1000 unless the environment sets a positive number', () => {
     const key = 'LURKER_BOUNCER_MAX_MONITOR';

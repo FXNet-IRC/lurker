@@ -92,7 +92,12 @@ import {
   keyMatchesCert,
 } from '../utils/bouncerCert.js';
 import { isChannelTarget } from '../../shared/channels.js';
-import { ClientLineFilter, parseLine, restrictTags } from './bouncerClientFilter.js';
+import {
+  ClientLineFilter,
+  EXTENDED_MONITOR_CAPS,
+  parseLine,
+  restrictTags,
+} from './bouncerClientFilter.js';
 import type { MonitorHolder } from './monitorList.js';
 import type { ReplyClient } from './replyRouter.js';
 
@@ -148,9 +153,10 @@ const SUPPORTED_CAPS = [
 // Caps offered only while the bound network has them, because the lines they
 // promise come from the network (soju's passthroughDownstreamCaps). Without the
 // cap, the client filter keeps those lines away from the client.
-// userhost-in-names is ZNC's addition; soju doesn't offer it. Not offered yet:
-// extended-monitor (its AWAY/ACCOUNT/CHGHOST lines for a monitored nick would have
-// to reach only the clients watching it) and labeled-response (reply routing, #493).
+// userhost-in-names is ZNC's addition; soju doesn't offer it. extended-monitor is
+// offered under both names while the network has either: the filter decides who
+// gets its lines (ClientLineFilter.inAudience), so the name needn't match. Not
+// offered yet: labeled-response (reply routing, #493).
 const PASSTHROUGH_CAPS = [
   'away-notify',
   'account-notify',
@@ -159,6 +165,7 @@ const PASSTHROUGH_CAPS = [
   'extended-join',
   'multi-prefix',
   'userhost-in-names',
+  ...EXTENDED_MONITOR_CAPS,
 ];
 
 const CAP_BOUNCER_NETWORKS = 'soju.im/bouncer-networks';
@@ -814,6 +821,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       nick: () => this.currentNick() || this.clientNick,
       prefixes: () => this.isupportPrefixes(),
       sharedChannels: (nick) => this.sharedChannels(nick),
+      monitors: (nick) => this.monitored.has(nick.toLowerCase()),
     });
     socket.setNoDelay(true);
     socket.on('data', (chunk) => this.onData(chunk));
@@ -1038,11 +1046,15 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     );
     const added: string[] = [];
     const removed: string[] = [];
+    const networkHas = (cap: string) =>
+      EXTENDED_MONITOR_CAPS.includes(cap)
+        ? EXTENDED_MONITOR_CAPS.some((name) => upstream.has(name))
+        : upstream.has(cap);
     for (const cap of PASSTHROUGH_CAPS) {
-      if (upstream.has(cap) && !this.availableCaps.has(cap)) {
+      if (networkHas(cap) && !this.availableCaps.has(cap)) {
         this.availableCaps.add(cap);
         added.push(cap);
-      } else if (!upstream.has(cap) && this.availableCaps.has(cap)) {
+      } else if (!networkHas(cap) && this.availableCaps.has(cap)) {
         this.availableCaps.delete(cap);
         this.caps.delete(cap);
         removed.push(cap);

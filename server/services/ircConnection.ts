@@ -875,8 +875,10 @@ export class IrcConnection {
     // 'away'/'back' handlers below already feed markPeerEvent regardless of how
     // the AWAY arrived. requestCap is a no-op on networks that don't advertise
     // the cap — irc-framework only emits a CAP REQ for caps the server lists in
-    // CAP LS. (#310)
+    // CAP LS. (#310) The draft name too, for a network that still offers only
+    // that one, as soju does.
     this.client.requestCap('extended-monitor');
+    this.client.requestCap('draft/extended-monitor');
     // batch + draft/multiline (IRCv3): lets a multi-line compose travel as one
     // logical message instead of N fragmented PRIVMSGs, and lets us reassemble
     // the same from peers (e.g. Ergo). requestCap is a no-op where the server

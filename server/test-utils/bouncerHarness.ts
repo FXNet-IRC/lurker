@@ -68,6 +68,7 @@ export const UPSTREAM_CAPS = [
   'extended-join',
   'chghost',
   'echo-message',
+  'extended-monitor',
 ];
 
 // Minimal stand-in for IrcConnection covering exactly what bouncer.ts reads.
