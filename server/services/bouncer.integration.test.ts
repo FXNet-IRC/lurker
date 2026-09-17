@@ -559,6 +559,8 @@ describe('pass-through caps follow the bound network', () => {
     'extended-join',
     'multi-prefix',
     'userhost-in-names',
+    'extended-monitor',
+    'draft/extended-monitor',
   ];
 
   it('lists them for CAP LS 302 before registration, and not for a plain CAP LS', async () => {
@@ -580,6 +582,7 @@ describe('pass-through caps follow the bound network', () => {
 
   it('delivers what a client asked for when the network has it', async () => {
     const acct = harnessMod.seedAccount({ nick: 'capable' });
+    acct.upstream.addChannel('#chan', { members: ['alice'] });
     const c = await attach(acct, ['away-notify', 'account-notify', 'extended-join']);
     const lines = [
       ':alice!a@h AWAY :lunch',
@@ -616,6 +619,7 @@ describe('pass-through caps follow the bound network', () => {
 
   it('offers them with CAP NEW once a connecting network connects', async () => {
     const acct = harnessMod.seedAccount({ nick: 'latecomer' });
+    acct.upstream.addChannel('#chan', { members: ['alice'] });
     acct.upstream.state = 'connecting';
     const c = await attach(acct, ['away-notify']);
     expect(c.lines.some((l) => l.includes(' DEL ') && l.includes('away-notify'))).toBe(true);

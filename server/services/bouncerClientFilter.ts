@@ -141,7 +141,17 @@ export interface ClientView {
   sharedChannels(
     nick: string,
   ): Array<{ channel: string; modes: readonly string[]; account?: string | null }>;
+  // Whether this client's MONITOR list has `nick`.
+  monitors(nick: string): boolean;
 }
+
+// Both names clients ask for: halloy asks only for the ratified one, HexDroid
+// only for the draft.
+export const EXTENDED_MONITOR_CAPS = ['extended-monitor', 'draft/extended-monitor'];
+
+// Someone's presence changing: for a client that shares a channel with them, or
+// that watches them with extended-monitor.
+const PRESENCE_COMMANDS = new Set(['AWAY', 'ACCOUNT', 'CHGHOST', 'SETNAME']);
 
 const MULTILINE_BATCH = 'draft/multiline';
 const MULTILINE_CONCAT = 'draft/multiline-concat';
@@ -236,6 +246,7 @@ export class ClientLineFilter {
     if (gate && !caps.has(gate)) {
       return msg.command === 'CHGHOST' ? this.chghostFallback(msg, relayedAt) : [];
     }
+    if (PRESENCE_COMMANDS.has(msg.command) && !this.inAudience(msg)) return [];
 
     if (msg.command === 'INVITE' && !caps.has('invite-notify')) {
       const nick = this.view.nick();
@@ -357,6 +368,24 @@ export class ClientLineFilter {
   // Whether this client was sent batch `ref`'s start and still has the batch cap.
   private sent(ref: string): boolean {
     return this.view.caps.has('batch') && this.batches.get(ref)?.opened === true;
+  }
+
+  // A presence line is for a client that shares a channel with its nick, or that
+  // watches it with extended-monitor, as the specs say. The network's one MONITOR
+  // list holds Lurker's own nicks and every client's, so a line can arrive about
+  // someone this client never asked for (soju relays those to everyone). HexDroid
+  // prints them in its server buffer and irssi in its status window.
+  private inAudience(msg: ClientLine): boolean {
+    const source = msg.source ?? '';
+    const bang = source.indexOf('!');
+    const nick = bang === -1 ? source : source.slice(0, bang);
+    if (!nick) return true;
+    const self = this.view.nick();
+    if (self && nick.toLowerCase() === self.toLowerCase()) return true;
+    const extended = EXTENDED_MONITOR_CAPS.some((cap) => this.view.caps.has(cap));
+    if (extended && this.view.monitors(nick)) return true;
+    // Last, as it walks every channel.
+    return this.view.sharedChannels(nick).length > 0;
   }
 
   private prefixSymbols(): string {

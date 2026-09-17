@@ -23,7 +23,11 @@ const PREFIXES = [
 
 function filterFor(
   caps: string[],
-  opts: { nick?: string; shared?: ReturnType<ClientView['sharedChannels']> } = {},
+  opts: {
+    nick?: string;
+    shared?: ReturnType<ClientView['sharedChannels']>;
+    monitored?: string[];
+  } = {},
 ): ClientLineFilter {
   return new ClientLineFilter({
     caps: new Set(caps),
@@ -31,8 +35,11 @@ function filterFor(
     nick: () => opts.nick ?? 'me',
     prefixes: () => PREFIXES,
     sharedChannels: () => opts.shared ?? [],
+    monitors: (nick) => (opts.monitored ?? []).includes(nick),
   });
 }
+
+const IN_A_CHANNEL = { shared: [{ channel: '#c', modes: [] as string[] }] };
 
 describe('parseLine / formatLine', () => {
   it.each([
@@ -116,7 +123,43 @@ describe('ClientLineFilter', () => {
     ['chghost', ':n!u@h CHGHOST u2 h2'],
   ])('sends a line gated on %s only to a client that has it', (cap, line) => {
     expect(filterFor([]).apply(line)).toEqual([]);
-    expect(filterFor([cap]).apply(line)).toEqual([line]);
+    // In a shared channel, so a presence line has an audience (see below).
+    expect(filterFor([cap], IN_A_CHANNEL).apply(line)).toEqual([line]);
+  });
+
+  // The network's one MONITOR list has Lurker's nicks and every client's, so a
+  // presence line can be about someone this client neither shares a channel
+  // with nor watches.
+  describe('presence lines', () => {
+    const CASES = [
+      ['away-notify', ':n!u@h AWAY :gone to lunch'],
+      ['account-notify', ':n!u@h ACCOUNT alice'],
+      ['chghost', ':n!u@h CHGHOST u2 h2'],
+      ['setname', ':n!u@h SETNAME :New Name'],
+    ];
+
+    it.each(CASES)('go (%s) to a client that shares a channel with the nick', (cap, line) => {
+      expect(filterFor([cap], IN_A_CHANNEL).apply(line)).toEqual([line]);
+    });
+
+    it.each(CASES)('go (%s) to a client watching the nick with extended-monitor', (cap, line) => {
+      for (const name of ['extended-monitor', 'draft/extended-monitor']) {
+        expect(filterFor([cap, name], { monitored: ['n'] }).apply(line)).toEqual([line]);
+      }
+    });
+
+    it.each(CASES)('stay (%s) from a client watching the nick without it', (cap, line) => {
+      expect(filterFor([cap], { monitored: ['n'] }).apply(line)).toEqual([]);
+    });
+
+    it.each(CASES)('stay (%s) from a client that neither shares nor watches', (cap, line) => {
+      expect(filterFor([cap, 'extended-monitor']).apply(line)).toEqual([]);
+    });
+
+    it('about our own nick, go with no channel', () => {
+      const line = ':Me!u@h CHGHOST u2 h2';
+      expect(filterFor(['chghost'], { nick: 'me' }).apply(line)).toEqual([line]);
+    });
   });
 
   describe('INVITE', () => {
@@ -245,6 +288,7 @@ describe('ClientLineFilter', () => {
         nick: () => 'me',
         prefixes: () => PREFIXES,
         sharedChannels: () => [],
+        monitors: () => false,
       });
     }
 

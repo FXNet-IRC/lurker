@@ -118,7 +118,7 @@ Presence dots on DMs, without Lurker hammering the network with `WHOIS` polls.
 - **`extended-monitor`** — extends that to away/back state for people you share no
   channel with, which is what makes presence useful for DM peers rather than just
   channel regulars.
-  <br>`server/services/ircConnection.ts:657`
+  <br>`server/services/ircConnection.ts:880`
 
 ### End-to-end encryption can identify who it's talking to
 
@@ -168,6 +168,7 @@ we advertise only what we actually implement.
 | Message metadata passed through from upstream                                                   | `message-tags`                                                |
 | Network list delivered as one grouped burst                                                     | `batch`                                                       |
 | People's away, account and host changes, when your network sends them                           | `away-notify`, `account-notify`, `chghost`                    |
+| The same for people you `MONITOR` but share no channel with                                     | `extended-monitor`, `draft/extended-monitor`                  |
 | Accounts on JOINs and on each message, when your network sends them                             | `extended-join`, `account-tag`                                |
 | Every prefix and full hostmasks in NAMES, when your network sends them                          | `multi-prefix`, `userhost-in-names`                           |
 | Invites other people get to your channels                                                       | `invite-notify`                                               |
@@ -209,6 +210,12 @@ Implementation notes worth knowing if you're writing against it:
   watching that nick. Everyone shares the network's limit, a client's list holds at most
   1000 nicks, and a nick that doesn't fit gets `734`.
   <br>`server/services/bouncer.ts:1963`, `server/services/monitorList.ts`
+- Someone's away, account, host and realname changes reach a client that shares a
+  channel with them. With `extended-monitor`, they also reach a client whose own
+  `MONITOR` list has them, but not other clients: the network sends them for every nick
+  on its one list, including Lurker's DM contacts and other clients' watches (soju
+  sends them to every client). Both names are offered while the network has either.
+  <br>`server/services/bouncerClientFilter.ts:378`
 - Read markers are the account's, the same unread position the web and iOS apps show.
   `MARKREAD` with a time moves it to the newest message at or before that time, and
   every client on the network that negotiated `draft/read-marker` hears the move, as do
@@ -281,8 +288,8 @@ attaching to Lurker.
 | `account-notify`                        |   ✅   |   ✅    |
 | `chghost`                               |   ✅   |   ✅    |
 | `invite-notify`                         |   ✅   |   ✅    |
-| `monitor`                               |   ✅   |    —    |
-| `extended-monitor`                      |   ✅   |    —    |
+| `monitor`                               |   ✅   |   ✅    |
+| `extended-monitor`                      |   ✅   |   ✅    |
 | `whox`                                  |   ✅   |    —    |
 | `znc.in/self-message`                   |   —    |   ✅    |
 | `soju.im/bouncer-networks` (+`-notify`) |   —    |   ✅    |

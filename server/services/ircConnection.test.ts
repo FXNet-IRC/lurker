@@ -2370,6 +2370,7 @@ describe('capability negotiation (#310)', () => {
     const caps = (conn as unknown as { client: { request_extra_caps: string[] } }).client
       .request_extra_caps;
     expect(caps).toContain('extended-monitor');
+    expect(caps).toContain('draft/extended-monitor');
     expect(caps).toContain('message-tags');
   });
 });
