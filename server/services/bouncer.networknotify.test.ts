@@ -253,6 +253,34 @@ describe('a network deleted in the web app', () => {
   });
 });
 
+describe('a network list', () => {
+  it('replaces what the client was told, so a later change is measured against it', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const beta = harnessMod.seedNetwork(acct.user, { networkName: 'beta' });
+    const c = await attach(acct, NOTIFY_CAPS);
+    const agent = await agentFor(acct);
+
+    // Without -notify the client isn't told beta is gone, but a list says so.
+    c.send('CAP REQ :-soju.im/bouncer-networks-notify');
+    await c.waitFor((l) => l.includes('ACK :-soju.im/bouncer-networks-notify'));
+    await agent.delete(`/api/networks/${beta.network.id}`);
+    c.send('CAP REQ :soju.im/bouncer-networks-notify');
+    await c.waitFor((l) => l.endsWith('ACK :soju.im/bouncer-networks-notify'));
+    c.send('BOUNCER LISTNETWORKS');
+    await synced(c);
+
+    const mark = c.lines.length;
+    ircManager.emit('event', {
+      userId: acct.user.id,
+      networkId: beta.network.id,
+      type: 'state',
+      state: 'disconnected',
+    });
+    await synced(c);
+    expect(networkLines(c, mark)).toEqual([]);
+  });
+});
+
 describe('a state change', () => {
   it('is sent once, however often the connection repeats it', async () => {
     const acct = harnessMod.seedAccount({ networkName: 'alpha' });
@@ -346,6 +374,25 @@ describe('error, on real connections', () => {
     expect(lastAttrs(later, network.id)).toContain(why);
 
     await agent.delete(`/api/networks/${network.id}`);
+    expect(ircManager.connectionError(acct.user.id, network.id)).toBeNull();
+  });
+
+  it("forgets a deleted account's errors", async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const agent = await agentFor(acct);
+    const network = networksDb.createNetwork(acct.user.id, {
+      name: 'halfcert',
+      host: '127.0.0.1',
+      port: ircd.port,
+      tls: true,
+      nick: 'halfnick',
+      autoconnect: false,
+    } as Parameters<typeof networksDb.createNetwork>[1])!;
+    db.prepare('UPDATE networks SET client_cert = ? WHERE id = ?').run('not-a-cert', network.id);
+    await agent.post(`/api/networks/${network.id}/connect`);
+    expect(ircManager.connectionError(acct.user.id, network.id)).not.toBeNull();
+
+    ircManager.disposeUser(acct.user.id, 'user deleted');
     expect(ircManager.connectionError(acct.user.id, network.id)).toBeNull();
   });
 });
