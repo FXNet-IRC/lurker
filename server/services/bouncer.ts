@@ -1855,7 +1855,6 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.withBatch('chathistory', [target], (ref) => {
       const lines = this.playbackLines(rows, target, isChannelName(target), {
         batchRef: ref ?? undefined,
-        events: this.caps.has(CAP_EVENT_PLAYBACK),
       });
       for (const line of lines) this.write(line);
     });
@@ -2138,12 +2137,14 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     rows: MessageEvent[],
     bufferTarget: string,
     isChannel: boolean,
-    opts: { batchRef?: string; events?: boolean } = {},
+    opts: { batchRef?: string } = {},
   ): string[] {
     const out: string[] = [];
     const selfNick = this.currentNick() || this.clientNick || '*';
     for (const row of rows) {
-      if (opts.events && HISTORY_EVENT_TYPES.includes(row.type)) {
+      // Event rows are here only for a draft/event-playback client: the query
+      // decides (historyFilter).
+      if (HISTORY_EVENT_TYPES.includes(row.type)) {
         const line = this.eventLine(row, bufferTarget, { time: row.time, batchRef: opts.batchRef });
         if (line) out.push(line);
         continue;

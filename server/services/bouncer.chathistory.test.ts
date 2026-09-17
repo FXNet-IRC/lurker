@@ -475,7 +475,14 @@ describe('draft/event-playback', () => {
   });
 
   it('replays joins, parts, quits, nick changes, kicks, and mode and topic changes', async () => {
-    const { lines, ref } = await history('ep1', '#ev', EVENTS, 'CHATHISTORY LATEST #ev * 100');
+    // With extended-join, which a plain JOIN must still go out as.
+    const { lines, ref } = await history(
+      'ep1',
+      '#ev',
+      EVENTS,
+      'CHATHISTORY LATEST #ev * 100',
+      `${EVENT_CAPS} extended-join`,
+    );
     const tag = (s: number) => `@batch=${ref};time=${at(s)} `;
     expect(lines).toEqual([
       `${tag(1)}:bob!u@h PRIVMSG #ev :hi`,
@@ -506,11 +513,12 @@ describe('draft/event-playback', () => {
       'ep3',
       '#ev',
       [
+        { type: 'join', nick: 'alice', userhost: 'alice!a@h' },
         { type: 'chghost', nick: 'alice', userhost: 'alice!a@h', extra: { newHost: 'h2' } },
         { type: 'invite', nick: 'op', extra: { invited: 'frank' } },
-        { type: 'join', nick: 'alice', userhost: 'alice!a@h' },
       ],
-      'CHATHISTORY LATEST #ev * 100',
+      // The newest rows are the ones left out, so they mustn't use up the limit.
+      'CHATHISTORY LATEST #ev * 1',
     );
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain(':alice!a@h JOIN #ev');
