@@ -8,7 +8,7 @@
 
 // MUST be first: redirects DATABASE_PATH before anything opens the db.
 import '../test-utils/isolateDb.js';
-import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import type { Express } from 'express';
 import {
   setupTestDb,
@@ -17,20 +17,18 @@ import {
   createAnonAgent,
 } from '../test-utils/testApp.js';
 
-// The listener isn't running under test, so what it would serve is stubbed.
-const h = vi.hoisted(() => ({
-  tls: null as { selfSigned: boolean; fingerprint: string } | null,
-}));
-vi.mock('../services/bouncer.js', () => ({ bouncerTlsInfo: () => h.tls }));
-
 const ctx = setupTestDb('routes-bouncer');
 
 let app: Express;
 let userId: number;
+// What the listener publishes as it comes up (startBouncer). It isn't running
+// under test, so the tests set it themselves.
+let setBouncerTlsState: typeof import('../utils/bouncerConfig.js').setBouncerTlsState;
 
 beforeAll(async () => {
   const { createUser } = await import('../db/users.js');
   userId = createUser('bouncer_pane').id;
+  ({ setBouncerTlsState } = await import('../utils/bouncerConfig.js'));
   const router = (await import('./bouncer.js')).default;
   app = createTestApp({ '/api/bouncer': router });
 });
@@ -38,7 +36,7 @@ beforeAll(async () => {
 afterAll(() => ctx.cleanup());
 
 afterEach(() => {
-  h.tls = null;
+  setBouncerTlsState(null);
   delete process.env.LURKER_BOUNCER_PUBLIC_URL;
   delete process.env.LURKER_BOUNCER_PORT;
   delete process.env.LURKER_BOUNCER_TLS;
@@ -114,14 +112,14 @@ describe('GET /api/bouncer', () => {
   // A client refuses a certificate Lurker made for itself until the member
   // accepts it, so the pane has to be able to say so.
   it("describes the certificate the listener serves, when it's Lurker's own", async () => {
-    h.tls = { selfSigned: true, fingerprint: 'AA:BB:CC' };
+    setBouncerTlsState({ selfSigned: true, fingerprint: 'AA:BB:CC' });
     expect(await read()).toMatchObject({
       certificate: { selfSigned: true, fingerprint: 'AA:BB:CC' },
     });
   });
 
   it('says nothing about a certificate for an address it does not answer on', async () => {
-    h.tls = { selfSigned: true, fingerprint: 'AA:BB:CC' };
+    setBouncerTlsState({ selfSigned: true, fingerprint: 'AA:BB:CC' });
     process.env.LURKER_BOUNCER_PUBLIC_URL = 'ircs://irc.example.com:6697';
     expect(await read()).toMatchObject({ certificate: null });
   });

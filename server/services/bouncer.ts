@@ -95,7 +95,12 @@ import {
   keyMatchesCert,
 } from '../utils/bouncerCert.js';
 import { isChannelTarget } from '../../shared/channels.js';
-import { bouncerBindHost, bouncerPort, bouncerTlsDisabled } from '../utils/bouncerConfig.js';
+import {
+  bouncerBindHost,
+  bouncerPort,
+  bouncerTlsDisabled,
+  setBouncerTlsState,
+} from '../utils/bouncerConfig.js';
 import {
   ClientLineFilter,
   EXTENDED_MONITOR_CAPS,
@@ -195,6 +200,7 @@ export {
   bouncerBindHost,
   bouncerPublicAddress,
   bouncerTerminatesTls,
+  bouncerTlsInfo,
 } from '../utils/bouncerConfig.js';
 
 // Upstream wire commands never relayed to attached clients: connection
@@ -3070,17 +3076,6 @@ let bouncerTlsState: {
   source: 'configured' | 'self-signed';
 } | null = null;
 
-/** The certificate the listener is serving, for Settings → Bouncer. A
- *  self-signed one is the default, and the first connection fails on it unless
- *  the member knows to accept it — so the pane says so, with the fingerprint to
- *  check against. Null when the bouncer isn't listening, or isn't doing TLS. */
-export function bouncerTlsInfo(): { selfSigned: boolean; fingerprint: string } | null {
-  if (!bouncerTlsState) return null;
-  return {
-    selfSigned: bouncerTlsState.source === 'self-signed',
-    fingerprint: bouncerTlsState.fingerprint,
-  };
-}
 let onIrcEvent: ((event: Record<string, unknown>) => void) | null = null;
 let onReadMarker: ((move: ReadMarkerMove) => void) | null = null;
 let onAway: ((change: AwayChange) => void) | null = null;
@@ -3268,11 +3263,16 @@ export async function startBouncer(
       fingerprint: tlsInfo.fingerprint,
       source: tlsInfo.source,
     };
+    setBouncerTlsState({
+      selfSigned: tlsInfo.source === 'self-signed',
+      fingerprint: tlsInfo.fingerprint,
+    });
     certReloadTimer = setInterval(() => reloadBouncerTls(), CERT_RELOAD_INTERVAL_MS);
     certReloadTimer.unref?.();
   } else {
     server = net.createServer(onConnection);
     bouncerTlsState = null;
+    setBouncerTlsState(null);
   }
   server.on('error', (err) => {
     console.warn(`[bouncer] listener error: ${(err as Error).message}`);

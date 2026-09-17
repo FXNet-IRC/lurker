@@ -18,11 +18,15 @@
 
     <dl class="connect">
       <dt>server</dt>
-      <dd>
+      <dd v-if="info">
         <code>{{ host }}</code>
         <span class="muted small"> port </span>
         <code>{{ port }}</code>
         <span class="muted small">{{ tls ? ' — connect in your client’s TLS/SSL mode' : '' }}</span>
+      </dd>
+      <dd v-else class="muted">
+        couldn’t be read just now — reload the page
+        <span class="small">(the login below is the same either way)</span>
       </dd>
       <dt>username</dt>
       <dd>
@@ -39,7 +43,9 @@
       <dt>password</dt>
       <dd>
         your Lurker password, or a
-        <RouterLink to="/settings/api-tokens">read-write API token</RouterLink>
+        <RouterLink :to="{ path: '/settings/api-tokens', query: { scope: 'read-write' } }"
+          >read-write API token</RouterLink
+        >
       </dd>
     </dl>
 
@@ -55,7 +61,7 @@
       be sent that way, so use a token.
     </p>
 
-    <p v-if="!pinned" class="muted small">
+    <p v-if="info && !pinned" class="muted small">
       That’s this instance’s own hostname and listener. If your bouncer answers somewhere else — a
       separate hostname, or TLS terminated in front of it — whoever runs this server can say so with
       <code>LURKER_BOUNCER_PUBLIC_URL</code>.
@@ -112,8 +118,11 @@ onMounted(async () => {
   }
 });
 
+// Only ever read with `info` set (the server row is hidden without it): a
+// guessed port or a guessed "use TLS" is a login that doesn't work, which is
+// worse than saying the details couldn't be read.
 const host = computed(() => info.value?.host || window.location.hostname);
-const port = computed(() => info.value?.port ?? 6667);
+const port = computed(() => info.value?.port);
 const tls = computed(() => info.value?.tls !== false);
 const pinned = computed(() => info.value?.pinned === true);
 const certificate = computed(() => info.value?.certificate ?? null);

@@ -83,5 +83,7 @@ describe('the saved registration burst', () => {
     } finally {
       conn.dispose();
     }
-  });
+    // A real connect and four round trips: comfortably under a second locally,
+    // but CI runners are loaded and the default 5s timed out (PR #955's run).
+  }, 20000);
 });

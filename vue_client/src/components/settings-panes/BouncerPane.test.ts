@@ -21,8 +21,12 @@ import BouncerPane from './BouncerPane.vue';
 import { useAuthStore } from '../../stores/auth.js';
 import { useNetworksStore } from '../../stores/networks.js';
 
-// Renders its slot, unlike the default stub: what the link SAYS is the point.
-const LINK_STUB = { template: '<a class="rl"><slot /></a>' };
+// Renders its slot and its target, unlike the default stub: what the link SAYS
+// and where it GOES are both the point.
+const LINK_STUB = {
+  props: ['to'],
+  template: '<a class="rl" :data-to="JSON.stringify(to)"><slot /></a>',
+};
 
 type Info = {
   host: string | null;
@@ -118,6 +122,16 @@ describe('BouncerPane', () => {
     expect(w.text()).toContain('A read-only token is refused');
   });
 
+  // The tokens pane defaults to read-only, which the bouncer refuses, so the
+  // link asks for the write box to start ticked.
+  it('asks the tokens pane for the scope the bouncer needs', async () => {
+    const w = await mountWith({ host: null, port: 6667, tls: true, pinned: false });
+    expect(JSON.parse(w.find('a.rl').attributes('data-to')!)).toEqual({
+      path: '/settings/api-tokens',
+      query: { scope: 'read-write' },
+    });
+  });
+
   it('fetches the networks itself, for a page loaded without the chat socket', async () => {
     setActivePinia(createPinia());
     useAuthStore().user = { id: 1, username: 'brad', role: 'user' } as never;
@@ -140,10 +154,16 @@ describe('BouncerPane', () => {
     expect(w.text()).toContain('brad/libera');
   });
 
-  it('still explains the login when the address cannot be read', async () => {
+  // A port and a "use TLS" that were guessed are a login that doesn't work,
+  // which is worse than saying the address couldn't be read.
+  it('says the address is unknown rather than inventing one, and still explains the login', async () => {
     const w = await mountWith(new Error('nope'));
     expect(w.text()).toContain('brad/libera');
-    expect(w.text()).toContain(window.location.hostname);
+    expect(w.text()).toContain('couldn’t be read just now');
+    expect(w.text()).not.toContain('6667');
+    expect(w.text()).not.toContain(window.location.hostname);
+    // Nothing to explain about an address that isn't shown.
+    expect(w.text()).not.toContain('LURKER_BOUNCER_PUBLIC_URL');
   });
 
   it('leaves out the single-network form for an account with no networks yet', async () => {

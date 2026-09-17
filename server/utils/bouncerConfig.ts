@@ -62,6 +62,24 @@ function warnPublicUrl(raw: string): void {
   );
 }
 
+// The certificate the listener is serving, published by startBouncer. Held here
+// rather than in the service so Settings can ask what a client will be shown
+// without loading the bouncer runtime behind the question.
+let tlsState: { selfSigned: boolean; fingerprint: string } | null = null;
+
+/** Called by the listener as it comes up, and with null when it isn't doing TLS. */
+export function setBouncerTlsState(state: { selfSigned: boolean; fingerprint: string } | null) {
+  tlsState = state;
+}
+
+/** What the listener serves, for Settings → Bouncer. A self-signed certificate
+ *  is the default, and the first connection fails on it unless the member knows
+ *  to accept it — so the pane says so, with the fingerprint to check against.
+ *  Null when the bouncer isn't listening, or isn't the one doing TLS. */
+export function bouncerTlsInfo(): { selfSigned: boolean; fingerprint: string } | null {
+  return tlsState;
+}
+
 /** Whether the bouncer terminates TLS itself. An operator may terminate it in
  *  front instead, which is what LURKER_BOUNCER_PUBLIC_URL is for. */
 export function bouncerTerminatesTls(): boolean {

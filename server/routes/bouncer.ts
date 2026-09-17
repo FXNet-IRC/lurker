@@ -14,8 +14,12 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth.js';
-import { bouncerPort, bouncerPublicAddress, bouncerTerminatesTls } from '../utils/bouncerConfig.js';
-import { bouncerTlsInfo } from '../services/bouncer.js';
+import {
+  bouncerPort,
+  bouncerPublicAddress,
+  bouncerTerminatesTls,
+  bouncerTlsInfo,
+} from '../utils/bouncerConfig.js';
 
 const router = Router();
 router.use(requireAuth);
