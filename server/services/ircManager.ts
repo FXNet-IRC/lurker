@@ -167,7 +167,8 @@ class IrcManager extends EventEmitter {
   // rather than left to the listeners on its predecessor.
   private reconcileHookedLink: EngineLink | null = null;
   // Why each network's last connection attempt failed, until it next connects:
-  // the `error` a failing attempt's state event carries (IrcConnection.setState).
+  // the `error` a failing attempt's state event carries (IrcConnection.setState),
+  // read off the event stream.
   // Held here rather than on the connection, because a connect refused over the
   // network's settings drops its connection from the map as it reports why.
   private connectionErrors = new Map<number, Map<number, string>>();
@@ -175,6 +176,9 @@ class IrcManager extends EventEmitter {
   constructor() {
     super();
     this.byUser = new Map();
+    // The first listener, so an error is recorded before anyone reading it
+    // hears the event.
+    this.on('event', (event) => this.noteConnectionError(event));
   }
 
   connectionError(userId: number, networkId: number): string | null {
@@ -405,10 +409,7 @@ class IrcManager extends EventEmitter {
 
     conn = new IrcConnection({
       network,
-      onEvent: (event) => {
-        this.noteConnectionError(event);
-        this.emit('event', event);
-      },
+      onEvent: (event) => this.emit('event', event),
       // #616: the retry controller asks this before each attempt opens a socket,
       // so a reconnect re-clears the same gates the initial connect did. Read
       // live (not captured), because pause/lockdown can change mid-backoff.

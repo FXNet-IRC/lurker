@@ -323,6 +323,28 @@ describe('a state change', () => {
   });
 });
 
+describe('error', () => {
+  it('comes from the state event that carries it, and goes with a connect', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const c = await attach(acct, NOTIFY_CAPS);
+    const why = 'Connection failed (irc.example.test:6697): ETIMEDOUT: connect ETIMEDOUT';
+
+    const mark = c.lines.length;
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', { error: why });
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'reconnecting');
+    expect(ircManager.connectionError(acct.user.id, acct.network.id)).toBe(why);
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'connected');
+    await synced(c);
+
+    expect(networkLines(c, mark)).toEqual([
+      `:lurker.bouncer BOUNCER NETWORK ${acct.network.id} state=disconnected;error=Connection\\sfailed\\s(irc.example.test:6697):\\sETIMEDOUT:\\sconnect\\sETIMEDOUT`,
+      `:lurker.bouncer BOUNCER NETWORK ${acct.network.id} state=connecting`,
+      `:lurker.bouncer BOUNCER NETWORK ${acct.network.id} state=connected;error=`,
+    ]);
+    expect(ircManager.connectionError(acct.user.id, acct.network.id)).toBeNull();
+  });
+});
+
 // A port nothing listens on.
 async function closedPort(): Promise<number> {
   const server = net.createServer();
