@@ -557,12 +557,24 @@ interface PeerWatch {
   reasons: Set<TrackReason>;
 }
 
-// A registration line without its tags, so a repeat is spotted whatever
-// per-delivery tags (time, msgid, batch) it happened to arrive with.
+// What makes a registration line the line it is: the command and its params,
+// less the target. Tags are per-delivery (time, msgid, batch), the source is the
+// server's name, and the target is OUR NICK — a server re-sending its ISUPPORT
+// addresses it to the nick of the moment, so without dropping it every line
+// would look new after a /nick. The replay rewrites the target anyway
+// (bouncer.rewriteNumericTarget).
 function burstPayload(line: string): string {
-  if (!line.startsWith('@')) return line;
-  const sp = line.indexOf(' ');
-  return sp === -1 ? line : line.slice(sp + 1);
+  const afterSpace = (s: string) => {
+    const sp = s.indexOf(' ');
+    return sp === -1 ? s : s.slice(sp + 1);
+  };
+  let rest = line;
+  if (rest.startsWith('@')) rest = afterSpace(rest);
+  if (rest.startsWith(':')) rest = afterSpace(rest);
+  const command = rest.indexOf(' ');
+  if (command === -1) return rest;
+  const target = rest.indexOf(' ', command + 1);
+  return target === -1 ? rest.slice(0, command) : rest.slice(0, command) + rest.slice(target);
 }
 
 export class IrcConnection {

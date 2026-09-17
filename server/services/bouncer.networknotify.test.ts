@@ -332,8 +332,79 @@ describe('a state change', () => {
     expect(networkLines(c, mark)).toEqual([]);
   });
 
+  // What a real drop looks like: 'socket close' says why, then 'close' says
+  // the same state with nothing to add.
+  it('says a drop once, and again only when the reason changes', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const c = await attachPlain(acct, 'alpha');
+
+    const mark = c.lines.length;
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: 'Connection failed (irc.example.test:6697): ECONNRESET.',
+    });
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected');
+    // The same reason again is the same news.
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: 'Connection failed (irc.example.test:6697): ECONNRESET.',
+    });
+    await synced(c);
+    let notices = c.lines.slice(mark).filter((l) => l.includes('Upstream '));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('ECONNRESET');
+
+    // The retry ladder running out says something new about the same state.
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: 'Not reconnecting automatically: banned by the server (G-Lined).',
+    });
+    await synced(c);
+    notices = c.lines.slice(mark).filter((l) => l.includes('Upstream '));
+    expect(notices).toHaveLength(2);
+    expect(notices[1]).toContain('banned by the server (G-Lined)');
+  });
+
+  // A ban reason is the server's own words, and the notice has 512 bytes.
+  it('keeps a long reason on one line', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const c = await attachPlain(acct, 'alpha');
+
+    const mark = c.lines.length;
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: `Not reconnecting automatically: banned by the server (${'why '.repeat(200)}).`,
+    });
+    await synced(c);
+
+    const notice = c.lines.slice(mark).find((l) => l.includes('Upstream '))!;
+    expect(Buffer.byteLength(notice)).toBeLessThanOrEqual(512);
+    expect(notice.endsWith('…')).toBe(true);
+  });
+
   // soju sends the same on attach (user.go:823).
   it('tells a client that attaches while the network is down why it is', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    acct.upstream.state = 'reconnecting';
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'reconnecting', {
+      error: 'Connection failed (irc.example.test:6697): ECONNREFUSED.',
+    });
+    const c = await attachPlain(acct, 'alpha');
+    await synced(c);
+
+    const notice = c.lines.find((l) => l.includes("Network 'alpha' is"));
+    expect(notice).toContain('ECONNREFUSED');
+
+    // Having been told on attach, the client isn't told again when the
+    // connection repeats itself.
+    const mark = c.lines.length;
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'reconnecting', {
+      error: 'Connection failed (irc.example.test:6697): ECONNREFUSED.',
+    });
+    await synced(c);
+    expect(c.lines.slice(mark).filter((l) => l.includes('Upstream '))).toEqual([]);
+  });
+
+  // Attaching to a network that gave up restarts it (ZNC's shape), so the
+  // reason the last attempt failed would contradict the attempt under way.
+  it('leaves out a reason the attach itself has superseded', async () => {
+    fakeDials();
     const acct = harnessMod.seedAccount({ networkName: 'alpha' });
     acct.upstream.state = 'disconnected';
     harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
@@ -343,7 +414,8 @@ describe('a state change', () => {
     await synced(c);
 
     const notice = c.lines.find((l) => l.includes("Network 'alpha' is"));
-    expect(notice).toContain('banned by the server (G-Lined)');
+    expect(notice).toBeDefined();
+    expect(notice).not.toContain('Not reconnecting automatically');
   });
 
   it('is sent once, however often the connection repeats it', async () => {

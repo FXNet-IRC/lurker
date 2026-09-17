@@ -60,6 +60,11 @@ describe('the saved registration burst', () => {
       ircd.sendRaw('burst', changed);
       await until(() => conn.registrationLines.length === registered + 2, 5000, 'the new 005');
 
+      // The same line addressed to a new nick is the same line: a server
+      // re-sending ISUPPORT addresses it to the nick of the moment, and the
+      // replay rewrites the target anyway.
+      ircd.sendRaw('burst', repeated.replace(' 005 burst ', ' 005 burst_ '));
+
       // No fourth line arrived behind the third: give the repeats a turn to.
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(conn.registrationLines.length).toBe(registered + 2);

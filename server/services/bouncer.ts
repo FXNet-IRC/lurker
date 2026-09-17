@@ -530,6 +530,14 @@ export function buildNamesLines(nick: string, channel: string, names: string[]):
  * Counted in bytes, not code units: names can be multi-byte and the wire cap is
  * bytes. The trailing trim is the backstop for a single pathological name.
  */
+/** `text` cut to `budget` bytes, marked when it was cut. */
+export function clampToBudget(text: string, budget: number): string {
+  if (Buffer.byteLength(text) <= budget) return text;
+  let out = text;
+  while (Buffer.byteLength(out) > budget - 1 && out.length > 0) out = out.slice(0, -1);
+  return `${out}…`;
+}
+
 export function withNetworkList(head: string, names: string[], budget: number): string {
   let out = head;
   let shown = 0;
@@ -825,6 +833,8 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   private batchSeq = 0;
   // The bound network's state this client was last told about in a notice.
   private noticedState: string | null = null;
+  // The reason last said with it, so the same state saying something new is news.
+  private noticedError = '';
   // The attributes this client was last sent for each network: in the network
   // list or a notification. A notification is a change to what the client
   // holds, and clients attach at different times, so this is what each
@@ -901,7 +911,9 @@ class BouncerSession implements MonitorHolder, ReplyClient {
 
   private notice(text: string): void {
     const nick = this.currentNick() || this.clientNick || '*';
-    this.write(`:${SERVER_NAME} NOTICE ${nick} :${text}`);
+    // A server's own words reach these (a ban reason in a disconnect notice),
+    // and a line past 512 bytes is truncated or dropped by the client.
+    this.write(`:${SERVER_NAME} NOTICE ${nick} :${clampToBudget(text, this.wireTextBudget())}`);
   }
 
   private currentNick(): string | null {
@@ -1342,10 +1354,13 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // time connect was refused and retries ran out) is restarted — safe here
     // because this session hasn't attached any listeners to it yet.
     let conn = ircManager.getConnection(user.id, network.id);
+    let restarted = false;
     if (!conn) {
       conn = ircManager.startNetwork(user.id, network.id);
+      restarted = true;
     } else if (conn.state === 'disconnected') {
       conn = ircManager.restartNetwork(user.id, network.id, 'bouncer client attached');
+      restarted = true;
     }
     if (!conn) {
       this.failRegistration('Network is unavailable');
@@ -1357,6 +1372,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.network = network;
     this.conn = conn;
     this.noticedState = conn.state;
+    this.noticedError = ircManager.connectionError(user.id, network.id) || '';
     this.registered = true;
     this.clearRegTimer();
     attachToRegistry(this);
@@ -1364,7 +1380,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.updateSupportedCaps(this.clientNick || '*');
     // Before the burst too, so its 306 follows an AWAY sent before registration.
     this.applyPendingAway();
-    this.sendAttachBurst();
+    this.sendAttachBurst(restarted);
     // An attached client is the user being here, unless it said `AWAY *`.
     evaluatePresence(this.userId);
     systemLog.log({
@@ -1412,7 +1428,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
 
   // --- attach burst ----------------------------------------------------------
 
-  private sendAttachBurst(): void {
+  private sendAttachBurst(restarted = false): void {
     const conn = this.conn!;
     const requested = this.clientNick || conn.currentNick || 'user';
     const liveNick = conn.currentNick || requested;
@@ -1459,8 +1475,10 @@ class BouncerSession implements MonitorHolder, ReplyClient {
 
     if (conn.state !== 'connected') {
       // Why it's down, for a client that attached after it went: soju sends the
-      // same on attach (user.go:823).
-      const why = ircManager.connectionError(this.userId, this.networkId) || '';
+      // same on attach (user.go:823). Not when this attach just restarted the
+      // network, though: the reason is about the attempt before it, and
+      // "not reconnecting automatically" would contradict the retry under way.
+      const why = restarted ? '' : ircManager.connectionError(this.userId, this.networkId) || '';
       this.notice(
         `Network '${this.network?.name}' is ${conn.state}; channels will appear once it registers.` +
           (why ? ` ${why}` : ''),
@@ -2721,14 +2739,14 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     if (!this.liveConn() || this.closed) return;
     // A connect brings the network's caps; a disconnect takes them away.
     this.updateSupportedCaps(this.currentNick() || '*');
-    // A connection says its state again without a change: 'socket close' and
-    // 'close' both say disconnected. The same state with a NEW reason is news,
-    // though — a stopped retry re-asserts 'disconnected' to say why it stopped —
-    // so the reason is part of what's already been said (soju dedupes on the
-    // error text alone, user.go:741).
-    const said = error ? `${state} ${error}` : state;
-    if (said === this.noticedState) return;
-    this.noticedState = said;
+    // A connection says its state again without a change: 'socket close' says
+    // disconnected with the reason and 'close' says it again with none. The
+    // same state with a NEW reason is news, though — a stopped retry re-asserts
+    // 'disconnected' to say why it stopped — so the reason, and only a reason,
+    // re-notices (soju dedupes on the error text alone, user.go:741).
+    if (state === this.noticedState && (!error || error === this.noticedError)) return;
+    this.noticedState = state;
+    this.noticedError = error;
     const name = this.network?.name;
     if (state === 'connected') this.notice(`Upstream connected to '${name}'.`);
     else if (state === 'reconnecting') this.notice(`Upstream reconnecting to '${name}'.`);
