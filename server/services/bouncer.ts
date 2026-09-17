@@ -189,11 +189,6 @@ function capLsList(caps: Iterable<string>, version: number): string {
     .join(' ');
 }
 
-// Upstream wire commands never relayed to attached clients: connection
-// plumbing that belongs to Lurker's own registration/keepalive (we answer the
-// client's PINGs ourselves and replay our own welcome burst at attach), plus
-// SASL/STARTTLS numerics from an upstream re-registration that would confuse a
-// client that never negotiated them.
 export {
   isBouncerEnabled,
   bouncerPort,
@@ -202,6 +197,11 @@ export {
   bouncerTerminatesTls,
 } from '../utils/bouncerConfig.js';
 
+// Upstream wire commands never relayed to attached clients: connection
+// plumbing that belongs to Lurker's own registration/keepalive (we answer the
+// client's PINGs ourselves and replay our own welcome burst at attach), plus
+// SASL/STARTTLS numerics from an upstream re-registration that would confuse a
+// client that never negotiated them.
 const RELAY_DROP = new Set([
   'PING',
   'PONG',
@@ -3063,7 +3063,24 @@ let certReloadTimer: ReturnType<typeof setInterval> | null = null;
 // Paths + current fingerprint of the live TLS cert, so the reload poll can
 // detect a renewed cert on disk and swap it in without a restart. null =
 // plaintext listener.
-let bouncerTlsState: { certPath: string; keyPath: string; fingerprint: string } | null = null;
+let bouncerTlsState: {
+  certPath: string;
+  keyPath: string;
+  fingerprint: string;
+  source: 'configured' | 'self-signed';
+} | null = null;
+
+/** The certificate the listener is serving, for Settings → Bouncer. A
+ *  self-signed one is the default, and the first connection fails on it unless
+ *  the member knows to accept it — so the pane says so, with the fingerprint to
+ *  check against. Null when the bouncer isn't listening, or isn't doing TLS. */
+export function bouncerTlsInfo(): { selfSigned: boolean; fingerprint: string } | null {
+  if (!bouncerTlsState) return null;
+  return {
+    selfSigned: bouncerTlsState.source === 'self-signed',
+    fingerprint: bouncerTlsState.fingerprint,
+  };
+}
 let onIrcEvent: ((event: Record<string, unknown>) => void) | null = null;
 let onReadMarker: ((move: ReadMarkerMove) => void) | null = null;
 let onAway: ((change: AwayChange) => void) | null = null;
@@ -3249,6 +3266,7 @@ export async function startBouncer(
       certPath: tlsInfo.certPath,
       keyPath: tlsInfo.keyPath,
       fingerprint: tlsInfo.fingerprint,
+      source: tlsInfo.source,
     };
     certReloadTimer = setInterval(() => reloadBouncerTls(), CERT_RELOAD_INTERVAL_MS);
     certReloadTimer.unref?.();

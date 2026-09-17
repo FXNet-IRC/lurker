@@ -15,6 +15,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { bouncerPort, bouncerPublicAddress, bouncerTerminatesTls } from '../utils/bouncerConfig.js';
+import { bouncerTlsInfo } from '../services/bouncer.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -30,6 +31,12 @@ router.get('/', (_req: Request, res: Response) => {
     // Whether that's a statement about this deployment or a guess from Lurker's
     // own listener, which the pane says out loud.
     pinned: pinned !== null,
+    // A self-signed certificate is the default, and a client refuses it until
+    // the member accepts or pins it — so the pane warns, with the fingerprint to
+    // check against. Null when the operator pinned an address (whatever answers
+    // there is theirs, not ours), when the listener isn't up, or when Lurker
+    // isn't the one doing TLS.
+    certificate: pinned ? null : bouncerTlsInfo(),
   });
 });
 

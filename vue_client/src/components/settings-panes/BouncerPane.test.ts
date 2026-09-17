@@ -21,17 +21,29 @@ import BouncerPane from './BouncerPane.vue';
 import { useAuthStore } from '../../stores/auth.js';
 import { useNetworksStore } from '../../stores/networks.js';
 
-type Info = { host: string | null; port: number; tls: boolean; pinned: boolean };
+// Renders its slot, unlike the default stub: what the link SAYS is the point.
+const LINK_STUB = { template: '<a class="rl"><slot /></a>' };
+
+type Info = {
+  host: string | null;
+  port: number;
+  tls: boolean;
+  pinned: boolean;
+  certificate?: { selfSigned: boolean; fingerprint: string } | null;
+};
 
 async function mountWith(info: Info | Error, networks: string[] = ['libera']) {
   setActivePinia(createPinia());
   useAuthStore().user = { id: 1, username: 'brad', role: 'user' } as never;
-  useNetworksStore().networks = networks.map((name, i) => ({ id: i + 1, name })) as never;
+  const store = useNetworksStore();
+  store.networks = networks.map((name, i) => ({ id: i + 1, name })) as never;
+  // Seeded, so the pane doesn't go and fetch them (its own test below covers that).
+  store.loaded = true;
   h.api.mockImplementation(async () => {
     if (info instanceof Error) throw info;
-    return info;
+    return { certificate: null, ...info };
   });
-  const wrapper = mount(BouncerPane, { global: { stubs: { RouterLink: true } } });
+  const wrapper = mount(BouncerPane, { global: { stubs: { RouterLink: LINK_STUB } } });
   await flushPromises();
   return wrapper;
 }
@@ -69,6 +81,63 @@ describe('BouncerPane', () => {
   it('leaves out the TLS instruction when the connection is plaintext', async () => {
     const w = await mountWith({ host: 'irc.example.com', port: 6667, tls: false, pinned: true });
     expect(w.text()).not.toContain('TLS');
+  });
+
+  // The default install serves a certificate it made itself, which a client
+  // refuses until the member accepts it.
+  it('warns about a self-signed certificate, with the fingerprint to check', async () => {
+    const w = await mountWith({
+      host: null,
+      port: 6667,
+      tls: true,
+      pinned: false,
+      certificate: { selfSigned: true, fingerprint: 'AA:BB:CC' },
+    });
+    expect(w.text()).toContain('AA:BB:CC');
+    expect(w.text()).toContain('trust it');
+  });
+
+  it("says nothing about a certificate when it isn't Lurker's to explain", async () => {
+    const w = await mountWith({ host: 'irc.example.com', port: 6697, tls: true, pinned: true });
+    expect(w.text()).not.toContain('fingerprint');
+  });
+
+  // A single "server password" box takes both, and a colon in the password
+  // can't survive that form.
+  it('spells out the combined server-password form', async () => {
+    const w = await mountWith({ host: null, port: 6667, tls: true, pinned: false });
+    expect(w.text()).toContain('brad:your-password');
+  });
+
+  it('names the token scope the bouncer actually accepts, in the link itself', async () => {
+    const w = await mountWith({ host: null, port: 6667, tls: true, pinned: false });
+    // The link goes to a pane that defaults to read-only, and the bouncer
+    // refuses that token — so the scope belongs in the link, not only in the
+    // paragraph below it.
+    expect(w.find('a.rl').text()).toBe('read-write API token');
+    expect(w.text()).toContain('A read-only token is refused');
+  });
+
+  it('fetches the networks itself, for a page loaded without the chat socket', async () => {
+    setActivePinia(createPinia());
+    useAuthStore().user = { id: 1, username: 'brad', role: 'user' } as never;
+    const networks = useNetworksStore();
+    const fetchAll = vi.fn<() => Promise<void>>(async () => {
+      networks.networks = [{ id: 1, name: 'libera' }] as never;
+      networks.loaded = true;
+    });
+    networks.fetchAll = fetchAll as never;
+    h.api.mockImplementation(async () => ({
+      host: null,
+      port: 6667,
+      tls: true,
+      pinned: false,
+      certificate: null,
+    }));
+    const w = mount(BouncerPane, { global: { stubs: { RouterLink: LINK_STUB } } });
+    await flushPromises();
+    expect(fetchAll).toHaveBeenCalled();
+    expect(w.text()).toContain('brad/libera');
   });
 
   it('still explains the login when the address cannot be read', async () => {

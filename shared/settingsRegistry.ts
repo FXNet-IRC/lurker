@@ -137,13 +137,13 @@ export interface StringListOption extends BaseOption {
 /** Any entry in the settings REGISTRY. Narrow on `.type` for type-specific fields. */
 export type SettingOption = StringOption | IntOption | BoolOption | EnumOption | StringListOption;
 
+/** An instance feature a settings surface depends on, as advertised by /api/config. */
+export type FeatureFlag = 'linkPreviews' | 'bouncer';
+
 /**
  * A Settings-sidebar category. `registry` categories are auto-rendered from
  * REGISTRY entries; `bespoke` ones have a hand-written pane component.
  */
-/** An instance feature a settings surface depends on, as advertised by /api/config. */
-export type FeatureFlag = 'linkPreviews' | 'bouncer';
-
 export interface SettingCategory {
   id: string;
   label: string;

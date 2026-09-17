@@ -524,7 +524,7 @@ If the bouncer answers somewhere other than this instance's own hostname and lis
 
 ```yaml
 environment:
-  - LURKER_BOUNCER_PUBLIC_URL=ircs://irc.example.com:6697 # ircs = TLS, irc = without
+  - LURKER_BOUNCER_PUBLIC_URL=ircs://irc.example.com:6697 # ircs = TLS, irc = without; give the port whenever it isn't Lurker's own
 ```
 
 Point your IRC client at the host/port with a **server password** of:

@@ -145,7 +145,7 @@ const searchIndex = computed(() =>
       CATEGORIES.some((c) => c.id === opt.category) &&
       optionVisible(opt, {
         isNode: config.isNode,
-        features: { linkPreviews: config.linkPreviews },
+        features: config.features,
       }),
   ).map((opt) => {
     const cat = CATEGORIES.find((c) => c.id === opt.category);

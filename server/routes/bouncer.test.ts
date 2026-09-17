@@ -8,7 +8,7 @@
 
 // MUST be first: redirects DATABASE_PATH before anything opens the db.
 import '../test-utils/isolateDb.js';
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import type { Express } from 'express';
 import {
   setupTestDb,
@@ -16,6 +16,12 @@ import {
   createAuthedAgent,
   createAnonAgent,
 } from '../test-utils/testApp.js';
+
+// The listener isn't running under test, so what it would serve is stubbed.
+const h = vi.hoisted(() => ({
+  tls: null as { selfSigned: boolean; fingerprint: string } | null,
+}));
+vi.mock('../services/bouncer.js', () => ({ bouncerTlsInfo: () => h.tls }));
 
 const ctx = setupTestDb('routes-bouncer');
 
@@ -32,6 +38,7 @@ beforeAll(async () => {
 afterAll(() => ctx.cleanup());
 
 afterEach(() => {
+  h.tls = null;
   delete process.env.LURKER_BOUNCER_PUBLIC_URL;
   delete process.env.LURKER_BOUNCER_PORT;
   delete process.env.LURKER_BOUNCER_TLS;
@@ -41,7 +48,13 @@ async function read() {
   const agent = await createAuthedAgent(app, userId);
   const res = await agent.get('/api/bouncer');
   expect(res.status).toBe(200);
-  return res.body as { host: string | null; port: number; tls: boolean; pinned: boolean };
+  return res.body as {
+    host: string | null;
+    port: number;
+    tls: boolean;
+    pinned: boolean;
+    certificate: { selfSigned: boolean; fingerprint: string } | null;
+  };
 }
 
 describe('GET /api/bouncer', () => {
@@ -51,7 +64,13 @@ describe('GET /api/bouncer', () => {
 
   it("falls back to the listener's own port and TLS, with no hostname to give", async () => {
     process.env.LURKER_BOUNCER_PORT = '6668';
-    expect(await read()).toEqual({ host: null, port: 6668, tls: true, pinned: false });
+    expect(await read()).toEqual({
+      host: null,
+      port: 6668,
+      tls: true,
+      pinned: false,
+      certificate: null,
+    });
   });
 
   it('reports TLS off when Lurker does not terminate it', async () => {
@@ -64,13 +83,47 @@ describe('GET /api/bouncer', () => {
     // client should do is still connect with TLS.
     process.env.LURKER_BOUNCER_TLS = 'off';
     process.env.LURKER_BOUNCER_PUBLIC_URL = 'ircs://irc.example.com:6697';
-    expect(await read()).toEqual({ host: 'irc.example.com', port: 6697, tls: true, pinned: true });
+    expect(await read()).toEqual({
+      host: 'irc.example.com',
+      port: 6697,
+      tls: true,
+      pinned: true,
+      certificate: null,
+    });
   });
 
   it('takes a pinned plaintext address, and the listener port when none is given', async () => {
     process.env.LURKER_BOUNCER_PORT = '6668';
     process.env.LURKER_BOUNCER_PUBLIC_URL = 'irc://irc.example.com';
-    expect(await read()).toEqual({ host: 'irc.example.com', port: 6668, tls: false, pinned: true });
+    expect(await read()).toEqual({
+      host: 'irc.example.com',
+      port: 6668,
+      tls: false,
+      pinned: true,
+      certificate: null,
+    });
+  });
+
+  // url.hostname keeps the brackets; an IRC client's server field wants the
+  // address itself.
+  it('hands over an IPv6 address without the URL brackets', async () => {
+    process.env.LURKER_BOUNCER_PUBLIC_URL = 'ircs://[2001:db8::1]:6697';
+    expect(await read()).toMatchObject({ host: '2001:db8::1', port: 6697 });
+  });
+
+  // A client refuses a certificate Lurker made for itself until the member
+  // accepts it, so the pane has to be able to say so.
+  it("describes the certificate the listener serves, when it's Lurker's own", async () => {
+    h.tls = { selfSigned: true, fingerprint: 'AA:BB:CC' };
+    expect(await read()).toMatchObject({
+      certificate: { selfSigned: true, fingerprint: 'AA:BB:CC' },
+    });
+  });
+
+  it('says nothing about a certificate for an address it does not answer on', async () => {
+    h.tls = { selfSigned: true, fingerprint: 'AA:BB:CC' };
+    process.env.LURKER_BOUNCER_PUBLIC_URL = 'ircs://irc.example.com:6697';
+    expect(await read()).toMatchObject({ certificate: null });
   });
 
   it('ignores an address it cannot use', async () => {

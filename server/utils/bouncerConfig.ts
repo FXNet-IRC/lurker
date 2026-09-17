@@ -46,7 +46,9 @@ export function bouncerPublicAddress(): { host: string; port: number; tls: boole
     warnPublicUrl(raw);
     return null;
   }
-  return { host: url.hostname, port, tls };
+  // url.hostname keeps an IPv6 literal's brackets; an IRC client's server field
+  // wants the address itself.
+  return { host: url.hostname.replace(/^\[|\]$/g, ''), port, tls };
 }
 
 let warnedPublicUrl = false;

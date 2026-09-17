@@ -38,10 +38,22 @@
       </dd>
       <dt>password</dt>
       <dd>
-        your Lurker password, or
-        <RouterLink to="/settings/api-tokens">an API token</RouterLink>
+        your Lurker password, or a
+        <RouterLink to="/settings/api-tokens">read-write API token</RouterLink>
       </dd>
     </dl>
+
+    <p v-if="certificate?.selfSigned" class="muted small">
+      Lurker made its own certificate for this, so your client will ask whether to trust it the
+      first time. Its SHA-256 fingerprint is <code>{{ certificate.fingerprint }}</code
+      >.
+    </p>
+
+    <p class="muted small">
+      Some clients have a single “server password” box rather than separate fields. Put
+      <code>{{ username }}:your-password</code> in it. A password with a <code>:</code> in it can’t
+      be sent that way, so use a token.
+    </p>
 
     <p v-if="!pinned" class="muted small">
       That’s this instance’s own hostname and listener. If your bouncer answers somewhere else — a
@@ -50,9 +62,9 @@
     </p>
 
     <p class="muted small">
-      An API token is the better password here: IRC clients keep the server password in a plaintext
-      config file, and a token can be revoked on its own. Revoking it disconnects the clients using
-      it.
+      A read-write API token is the better password here: IRC clients keep the server password in a
+      plaintext config file, and a token can be revoked on its own. Revoking it disconnects the
+      clients using it. A read-only token is refused.
     </p>
 
     <p class="muted small">
@@ -84,9 +96,15 @@ interface BouncerInfo {
   port: number;
   tls: boolean;
   pinned: boolean;
+  certificate: { selfSigned: boolean; fingerprint: string } | null;
 }
 const info = ref<BouncerInfo | null>(null);
 onMounted(async () => {
+  // The networks are fetched by the chat socket, which a direct load of
+  // /settings/bouncer — a bookmark, or a reload while setting a client up —
+  // never opens. Without this the login form for one network is missing, which
+  // reads as "this account has no networks".
+  if (!networks.loaded) networks.fetchAll().catch(() => {});
   try {
     info.value = await api<BouncerInfo>('/api/bouncer');
   } catch {
@@ -98,6 +116,7 @@ const host = computed(() => info.value?.host || window.location.hostname);
 const port = computed(() => info.value?.port ?? 6667);
 const tls = computed(() => info.value?.tls !== false);
 const pinned = computed(() => info.value?.pinned === true);
+const certificate = computed(() => info.value?.certificate ?? null);
 const username = computed(() => auth.user?.username || 'username');
 const networkNames = computed(() => networks.networks.map((n) => n.name));
 </script>

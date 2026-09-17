@@ -27,7 +27,7 @@ import pushRouter from './routes/push.js';
 import adminRouter from './routes/admin.js';
 import uploadsRouter from './routes/uploads.js';
 import filehostRouter from './routes/filehost.js';
-import { isBouncerEnabled } from './services/bouncer.js';
+import { isBouncerEnabled } from './utils/bouncerConfig.js';
 import uploadersRouter from './routes/uploaders.js';
 import localUploadsRouter from './routes/localUploads.js';
 import dccRouter from './routes/dcc.js';
