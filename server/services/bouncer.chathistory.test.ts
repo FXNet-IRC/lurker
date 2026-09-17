@@ -578,12 +578,8 @@ describe('draft/event-playback', () => {
   it("compares our nick under the network's casemapping", async () => {
     const { default: db } = await import('../db/index.js');
     const { invalidateCasemappingCache } = await import('../db/buffers.js');
-    const rows = [
-      { type: 'join', nick: 'Ep{11}^', userhost: 'Ep{11}^!e@h' },
-      { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'out', extra: { kicked: 'EP[11]~' } },
-      { type: 'join', nick: 'zed', userhost: 'zed!z@h' },
-    ];
-    const replayed = async (nick: string, casemapping: string) => {
+    type Row = Partial<Parameters<typeof insertMessage>[0]>;
+    const replayed = async (nick: string, casemapping: string, rows: Row[]) => {
       const acct = harnessMod.seedAccount({ nick });
       db.prepare('UPDATE networks SET casemapping = ? WHERE id = ?').run(
         casemapping,
@@ -608,11 +604,29 @@ describe('draft/event-playback', () => {
       c.close();
       return batchBodies(c.lines, ref).map((l) => l.split(' ')[2] + ' ' + l.split(' ')[1]);
     };
+    const brackets: Row[] = [
+      { type: 'join', nick: 'Ep{11}^', userhost: 'Ep{11}^!e@h' },
+      { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'out', extra: { kicked: 'EP[11]~' } },
+      { type: 'join', nick: 'zed', userhost: 'zed!z@h' },
+    ];
     // rfc1459: [ ] \ ^ are the capitals of { } | ~.
-    expect(await replayed('ep[11]~', 'rfc1459')).toEqual(['JOIN :zed!z@h']);
+    expect(await replayed('ep[11]~', 'rfc1459', brackets)).toEqual(['JOIN :zed!z@h']);
     // ascii: they're different characters, so both lines are someone else's.
-    expect(await replayed('ep[11]^', 'ascii')).toEqual([
+    expect(await replayed('ep[11]^', 'ascii', brackets)).toEqual([
       'JOIN :Ep{11}^!e@h',
+      'KICK :op!o@h',
+      'JOIN :zed!z@h',
+    ]);
+    const unicode: Row[] = [
+      { type: 'join', nick: 'äLICE', userhost: 'äLICE!a@h' },
+      { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'out', extra: { kicked: 'äLiCe' } },
+      { type: 'join', nick: 'zed', userhost: 'zed!z@h' },
+    ];
+    // rfc7613 folds Unicode: Ä is the capital of ä.
+    expect(await replayed('Älice', 'rfc7613', unicode)).toEqual(['JOIN :zed!z@h']);
+    // ascii folds only A-Z.
+    expect(await replayed('Älice', 'ascii', unicode)).toEqual([
+      'JOIN :äLICE!a@h',
       'KICK :op!o@h',
       'JOIN :zed!z@h',
     ]);

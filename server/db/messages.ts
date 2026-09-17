@@ -589,22 +589,15 @@ export interface HistoryEvents {
   me: string | null;
 }
 
-// `expr` folded in SQL as foldTargetWith folds under `mapping`. SQLite's lower()
-// is ASCII-only, so rfc7613 and an undeclared mapping fold as ascii here, and
-// the nick compared against is folded to match (foldForSql).
-function sqlFold(expr: string, mapping: Casemapping | null): string {
-  let out = `lower(${expr})`;
-  if (mapping === 'rfc1459' || mapping === 'rfc1459-strict') {
-    out = `replace(replace(replace(${out}, '[', '{'), ']', '}'), '\\', '|')`;
-    if (mapping === 'rfc1459') out = `replace(${out}, '^', '~')`;
-  }
-  return out;
-}
-
-function foldForSql(nick: string, mapping: Casemapping | null): string {
-  const sqlMapping = mapping === 'rfc1459' || mapping === 'rfc1459-strict' ? mapping : 'ascii';
-  return foldTargetWith(sqlMapping, nick);
-}
+// foldTargetWith as an SQL function, so a nick stored in a row folds exactly as
+// the network folds nicks (#707): ASCII, rfc1459's [ ] \\ ^ pairs, or Unicode
+// for rfc7613 and an undeclared mapping. SQLite's own lower() is ASCII-only.
+const FOLD_NICK_FN = 'lurker_fold_nick';
+db.function(FOLD_NICK_FN, { deterministic: true }, (mapping: unknown, nick: unknown) =>
+  typeof nick === 'string'
+    ? foldTargetWith(typeof mapping === 'string' ? (mapping as Casemapping) : null, nick)
+    : null,
+);
 
 // The rows a window holds: messages, and for a draft/event-playback client the
 // event rows too, every one counting toward the limit as soju's do. Filtered
@@ -613,7 +606,8 @@ function foldForSql(nick: string, mapping: Casemapping | null): string {
 //
 // Events naming our current nick stay out: a JOIN, PART, QUIT or NICK from it,
 // or a KICK of it, compared under the network's CASEMAPPING as clients compare
-// (goguma's isMyNick), so `foo{bar}` is `foo[bar]` on rfc1459. goguma applies every replayed line to its live state
+// (goguma's isMyNick), so `foo{bar}` is `foo[bar]` on rfc1459 and `Älice` is
+// `älice` on rfc7613. goguma applies every replayed line to its live state
 // (client_controller.dart:577-721), and those are the ones it takes as ours: an
 // old PART marks the channel as left, an old NICK renames us. HexDroid rejoins
 // on an old JOIN of ours. An event under a nick we no longer use reads as
@@ -624,24 +618,21 @@ function historyFilter(
   alias: string,
   events: HistoryEvents | null | undefined,
   mapping: Casemapping | null,
-): { sql: string; params: string[] } {
+): { sql: string; params: Array<string | null> } {
   const messages = chathistoryMsgFilter(alias);
   if (!events) return { sql: messages, params: [] };
   const p = alias ? `${alias}.` : '';
   const types = HISTORY_EVENT_TYPES.map((t) => `'${t}'`).join(', ');
   let eventSql = `${p}type IN (${types})`;
-  const params: string[] = [];
+  const params: Array<string | null> = [];
   if (events.me) {
     // COALESCE, or a row with no nick would compare NULL and drop out too.
-    const nick = sqlFold(`COALESCE(${p}nick, '')`, mapping);
-    const kicked = sqlFold(
-      `COALESCE(CASE WHEN json_valid(${p}extra) THEN json_extract(${p}extra, '$.kicked') END, '')`,
-      mapping,
-    );
+    const nick = `${FOLD_NICK_FN}(?, COALESCE(${p}nick, ''))`;
+    const kicked = `${FOLD_NICK_FN}(?, COALESCE(CASE WHEN json_valid(${p}extra) THEN json_extract(${p}extra, '$.kicked') END, ''))`;
     eventSql += ` AND NOT (${p}type IN ('join', 'part', 'quit', 'nick') AND ${nick} = ?)`;
     eventSql += ` AND NOT (${p}type = 'kick' AND ${kicked} = ?)`;
-    const me = foldForSql(events.me, mapping);
-    params.push(me, me);
+    const me = foldTargetWith(mapping, events.me);
+    params.push(mapping, me, mapping, me);
   }
   return { sql: `((${messages}) OR (${eventSql}))`, params };
 }
@@ -673,7 +664,7 @@ export function loadHistoryWindow(
   if (bufferId === undefined) return [];
   const filter = historyFilter('', forEvents, forEvents?.me ? networkCasemapping(networkId) : null);
   const conds = ['buffer_id = ?', filter.sql];
-  const params: (string | number)[] = [bufferId, ...filter.params];
+  const params: (string | number | null)[] = [bufferId, ...filter.params];
   if (lower !== null) {
     conds.push('time > ?');
     params.push(lower);
