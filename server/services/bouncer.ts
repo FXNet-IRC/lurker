@@ -3218,6 +3218,9 @@ export function reloadBouncerTls(): 'reloaded' | 'unchanged' | 'skipped' | 'erro
     }
     (server as tls.Server).setSecureContext({ cert, key });
     bouncerTlsState.fingerprint = fingerprint;
+    // Settings → Bouncer shows this for a member to check against, so a renewal
+    // has to move it: a stale one has them pinning a certificate that's gone.
+    setBouncerTlsState({ selfSigned: bouncerTlsState.source === 'self-signed', fingerprint });
     console.log(`[bouncer] reloaded TLS certificate (SHA-256 ${fingerprint})`);
     systemLog.log({
       scope: 'bouncer',
@@ -3334,6 +3337,7 @@ export function stopBouncer(): void {
     certReloadTimer = null;
   }
   bouncerTlsState = null;
+  setBouncerTlsState(null);
   if (onIrcEvent) {
     ircManager.off('event', onIrcEvent);
     onIrcEvent = null;
