@@ -166,10 +166,58 @@ class IrcManager extends EventEmitter {
   // link replaced under us (tests rebuild the singleton) is hooked afresh
   // rather than left to the listeners on its predecessor.
   private reconcileHookedLink: EngineLink | null = null;
+  // Why each network's last connection attempt failed, until it next connects:
+  // the `error` a failing attempt's state event carries (IrcConnection.setState),
+  // read off the event stream.
+  // Held here rather than on the connection, because a connect refused over the
+  // network's settings drops its connection from the map as it reports why.
+  private connectionErrors = new Map<number, Map<number, string>>();
 
   constructor() {
     super();
     this.byUser = new Map();
+    // The first listener, so an error is recorded before anyone reading it
+    // hears the event.
+    this.on('event', (event) => this.noteConnectionError(event));
+  }
+
+  connectionError(userId: number, networkId: number): string | null {
+    return this.connectionErrors.get(userId)?.get(networkId) ?? null;
+  }
+
+  private noteConnectionError(event: {
+    type: string;
+    userId: number;
+    networkId: number;
+    [key: string]: unknown;
+  }): void {
+    if (event.type !== 'state') return;
+    const { userId, networkId } = event;
+    if (typeof event.error === 'string' && event.error) {
+      let errors = this.connectionErrors.get(userId);
+      if (!errors) {
+        errors = new Map();
+        this.connectionErrors.set(userId, errors);
+      }
+      errors.set(networkId, event.error);
+    } else if (event.state === 'connected') {
+      this.forgetConnectionError(userId, networkId);
+    }
+  }
+
+  // Drops the account's entry with its last error, so an account whose errors
+  // have all cleared holds nothing.
+  private forgetConnectionError(userId: number, networkId: number): void {
+    const errors = this.connectionErrors.get(userId);
+    if (!errors?.delete(networkId)) return;
+    if (errors.size === 0) this.connectionErrors.delete(userId);
+  }
+
+  // A network row was created, edited or deleted. The bouncer tells its
+  // bouncer-networks-notify clients; call it once the row is written (or gone).
+  networkChanged(userId: number, networkId: number): void {
+    if (!getNetwork(networkId, userId)) this.forgetConnectionError(userId, networkId);
+    this.emit('network-changed', { userId, networkId });
   }
 
   connectionsForUser(userId: number): Map<number, IrcConnection> {
@@ -1012,6 +1060,7 @@ class IrcManager extends EventEmitter {
       }
       this.byUser.delete(userId);
     }
+    this.connectionErrors.delete(userId);
     this.emit('user-disposed', { userId });
   }
 

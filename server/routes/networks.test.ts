@@ -41,6 +41,12 @@ const fakeManager = {
   disposeNetwork(userId: number, networkId: number, reason: string) {
     this.calls.push(['disposeNetwork', userId, networkId, reason]);
   },
+  // Records whether the row was there when the change was announced: a bouncer
+  // client is told about a new or edited network from its row, and a deleted
+  // one by its absence.
+  networkChanged(userId: number, networkId: number) {
+    this.calls.push(['networkChanged', userId, networkId, rowExists(networkId)]);
+  },
   joinChannel(userId: number, networkId: number, channel: string, key?: string) {
     this.calls.push(['joinChannel', userId, networkId, channel, key]);
     return this.joinReturn !== undefined ? this.joinReturn : true;
@@ -63,6 +69,9 @@ function certOnRow(networkId: number): string | null {
     | { client_cert: string | null }
     | undefined;
   return row?.client_cert ?? null;
+}
+function rowExists(networkId: number): boolean {
+  return !!dbRef?.prepare('SELECT 1 FROM networks WHERE id = ?').get(networkId);
 }
 let dbRef: typeof import('../db/index.js').default | null = null;
 
@@ -134,6 +143,15 @@ describe('POST /api/networks', () => {
     const res = await makeNet(aliceAgent, { autoconnect: true, name: 'autoconn' });
     expect(res.status).toBe(201);
     expect(fakeManager.calls.some(([m]) => m === 'startNetwork')).toBe(true);
+  });
+
+  it('announces the new network before connecting it', async () => {
+    const res = await makeNet(aliceAgent, { name: 'announced' });
+    expect(res.status).toBe(201);
+    const id = res.body.network.id;
+    const methods = fakeManager.calls.map(([m]) => m);
+    expect(fakeManager.calls).toContainEqual(['networkChanged', alice.id, id, true]);
+    expect(methods.indexOf('networkChanged')).toBeLessThan(methods.indexOf('startNetwork'));
   });
 
   it('still starts the connection on create when autoconnect is false (#186)', async () => {
@@ -288,6 +306,19 @@ describe('PATCH /api/networks/:id', () => {
     expect(res.status).toBe(200);
     expect(res.body.network.nick).toBe('newnick');
     expect(res.body.network.trusted_certificates).toBe(false);
+    expect(fakeManager.calls).toContainEqual([
+      'networkChanged',
+      alice.id,
+      net.body.network.id,
+      true,
+    ]);
+  });
+
+  it('announces nothing for an edit it refuses', async () => {
+    const bobNet = await makeNet(bobAgent, { name: 'bobs-quiet' });
+    fakeManager.reset();
+    await aliceAgent.patch(`/api/networks/${bobNet.body.network.id}`).send({ nick: 'x' });
+    expect(fakeManager.calls.some(([m]) => m === 'networkChanged')).toBe(false);
   });
 });
 
@@ -297,6 +328,13 @@ describe('DELETE /api/networks/:id', () => {
     const res = await aliceAgent.delete(`/api/networks/${net.body.network.id}`);
     expect(res.status).toBe(200);
     expect(fakeManager.calls.some(([m]) => m === 'disposeNetwork')).toBe(true);
+    // Announced once the row is gone, so the bouncer reads it as deleted.
+    expect(fakeManager.calls).toContainEqual([
+      'networkChanged',
+      alice.id,
+      net.body.network.id,
+      false,
+    ]);
     const list = await aliceAgent.get('/api/networks');
     expect(
       list.body.networks.find((n: { id: number }) => n.id === net.body.network.id),

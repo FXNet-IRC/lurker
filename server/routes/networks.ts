@@ -361,6 +361,8 @@ async function createAndConnectInner(req: Request, res: Response): Promise<void>
   // network is connected automatically at cold-start (connectScheduler /
   // ircManager.initAll) and on un-pause resume — not whether this initial,
   // user-initiated setup connects.
+  // Announced first, so a bouncer client hears of the network before its state.
+  ircManager.networkChanged(req.user!.id, network.id);
   ircManager.startNetwork(req.user!.id, network.id);
   res.status(201).json({ network: networkPayload(withCert) });
 }
@@ -425,6 +427,7 @@ router.patch('/:id', (req: Request, res: Response) => {
     return;
   }
   const updated = updateNetwork(id, req.user!.id, body);
+  ircManager.networkChanged(req.user!.id, id);
   res.json({ network: networkPayload(updated) });
 });
 
@@ -437,6 +440,7 @@ router.delete('/:id', (req: Request, res: Response) => {
   }
   ircManager.disposeNetwork(req.user!.id, id, 'network removed');
   deleteNetwork(id, req.user!.id);
+  ircManager.networkChanged(req.user!.id, id);
   // The network's buffers cascaded away and took their favorite rows with
   // them, leaving holes mid-sequence in the user's global favorites order.
   // Re-densify and re-publish so open tabs drop the dead entries instead of

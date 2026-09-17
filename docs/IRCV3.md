@@ -244,6 +244,12 @@ Implementation notes worth knowing if you're writing against it:
   your reply, or nothing if it's empty or CTCP replies are off. A connection that sent
   `AWAY *` doesn't count as attached.
   <br>`server/services/ctcp.ts`, `server/services/ircConnection.ts`
+- With `soju.im/bouncer-networks-notify`, your client hears when a network is added,
+  edited or deleted in Lurker, and each notice carries only what changed. A network
+  that failed to connect says why in its `error` attribute until it connects. A client
+  attached to a network that's deleted is disconnected. Networks are managed in Lurker
+  itself, so `ADDNETWORK`, `CHANGENETWORK` and `DELNETWORK` are refused.
+  <br>`server/services/bouncer.ts:1669`
 
 ---
 

@@ -26,6 +26,8 @@ import { computeExportPreview } from '../services/exportService.js';
 import { startExport, toClientJob, exportArtifactPath } from '../services/exportJobs.js';
 import { getLatestJobForUser, getExportJobForUser, markDownloaded } from '../db/dataExports.js';
 import { importFromZipFile, ImportError } from '../services/importService.js';
+import ircManager from '../services/ircManager.js';
+import { listNetworksForUser } from '../db/networks.js';
 import { clampToTransport, formatCapMb } from '../services/uploadLimits.js';
 
 const router = Router();
@@ -224,6 +226,10 @@ importRouter.post('/', importUpload, async (req: Request, res: Response, next: N
       return;
     }
     const result = await importFromZipFile(req.user!.id, req.file.path);
+    // The account was empty, so every network it has now came from the archive.
+    for (const network of listNetworksForUser(req.user!.id)) {
+      ircManager.networkChanged(req.user!.id, network.id);
+    }
     res.json({ ok: true, ...result });
   } catch (err) {
     if (err instanceof ImportError) {

@@ -73,6 +73,9 @@ export const UPSTREAM_CAPS = [
 // Minimal stand-in for IrcConnection covering exactly what bouncer.ts reads.
 export class FakeUpstream {
   state = 'connected';
+  // IrcConnection.network: the row the connection was built from. seedAccount
+  // and seedNetwork set it.
+  network: Network | null = null;
   currentNick = 'tester';
   registrationLines: string[] = [];
   channels = new Map<string, FakeChannel>();
@@ -135,6 +138,10 @@ export class FakeUpstream {
   raw(line: string): void {
     this.rawSent.push(line);
   }
+
+  // IrcConnection.dispose: it marks itself disposed before it quits, so it
+  // publishes nothing, not even a state change.
+  dispose(): void {}
 
   supportsMessageTags(): boolean {
     return this.messageTags;
@@ -226,6 +233,7 @@ export function seedAccount(
   } as Parameters<typeof createNetwork>[1])!;
 
   const upstream = opts.upstream ?? new FakeUpstream(nick);
+  upstream.network = network;
   ircManager.connectionsForUser(user.id).set(network.id, upstream as never);
 
   return { user, network, password, token, upstream };
@@ -244,9 +252,20 @@ export function attachedFor(acct: HarnessAccount): number {
   return attachedSessionCount(acct.user.id, acct.network.id);
 }
 
-/** Simulate an upstream network state change flowing through ircManager. */
-export function emitNetworkState(userId: number, networkId: number, state: string): void {
-  ircManager.emit('event', { userId, networkId, type: 'state', state });
+/**
+ * Simulate an upstream network state change flowing through ircManager. Like
+ * IrcConnection.setState, the connection's state moves before the event goes
+ * out; `extra` rides the event (an `error`, say).
+ */
+export function emitNetworkState(
+  userId: number,
+  networkId: number,
+  state: string,
+  extra: Record<string, unknown> = {},
+): void {
+  const conn = ircManager.getConnection(userId, networkId);
+  if (conn) conn.state = state;
+  ircManager.emit('event', { userId, networkId, type: 'state', state, ...extra });
 }
 
 /** Add a second network + upstream to an already-seeded user. */
@@ -263,6 +282,7 @@ export function seedNetwork(
     nick,
   } as Parameters<typeof createNetwork>[1])!;
   const upstream = opts.upstream ?? new FakeUpstream(nick);
+  upstream.network = network;
   ircManager.connectionsForUser(user.id).set(network.id, upstream as never);
   return { network, upstream };
 }

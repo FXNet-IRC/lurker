@@ -61,7 +61,7 @@ import { findUserByUsername, getPasswordHash } from '../db/users.js';
 import type { User } from '../db/users.js';
 import { verifyPassword, hashPassword } from './password.js';
 import { hashToken, findActiveByHash, touchLastUsed } from '../db/apiTokens.js';
-import { listNetworksForUser } from '../db/networks.js';
+import { getNetwork, listNetworksForUser } from '../db/networks.js';
 import type { Network } from '../db/networks.js';
 import { closedFoldedSetForNetwork, foldTargetFor } from '../db/buffers.js';
 import {
@@ -627,22 +627,50 @@ export function bouncerNetworkState(connState: string | undefined): string {
   return 'disconnected';
 }
 
-// Build the tag-encoded attribute list for one network's BOUNCER NETWORK line.
-// (v1 omits soju's `error`/`username`/`realname` — LISTNETWORKS is read-only and
-// we don't yet plumb a per-network last-error string here.)
-export function buildNetworkAttrs(
+// One network's BOUNCER NETWORK attributes, in wire order. `error` is there only
+// while the network has one: why its last connection attempt failed.
+// (soju's `username` and `realname` aren't attributes here.)
+export function networkAttrs(
   network: { name: string; host: string; port: number; tls: number | boolean; nick: string },
-  opts: { state: string; nickname?: string },
-): string {
-  const attrs: Array<[string, string]> = [
+  opts: { state: string; nickname?: string; error?: string | null },
+): Map<string, string> {
+  const attrs = new Map<string, string>([
     ['name', network.name],
     ['state', opts.state],
     ['host', network.host],
     ['port', String(network.port)],
     ['tls', network.tls ? '1' : '0'],
     ['nickname', opts.nickname || network.nick],
-  ];
-  return attrs.map(([k, v]) => `${k}=${escapeTagValue(v)}`).join(';');
+  ]);
+  if (opts.error) attrs.set('error', opts.error);
+  return attrs;
+}
+
+// Build the tag-encoded attribute list for one network's BOUNCER NETWORK line.
+export function buildNetworkAttrs(
+  network: { name: string; host: string; port: number; tls: number | boolean; nick: string },
+  opts: { state: string; nickname?: string; error?: string | null },
+): string {
+  return formatNetworkAttrs(networkAttrs(network, opts));
+}
+
+function formatNetworkAttrs(attrs: Iterable<[string, string]>): string {
+  return Array.from(attrs, ([k, v]) => `${k}=${escapeTagValue(v)}`).join(';');
+}
+
+// The attributes to notify a client of, given what it was last sent: all of
+// them for a network it hasn't been told about, otherwise only those that
+// changed, which is what the spec asks. A removed attribute goes out as `key=`:
+// HexDroid reads that as a clear and skips a bare `key`. Null if nothing changed.
+export function networkAttrsUpdate(
+  sent: Map<string, string> | undefined,
+  now: Map<string, string>,
+): string | null {
+  if (!sent) return formatNetworkAttrs(now);
+  const changed: Array<[string, string]> = [];
+  for (const [k, v] of now) if (sent.get(k) !== v) changed.push([k, v]);
+  for (const k of sent.keys()) if (!now.has(k)) changed.push([k, '']);
+  return changed.length > 0 ? formatNetworkAttrs(changed) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -755,6 +783,14 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   private boundNetId: number | null = null;
   // A per-session counter for BATCH reference tags (LISTNETWORKS / initial dump).
   private batchSeq = 0;
+  // The bound network's state this client was last told about in a notice.
+  private noticedState: string | null = null;
+  // The attributes this client was last sent for each network: in the network
+  // list or a notification. A notification is a change to what the client
+  // holds, and clients attach at different times, so this is what each
+  // client's notifications are measured against. The networks are the
+  // account's; this only records what this client has been told.
+  private networksSent = new Map<number, Map<string, string>>();
   // Outbound sends awaiting their self-echo event from ircManager, so a
   // client that didn't negotiate echo-message doesn't get its own message
   // back (it already rendered it locally). Other attached clients and web
@@ -1260,6 +1296,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.networkId = network.id;
     this.network = network;
     this.conn = conn;
+    this.noticedState = conn.state;
     this.registered = true;
     this.clearRegTimer();
     attachToRegistry(this);
@@ -1589,10 +1626,6 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     }
   }
 
-  // Reply to LISTNETWORKS (and the initial -notify dump) with a BOUNCER NETWORK
-  // line per network. The soju.im/bouncer-networks batch wrapper (and its
-  // `@batch=` message tag) is only used when the client negotiated `batch` —
-  // otherwise we must not emit tags, so send the same lines unwrapped.
   // Run `fn(ref)` wrapped in a BATCH of the given type + params when the client
   // negotiated the `batch` cap (`ref` is the batch reference, or null unbatched
   // — IRCv3: no tags to clients that didn't ask). Mirrors soju's SendBatch.
@@ -1603,24 +1636,54 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     if (ref) this.write(`:${SERVER_NAME} BATCH -${ref}`);
   }
 
+  // Reply to LISTNETWORKS (and the initial -notify dump) with a BOUNCER NETWORK
+  // line per network. The soju.im/bouncer-networks batch wrapper (and its
+  // `@batch=` message tag) is only used when the client negotiated `batch` —
+  // otherwise we must not emit tags, so send the same lines unwrapped. The list
+  // is everything the client now knows, so later notifications start from it.
   private sendNetworkList(): void {
+    this.networksSent.clear();
     this.withBatch('soju.im/bouncer-networks', [], (ref) => {
       const tag = ref ? `@batch=${ref} ` : '';
       for (const network of listNetworksForUser(this.userId)) {
-        const conn = ircManager.getConnection(this.userId, network.id);
-        const attrs = buildNetworkAttrs(network, {
-          state: bouncerNetworkState(conn?.state),
-          nickname: conn?.currentNick || network.nick,
-        });
-        this.write(`${tag}:${SERVER_NAME} BOUNCER NETWORK ${network.id} ${attrs}`);
+        const attrs = this.currentNetworkAttrs(network);
+        this.networksSent.set(network.id, attrs);
+        this.write(
+          `${tag}:${SERVER_NAME} BOUNCER NETWORK ${network.id} ${formatNetworkAttrs(attrs)}`,
+        );
       }
     });
   }
 
-  // Push an unsolicited (unbatched) network state change to a -notify client.
-  private notifyNetworkState(networkId: number, attrs: string): void {
-    if (this.closed || !this.caps.has(CAP_BOUNCER_NETWORKS_NOTIFY)) return;
-    this.write(`:${SERVER_NAME} BOUNCER NETWORK ${networkId} ${attrs}`);
+  private currentNetworkAttrs(network: Network): Map<string, string> {
+    const conn = ircManager.getConnection(this.userId, network.id);
+    return networkAttrs(network, {
+      state: bouncerNetworkState(conn?.state),
+      nickname: conn?.currentNick || network.nick,
+      error: ircManager.connectionError(this.userId, network.id),
+    });
+  }
+
+  // One of the account's networks was added, edited or deleted, or changed
+  // state (`network` is its row now, undefined once deleted). A client bound to
+  // it takes the new row, so its notices name the network right. A -notify
+  // client hears what changed since it was last told: every attribute of a
+  // network new to it, `*` for one it knew that's gone (soju's deleteNetwork).
+  onNetworkChanged(networkId: number, network: Network | undefined): void {
+    if (this.closed) return;
+    if (network && this.networkId === networkId) this.network = network;
+    if (!this.caps.has(CAP_BOUNCER_NETWORKS_NOTIFY)) return;
+    const sent = this.networksSent.get(networkId);
+    if (!network) {
+      if (!sent) return;
+      this.networksSent.delete(networkId);
+      this.write(`:${SERVER_NAME} BOUNCER NETWORK ${networkId} *`);
+      return;
+    }
+    const now = this.currentNetworkAttrs(network);
+    const update = networkAttrsUpdate(sent, now);
+    this.networksSent.set(networkId, now);
+    if (update) this.write(`:${SERVER_NAME} BOUNCER NETWORK ${networkId} ${update}`);
   }
 
   // --- CHATHISTORY (draft/chathistory) ---------------------------------------
@@ -2541,20 +2604,14 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     if (!this.liveConn() || this.closed) return;
     // A connect brings the network's caps; a disconnect takes them away.
     this.updateSupportedCaps(this.currentNick() || '*');
+    // A connection says its state again without a change: 'socket close' and
+    // 'close' both say disconnected, and a stopped retry says why.
+    if (state === this.noticedState) return;
+    this.noticedState = state;
     if (state === 'connected') this.notice(`Upstream reconnected to '${this.network?.name}'.`);
     else if (state === 'reconnecting' || state === 'disconnected') {
       this.notice(`Upstream ${state} ('${this.network?.name}') — Lurker will keep retrying.`);
     }
-  }
-
-  // A -notify client's view of ANY of the user's networks changing state (both
-  // control and bound connections receive these). Emits only the changed
-  // attributes, soju-style (a connect also clears any prior error).
-  onNetworkNotify(networkId: number, connState: string): void {
-    if (this.closed) return;
-    const state = bouncerNetworkState(connState);
-    const attrs = state === 'connected' ? 'state=connected;error=' : `state=${state}`;
-    this.notifyNetworkState(networkId, attrs);
   }
 
   heartbeat(now: number): void {
@@ -2721,23 +2778,33 @@ function presentClientCount(userId: number, networkId?: number): number {
   return n;
 }
 
+// One of a user's networks was added, edited, deleted or changed state. The
+// clients bound to a deleted network are closed, as soju and ZNC close theirs;
+// every other client of the user hears of the change. Rare enough (a state
+// transition, a settings save) that reading the row and scanning is cheap.
+function dispatchNetworkChange(userId: number, networkId: number): void {
+  let network: Network | undefined;
+  let read = false;
+  for (const session of sessions) {
+    if (session.userId !== userId || !session.isRegistered()) continue;
+    if (!read) {
+      network = getNetwork(networkId, userId);
+      read = true;
+    }
+    if (!network && session.networkId === networkId) session.closeWithError('Network removed');
+    else session.onNetworkChanged(networkId, network);
+  }
+}
+
 function dispatchIrcEvent(event: Record<string, unknown>): void {
   const userId = Number(event.userId);
   const networkId = Number(event.networkId);
   if (!userId || !networkId) return;
   const type = String(event.type || '');
   // A -notify client (bound OR control) tracks state for ALL of the user's
-  // networks — including ones no bound session is attached to — so fan state
-  // events across every one of the user's sessions, before the per-network
-  // early-return below. State transitions are infrequent, so the scan is cheap.
-  if (type === 'state') {
-    const state = String(event.state || '');
-    for (const session of sessions) {
-      if (session.userId === userId && session.isRegistered()) {
-        session.onNetworkNotify(networkId, state);
-      }
-    }
-  }
+  // networks — including ones no bound session is attached to — so this goes to
+  // every one of the user's sessions, before the per-network early-return below.
+  if (type === 'state') dispatchNetworkChange(userId, networkId);
   const set = registry.get(registryKey(userId, networkId));
   if (!set || set.size === 0) return;
   if (type === 'state') {
@@ -2807,6 +2874,7 @@ let onReadMarker: ((move: ReadMarkerMove) => void) | null = null;
 let onAway: ((change: AwayChange) => void) | null = null;
 let onUserDisposed: ((payload: { userId: number }) => void) | null = null;
 let onUserSuspended: ((payload: { userId: number }) => void) | null = null;
+let onNetworkChanged: ((payload: { userId: number; networkId: number }) => void) | null = null;
 
 export function isBouncerEnabled(): boolean {
   return /^(1|true|yes|on)$/i.test((process.env.LURKER_BOUNCER_ENABLED || '').trim());
@@ -3055,6 +3123,8 @@ export async function startBouncer(
   onUserSuspended = ({ userId }) => dropSessionsForUser(userId, 'Account paused');
   ircManager.on('user-disposed', onUserDisposed);
   ircManager.on('user-suspended', onUserSuspended);
+  onNetworkChanged = ({ userId, networkId }) => dispatchNetworkChange(userId, networkId);
+  ircManager.on('network-changed', onNetworkChanged);
 
   heartbeatTimer = setInterval(() => {
     const now = Date.now();
@@ -3095,6 +3165,10 @@ export function stopBouncer(): void {
   if (onUserSuspended) {
     ircManager.off('user-suspended', onUserSuspended);
     onUserSuspended = null;
+  }
+  if (onNetworkChanged) {
+    ircManager.off('network-changed', onNetworkChanged);
+    onNetworkChanged = null;
   }
   for (const session of sessions) session.destroy('Server shutting down');
   if (server) {
