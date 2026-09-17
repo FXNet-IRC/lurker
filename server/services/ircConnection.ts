@@ -557,6 +557,26 @@ interface PeerWatch {
   reasons: Set<TrackReason>;
 }
 
+// What makes a registration line the line it is: the command and its params,
+// less the target. Tags are per-delivery (time, msgid, batch), the source is the
+// server's name, and the target is OUR NICK — a server re-sending its ISUPPORT
+// addresses it to the nick of the moment, so without dropping it every line
+// would look new after a /nick. The replay rewrites the target anyway
+// (bouncer.rewriteNumericTarget).
+function burstPayload(line: string): string {
+  const afterSpace = (s: string) => {
+    const sp = s.indexOf(' ');
+    return sp === -1 ? s : s.slice(sp + 1);
+  };
+  let rest = line;
+  if (rest.startsWith('@')) rest = afterSpace(rest);
+  if (rest.startsWith(':')) rest = afterSpace(rest);
+  const command = rest.indexOf(' ');
+  if (command === -1) return rest;
+  const target = rest.indexOf(' ', command + 1);
+  return target === -1 ? rest.slice(0, command) : rest.slice(0, command) + rest.slice(target);
+}
+
 export class IrcConnection {
   network: Network;
   onEvent: (event: EnrichedEvent) => void;
@@ -1332,14 +1352,24 @@ export class IrcConnection {
         }
       }
       const burstLine = event.line.replace(/[\r\n]+$/, '');
-      if (rawCommand === '001') this.registrationLines = [burstLine];
-      else if (
+      if (rawCommand === '001') {
+        this.registrationLines = [burstLine];
+      } else if (
         this.registrationLines.length > 0 &&
         (rawCommand === '002' ||
           rawCommand === '003' ||
           rawCommand === '004' ||
           rawCommand === '005')
       ) {
+        // Servers repeat these: solanum sends its whole ISUPPORT again after
+        // every VERSION (show_isupport in m_version.c), and every attach would
+        // replay the pile. A line the burst already holds keeps its one place,
+        // moved to the end so the newest copy is the one that lands last — a
+        // token that went A → B → A is back at A for the client, where dropping
+        // the repeat would leave it at B.
+        const payload = burstPayload(burstLine);
+        const at = this.registrationLines.findIndex((l) => burstPayload(l) === payload);
+        if (at !== -1) this.registrationLines.splice(at, 1);
         this.registrationLines.push(burstLine);
       }
       // Command-result errors (a failed kick / invite / mode / topic) name the
@@ -1877,7 +1907,9 @@ export class IrcConnection {
         } else if (engineCode === ENGINE_CLOSE.DETACHED) {
           this.setState('disconnected', {}, { log: DETACHED_LOG });
         } else {
-          this.setState('reconnecting');
+          // `engineLink`: the IRC socket is up, only our link to it is gone, so
+          // a bouncer client hears nothing about it (services/bouncer.ts).
+          this.setState('reconnecting', { engineLink: true });
         }
         return;
       }
@@ -1928,7 +1960,12 @@ export class IrcConnection {
     // "Connecting…" in the system buffer would describe a connect that isn't
     // happening; the manager already said "Attaching…" and the engine hook
     // says "Re-attached" when it lands.
-    c.on('connecting', () => this.setState('connecting', {}, { log: !this.engineHoldsUs() }));
+    c.on('connecting', () => {
+      // Re-attaching to a connection the engine still holds isn't the network
+      // connecting: the same flag, and the same silence for bouncer clients.
+      const held = this.engineHoldsUs();
+      this.setState('connecting', held ? { engineLink: true } : {}, { log: !held });
+    });
 
     // Diagnostic: irc-framework fires 'ping timeout' when it hasn't seen data
     // from the server for `ping_timeout` seconds (120s default) — then it QUITs

@@ -238,6 +238,15 @@ describe('IrcConnection through the engine', () => {
     managerEvents.length = 0;
     const rowsBefore = rows().length;
     const sentBefore = sentBy('lurk').length;
+    // The caps the connection had when it said 'connected' again, read at the
+    // moment the event fires, as the bouncer reads them.
+    let capsAtConnected: string[] = [];
+    const watchCaps = (e: Ev) => {
+      if (e.type === 'state' && e.state === 'connected') {
+        capsAtConnected = [...conn.client.network.cap.enabled].toSorted();
+      }
+    };
+    ircManager.on('event', watchCaps);
     EngineLink.shared().simulateLoss();
     // The whole cycle can finish inside one poll interval, so read the trail of
     // state events rather than sampling conn.state.
@@ -255,6 +264,21 @@ describe('IrcConnection through the engine', () => {
     expect(conn.state).toBe('connected');
     await new Promise((r) => setTimeout(r, 50));
     expect(stateEvents(managerEvents)).not.toContain('disconnected');
+    // Every state on the way back says it was the engine link that moved, not
+    // the network, so an attached IRC client is told nothing (bouncer.ts). The
+    // 'connected' at the end needs no flag: it re-asserts the state the client
+    // was already in.
+    const midway = managerEvents.filter((e) => e.type === 'state' && e.state !== 'connected');
+    expect(midway.length).toBeGreaterThan(0);
+    expect(midway.every((e) => e.engineLink === true)).toBe(true);
+    // And what the bouncer reads when that unflagged 'connected' arrives: the
+    // replayed CAP exchange runs ahead of the 001 that publishes it, so the
+    // network's caps are back. Were they not, every attached client's
+    // pass-through caps would be taken away and re-offered (bouncer.ts
+    // updateSupportedCaps) on every engine blip.
+    expect(capsAtConnected.length).toBeGreaterThan(0);
+    expect(capsAtConnected).toEqual([...conn.client.network.cap.enabled].toSorted());
+    ircManager.off('event', watchCaps);
     expect(
       rows()
         .slice(rowsBefore)

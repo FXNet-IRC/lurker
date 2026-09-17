@@ -197,7 +197,7 @@ describe('an edit in the web app', () => {
     harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'reconnecting');
 
     const notice = await c.waitFor((l) => l.includes('Upstream reconnecting'));
-    expect(notice).toContain("('renamed')");
+    expect(notice).toContain("to 'renamed'.");
   });
 });
 
@@ -299,9 +299,166 @@ describe('a state change', () => {
     await synced(c);
 
     const notices = c.lines.slice(mark).filter((l) => l.includes('Upstream '));
+    // The bare disconnect, the same state saying why it won't come back, and
+    // the retry. The two bare repeats say nothing new.
+    expect(notices).toHaveLength(3);
+    expect(notices[0]).toContain("Upstream disconnected from 'alpha'.");
+    expect(notices[1]).toContain(
+      "Upstream disconnected from 'alpha': Not reconnecting automatically: banned by the server (G-Lined).",
+    );
+    expect(notices[2]).toContain("Upstream reconnecting to 'alpha'.");
+    // Never a promise to retry: three of those five states won't.
+    expect(notices.join('\n')).not.toContain('keep retrying');
+  });
+
+  // The app's link to the engine dropped while the engine kept the IRC socket
+  // open. Nothing about the network changed, so the client hears nothing: the
+  // caps it negotiated would otherwise be taken away and re-offered.
+  it('says nothing, and takes no caps away, when only the engine link moved', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const c = await attach(acct, `${NOTIFY_CAPS} away-notify`, acct.network.id);
+
+    const mark = c.lines.length;
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'reconnecting', {
+      engineLink: true,
+    });
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'connecting', { engineLink: true });
+    // As production does: the 'connected' at the end of a re-attach carries no
+    // flag (ircConnection's registered handler), and the dedupe covers it.
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'connected');
+    await synced(c);
+
+    const after = c.lines.slice(mark);
+    expect(after.filter((l) => l.includes('Upstream '))).toEqual([]);
+    expect(after.filter((l) => l.includes(' CAP '))).toEqual([]);
+    expect(networkLines(c, mark)).toEqual([]);
+  });
+
+  // What a real drop looks like: 'socket close' says why, then 'close' says
+  // the same state with nothing to add.
+  it('says a drop once, and again only when the reason changes', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const c = await attachPlain(acct, 'alpha');
+
+    const mark = c.lines.length;
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: 'Connection failed (irc.example.test:6697): ECONNRESET.',
+    });
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected');
+    // The same reason again is the same news.
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: 'Connection failed (irc.example.test:6697): ECONNRESET.',
+    });
+    await synced(c);
+    let notices = c.lines.slice(mark).filter((l) => l.includes('Upstream '));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('ECONNRESET');
+
+    // The retry ladder running out says something new about the same state.
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: 'Not reconnecting automatically: banned by the server (G-Lined).',
+    });
+    await synced(c);
+    notices = c.lines.slice(mark).filter((l) => l.includes('Upstream '));
     expect(notices).toHaveLength(2);
-    expect(notices[0]).toContain('Upstream disconnected');
-    expect(notices[1]).toContain('Upstream reconnecting');
+    expect(notices[1]).toContain('banned by the server (G-Lined)');
+  });
+
+  // A ban reason is the server's own words, and the notice has 512 bytes.
+  it('keeps a long reason on one line', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const c = await attachPlain(acct, 'alpha');
+
+    const mark = c.lines.length;
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: `Not reconnecting automatically: banned by the server (${'why '.repeat(200)}).`,
+    });
+    await synced(c);
+
+    const notice = c.lines.slice(mark).find((l) => l.includes('Upstream '))!;
+    expect(Buffer.byteLength(notice)).toBeLessThanOrEqual(512);
+    expect(notice.endsWith('…')).toBe(true);
+  });
+
+  // soju sends the same on attach (user.go:823).
+  it('tells a client that attaches while the network is down why it is', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    acct.upstream.state = 'reconnecting';
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'reconnecting', {
+      error: 'Connection failed (irc.example.test:6697): ECONNREFUSED.',
+    });
+    const c = await attachPlain(acct, 'alpha');
+    await synced(c);
+
+    const notice = c.lines.find((l) => l.includes("Network 'alpha' is"));
+    expect(notice).toContain('ECONNREFUSED');
+
+    // Having been told on attach, the client isn't told again when the
+    // connection repeats itself.
+    const mark = c.lines.length;
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'reconnecting', {
+      error: 'Connection failed (irc.example.test:6697): ECONNREFUSED.',
+    });
+    await synced(c);
+    expect(c.lines.slice(mark).filter((l) => l.includes('Upstream '))).toEqual([]);
+  });
+
+  // A restart that fails on the spot — a proxy or certificate refusal is
+  // synchronous — records a reason about what just happened, not the one before.
+  it("says why when the attach's own restart is what failed", async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    acct.upstream.state = 'disconnected';
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: 'Not reconnecting automatically: banned by the server (G-Lined).',
+    });
+    vi.spyOn(ircManager, 'restartNetwork').mockImplementation((userId, networkId) => {
+      const conn = ircManager.getConnection(userId, networkId)!;
+      harnessMod.emitNetworkState(userId, networkId, 'disconnected', {
+        error: 'Not connecting: the proxy refused the connection.',
+      });
+      return conn as never;
+    });
+    const c = await attachPlain(acct, 'alpha');
+    await synced(c);
+
+    const notice = c.lines.find((l) => l.includes("Network 'alpha' is"));
+    expect(notice).toContain('the proxy refused the connection');
+  });
+
+  // The same host refusing the same certificate twice says the same words, so
+  // the reason can't be told apart by its text.
+  it('says why when the restart failed exactly as the attempt before it did', async () => {
+    const same = 'Not connecting: the certificate is not trusted.';
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    acct.upstream.state = 'disconnected';
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', { error: same });
+    vi.spyOn(ircManager, 'restartNetwork').mockImplementation((userId, networkId) => {
+      const conn = ircManager.getConnection(userId, networkId)!;
+      harnessMod.emitNetworkState(userId, networkId, 'disconnected', { error: same });
+      return conn as never;
+    });
+    const c = await attachPlain(acct, 'alpha');
+    await synced(c);
+
+    const notice = c.lines.find((l) => l.includes("Network 'alpha' is"));
+    expect(notice).toContain('the certificate is not trusted');
+  });
+
+  // Attaching to a network that gave up restarts it (ZNC's shape), so the
+  // reason the last attempt failed would contradict the attempt under way.
+  it('leaves out a reason the attach itself has superseded', async () => {
+    fakeDials();
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    acct.upstream.state = 'disconnected';
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: 'Not reconnecting automatically: banned by the server (G-Lined).',
+    });
+    const c = await attachPlain(acct, 'alpha');
+    await synced(c);
+
+    const notice = c.lines.find((l) => l.includes("Network 'alpha' is"));
+    expect(notice).toBeDefined();
+    expect(notice).not.toContain('Not reconnecting automatically');
   });
 
   it('is sent once, however often the connection repeats it', async () => {
@@ -446,5 +603,21 @@ describe('error, on real connections', () => {
 
     ircManager.disposeUser(acct.user.id, 'user deleted');
     expect(ircManager.connectionError(acct.user.id, network.id)).toBeNull();
+  });
+});
+
+// A ban reason is the server's own words: it can be long, and it can be
+// multibyte. The line it rides has 512 bytes.
+describe('clampToBudget', () => {
+  it('honours the budget in bytes, marker included, without splitting a character', () => {
+    const budget = 20;
+    const clamped = bouncerMod.clampToBudget('🚫'.repeat(10), budget);
+    expect(Buffer.byteLength(clamped)).toBeLessThanOrEqual(budget);
+    expect(clamped.endsWith('…')).toBe(true);
+    // Whole emoji, never half a surrogate pair.
+    expect([...clamped].every((ch) => ch === '…' || ch === '🚫')).toBe(true);
+    expect(bouncerMod.clampToBudget('short', budget)).toBe('short');
+    // Tight enough that the marker's three bytes are the difference.
+    expect(Buffer.byteLength(bouncerMod.clampToBudget('a'.repeat(20), 10))).toBeLessThanOrEqual(10);
   });
 });
