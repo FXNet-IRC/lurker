@@ -2099,13 +2099,11 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   ): string | null {
     const nick = row.nick || '';
     if (!nick) return null;
-    // A mode set by the server is stored under its name, which no nick contains
-    // a dot of.
-    const source = row.userhost?.includes('!')
-      ? row.userhost
-      : nick.includes('.')
-        ? nick
-        : `${nick}!${nick}@${SERVER_NAME}`;
+    // Without a stored mask (mode and topic rows keep none), the bare name: a
+    // valid source for a user or a server alike, which is how a server sends
+    // its own MODE. Guessing a server from a dot fails for one named `localhost`
+    // (Copilot, #943).
+    const source = row.userhost?.includes('!') ? row.userhost : nick;
     const head = `${this.formatTags(tags)}:${source}`;
     const text = row.text ?? '';
     switch (row.type) {

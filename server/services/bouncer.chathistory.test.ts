@@ -492,8 +492,9 @@ describe('draft/event-playback', () => {
       `${tag(4)}:carol!c@h QUIT :Quit: gone`,
       `${tag(5)}:dave!d@h NICK david`,
       `${tag(6)}:op!o@h KICK #ev eve :spam`,
-      `${tag(7)}:op!op@lurker.bouncer MODE #ev +o bob`,
-      `${tag(8)}:op!op@lurker.bouncer TOPIC #ev :new topic`,
+      // Mode and topic rows store no mask, so the setter goes out bare.
+      `${tag(7)}:op MODE #ev +o bob`,
+      `${tag(8)}:op TOPIC #ev :new topic`,
     ]);
   });
 
@@ -553,15 +554,20 @@ describe('draft/event-playback', () => {
     ]);
   });
 
-  it('names the server as the source of a mode it set', async () => {
+  it('names the server as the source of a mode it set, whatever its name', async () => {
     const { lines } = await history(
       'ep6',
       '#ev',
-      [{ type: 'mode', nick: 'irc.example.net', text: '+nt', extra: { modes: [] } }],
+      [
+        { type: 'mode', nick: 'irc.example.net', text: '+nt', extra: { modes: [] } },
+        { type: 'mode', nick: 'localhost', text: '+s', extra: { modes: [] } },
+      ],
       'CHATHISTORY LATEST #ev * 100',
     );
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain(' :irc.example.net MODE #ev +nt');
+    expect(lines.map((l) => l.slice(l.indexOf(' :') + 1))).toEqual([
+      ':irc.example.net MODE #ev +nt',
+      ':localhost MODE #ev +s',
+    ]);
   });
 
   it('lists a buffer with only events among TARGETS, for a client that asked', async () => {
