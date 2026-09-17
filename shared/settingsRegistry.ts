@@ -54,7 +54,7 @@ interface BaseOption {
   // (a cosmetic gate on a knob that still works), a flagged-off feature has no server behind it
   // at all — the routes aren't even mounted — so the option is HIDDEN rather than shown and
   // ignored. Offering a switch that silently does nothing is worse than offering none.
-  requiresFeature?: 'linkPreviews';
+  requiresFeature?: FeatureFlag;
 
   // Conditions under which this setting actually does anything, ORed together:
   // the option is live if ANY clause holds. Resolution is TRANSITIVE — an
@@ -141,12 +141,18 @@ export type SettingOption = StringOption | IntOption | BoolOption | EnumOption |
  * A Settings-sidebar category. `registry` categories are auto-rendered from
  * REGISTRY entries; `bespoke` ones have a hand-written pane component.
  */
+/** An instance feature a settings surface depends on, as advertised by /api/config. */
+export type FeatureFlag = 'linkPreviews' | 'bouncer';
+
 export interface SettingCategory {
   id: string;
   label: string;
   kind: 'registry' | 'bespoke';
   // As on BaseOption: hide the whole category in the hosted (node) edition.
   selfHostedOnly?: boolean;
+  // As on BaseOption: the category exists only where the instance runs the
+  // feature behind it. A pane explaining a bouncer nobody runs is worse than none.
+  requiresFeature?: FeatureFlag;
 }
 
 // ─── Shared dependency clauses ─────────────────────────────────────────────
@@ -1965,6 +1971,15 @@ export const CATEGORIES: readonly SettingCategory[] = Object.freeze([
   { id: 'ignores', label: 'Ignores', kind: 'bespoke' },
   { id: 'away', label: 'Away', kind: 'registry' },
   { id: 'networks', label: 'Networks', kind: 'bespoke' },
+  // How to attach an IRC client to this instance's bouncer. Self-hosted only
+  // (a hosted cell runs no bouncer), and only where the operator enabled it.
+  {
+    id: 'bouncer',
+    label: 'Bouncer',
+    kind: 'bespoke',
+    selfHostedOnly: true,
+    requiresFeature: 'bouncer',
+  },
   { id: 'account', label: 'Account', kind: 'bespoke' },
   // Disabled in node edition: an API token can't be routed through the per-cell
   // proxy, so the server doesn't mount /api/api-tokens there (A7). Hide the whole

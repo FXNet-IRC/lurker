@@ -119,7 +119,7 @@ function seedSettings({ inlineMedia = true, linkPreviews = true, feature = true 
   // The instance feature flag gates both user settings — a stored `true` must not render on an
   // instance that has the feature off, where the routes aren't even mounted. Defaults on here so
   // the suite is about the user settings; `feature: false` covers the gate itself.
-  useConfigStore().features = { linkPreviews: feature };
+  useConfigStore().features = { linkPreviews: feature, bouncer: false };
   const settings = useSettingsStore();
   // Real store values rather than a mocked getter: `effective` is a Pinia getter returning a
   // closure, so it can't be spied — and seeding state exercises the same lookup the app does.
@@ -1342,7 +1342,7 @@ describe('MessageAttachments — the lightbox is a gallery over the whole messag
     for (const n of [1, 2]) resolved.set(img(n).url, img(n));
     // Hand-built rather than via seedSettings because this one needs image_modal OFF.
     setActivePinia(createPinia());
-    useConfigStore().features = { linkPreviews: true };
+    useConfigStore().features = { linkPreviews: true, bouncer: false };
     const settings = useSettingsStore();
     settings.values = {
       'chat.inline_media.enabled': true,

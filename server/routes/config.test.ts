@@ -41,6 +41,22 @@ describe('GET /api/config', () => {
   });
 });
 
+describe('the bouncer flag', () => {
+  // The pane is hidden without it; the port it would name stays behind auth.
+  it('follows LURKER_BOUNCER_ENABLED, and is off in the hosted edition', async () => {
+    process.env.LURKER_BOUNCER_ENABLED = 'true';
+    try {
+      // This file runs as the node edition, which never runs a bouncer.
+      const hosted = (await createAnonAgent(app).get('/api/config')).body as {
+        features?: { bouncer?: boolean };
+      };
+      expect(hosted.features?.bouncer).toBe(false);
+    } finally {
+      delete process.env.LURKER_BOUNCER_ENABLED;
+    }
+  });
+});
+
 describe('feature flags', () => {
   const withDecoder = async (value: string | undefined) => {
     const saved = process.env.LURKER_PREVIEWS_URL;

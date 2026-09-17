@@ -146,6 +146,31 @@ describe('buildApp route gating by edition', () => {
   });
 });
 
+// The Settings pane that explains how to attach an IRC client only exists where
+// there is a bouncer to attach to.
+describe('/api/bouncer mounting', () => {
+  afterEach(() => {
+    delete process.env.LURKER_BOUNCER_ENABLED;
+  });
+
+  it('is mounted with the bouncer on (requireAuth → 401, not 404)', async () => {
+    process.env.LURKER_BOUNCER_ENABLED = 'true';
+    const app = await buildFor('standalone');
+    expect((await testRequest(app).get('/api/bouncer')).status).toBe(401);
+  });
+
+  it('is not mounted with the bouncer off', async () => {
+    const app = await buildFor('standalone');
+    expect((await testRequest(app).get('/api/bouncer')).status).toBe(404);
+  });
+
+  it('is not mounted in the hosted edition, which runs no bouncer', async () => {
+    process.env.LURKER_BOUNCER_ENABLED = 'true';
+    const app = await buildFor('node');
+    expect((await testRequest(app).get('/api/bouncer')).status).toBe(404);
+  });
+});
+
 describe('OAuth (#891) mounting', () => {
   it('is mounted in standalone: registration answers rather than 404ing', async () => {
     const app = await buildFor('standalone');

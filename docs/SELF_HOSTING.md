@@ -518,6 +518,15 @@ environment:
   - LURKER_BOUNCER_PORT=6667 # remember to publish this port in docker-compose
 ```
 
+Your members don't have to be told any of this: with the bouncer on, **Settings → Bouncer** shows each of them the address, their username, and the two login forms below, with their own network names filled in.
+
+If the bouncer answers somewhere other than this instance's own hostname and listener — TLS terminated in front of it, or a hostname of its own — say so, and the pane shows that instead:
+
+```yaml
+environment:
+  - LURKER_BOUNCER_PUBLIC_URL=ircs://irc.example.com:6697 # ircs = TLS, irc = without
+```
+
 Point your IRC client at the host/port with a **server password** of:
 
 - `username:secret` — when you have one network configured
