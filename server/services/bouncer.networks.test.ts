@@ -347,3 +347,143 @@ describe('selector-less registration (soju parity)', () => {
     expect(harnessMod.attachedFor(acct)).toBe(0); // control mode, not a blind bind
   });
 });
+
+// soju.im/FILEHOST (routes/filehost.ts): goguma and gamja read it on a bound
+// connection, halloy on the unbound one, so both carry it.
+describe('soju.im/FILEHOST in ISUPPORT', () => {
+  const TOKEN = 'soju.im/FILEHOST=https://irc.example.test/api/filehost';
+
+  // The 005 lines a client gets up to its 422.
+  async function isupportFor(
+    bound: boolean,
+    registration?: (nick: string) => string[],
+  ): Promise<string> {
+    const acct = harnessMod.seedAccount({ nick: `fh${Math.random().toString(36).slice(2, 7)}` });
+    if (registration) acct.upstream.registrationLines = registration(acct.upstream.currentNick);
+    const c = await harness.connect();
+    if (bound) {
+      c.send(`PASS ${acct.user.username}:${acct.password}`);
+      c.send('NICK client');
+      c.send('USER client 0 * :client');
+    } else {
+      harnessMod.seedNetwork(acct.user, { networkName: 'second' });
+      await negotiate(c, acct, 'sasl soju.im/bouncer-networks');
+      c.send('CAP END');
+    }
+    await c.waitForCommand('422');
+    c.close();
+    return c.lines.filter((l) => harnessMod.commandOf(l) === '005').join('\n');
+  }
+
+  async function withBaseUrl<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+    const prev = process.env.PUBLIC_BASE_URL;
+    if (value === undefined) delete process.env.PUBLIC_BASE_URL;
+    else process.env.PUBLIC_BASE_URL = value;
+    try {
+      return await fn();
+    } finally {
+      if (prev === undefined) delete process.env.PUBLIC_BASE_URL;
+      else process.env.PUBLIC_BASE_URL = prev;
+    }
+  }
+
+  it('is advertised on bound and control connections with an https PUBLIC_BASE_URL', async () => {
+    await withBaseUrl('https://irc.example.test/', async () => {
+      expect(await isupportFor(true)).toContain(TOKEN);
+      expect(await isupportFor(false)).toContain(TOKEN);
+    });
+  });
+
+  it('is advertised for a base with whitespace around it', async () => {
+    await withBaseUrl(`  https://irc.example.test/  `, async () => {
+      expect(await isupportFor(true)).toContain(TOKEN);
+    });
+  });
+
+  it('is not advertised without a usable https PUBLIC_BASE_URL', async () => {
+    await withBaseUrl(undefined, async () => {
+      expect(await isupportFor(true)).not.toContain('FILEHOST');
+    });
+    const advertised: string[] = [];
+    for (const base of [
+      'https://irc.example.test?x=1',
+      'https://irc.example.test#top',
+      'https://admin:secret@irc.example.test',
+      'https://irc.example.test:99999',
+    ]) {
+      await withBaseUrl(base, async () => {
+        if ((await isupportFor(true)).includes('FILEHOST')) advertised.push(base);
+      });
+    }
+    expect(advertised).toEqual([]);
+    await withBaseUrl('http://irc.example.test', async () => {
+      expect(await isupportFor(true)).not.toContain('FILEHOST');
+      expect(await isupportFor(false)).not.toContain('FILEHOST');
+    });
+  });
+
+  // A client uploads to the URL with its Lurker credentials, so a network's own
+  // (an upstream soju's) must not reach it, advertised or not.
+  it("never passes on the network's own FILEHOST", async () => {
+    const registration = (nick: string) => [
+      `:irc.example.net 001 ${nick} :Welcome`,
+      `:irc.example.net 005 ${nick} CHANTYPES=# soju.im/FILEHOST=https://upstream.example/up draft/FILEHOSTING=1 :are supported by this server`,
+      `:irc.example.net 005 ${nick} FILEHOST=https://upstream.example/x :are supported by this server`,
+      `:irc.example.net 005 ${nick} -vendor.example/filehost :are supported by this server`,
+      // With no text after the tokens, which halloy would read the last of.
+      `:irc.example.net 005 ${nick} AWAYLEN=200 soju.im/FILEHOST=https://upstream.example/y`,
+      `:irc.example.net 005 ${nick} SAFELIST :soju.im/FILEHOST=https://upstream.example/z`,
+      `:irc.example.net 005 ${nick} soju.im/FILEHOST=https://upstream.example/w`,
+    ];
+    await withBaseUrl(undefined, async () => {
+      expect(await isupportFor(true, registration)).toBe(
+        [
+          ':irc.example.net 005 client CHANTYPES=# draft/FILEHOSTING=1 :are supported by this server',
+          ':irc.example.net 005 client AWAYLEN=200',
+          ':irc.example.net 005 client SAFELIST',
+        ].join('\n'),
+      );
+    });
+    await withBaseUrl('https://irc.example.test', async () => {
+      const isupport = await isupportFor(true, registration);
+      expect(isupport).toContain(TOKEN);
+      expect(isupport).not.toContain('upstream.example');
+    });
+  });
+
+  // A network's later 005 isn't relayed at all (RELAY_DROP); IrcConnection adds
+  // it to registrationLines, whose replay strips the token.
+  it("doesn't relay a network's own FILEHOST sent after registration", async () => {
+    const acct = harnessMod.seedAccount({ nick: 'fhlive' });
+    const c = await harness.connect();
+    c.send(`PASS ${acct.user.username}:${acct.password}`);
+    c.send('NICK client');
+    c.send('USER client 0 * :client');
+    await c.waitForCommand('422');
+    const from = c.lines.length;
+    acct.upstream.pushUpstream(
+      `:irc.example.net 005 fhlive soju.im/FILEHOST=https://upstream.example/up :are supported by this server`,
+    );
+    acct.upstream.pushUpstream(':bot!b@h PRIVMSG #chan :sentinel');
+    await c.waitFor((l) => l.endsWith(':sentinel'));
+    expect(c.lines.slice(from).join('\n')).not.toContain('upstream.example');
+    c.close();
+  });
+
+  it('is not advertised to an account with no usable uploader', async () => {
+    const { default: db } = await import('../db/index.js');
+    const defaults = db
+      .prepare(`SELECT id FROM uploader_config WHERE scope = 'instance' AND is_default = 1`)
+      .all() as Array<{ id: number }>;
+    db.prepare(`UPDATE uploader_config SET is_default = 0 WHERE scope = 'instance'`).run();
+    try {
+      await withBaseUrl('https://irc.example.test', async () => {
+        expect(await isupportFor(true)).not.toContain('FILEHOST');
+      });
+    } finally {
+      for (const { id } of defaults) {
+        db.prepare('UPDATE uploader_config SET is_default = 1 WHERE id = ?').run(id);
+      }
+    }
+  });
+});

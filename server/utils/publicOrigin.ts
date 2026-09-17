@@ -33,7 +33,13 @@ export function requestOrigin(req: Request): string {
   return host ? `${proto}://${host}` : '';
 }
 
+/** PUBLIC_BASE_URL as configured: trimmed, without a trailing slash. '' when unset.
+ *  An operator's stray whitespace would otherwise end up inside every link. */
+export function configuredBaseUrl(): string {
+  return (process.env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '');
+}
+
 /** PUBLIC_BASE_URL, else the request origin, without a trailing slash. '' if neither is usable. */
 export function publicBaseUrl(req: Request): string {
-  return (process.env.PUBLIC_BASE_URL || requestOrigin(req)).replace(/\/+$/, '');
+  return configuredBaseUrl() || requestOrigin(req).replace(/\/+$/, '');
 }

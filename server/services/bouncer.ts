@@ -57,10 +57,12 @@ import { StringDecoder } from 'node:string_decoder';
 import ircManager from './ircManager.js';
 import type { IrcConnection } from './ircConnection.js';
 import * as systemLog from './systemLog.js';
-import { findUserById, findUserByUsername, getPasswordHash } from '../db/users.js';
+import { findUserById } from '../db/users.js';
 import type { User } from '../db/users.js';
-import { verifyPassword, hashPassword } from './password.js';
-import { hashToken, findActiveByHash, touchLastUsed } from '../db/apiTokens.js';
+import { verifyBouncerLogin } from './bouncerLogin.js';
+import { isNodeMode } from '../utils/edition.js';
+import { configuredBaseUrl } from '../utils/publicOrigin.js';
+import { resolveUploader } from './uploadProviders/resolve.js';
 import { getNetwork, listNetworksForUser } from '../db/networks.js';
 import type { Network } from '../db/networks.js';
 import { closedFoldedSetForNetwork, foldTargetFor } from '../db/buffers.js';
@@ -98,21 +100,12 @@ import {
   EXTENDED_MONITOR_CAPS,
   parseLine,
   restrictTags,
+  withoutUpstreamFilehost,
 } from './bouncerClientFilter.js';
 import type { MonitorHolder } from './monitorList.js';
 import type { ReplyClient } from './replyRouter.js';
 
 const SERVER_NAME = 'lurker.bouncer';
-
-// A scrypt hash used ONLY to equalize login latency (see verifyUser): every
-// auth path runs one scrypt so an unknown/passwordless username can't be told
-// apart from a real one by response time. Computed lazily on the first bouncer
-// login rather than at import, so a disabled bouncer costs no startup scrypt.
-let timingDummyHash: string | null = null;
-function timingEqualizerHash(): string {
-  if (timingDummyHash === null) timingDummyHash = hashPassword('lurker-bouncer-timing-equalizer');
-  return timingDummyHash;
-}
 
 // Caps we can honestly offer an attaching client, whatever network it binds.
 // server-time stamps playback and relayed lines; message-tags passes upstream
@@ -580,6 +573,37 @@ function serverTimeMs(s: string): number {
 // lines carry the network's msgid (networkMsgid), but not every message has one,
 // and resolving `msgid=` is #641. Timestamp works off any line's @time.
 type ChatBound = { star: true } | { iso: string };
+
+// soju.im/FILEHOST: where this account's IRC clients upload a file
+// (routes/filehost.ts), or null when there's nowhere to send them. goguma and
+// gamja read it on a bound connection and halloy on an unbound one, so both
+// bursts carry it, spelled exactly: goguma and halloy match it case-sensitively.
+// It needs an https PUBLIC_BASE_URL, which a client on a TLS connection must
+// insist on, and which is the only origin the bouncer can know without an HTTP
+// request to read one from. Not on a hosted cell, which doesn't mount the route,
+// nor for an account with no usable uploader, whose uploads would only fail.
+function filehostToken(userId: number): string | null {
+  if (isNodeMode()) return null;
+  let url: URL;
+  try {
+    url = new URL(configuredBaseUrl());
+  } catch {
+    return null;
+  }
+  // An https origin, maybe with a path, and nothing a path can't follow.
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
+    return null;
+  }
+  const base = `${url.origin}${url.pathname.replace(/\/+$/, '')}`;
+  const user = findUserById(userId);
+  if (!user) return null;
+  try {
+    resolveUploader({ userId, isAdmin: user.role === 'admin', requestedId: null });
+  } catch {
+    return null;
+  }
+  return `soju.im/FILEHOST=${base}/api/filehost`;
+}
 
 function isChannelName(target: string): boolean {
   return isChannelTarget(target);
@@ -1141,7 +1165,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       noteAuthFailure(this.remoteIp);
       return fail();
     }
-    const verified = this.verifyUser(login.username, passwd);
+    const verified = verifyBouncerLogin(login.username, passwd);
     if (!verified) {
       noteAuthFailure(this.remoteIp);
       return fail();
@@ -1203,7 +1227,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       this.failRegistration('Invalid credentials format: PASS <username>[/<network>]:<secret>');
       return;
     }
-    const verified = this.verifyUser(creds.username, creds.secret);
+    const verified = verifyBouncerLogin(creds.username, creds.secret);
     if (!verified) {
       noteAuthFailure(this.remoteIp);
       this.failRegistration('Invalid username or password/token');
@@ -1386,31 +1410,6 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     });
   }
 
-  // The account a password or read-write API token opens, with the token's id
-  // (null for the password), so revoking the token can close this session.
-  private verifyUser(
-    username: string,
-    secret: string,
-  ): { user: User; apiTokenId: number | null } | null {
-    // findUserByUsername folds case itself now, so the old explicit
-    // lowercase retry (IRC clients routinely lowercase the SASL username) is
-    // no longer needed.
-    const user = findUserByUsername(username);
-    const storedHash = user ? getPasswordHash(user.id) : null;
-    // Always run exactly one scrypt (against a dummy hash when the user is
-    // unknown or has no password) so login latency can't reveal whether the
-    // username exists — verifyPassword(_, null) would otherwise return instantly.
-    const passwordOk = verifyPassword(secret, storedHash ?? timingEqualizerHash());
-    if (!user) return null;
-    if (passwordOk && storedHash) return { user, apiTokenId: null };
-    const token = findActiveByHash(hashToken(secret));
-    if (token && token.userId === user.id && token.scope === 'read-write') {
-      touchLastUsed(token.id);
-      return { user, apiTokenId: token.id };
-    }
-    return null;
-  }
-
   // --- attach burst ----------------------------------------------------------
 
   private sendAttachBurst(): void {
@@ -1426,9 +1425,11 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       // Saved at registration with the upstream's tags, so any per-delivery tag
       // on them (msgid, batch) is stale by now. Like ZNC, the replay keeps at
       // most `time`, and write() drops that too unless the client negotiated
-      // server-time (#892).
+      // server-time (#892). The network's own FILEHOST never goes out: our
+      // clients upload with their Lurker credentials (filehostToken).
       for (const line of conn.registrationLines) {
-        const out = restrictTags(line, (key) => key === 'time');
+        const tagged = restrictTags(line, (key) => key === 'time');
+        const out = tagged && withoutUpstreamFilehost(tagged);
         if (out) this.write(rewriteNumericTarget(out, requested));
       }
     } else {
@@ -1447,6 +1448,8 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     if (this.caps.has(CAP_CHATHISTORY)) {
       extraIsupport.push(`CHATHISTORY=${MAX_CHATHISTORY}`, 'MSGREFTYPES=timestamp');
     }
+    const filehost = filehostToken(this.userId);
+    if (filehost) extraIsupport.push(filehost);
     if (extraIsupport.length > 0) {
       this.write(
         `:${SERVER_NAME} 005 ${liveNick} ${extraIsupport.join(' ')} :are supported by this server`,
@@ -1572,8 +1575,9 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   private sendControlBurst(user: User, networks: Network[]): void {
     const nick = this.clientNick || 'user';
     this.writeWelcomeNumerics(nick);
+    const filehost = filehostToken(user.id);
     this.write(
-      `:${SERVER_NAME} 005 ${nick} NETWORK=${APP_NAME} CASEMAPPING=ascii :are supported by this server`,
+      `:${SERVER_NAME} 005 ${nick} NETWORK=${APP_NAME} CASEMAPPING=ascii${filehost ? ` ${filehost}` : ''} :are supported by this server`,
     );
     // Say why nothing is here, ahead of the MOTD-missing line that closes the
     // burst. A bouncer-networks client with networks to pick from needs no

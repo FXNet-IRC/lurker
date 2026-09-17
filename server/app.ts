@@ -26,6 +26,8 @@ import themesRouter from './routes/themes.js';
 import pushRouter from './routes/push.js';
 import adminRouter from './routes/admin.js';
 import uploadsRouter from './routes/uploads.js';
+import filehostRouter from './routes/filehost.js';
+import { isBouncerEnabled } from './services/bouncer.js';
 import uploadersRouter from './routes/uploaders.js';
 import localUploadsRouter from './routes/localUploads.js';
 import dccRouter from './routes/dcc.js';
@@ -95,6 +97,14 @@ export function buildApp(sessionSecret: string, options: BuildAppOptions = {}): 
       `[lurker] CORS_ORIGIN is set ("${process.env.CORS_ORIGIN}") but no valid origin parsed from it — cross-origin requests will be rejected. Each entry needs a scheme, e.g. https://irc.example.com`,
     );
   }
+  // soju.im/FILEHOST, the bouncer's upload URL for IRC clients. Ahead of cors()
+  // and the JSON parser: it answers its own preflight with CORS for any origin
+  // (it takes no cookies), and its body is the file, which a `.json` upload's
+  // Content-Type would otherwise hand to express.json. Self-host only, like the
+  // bouncer's credentials: a hosted cell holds no account password and no API
+  // tokens, and the proxy can't route a Basic header to a cell. Only with the
+  // bouncer on: nothing else advertises it, and it takes the bouncer's logins.
+  if (!isNodeMode() && isBouncerEnabled()) app.use('/api/filehost', filehostRouter);
   app.use(cors({ origin: corsOrigins, credentials: true }));
   app.use(express.json({ limit: '1mb' }));
   app.use(cookieParser(sessionSecret));
