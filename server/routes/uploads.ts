@@ -20,7 +20,7 @@ import {
   deleteUpload,
   setUploadFavorite,
 } from '../db/uploadHistory.js';
-import { publicBaseUrl } from '../utils/publicOrigin.js';
+import { configuredBaseUrl, publicBaseUrl } from '../utils/publicOrigin.js';
 import {
   processUpload,
   providerErrorStatus,
@@ -41,7 +41,7 @@ let warnedRequestOriginFallback = false;
 /** The instance's public base for a local upload's root-relative URL:
  *  PUBLIC_BASE_URL, else the request origin (see utils/publicOrigin). */
 function requestBaseUrl(req: Request): string {
-  if (!process.env.PUBLIC_BASE_URL && !warnedRequestOriginFallback) {
+  if (!configuredBaseUrl() && !warnedRequestOriginFallback) {
     warnedRequestOriginFallback = true;
     console.warn(
       '[lurker] PUBLIC_BASE_URL is not set; local-upload links are derived from ' +

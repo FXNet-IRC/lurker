@@ -394,6 +394,12 @@ describe('soju.im/FILEHOST in ISUPPORT', () => {
     });
   });
 
+  it('is advertised for a base with whitespace around it', async () => {
+    await withBaseUrl(`  https://irc.example.test/  `, async () => {
+      expect(await isupportFor(true)).toContain(TOKEN);
+    });
+  });
+
   it('is not advertised without a usable https PUBLIC_BASE_URL', async () => {
     await withBaseUrl(undefined, async () => {
       expect(await isupportFor(true)).not.toContain('FILEHOST');

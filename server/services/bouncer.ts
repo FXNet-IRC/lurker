@@ -61,6 +61,7 @@ import { findUserById } from '../db/users.js';
 import type { User } from '../db/users.js';
 import { verifyBouncerLogin } from './bouncerLogin.js';
 import { isNodeMode } from '../utils/edition.js';
+import { configuredBaseUrl } from '../utils/publicOrigin.js';
 import { resolveUploader } from './uploadProviders/resolve.js';
 import { getNetwork, listNetworksForUser } from '../db/networks.js';
 import type { Network } from '../db/networks.js';
@@ -585,7 +586,7 @@ function filehostToken(userId: number): string | null {
   if (isNodeMode()) return null;
   let url: URL;
   try {
-    url = new URL((process.env.PUBLIC_BASE_URL || '').trim());
+    url = new URL(configuredBaseUrl());
   } catch {
     return null;
   }

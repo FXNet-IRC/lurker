@@ -356,6 +356,20 @@ describe('POST', () => {
     }
   });
 
+  // A padded PUBLIC_BASE_URL is what the bouncer advertises, so the URL answered
+  // here has to match it (publicOrigin.configuredBaseUrl).
+  it('answers the same base the bouncer advertises when the value has whitespace', async () => {
+    const user = await seedUser();
+    process.env.PUBLIC_BASE_URL = `  ${BASE}/  `;
+    try {
+      const res = await upload(basic(user.username, PASSWORD));
+      expect(res.status).toBe(201);
+      expect(res.headers['location']).toMatch(new RegExp(`^${BASE}/uploads/[0-9a-f]{12}\\.webp$`));
+    } finally {
+      process.env.PUBLIC_BASE_URL = BASE;
+    }
+  });
+
   it('keeps control characters out of the stored name', async () => {
     const user = await seedUser();
     const res = await upload(basic(user.username, PASSWORD), png, {
