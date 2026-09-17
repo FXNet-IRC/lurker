@@ -783,8 +783,6 @@ export class IrcConnection {
   // (nick-rewritten) to IRC clients that attach mid-session, so they see the
   // network's real ISUPPORT tokens instead of a synthesized approximation.
   registrationLines: string[];
-  // The burst's lines without their tags, to spot a server repeating one.
-  private registrationSeen = new Set<string>();
   // Auto-reconnect controller (we own the policy; irc-framework's auto_reconnect
   // is disabled in connect()). See scheduleReconnectIfWarranted.
   //
@@ -991,7 +989,6 @@ export class IrcConnection {
     this.ctcpLimiter = new RateLimiter();
     this.ctcpOutstanding = new Map();
     this.registrationLines = [];
-    this.registrationSeen = new Set();
     this.reconnectTimer = null;
     this.reconnectAttempt = 0;
     this.intentionalDisconnect = false;
@@ -1357,7 +1354,6 @@ export class IrcConnection {
       const burstLine = event.line.replace(/[\r\n]+$/, '');
       if (rawCommand === '001') {
         this.registrationLines = [burstLine];
-        this.registrationSeen = new Set([burstPayload(burstLine)]);
       } else if (
         this.registrationLines.length > 0 &&
         (rawCommand === '002' ||
@@ -1365,15 +1361,16 @@ export class IrcConnection {
           rawCommand === '004' ||
           rawCommand === '005')
       ) {
-        // A line the burst already holds tells a client nothing, and servers do
-        // repeat one: solanum sends its whole ISUPPORT again after every VERSION
-        // (show_isupport in m_version.c), and each attach would replay the pile.
-        // A token that CHANGED still arrives as a line of its own.
+        // Servers repeat these: solanum sends its whole ISUPPORT again after
+        // every VERSION (show_isupport in m_version.c), and every attach would
+        // replay the pile. A line the burst already holds keeps its one place,
+        // moved to the end so the newest copy is the one that lands last — a
+        // token that went A → B → A is back at A for the client, where dropping
+        // the repeat would leave it at B.
         const payload = burstPayload(burstLine);
-        if (!this.registrationSeen.has(payload)) {
-          this.registrationSeen.add(payload);
-          this.registrationLines.push(burstLine);
-        }
+        const at = this.registrationLines.findIndex((l) => burstPayload(l) === payload);
+        if (at !== -1) this.registrationLines.splice(at, 1);
+        this.registrationLines.push(burstLine);
       }
       // Command-result errors (a failed kick / invite / mode / topic) name the
       // channel they concern, so surface them in that buffer instead of leaving

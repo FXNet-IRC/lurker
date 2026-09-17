@@ -65,11 +65,21 @@ describe('the saved registration burst', () => {
       // replay rewrites the target anyway.
       ircd.sendRaw('burst', repeated.replace(' 005 burst ', ' 005 burst_ '));
 
-      // No fourth line arrived behind the third: give the repeats a turn to.
+      // A token that goes back to a value the burst has seen wins again: the
+      // repeat keeps its one place, at the end.
+      ircd.sendRaw('burst', repeated);
+      await until(
+        () => conn.registrationLines.at(-1) === repeated,
+        5000,
+        'the earlier value back at the end',
+      );
+      expect(conn.registrationLines.length).toBe(registered + 2);
+
+      // Nothing arrived behind the last line: give the repeats a turn to land.
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(conn.registrationLines.length).toBe(registered + 2);
       expect(conn.registrationLines.filter((l) => l.endsWith(repeated))).toHaveLength(1);
-      expect(conn.registrationLines.at(-1)).toBe(changed);
+      expect(conn.registrationLines.at(-1)).toBe(repeated);
     } finally {
       conn.dispose();
     }

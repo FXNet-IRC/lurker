@@ -401,6 +401,28 @@ describe('a state change', () => {
     expect(c.lines.slice(mark).filter((l) => l.includes('Upstream '))).toEqual([]);
   });
 
+  // A restart that fails on the spot — a proxy or certificate refusal is
+  // synchronous — records a reason about what just happened, not the one before.
+  it("says why when the attach's own restart is what failed", async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    acct.upstream.state = 'disconnected';
+    harnessMod.emitNetworkState(acct.user.id, acct.network.id, 'disconnected', {
+      error: 'Not reconnecting automatically: banned by the server (G-Lined).',
+    });
+    vi.spyOn(ircManager, 'restartNetwork').mockImplementation((userId, networkId) => {
+      const conn = ircManager.getConnection(userId, networkId)!;
+      harnessMod.emitNetworkState(userId, networkId, 'disconnected', {
+        error: 'Not connecting: the proxy refused the connection.',
+      });
+      return conn as never;
+    });
+    const c = await attachPlain(acct, 'alpha');
+    await synced(c);
+
+    const notice = c.lines.find((l) => l.includes("Network 'alpha' is"));
+    expect(notice).toContain('the proxy refused the connection');
+  });
+
   // Attaching to a network that gave up restarts it (ZNC's shape), so the
   // reason the last attempt failed would contradict the attempt under way.
   it('leaves out a reason the attach itself has superseded', async () => {
@@ -560,5 +582,21 @@ describe('error, on real connections', () => {
 
     ircManager.disposeUser(acct.user.id, 'user deleted');
     expect(ircManager.connectionError(acct.user.id, network.id)).toBeNull();
+  });
+});
+
+// A ban reason is the server's own words: it can be long, and it can be
+// multibyte. The line it rides has 512 bytes.
+describe('clampToBudget', () => {
+  it('honours the budget in bytes, marker included, without splitting a character', () => {
+    const budget = 20;
+    const clamped = bouncerMod.clampToBudget('🚫'.repeat(10), budget);
+    expect(Buffer.byteLength(clamped)).toBeLessThanOrEqual(budget);
+    expect(clamped.endsWith('…')).toBe(true);
+    // Whole emoji, never half a surrogate pair.
+    expect([...clamped].every((ch) => ch === '…' || ch === '🚫')).toBe(true);
+    expect(bouncerMod.clampToBudget('short', budget)).toBe('short');
+    // Tight enough that the marker's three bytes are the difference.
+    expect(Buffer.byteLength(bouncerMod.clampToBudget('a'.repeat(20), 10))).toBeLessThanOrEqual(10);
   });
 });

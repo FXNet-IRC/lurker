@@ -533,9 +533,18 @@ export function buildNamesLines(nick: string, channel: string, names: string[]):
 /** `text` cut to `budget` bytes, marked when it was cut. */
 export function clampToBudget(text: string, budget: number): string {
   if (Buffer.byteLength(text) <= budget) return text;
-  let out = text;
-  while (Buffer.byteLength(out) > budget - 1 && out.length > 0) out = out.slice(0, -1);
-  return `${out}…`;
+  const marker = '…';
+  // The marker is 3 bytes of the budget, not one character of it, and the cut
+  // runs over code points so it can't split a surrogate pair (an emoji in a
+  // server's ban reason) into a lone half.
+  const room = budget - Buffer.byteLength(marker);
+  if (room <= 0) return '';
+  let out = '';
+  for (const ch of text) {
+    if (Buffer.byteLength(out) + Buffer.byteLength(ch) > room) break;
+    out += ch;
+  }
+  return `${out}${marker}`;
 }
 
 export function withNetworkList(head: string, names: string[], budget: number): string {
@@ -1353,6 +1362,10 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // client attaches. A conn object stuck in 'disconnected' (e.g. its boot-
     // time connect was refused and retries ran out) is restarted — safe here
     // because this session hasn't attached any listeners to it yet.
+    // What the last attempt said before this attach touched anything. A restart
+    // below supersedes it — but a restart that fails on the spot (a proxy or
+    // certificate refusal is synchronous) records a NEW reason, which stands.
+    const errorBefore = ircManager.connectionError(user.id, network.id);
     let conn = ircManager.getConnection(user.id, network.id);
     let restarted = false;
     if (!conn) {
@@ -1362,6 +1375,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       conn = ircManager.restartNetwork(user.id, network.id, 'bouncer client attached');
       restarted = true;
     }
+    const superseded = restarted ? errorBefore : null;
     if (!conn) {
       this.failRegistration('Network is unavailable');
       return;
@@ -1380,7 +1394,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.updateSupportedCaps(this.clientNick || '*');
     // Before the burst too, so its 306 follows an AWAY sent before registration.
     this.applyPendingAway();
-    this.sendAttachBurst(restarted);
+    this.sendAttachBurst(superseded);
     // An attached client is the user being here, unless it said `AWAY *`.
     evaluatePresence(this.userId);
     systemLog.log({
@@ -1428,7 +1442,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
 
   // --- attach burst ----------------------------------------------------------
 
-  private sendAttachBurst(restarted = false): void {
+  private sendAttachBurst(superseded: string | null = null): void {
     const conn = this.conn!;
     const requested = this.clientNick || conn.currentNick || 'user';
     const liveNick = conn.currentNick || requested;
@@ -1475,10 +1489,12 @@ class BouncerSession implements MonitorHolder, ReplyClient {
 
     if (conn.state !== 'connected') {
       // Why it's down, for a client that attached after it went: soju sends the
-      // same on attach (user.go:823). Not when this attach just restarted the
-      // network, though: the reason is about the attempt before it, and
-      // "not reconnecting automatically" would contradict the retry under way.
-      const why = restarted ? '' : ircManager.connectionError(this.userId, this.networkId) || '';
+      // same on attach (user.go:823). `superseded` is the reason this attach's
+      // own restart replaced — saying "not reconnecting automatically" would
+      // contradict the retry under way — while a reason that restart just
+      // recorded is about what's happening now, and is said.
+      const current = ircManager.connectionError(this.userId, this.networkId) || '';
+      const why = current === superseded ? '' : current;
       this.notice(
         `Network '${this.network?.name}' is ${conn.state}; channels will appear once it registers.` +
           (why ? ` ${why}` : ''),
