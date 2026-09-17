@@ -574,7 +574,46 @@ const chathistoryMsgFilter = (alias = '') => {
   const p = alias ? `${alias}.` : '';
   return `${p}type IN ('message', 'action', 'notice') AND ${p}mirrored = 0 AND ${p}text IS NOT NULL AND ${p}text != ''`;
 };
-const CHATHISTORY_MSG_FILTER = chathistoryMsgFilter();
+
+// The event rows a draft/event-playback client also gets in history, as soju
+// replays them: joins, parts, quits, nick changes, kicks, and mode and topic
+// changes. Not chghost or invite rows: soju keeps neither, and the spec's list
+// names neither.
+export const HISTORY_EVENT_TYPES = ['join', 'part', 'quit', 'nick', 'kick', 'mode', 'topic'];
+
+// Who a history window is for. `me` is our current nick on the network.
+export interface HistoryEvents {
+  me: string | null;
+}
+
+// The rows a window holds: messages, and for a draft/event-playback client the
+// event rows too, every one counting toward the limit as soju's do. Filtered
+// here rather than at playback, because a batch shorter than its limit reads as
+// the start of history to halloy and gamja.
+//
+// Events naming our current nick stay out: a JOIN, PART, QUIT or NICK from it,
+// or a KICK of it. goguma applies every replayed line to its live state, so an
+// old PART of ours marks the channel as left and an old NICK of ours renames us
+// (client_controller.dart:577-663); HexDroid rejoins on an old JOIN of ours. An
+// event under a nick we no longer use reads as someone else's there.
+function historyFilter(
+  alias: string,
+  events: HistoryEvents | null | undefined,
+): { sql: string; params: string[] } {
+  const messages = chathistoryMsgFilter(alias);
+  if (!events) return { sql: messages, params: [] };
+  const p = alias ? `${alias}.` : '';
+  const types = HISTORY_EVENT_TYPES.map((t) => `'${t}'`).join(', ');
+  let eventSql = `${p}type IN (${types})`;
+  const params: string[] = [];
+  if (events.me) {
+    // COALESCE, or a row with no nick would compare NULL and drop out too.
+    eventSql += ` AND NOT (${p}type IN ('join', 'part', 'quit', 'nick') AND COALESCE(${p}nick, '') = ? COLLATE NOCASE)`;
+    eventSql += ` AND NOT (${p}type = 'kick' AND COALESCE(CASE WHEN json_valid(${p}extra) THEN json_extract(${p}extra, '$.kicked') END, '') = ? COLLATE NOCASE)`;
+    params.push(events.me, events.me);
+  }
+  return { sql: `((${messages}) OR (${eventSql}))`, params };
+}
 
 // Windowed history fetch for CHATHISTORY. `lower`/`upper` are exclusive ISO time
 // bounds (null = unbounded on that side). `newestFirst` takes the `limit` from
@@ -594,12 +633,16 @@ export function loadHistoryWindow(
   lower: string | null,
   upper: string | null,
   limit: number,
-  { newestFirst = false }: { newestFirst?: boolean } = {},
+  {
+    newestFirst = false,
+    events: forEvents,
+  }: { newestFirst?: boolean; events?: HistoryEvents | null } = {},
 ): MessageEvent[] {
   const bufferId = resolveBufferIdByNetwork(networkId, target);
   if (bufferId === undefined) return [];
-  const conds = ['buffer_id = ?', CHATHISTORY_MSG_FILTER];
-  const params: (string | number)[] = [bufferId];
+  const filter = historyFilter('', forEvents);
+  const conds = ['buffer_id = ?', filter.sql];
+  const params: (string | number)[] = [bufferId, ...filter.params];
   if (lower !== null) {
     conds.push('time > ?');
     params.push(lower);
@@ -622,15 +665,18 @@ export function loadHistoryWindow(
 
 // Buffers with real message activity inside a time window (exclusive), newest
 // first, for CHATHISTORY TARGETS. Excludes :server: pseudo-buffers and applies
-// the same message filter (a buffer whose only in-window rows are JOINs isn't
-// "active"). The two bounds may arrive in either order; we normalize.
+// the same filter as a window: a buffer whose only in-window rows are JOINs isn't
+// "active", except to a draft/event-playback client (soju). The two bounds may
+// arrive in either order; we normalize.
 export function listActiveTargetsInWindow(
   networkId: number,
   isoA: string,
   isoB: string,
   limit: number,
+  { events }: { events?: HistoryEvents | null } = {},
 ): BufferSummary[] {
   const [lo, hi] = isoA <= isoB ? [isoA, isoB] : [isoB, isoA];
+  const filter = historyFilter('m', events);
   // Grouped by buffer_id and named from the registry row, so the summary
   // carries the canonical casing rather than whichever casing the window's
   // rows happened to arrive under. Sentinels are excluded by kind — the
@@ -642,13 +688,13 @@ export function listActiveTargetsInWindow(
          JOIN buffers b ON b.id = m.buffer_id
         WHERE b.network_id = ?
           AND b.kind NOT IN ('server', 'system')
-          AND ${chathistoryMsgFilter('m')}
+          AND ${filter.sql}
           AND m.time > ? AND m.time < ?
         GROUP BY b.id
         ORDER BY lastMessageAt DESC
         LIMIT ?`,
     )
-    .all(networkId, lo, hi, limit) as BufferSummary[];
+    .all(networkId, ...filter.params, lo, hi, limit) as BufferSummary[];
 }
 
 export function listRecentForBuffers(

@@ -160,6 +160,7 @@ we advertise only what we actually implement.
 | Log in with SASL instead of a server password                                                   | `sasl` (PLAIN)                                                |
 | Backlog replays at its original timestamps, not at attach time                                  | `server-time`                                                 |
 | Scrollback on demand — page back through Lurker's full stored history from your terminal client | `draft/chathistory`                                           |
+| Joins, parts, quits, nick changes, kicks, and mode and topic changes in that scrollback         | `draft/event-playback`                                        |
 | What you've read in one client is read in the others, and in the web and iOS apps               | `draft/read-marker`                                           |
 | A client connecting in the background doesn't count as you being here                           | `draft/pre-away`                                              |
 | Your own sent messages echoed back, if your client wants them                                   | `echo-message`                                                |
@@ -188,6 +189,15 @@ Implementation notes worth knowing if you're writing against it:
 - A client that negotiates `draft/chathistory` gets no playback on attach, as with
   soju. It fetches the history it wants itself, so it doesn't see the same lines twice.
   <br>`server/services/bouncer.ts:1717`
+- With `draft/event-playback`, history also has joins, parts, quits, nick changes,
+  kicks, and mode and topic changes, and they count toward the limit, as with soju.
+  Events that name your current nick are left out: your own join, part, quit or nick
+  change, or a kick of you. Some clients apply every replayed line to what they show
+  now, so an old part of yours would mark the channel as left. Host changes and
+  invites aren't replayed, a JOIN is sent without extended-join's account and
+  realname, and by default join, part, quit, nick and mode lines are kept for 7 days.
+  Playback on attach stays messages only.
+  <br>`server/db/messages.ts:599`, `server/services/bouncer.ts:2098`
 - Tags that only a server may set — `time`, `account`, `msgid`, `label`, `batch` —
   are stripped from anything an attached client sends, so a downstream client can't
   forge them.
@@ -279,6 +289,7 @@ attaching to Lurker.
 | `draft/multiline`                       |   ✅   |    —    |
 | `+typing`                               |   ✅   |    —    |
 | `draft/chathistory`                     |   —    |   ✅    |
+| `draft/event-playback`                  |   —    |   ✅    |
 | `draft/read-marker`                     |   —    |   ✅    |
 | `draft/pre-away`                        |   —    |   ✅    |
 | `multi-prefix`                          |   ✅   |   ✅    |

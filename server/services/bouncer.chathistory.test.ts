@@ -419,3 +419,179 @@ describe('CHATHISTORY errors', () => {
     expect(batchBodies(c.lines, ref)).toHaveLength(0);
   });
 });
+
+describe('draft/event-playback', () => {
+  const EVENT_CAPS = `${HISTORY_CAPS} draft/event-playback`;
+  const at = (s: number) => `2023-05-23T06:00:${String(s).padStart(2, '0')}.000Z`;
+
+  // Rows in `target`, one second apart from :01, then the lines one CHATHISTORY
+  // command returns for them.
+  async function history(
+    nick: string,
+    target: string,
+    rows: Array<Partial<Parameters<typeof insertMessage>[0]>>,
+    command: string,
+    caps = EVENT_CAPS,
+  ): Promise<{ lines: string[]; ref: string }> {
+    const acct = harnessMod.seedAccount({ nick });
+    rows.forEach((row, i) =>
+      insertMessage({
+        networkId: acct.network.id,
+        target,
+        time: at(i + 1),
+        type: 'message',
+        nick: 'bob',
+        self: false,
+        ...row,
+      } as Parameters<typeof insertMessage>[0]),
+    );
+    const c = await harness.connect();
+    await attachBound(c, acct, caps);
+    c.send(command);
+    const open = await c.waitFor((l) => l.includes('BATCH +'));
+    const ref = open.split('BATCH +')[1].split(' ')[0];
+    await c.waitFor((l) => l.includes(`BATCH -${ref}`));
+    c.close();
+    return { lines: batchBodies(c.lines, ref), ref };
+  }
+
+  const EVENTS: Array<Partial<Parameters<typeof insertMessage>[0]>> = [
+    { type: 'message', nick: 'bob', userhost: 'bob!u@h', text: 'hi' },
+    { type: 'join', nick: 'alice', userhost: 'alice!a@h', extra: { account: 'alice' } },
+    { type: 'part', nick: 'alice', userhost: 'alice!a@h', text: 'bye now' },
+    { type: 'quit', nick: 'carol', userhost: 'carol!c@h', text: 'Quit: gone' },
+    { type: 'nick', nick: 'dave', userhost: 'dave!d@h', extra: { newNick: 'david' } },
+    { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'spam', extra: { kicked: 'eve' } },
+    { type: 'mode', nick: 'op', text: '+o bob', extra: { modes: [] } },
+    { type: 'topic', nick: 'op', text: 'new topic' },
+  ];
+
+  it('is offered', async () => {
+    const c = await harness.connect();
+    c.send('CAP LS 302');
+    const ls = await c.waitFor((l) => l.includes(' LS '));
+    expect(ls).toContain('draft/event-playback');
+    c.close();
+  });
+
+  it('replays joins, parts, quits, nick changes, kicks, and mode and topic changes', async () => {
+    const { lines, ref } = await history('ep1', '#ev', EVENTS, 'CHATHISTORY LATEST #ev * 100');
+    const tag = (s: number) => `@batch=${ref};time=${at(s)} `;
+    expect(lines).toEqual([
+      `${tag(1)}:bob!u@h PRIVMSG #ev :hi`,
+      // Plain: the realname an extended JOIN carries isn't stored.
+      `${tag(2)}:alice!a@h JOIN #ev`,
+      `${tag(3)}:alice!a@h PART #ev :bye now`,
+      `${tag(4)}:carol!c@h QUIT :Quit: gone`,
+      `${tag(5)}:dave!d@h NICK david`,
+      `${tag(6)}:op!o@h KICK #ev eve :spam`,
+      `${tag(7)}:op!op@lurker.bouncer MODE #ev +o bob`,
+      `${tag(8)}:op!op@lurker.bouncer TOPIC #ev :new topic`,
+    ]);
+  });
+
+  it('replays only messages to a client that did not ask', async () => {
+    const { lines } = await history(
+      'ep2',
+      '#ev',
+      EVENTS,
+      'CHATHISTORY LATEST #ev * 100',
+      HISTORY_CAPS,
+    );
+    expect(lines.map((l) => l.slice(l.indexOf(' :') + 1))).toEqual([':bob!u@h PRIVMSG #ev :hi']);
+  });
+
+  it('leaves out host changes and invites, which soju replays neither of', async () => {
+    const { lines } = await history(
+      'ep3',
+      '#ev',
+      [
+        { type: 'chghost', nick: 'alice', userhost: 'alice!a@h', extra: { newHost: 'h2' } },
+        { type: 'invite', nick: 'op', extra: { invited: 'frank' } },
+        { type: 'join', nick: 'alice', userhost: 'alice!a@h' },
+      ],
+      'CHATHISTORY LATEST #ev * 100',
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(':alice!a@h JOIN #ev');
+  });
+
+  it('counts events toward the limit', async () => {
+    const { lines } = await history('ep4', '#ev', EVENTS, 'CHATHISTORY LATEST #ev * 3');
+    expect(lines.map((l) => l.split(' ')[2])).toEqual(['KICK', 'MODE', 'TOPIC']);
+  });
+
+  // goguma applies every replayed line to its live state: an old PART from its
+  // own nick marks the channel as left, an old NICK from it renames us.
+  it('leaves out events naming our current nick, before the limit is applied', async () => {
+    const { lines } = await history(
+      'ep5',
+      '#ev',
+      [
+        { type: 'join', nick: 'zed', userhost: 'zed!z@h' },
+        { type: 'kick', nick: 'EP5', userhost: 'EP5!e@h', text: 'bye', extra: { kicked: 'zed' } },
+        { type: 'join', nick: 'Ep5', userhost: 'Ep5!e@h' },
+        { type: 'part', nick: 'ep5', userhost: 'ep5!e@h', text: 'later' },
+        { type: 'nick', nick: 'EP5', userhost: 'EP5!e@h', extra: { newNick: 'ep5_' } },
+        { type: 'quit', nick: 'ep5', userhost: 'ep5!e@h', text: 'bye' },
+        { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'out', extra: { kicked: 'eP5' } },
+      ],
+      'CHATHISTORY LATEST #ev * 2',
+    );
+    // Our kick of someone else still goes, and nothing else fills the limit.
+    expect(lines.map((l) => l.slice(l.indexOf(' :') + 1))).toEqual([
+      ':zed!z@h JOIN #ev',
+      ':EP5!e@h KICK #ev zed :bye',
+    ]);
+  });
+
+  it('names the server as the source of a mode it set', async () => {
+    const { lines } = await history(
+      'ep6',
+      '#ev',
+      [{ type: 'mode', nick: 'irc.example.net', text: '+nt', extra: { modes: [] } }],
+      'CHATHISTORY LATEST #ev * 100',
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(' :irc.example.net MODE #ev +nt');
+  });
+
+  it('lists a buffer with only events among TARGETS, for a client that asked', async () => {
+    const window =
+      'CHATHISTORY TARGETS timestamp=2023-05-23T00:00:00.000Z timestamp=2023-05-24T00:00:00.000Z 100';
+    const rows = [{ type: 'join', nick: 'alice', userhost: 'alice!a@h' }];
+    const withEvents = await history('ep7', '#joinsonly', rows, window);
+    expect(withEvents.lines.some((l) => l.includes('TARGETS #joinsonly'))).toBe(true);
+    const without = await history('ep8', '#joinsonly', rows, window, HISTORY_CAPS);
+    expect(without.lines.some((l) => l.includes('TARGETS #joinsonly'))).toBe(false);
+  });
+
+  it("keeps a buffer's joins from using up its attach playback", async () => {
+    const acct = harnessMod.seedAccount({ nick: 'ep9' });
+    acct.upstream.addChannel('#busy', { members: ['ep9', 'bob'] });
+    seedMessages(acct.network.id, '#busy', 2);
+    for (let s = 3; s <= 6; s++) {
+      insertMessage({
+        networkId: acct.network.id,
+        target: '#busy',
+        time: at(s),
+        type: 'join',
+        nick: `joiner${s}`,
+        self: false,
+      });
+    }
+    process.env.LURKER_BOUNCER_PLAYBACK = '2';
+    try {
+      const c = await harness.connect();
+      await attachBound(c, acct, 'sasl batch server-time message-tags draft/event-playback');
+      c.send('PING sync');
+      await c.waitForCommand('PONG');
+      expect(c.lines.filter((l) => l.includes('PRIVMSG #busy'))).toHaveLength(2);
+      // Attach playback never replays events, even to a client that asked.
+      expect(c.lines.some((l) => l.includes('joiner'))).toBe(false);
+      c.close();
+    } finally {
+      delete process.env.LURKER_BOUNCER_PLAYBACK;
+    }
+  });
+});

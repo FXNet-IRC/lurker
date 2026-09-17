@@ -65,14 +65,14 @@ import { getNetwork, listNetworksForUser } from '../db/networks.js';
 import type { Network } from '../db/networks.js';
 import { closedFoldedSetForNetwork, foldTargetFor } from '../db/buffers.js';
 import {
-  listMessages,
+  HISTORY_EVENT_TYPES,
   listBuffersForNetwork,
   loadHistoryWindow,
   listActiveTargetsInWindow,
   readMarkerTime,
   newestIdAtOrBefore,
 } from '../db/messages.js';
-import type { MessageEvent } from '../db/messages.js';
+import type { HistoryEvents, MessageEvent } from '../db/messages.js';
 import { getReadState } from '../db/bufferReads.js';
 import { resolveBuffer } from '../db/bufferResolve.js';
 import type { AwayChange, ReadMarkerMove } from './ircManager.js';
@@ -135,6 +135,10 @@ const SUPPORTED_CAPS = [
   'soju.im/bouncer-networks-notify',
   // draft/chathistory: on-demand scrollback fetch (CHATHISTORY BEFORE/AFTER/…).
   'draft/chathistory',
+  // draft/event-playback: joins, parts, quits, nick changes, kicks and mode and
+  // topic changes in that history too. Lurker's own store serves them, so it
+  // doesn't depend on the network (soju offers it the same way).
+  'draft/event-playback',
   // cap-notify: CAP NEW/DEL as the bound network's caps come and go (see
   // updateSupportedCaps). CAP LS 302 turns it on without a REQ.
   'cap-notify',
@@ -171,6 +175,7 @@ const PASSTHROUGH_CAPS = [
 const CAP_BOUNCER_NETWORKS = 'soju.im/bouncer-networks';
 const CAP_BOUNCER_NETWORKS_NOTIFY = 'soju.im/bouncer-networks-notify';
 const CAP_CHATHISTORY = 'draft/chathistory';
+const CAP_EVENT_PLAYBACK = 'draft/event-playback';
 const CAP_READ_MARKER = 'draft/read-marker';
 
 // Max messages a single CHATHISTORY request may return (advertised as the
@@ -1780,9 +1785,9 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // The set holds target_folded values — per-network folds since #707, so
     // the probe must fold the same way or a closed 'foo[m]' (stored 'foo{m}'
     // on an rfc1459 network) slips past and gets re-offered.
-    const targets = listActiveTargetsInWindow(this.networkId, isoA, isoB, limit).filter(
-      (t) => !closed.has(foldTargetFor(this.networkId, t.target)),
-    );
+    const targets = listActiveTargetsInWindow(this.networkId, isoA, isoB, limit, {
+      events: this.historyEvents(),
+    }).filter((t) => !closed.has(foldTargetFor(this.networkId, t.target)));
     this.withBatch('draft/chathistory-targets', [], (ref) => {
       const tag = ref ? `@batch=${ref} ` : '';
       for (const t of targets) {
@@ -1804,23 +1809,31 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     limit: number,
   ): MessageEvent[] {
     const nid = this.networkId;
+    const events = this.historyEvents();
     // Only LATEST's bound can be `*` (unbounded); every other bound is a
     // timestamp by the time we get here (the parser rejects `*` elsewhere).
     const iso = (b: ChatBound): string | null => ('iso' in b ? b.iso : null);
     switch (sub) {
       case 'BEFORE':
-        return loadHistoryWindow(nid, target, null, iso(bound0), limit, { newestFirst: true });
+        return loadHistoryWindow(nid, target, null, iso(bound0), limit, {
+          newestFirst: true,
+          events,
+        });
       case 'AFTER':
-        return loadHistoryWindow(nid, target, iso(bound0), null, limit);
+        return loadHistoryWindow(nid, target, iso(bound0), null, limit, { events });
       case 'LATEST':
-        return loadHistoryWindow(nid, target, iso(bound0), null, limit, { newestFirst: true });
+        return loadHistoryWindow(nid, target, iso(bound0), null, limit, {
+          newestFirst: true,
+          events,
+        });
       case 'AROUND': {
         // Split the limit around the point: newest half before, earliest after.
         const afterLimit = Math.floor(limit / 2);
         const older = loadHistoryWindow(nid, target, null, iso(bound0), limit - afterLimit, {
           newestFirst: true,
+          events,
         });
-        const newer = loadHistoryWindow(nid, target, iso(bound0), null, afterLimit);
+        const newer = loadHistoryWindow(nid, target, iso(bound0), null, afterLimit, { events });
         return [...older, ...newer];
       }
       case 'BETWEEN': {
@@ -1831,6 +1844,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
         const ascending = (a ?? '') <= (b ?? '');
         return loadHistoryWindow(nid, target, ascending ? a : b, ascending ? b : a, limit, {
           newestFirst: !ascending,
+          events,
         });
       }
     }
@@ -1841,9 +1855,17 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     this.withBatch('chathistory', [target], (ref) => {
       const lines = this.playbackLines(rows, target, isChannelName(target), {
         batchRef: ref ?? undefined,
+        events: this.caps.has(CAP_EVENT_PLAYBACK),
       });
       for (const line of lines) this.write(line);
     });
+  }
+
+  // For a draft/event-playback client, the event rows its history windows also
+  // hold (see historyFilter): everything but those naming our current nick.
+  private historyEvents(): HistoryEvents | null {
+    if (!this.caps.has(CAP_EVENT_PLAYBACK)) return null;
+    return { me: this.currentNick() || this.network?.nick || null };
   }
 
   // Parse a CHATHISTORY selector — `*` (LATEST only) or `timestamp=<iso>`. msgid
@@ -2027,7 +2049,10 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     let budget = maxTotalPlaybackLines();
     for (const { target, isChannel } of targets) {
       if (budget <= 0) break;
-      const rows = listMessages(this.networkId, target, { limit });
+      // Messages only, so a buffer's joins and parts don't use up its share.
+      const rows = loadHistoryWindow(this.networkId, target, null, null, limit, {
+        newestFirst: true,
+      });
       for (const line of this.playbackLines(rows, target, isChannel)) {
         this.write(line);
         if (--budget <= 0) break;
@@ -2066,15 +2091,63 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     return out;
   }
 
+  // A stored event as the line the network sent it as, which is what soju
+  // replays. The JOIN is the plain form: an extended JOIN's realname isn't
+  // stored, and goguma would take an empty one as the user's. A row missing
+  // what its line needs gives none.
+  private eventLine(
+    row: MessageEvent,
+    bufferTarget: string,
+    tags: { time?: string; batchRef?: string },
+  ): string | null {
+    const nick = row.nick || '';
+    if (!nick) return null;
+    // A mode set by the server is stored under its name, which no nick contains
+    // a dot of.
+    const source = row.userhost?.includes('!')
+      ? row.userhost
+      : nick.includes('.')
+        ? nick
+        : `${nick}!${nick}@${SERVER_NAME}`;
+    const head = `${this.formatTags(tags)}:${source}`;
+    const text = row.text ?? '';
+    switch (row.type) {
+      case 'join':
+        return `${head} JOIN ${bufferTarget}`;
+      case 'part':
+        return text ? `${head} PART ${bufferTarget} :${text}` : `${head} PART ${bufferTarget}`;
+      case 'quit':
+        return `${head} QUIT :${text}`;
+      case 'nick':
+        return typeof row.newNick === 'string' && row.newNick
+          ? `${head} NICK ${row.newNick}`
+          : null;
+      case 'kick':
+        return typeof row.kicked === 'string' && row.kicked
+          ? `${head} KICK ${bufferTarget} ${row.kicked} :${text}`
+          : null;
+      case 'mode':
+        return text ? `${head} MODE ${bufferTarget} ${text}` : null;
+      case 'topic':
+        return `${head} TOPIC ${bufferTarget} :${text}`;
+    }
+    return null;
+  }
+
   private playbackLines(
     rows: MessageEvent[],
     bufferTarget: string,
     isChannel: boolean,
-    opts: { batchRef?: string } = {},
+    opts: { batchRef?: string; events?: boolean } = {},
   ): string[] {
     const out: string[] = [];
     const selfNick = this.currentNick() || this.clientNick || '*';
     for (const row of rows) {
+      if (opts.events && HISTORY_EVENT_TYPES.includes(row.type)) {
+        const line = this.eventLine(row, bufferTarget, { time: row.time, batchRef: opts.batchRef });
+        if (line) out.push(line);
+        continue;
+      }
       if (row.type !== 'message' && row.type !== 'action' && row.type !== 'notice') continue;
       // Note: `fromIgnored` is deliberately NOT filtered here — the live relay
       // passes ignored senders through (ignore is a client-side Lurker feature,
