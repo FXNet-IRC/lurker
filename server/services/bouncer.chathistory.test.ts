@@ -574,6 +574,50 @@ describe('draft/event-playback', () => {
     ]);
   });
 
+  // goguma compares nicks under the network's CASEMAPPING, so the filter does.
+  it("compares our nick under the network's casemapping", async () => {
+    const { default: db } = await import('../db/index.js');
+    const { invalidateCasemappingCache } = await import('../db/buffers.js');
+    const rows = [
+      { type: 'join', nick: 'Ep{11}^', userhost: 'Ep{11}^!e@h' },
+      { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'out', extra: { kicked: 'EP[11]~' } },
+      { type: 'join', nick: 'zed', userhost: 'zed!z@h' },
+    ];
+    const replayed = async (nick: string, casemapping: string) => {
+      const acct = harnessMod.seedAccount({ nick });
+      db.prepare('UPDATE networks SET casemapping = ? WHERE id = ?').run(
+        casemapping,
+        acct.network.id,
+      );
+      invalidateCasemappingCache(acct.network.id);
+      rows.forEach((row, i) =>
+        insertMessage({
+          networkId: acct.network.id,
+          target: '#ev',
+          time: at(i + 1),
+          self: false,
+          ...row,
+        } as Parameters<typeof insertMessage>[0]),
+      );
+      const c = await harness.connect();
+      await attachBound(c, acct, EVENT_CAPS);
+      c.send('CHATHISTORY LATEST #ev * 100');
+      const open = await c.waitFor((l) => l.includes('BATCH +'));
+      const ref = open.split('BATCH +')[1].split(' ')[0];
+      await c.waitFor((l) => l.includes(`BATCH -${ref}`));
+      c.close();
+      return batchBodies(c.lines, ref).map((l) => l.split(' ')[2] + ' ' + l.split(' ')[1]);
+    };
+    // rfc1459: [ ] \ ^ are the capitals of { } | ~.
+    expect(await replayed('ep[11]~', 'rfc1459')).toEqual(['JOIN :zed!z@h']);
+    // ascii: they're different characters, so both lines are someone else's.
+    expect(await replayed('ep[11]^', 'ascii')).toEqual([
+      'JOIN :Ep{11}^!e@h',
+      'KICK :op!o@h',
+      'JOIN :zed!z@h',
+    ]);
+  });
+
   it('names the server as the source of a mode it set, whatever its name', async () => {
     const { lines } = await history(
       'ep6',

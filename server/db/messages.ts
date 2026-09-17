@@ -8,6 +8,9 @@ import {
   resolveOrMintForInsert,
 } from './bufferResolve.js';
 import { markBufferDirty, noteNoiseInsert } from './retention.js';
+import { networkCasemapping } from './buffers.js';
+import { foldTargetWith } from './casemapping.js';
+import type { Casemapping } from './casemapping.js';
 import { EARLY_PRUNE_TYPES } from '../../shared/eventFilter.js';
 import { countsTowardPage } from '../../shared/eventFilter.js';
 import type { PageUnit } from '../../shared/eventFilter.js';
@@ -586,13 +589,31 @@ export interface HistoryEvents {
   me: string | null;
 }
 
+// `expr` folded in SQL as foldTargetWith folds under `mapping`. SQLite's lower()
+// is ASCII-only, so rfc7613 and an undeclared mapping fold as ascii here, and
+// the nick compared against is folded to match (foldForSql).
+function sqlFold(expr: string, mapping: Casemapping | null): string {
+  let out = `lower(${expr})`;
+  if (mapping === 'rfc1459' || mapping === 'rfc1459-strict') {
+    out = `replace(replace(replace(${out}, '[', '{'), ']', '}'), '\\', '|')`;
+    if (mapping === 'rfc1459') out = `replace(${out}, '^', '~')`;
+  }
+  return out;
+}
+
+function foldForSql(nick: string, mapping: Casemapping | null): string {
+  const sqlMapping = mapping === 'rfc1459' || mapping === 'rfc1459-strict' ? mapping : 'ascii';
+  return foldTargetWith(sqlMapping, nick);
+}
+
 // The rows a window holds: messages, and for a draft/event-playback client the
 // event rows too, every one counting toward the limit as soju's do. Filtered
 // here rather than at playback, because a batch shorter than its limit reads as
 // the start of history to halloy and gamja.
 //
 // Events naming our current nick stay out: a JOIN, PART, QUIT or NICK from it,
-// or a KICK of it. goguma applies every replayed line to its live state
+// or a KICK of it, compared under the network's CASEMAPPING as clients compare
+// (goguma's isMyNick), so `foo{bar}` is `foo[bar]` on rfc1459. goguma applies every replayed line to its live state
 // (client_controller.dart:577-721), and those are the ones it takes as ours: an
 // old PART marks the channel as left, an old NICK renames us. HexDroid rejoins
 // on an old JOIN of ours. An event under a nick we no longer use reads as
@@ -602,6 +623,7 @@ export interface HistoryEvents {
 function historyFilter(
   alias: string,
   events: HistoryEvents | null | undefined,
+  mapping: Casemapping | null,
 ): { sql: string; params: string[] } {
   const messages = chathistoryMsgFilter(alias);
   if (!events) return { sql: messages, params: [] };
@@ -611,9 +633,15 @@ function historyFilter(
   const params: string[] = [];
   if (events.me) {
     // COALESCE, or a row with no nick would compare NULL and drop out too.
-    eventSql += ` AND NOT (${p}type IN ('join', 'part', 'quit', 'nick') AND COALESCE(${p}nick, '') = ? COLLATE NOCASE)`;
-    eventSql += ` AND NOT (${p}type = 'kick' AND COALESCE(CASE WHEN json_valid(${p}extra) THEN json_extract(${p}extra, '$.kicked') END, '') = ? COLLATE NOCASE)`;
-    params.push(events.me, events.me);
+    const nick = sqlFold(`COALESCE(${p}nick, '')`, mapping);
+    const kicked = sqlFold(
+      `COALESCE(CASE WHEN json_valid(${p}extra) THEN json_extract(${p}extra, '$.kicked') END, '')`,
+      mapping,
+    );
+    eventSql += ` AND NOT (${p}type IN ('join', 'part', 'quit', 'nick') AND ${nick} = ?)`;
+    eventSql += ` AND NOT (${p}type = 'kick' AND ${kicked} = ?)`;
+    const me = foldForSql(events.me, mapping);
+    params.push(me, me);
   }
   return { sql: `((${messages}) OR (${eventSql}))`, params };
 }
@@ -643,7 +671,7 @@ export function loadHistoryWindow(
 ): MessageEvent[] {
   const bufferId = resolveBufferIdByNetwork(networkId, target);
   if (bufferId === undefined) return [];
-  const filter = historyFilter('', forEvents);
+  const filter = historyFilter('', forEvents, forEvents?.me ? networkCasemapping(networkId) : null);
   const conds = ['buffer_id = ?', filter.sql];
   const params: (string | number)[] = [bufferId, ...filter.params];
   if (lower !== null) {
@@ -702,7 +730,7 @@ export function listActiveTargetsInWindow(
   { events }: { events?: HistoryEvents | null } = {},
 ): BufferSummary[] {
   const [lo, hi] = isoA <= isoB ? [isoA, isoB] : [isoB, isoA];
-  const filter = historyFilter('m', events);
+  const filter = historyFilter('m', events, events?.me ? networkCasemapping(networkId) : null);
   // Grouped by buffer_id and named from the registry row, so the summary
   // carries the canonical casing rather than whichever casing the window's
   // rows happened to arrive under. Sentinels are excluded by kind — the
