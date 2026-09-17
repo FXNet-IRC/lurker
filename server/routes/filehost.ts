@@ -199,7 +199,8 @@ async function receiveUpload(req: Request, res: Response): Promise<void> {
 }
 
 async function handleUpload(req: Request, res: Response): Promise<void> {
-  // Failed logins count toward the same per-IP budget as the web sign-in.
+  // Failed logins count toward the same per-IP budget as the web sign-in. A
+  // request with no Authorization at all isn't one: it tried no password.
   const key = clientIp(req);
   const retry = key === null ? null : loginFailureThrottle.retryAfter(key);
   if (retry !== null) {
@@ -210,7 +211,7 @@ async function handleUpload(req: Request, res: Response): Promise<void> {
 
   const user = filehostUser(req.headers.authorization);
   if (!user) {
-    if (key !== null) loginFailureThrottle.recordFailure(key);
+    if (key !== null && req.headers.authorization) loginFailureThrottle.recordFailure(key);
     res.set('WWW-Authenticate', 'Basic realm="Lurker", charset="UTF-8"');
     refuse(req, res, 401, 'invalid or missing credentials');
     return;

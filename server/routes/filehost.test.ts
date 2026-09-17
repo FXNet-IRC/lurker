@@ -50,6 +50,7 @@ beforeAll(async () => {
   storageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lurker-filehost-'));
   process.env.LOCAL_UPLOADS_DIR = storageDir;
   process.env.PUBLIC_BASE_URL = BASE;
+  process.env.LURKER_BOUNCER_ENABLED = 'true';
   clientDist = fs.mkdtempSync(path.join(os.tmpdir(), 'lurker-filehost-dist-'));
   fs.writeFileSync(path.join(clientDist, 'index.html'), '<!doctype html>\n');
   users = await import('../db/users.js');
@@ -72,6 +73,7 @@ beforeAll(async () => {
 afterAll(() => {
   delete process.env.LOCAL_UPLOADS_DIR;
   delete process.env.PUBLIC_BASE_URL;
+  delete process.env.LURKER_BOUNCER_ENABLED;
   fs.rmSync(storageDir, { recursive: true, force: true });
   fs.rmSync(clientDist, { recursive: true, force: true });
   ctx.cleanup();
@@ -173,6 +175,17 @@ describe('POST', () => {
       expect(res.headers['www-authenticate']).toBe('Basic realm="Lurker", charset="UTF-8"');
       expect(res.headers['content-type']).toMatch(/^text\/plain/);
     }
+  });
+
+  // goguma or a script with no credentials set: it tried no password, so it
+  // doesn't use up the IP's login budget for the client that has one.
+  it("doesn't count a request with no credentials as a failed login", async () => {
+    const user = await seedUser();
+    const { LOGIN_FAILURE_MAX } = await import('../middleware/rateLimit.js');
+    for (let i = 0; i <= LOGIN_FAILURE_MAX; i++) {
+      expect((await upload(null)).status).toBe(401);
+    }
+    expect((await upload(basic(user.username, PASSWORD))).status).toBe(201);
   });
 
   it('ignores a session cookie', async () => {
@@ -321,6 +334,26 @@ describe('POST', () => {
     const user = await seedUser();
     const res = await upload(basic(user.username, PASSWORD), Buffer.alloc(0));
     expect(res.status).toBe(400);
+  });
+});
+
+describe('with the bouncer off', () => {
+  it('is not mounted', async () => {
+    delete process.env.LURKER_BOUNCER_ENABLED;
+    try {
+      const { buildApp } = await import('../app.js');
+      const off = buildApp(TEST_SESSION_SECRET, { clientDist });
+      const user = await seedUser();
+      const res = await testRequest(off)
+        .post('/api/filehost')
+        .set('Authorization', basic(user.username, PASSWORD))
+        .set('Content-Type', 'image/png')
+        .send(png);
+      expect(res.status).toBe(404);
+      expect(res.headers['location']).toBeUndefined();
+    } finally {
+      process.env.LURKER_BOUNCER_ENABLED = 'true';
+    }
   });
 });
 

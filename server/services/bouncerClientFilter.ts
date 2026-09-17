@@ -104,6 +104,29 @@ export function restrictTags(line: string, keep: (key: string) => boolean): stri
   return formatLine(msg);
 }
 
+// A FILEHOST token under any vendor prefix, set or negated: `soju.im/FILEHOST=…`,
+// `FILEHOST`, `-soju.im/FILEHOST`.
+const FILEHOST_TOKEN = /^-?(?:\S*\/)?FILEHOST(?:=|$)/i;
+
+/**
+ * A network's 005 line without any FILEHOST token, or null when that was all it
+ * advertised. A client uploads there with the credentials it gave the bouncer,
+ * so a network's own URL (an upstream soju's, say) would get the Lurker account
+ * password. The tokens are the params between the nick and the last, which is
+ * how clients read them. Any other line comes back unchanged.
+ */
+export function withoutUpstreamFilehost(line: string): string | null {
+  const msg = parseLine(line);
+  if (!msg || msg.command !== '005' || msg.params.length < 3) return line;
+  const last = msg.params.length - 1;
+  const tokens = msg.params.slice(1, last);
+  const kept = tokens.filter((token) => !FILEHOST_TOKEN.test(token));
+  if (kept.length === tokens.length) return line;
+  if (kept.length === 0) return null;
+  msg.params = [msg.params[0], ...kept, msg.params[last]];
+  return formatLine(msg);
+}
+
 /**
  * A NAMES entry with only its highest prefix, for a client without multi-prefix:
  * `@+nick` → `@nick`. `symbols` is the network's PREFIX symbols, highest first.

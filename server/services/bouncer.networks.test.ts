@@ -354,8 +354,12 @@ describe('soju.im/FILEHOST in ISUPPORT', () => {
   const TOKEN = 'soju.im/FILEHOST=https://irc.example.test/api/filehost';
 
   // The 005 lines a client gets up to its 422.
-  async function isupportFor(bound: boolean): Promise<string> {
+  async function isupportFor(
+    bound: boolean,
+    registration?: (nick: string) => string[],
+  ): Promise<string> {
     const acct = harnessMod.seedAccount({ nick: `fh${Math.random().toString(36).slice(2, 7)}` });
+    if (registration) acct.upstream.registrationLines = registration(acct.upstream.currentNick);
     const c = await harness.connect();
     if (bound) {
       c.send(`PASS ${acct.user.username}:${acct.password}`);
@@ -397,6 +401,27 @@ describe('soju.im/FILEHOST in ISUPPORT', () => {
     await withBaseUrl('http://irc.example.test', async () => {
       expect(await isupportFor(true)).not.toContain('FILEHOST');
       expect(await isupportFor(false)).not.toContain('FILEHOST');
+    });
+  });
+
+  // A client uploads to the URL with its Lurker credentials, so a network's own
+  // (an upstream soju's) must not reach it, advertised or not.
+  it("never passes on the network's own FILEHOST", async () => {
+    const registration = (nick: string) => [
+      `:irc.example.net 001 ${nick} :Welcome`,
+      `:irc.example.net 005 ${nick} CHANTYPES=# soju.im/FILEHOST=https://upstream.example/up draft/FILEHOSTING=1 :are supported by this server`,
+      `:irc.example.net 005 ${nick} FILEHOST=https://upstream.example/x :are supported by this server`,
+      `:irc.example.net 005 ${nick} -vendor.example/filehost :are supported by this server`,
+    ];
+    await withBaseUrl(undefined, async () => {
+      expect(await isupportFor(true, registration)).toBe(
+        ':irc.example.net 005 client CHANTYPES=# draft/FILEHOSTING=1 :are supported by this server',
+      );
+    });
+    await withBaseUrl('https://irc.example.test', async () => {
+      const isupport = await isupportFor(true, registration);
+      expect(isupport).toContain(TOKEN);
+      expect(isupport).not.toContain('upstream.example');
     });
   });
 

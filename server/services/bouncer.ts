@@ -99,6 +99,7 @@ import {
   EXTENDED_MONITOR_CAPS,
   parseLine,
   restrictTags,
+  withoutUpstreamFilehost,
 } from './bouncerClientFilter.js';
 import type { MonitorHolder } from './monitorList.js';
 import type { ReplyClient } from './replyRouter.js';
@@ -1414,9 +1415,11 @@ class BouncerSession implements MonitorHolder, ReplyClient {
       // Saved at registration with the upstream's tags, so any per-delivery tag
       // on them (msgid, batch) is stale by now. Like ZNC, the replay keeps at
       // most `time`, and write() drops that too unless the client negotiated
-      // server-time (#892).
+      // server-time (#892). The network's own FILEHOST never goes out: our
+      // clients upload with their Lurker credentials (filehostToken).
       for (const line of conn.registrationLines) {
-        const out = restrictTags(line, (key) => key === 'time');
+        const tagged = restrictTags(line, (key) => key === 'time');
+        const out = tagged && withoutUpstreamFilehost(tagged);
         if (out) this.write(rewriteNumericTarget(out, requested));
       }
     } else {
