@@ -66,6 +66,12 @@ import {
 
 const CHALLENGE_COOKIE = 'lurker_webauthn_challenge';
 
+// The passkey algorithms we offer and accept: Ed25519, ES256 and RS256, which
+// were @simplewebauthn/server 13's defaults. v14 puts ML-DSA-44 (-48) first on
+// any runtime that has it. Node's ML-DSA support is still experimental, and a
+// passkey made with it can't be verified on a Node that lacks it.
+const PASSKEY_ALGORITHM_IDS = [-8, -7, -257];
+
 function challengeCookieOptions(): ReturnType<typeof getCookieOptions> & { maxAge: number } {
   // Short-lived, signed, scoped to the auth flow. Mirrors session cookie
   // security flags so it works under the same dev/prod settings.
@@ -144,6 +150,7 @@ router.post('/setup/options', async (req: Request, res: Response) => {
     userID: new Uint8Array(userIdToHandle(user.id)),
     userDisplayName: user.username,
     attestationType: 'none',
+    supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     authenticatorSelection: {
       residentKey: 'required',
       userVerification: 'preferred',
@@ -184,6 +191,7 @@ router.post('/setup/verify', async (req: Request, res: Response) => {
       expectedOrigin,
       expectedRPID: rpID,
       requireUserVerification: false,
+      supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     });
   } catch (err) {
     const e = err as { message?: string };
@@ -293,6 +301,7 @@ router.post('/invite/:token/options', async (req: Request<{ token: string }>, re
     userID: new Uint8Array(userIdToHandle(user.id)),
     userDisplayName: user.username,
     attestationType: 'none',
+    supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     authenticatorSelection: {
       residentKey: 'required',
       userVerification: 'preferred',
@@ -334,6 +343,7 @@ router.post('/invite/:token/verify', async (req: Request<{ token: string }>, res
       expectedOrigin,
       expectedRPID: rpID,
       requireUserVerification: false,
+      supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     });
   } catch (err) {
     deleteUser(entryUserId);
@@ -557,6 +567,7 @@ router.post('/recovery/:token/options', async (req: Request<{ token: string }>, 
     userID: new Uint8Array(userIdToHandle(user.id)),
     userDisplayName: user.username,
     attestationType: 'none',
+    supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     authenticatorSelection: {
       residentKey: 'required',
       userVerification: 'preferred',
@@ -598,6 +609,7 @@ router.post('/recovery/:token/verify', async (req: Request<{ token: string }>, r
       expectedOrigin,
       expectedRPID: rpID,
       requireUserVerification: false,
+      supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     });
   } catch (err) {
     const e = err as { message?: string };
@@ -877,6 +889,7 @@ router.post('/passkeys/options', requireAuth, async (req: Request, res: Response
     userID: new Uint8Array(userIdToHandle(req.user!.id)),
     userDisplayName: req.user!.username,
     attestationType: 'none',
+    supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     authenticatorSelection: {
       residentKey: 'required',
       userVerification: 'preferred',
@@ -912,6 +925,7 @@ router.post('/passkeys/verify', requireAuth, async (req: Request, res: Response)
       expectedOrigin,
       expectedRPID: rpID,
       requireUserVerification: false,
+      supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     });
   } catch (err) {
     const e = err as { message?: string };
