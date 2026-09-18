@@ -723,6 +723,11 @@ export class IrcConnection {
   // client's relay reads it, and cleared with replyOwner. Null for any other
   // line and outside a line's handlers.
   ctcpAnswerer: CtcpAnswerer | null;
+  // The command of the server line being handled, for a handler whose event
+  // doesn't say which line raised it. Set in the raw listener and cleared with
+  // replyOwner; null outside a line's handlers. A batch's lines run when the
+  // batch ends, so their handlers read the closing BATCH line's.
+  lineCommand: string | null;
   // The raw listener's decisions for CTCP requests inside a batch, in arrival
   // order per batch reference. irc-framework runs a batch's lines only when it
   // ends, after ctcpAnswerer is cleared, so each request's handler takes its
@@ -980,6 +985,7 @@ export class IrcConnection {
     });
     this.replyOwner = null;
     this.ctcpAnswerer = null;
+    this.lineCommand = null;
     this.batchedCtcpAnswerers = new Map();
     this.multilineBatches = new Map();
     this.multilineBatchTags = new Map();
@@ -1269,6 +1275,7 @@ export class IrcConnection {
         this.lineArrivedAt = null;
         this.replyOwner = null;
         this.ctcpAnswerer = null;
+        this.lineCommand = null;
       });
       // A ban-classified ERROR is only believed if it's the link's LAST line
       // (#651). Every server line passes through here, and for the ban line
@@ -1285,6 +1292,7 @@ export class IrcConnection {
         return;
       }
       const rawCommand = (msg?.command || '').toString();
+      this.lineCommand = rawCommand;
       // Who this line is for, before anything reads it (see replyOwner).
       this.replyOwner = this.replies.noteServerLine(
         event.line.replace(/[\r\n]+$/, ''),
@@ -1846,6 +1854,12 @@ export class IrcConnection {
     // connects. The regain handler doesn't react to online events, so
     // there's no conflict to filter.
     on('users online', (event: Record<string, unknown>) => {
+      // irc-framework raises this for an ISON reply (303) as well as MONITOR's
+      // 730, with the same payload. ISON is a poll (/ison, or a bouncer client's
+      // notify list on a network without MONITOR) and nothing on such a network
+      // ever marks the peer offline again, so a tracked DM peer would read
+      // online long after they'd gone (#933). Presence is MONITOR's alone.
+      if (this.lineCommand === '303') return;
       const nicks: string[] = Array.isArray(event?.nicks) ? (event.nicks as string[]) : [];
       this.monitor.noteStatus(
         nicks.filter((n) => typeof n === 'string'),
