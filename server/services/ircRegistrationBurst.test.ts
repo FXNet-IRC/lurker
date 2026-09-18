@@ -46,11 +46,15 @@ describe('the saved registration burst', () => {
     conn.connect();
     try {
       await until(() => conn.state === 'connected', 5000, 'connected');
-      const registered = conn.registrationLines.length;
 
+      // ⚠ 'connected' is 001: the rest of the registration burst is still on
+      // its way, so counting the lines here races it (CI caught that on PR
+      // #956). One connection delivers in order, so once OUR line has landed
+      // every line before it has too — that is the moment to count from.
       const repeated = isupport('AWAYLEN=200 CHANNELLEN=64');
       ircd.sendRaw('burst', repeated);
-      await until(() => conn.registrationLines.length === registered + 1, 5000, 'the 005');
+      await until(() => conn.registrationLines.includes(repeated), 5000, 'the 005');
+      const registered = conn.registrationLines.length - 1;
       // What solanum does after each VERSION, and a tag on the copy doesn't
       // make it a different line.
       ircd.sendRaw('burst', repeated);

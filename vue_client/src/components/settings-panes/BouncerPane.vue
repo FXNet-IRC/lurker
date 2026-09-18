@@ -18,19 +18,19 @@
     <table v-if="info" class="connect">
       <tbody>
         <tr>
-          <td class="label">Server</td>
+          <th scope="row">Server</th>
           <td>
             <code>{{ host }}</code>
           </td>
         </tr>
         <tr>
-          <td class="label">Port</td>
+          <th scope="row">Port</th>
           <td>
             <code>{{ port }}</code>
           </td>
         </tr>
         <tr>
-          <td class="label">TLS</td>
+          <th scope="row">TLS</th>
           <td>{{ tls ? 'Yes' : 'No' }}</td>
         </tr>
       </tbody>
@@ -121,10 +121,13 @@ code {
   margin: var(--space-6) 0;
   border-collapse: collapse;
 }
+.connect th,
 .connect td {
   padding: var(--space-1) var(--space-6) var(--space-1) 0;
+  text-align: left;
+  font-weight: normal;
 }
-.connect .label {
+.connect th {
   color: var(--fg-muted);
 }
 .fingerprint {

@@ -51,12 +51,13 @@ async function mountWith(info: Info | Error, networks: string[] = ['libera']) {
   return wrapper;
 }
 
-// The connection table as { label: value }.
+// The connection table as { label: value }. Each label is its row's header, so
+// a screen reader reads "Server: irc.example.com" and not two loose cells.
 function table(w: Awaited<ReturnType<typeof mountWith>>): Record<string, string> {
   const rows: Record<string, string> = {};
   for (const tr of w.findAll('.connect tr')) {
-    const cells = tr.findAll('td');
-    rows[cells[0].text()] = cells[1].text();
+    const header = tr.get('th[scope="row"]');
+    rows[header.text()] = tr.get('td').text();
   }
   return rows;
 }
