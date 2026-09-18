@@ -23,9 +23,15 @@ import { EventEmitter, once } from 'node:events';
 import { generate as generateSelfSigned } from 'selfsigned';
 import { ircLineParser } from 'irc-framework';
 import { CHANNEL_PREFIX_CHARS, isChannelTarget } from '../../shared/channels.js';
+import { stripFormatting } from '../../shared/textMatch.js';
 
 export interface FakeIrcdOptions {
   tls?: boolean;
+  // Strip mIRC formatting codes from PRIVMSG/NOTICE text before relaying it,
+  // the way a channel in UnrealIRCd's +S or InspIRCd's stripcolor does. The
+  // sender's own echo comes back stripped too, which is what breaks a
+  // byte-exact echo match (#612).
+  stripFormatting?: boolean;
   // Advertise these in CAP LS (and ACK them when requested).
   caps?: string[];
   // false → 422 instead of a MOTD.
@@ -436,7 +442,8 @@ export class FakeIrcd extends EventEmitter {
       case 'PRIVMSG':
       case 'NOTICE': {
         const target = p[0] ?? '';
-        const text = p[1] ?? '';
+        const raw = p[1] ?? '';
+        const text = this.opts.stripFormatting ? stripFormatting(raw) : raw;
         const msgid = `m${++this.msgidCounter}`;
         const out = `:${this.hostmask(c)} ${cmd} ${target} :${text}`;
         if (isChannelTarget(target)) {

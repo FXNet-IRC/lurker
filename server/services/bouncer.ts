@@ -95,6 +95,7 @@ import {
   keyMatchesCert,
 } from '../utils/bouncerCert.js';
 import { isChannelTarget } from '../../shared/channels.js';
+import { stripFormatting } from './textMatch.js';
 import {
   bouncerBindHost,
   bouncerPort,
@@ -2881,8 +2882,14 @@ class BouncerSession implements MonitorHolder, ReplyClient {
   }
 }
 
+// The text goes in without its formatting codes (#612): a channel in a
+// strip-formatting mode (UnrealIRCd +S, InspIRCd stripcolor) echoes a message
+// back with the codes gone, and a byte-exact key misses — which hands the
+// sender its own line a second time. Two of our own sends that differ only in
+// formatting then share a key, which is harmless: either echo consumes either
+// entry, and both are this session's.
 function echoKey(type: string, target: string, text: string): string {
-  return `${type}\u0000${target.toLowerCase()}\u0000${text}`;
+  return `${type}\u0000${target.toLowerCase()}\u0000${stripFormatting(text)}`;
 }
 
 // ---------------------------------------------------------------------------
