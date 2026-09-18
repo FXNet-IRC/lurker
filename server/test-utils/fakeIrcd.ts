@@ -27,10 +27,10 @@ import { stripFormatting } from '../../shared/textMatch.js';
 
 export interface FakeIrcdOptions {
   tls?: boolean;
-  // Strip mIRC formatting codes from PRIVMSG/NOTICE text before relaying it,
-  // the way a channel in UnrealIRCd's +S or InspIRCd's stripcolor does. The
-  // sender's own echo comes back stripped too, which is what breaks a
-  // byte-exact echo match (#612).
+  // Strip mIRC formatting codes from every PRIVMSG/NOTICE relayed, whoever sent
+  // it — a client's own, and a peer's through say() — the way a channel in
+  // UnrealIRCd's +S or InspIRCd's stripcolor does. The sender's own echo comes
+  // back stripped too, which is what breaks a byte-exact echo match (#612).
   stripFormatting?: boolean;
   // Advertise these in CAP LS (and ACK them when requested).
   caps?: string[];
@@ -251,7 +251,8 @@ export class FakeIrcd extends EventEmitter {
   // Deliver a line from a synthetic peer to a nick or a channel.
   say(from: string, target: string, text: string): string {
     const msgid = `m${++this.msgidCounter}`;
-    const line = `:${from}!~${from}@peer.fake PRIVMSG ${target} :${text}`;
+    const body = this.opts.stripFormatting ? stripFormatting(text) : text;
+    const line = `:${from}!~${from}@peer.fake PRIVMSG ${target} :${body}`;
     if (isChannelTarget(target)) {
       for (const c of this.members(target)) this.tagged(c, line, msgid);
     } else {

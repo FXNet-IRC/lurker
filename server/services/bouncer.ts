@@ -2885,9 +2885,16 @@ class BouncerSession implements MonitorHolder, ReplyClient {
 // The text goes in without its formatting codes (#612): a channel in a
 // strip-formatting mode (UnrealIRCd +S, InspIRCd stripcolor) echoes a message
 // back with the codes gone, and a byte-exact key misses — which hands the
-// sender its own line a second time. Two of our own sends that differ only in
-// formatting then share a key, which is harmless: either echo consumes either
-// entry, and both are this session's.
+// sender its own line a second time.
+//
+// ⚠ Two texts that differ only in formatting now share a key. For this session's
+// own sends that costs nothing: either echo consumes either entry. What it
+// widens is the existing hazard of a key nothing ever consumes — a send the
+// network refused (+m, a ban) leaves one behind, and the next message with the
+// same words from ANY surface (the web app, iOS, another client) is what
+// consumes it, so this session doesn't see that one. Before, only a byte-exact
+// repeat could do that; now a repeat that differs in formatting can too. The
+// 30s window is the bound on it, which is the reason not to lengthen it.
 function echoKey(type: string, target: string, text: string): string {
   return `${type}\u0000${target.toLowerCase()}\u0000${stripFormatting(text)}`;
 }

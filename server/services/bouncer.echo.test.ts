@@ -144,6 +144,15 @@ async function linesAfter(c: Client, mark: number, channel: string): Promise<str
   return c.lines.slice(mark).filter((l) => !l.includes(sentinel));
 }
 
+function msgidOf(line: string): string | undefined {
+  if (!line.startsWith('@')) return undefined;
+  return line
+    .slice(1, line.indexOf(' '))
+    .split(';')
+    .find((t) => t.startsWith('msgid='))
+    ?.slice('msgid='.length);
+}
+
 const BOLD = String.fromCharCode(2);
 const COLOR = String.fromCharCode(3);
 
@@ -204,9 +213,40 @@ describe('a client that did not ask for echo-message', () => {
     expect(after.filter((l) => l.includes('snap'))).toHaveLength(1);
     expect(after.find((l) => l.includes('snap'))).toContain(':bob!');
   });
+
+  // The consequence of a key that goes unconsumed: the next message with the
+  // same words — from anywhere — is what consumes it, and this client doesn't
+  // see that one. With the key byte-exact, the formatted send left its key
+  // behind and the web app's plain copy is what it swallowed, so the client
+  // showed its own line and missed the one it should have had.
+  it('still gets the same words from the web app after saying them with formatting', async () => {
+    const live = await seedLive();
+    const c = await attachIn(live, '#room');
+
+    const mark = c.lines.length;
+    c.send(`PRIVMSG #room :${BOLD}deploy now${BOLD}`);
+    await published(live, 'deploy now');
+    ircManager.send(live.userId, live.networkId, '#room', 'deploy now');
+    await until(
+      () => live.events.filter((e) => e.type === 'message' && e.text === 'deploy now').length === 2,
+      5000,
+      'both copies',
+    );
+    const fromTheWeb = live.events.filter(
+      (e) => e.type === 'message' && e.text === 'deploy now',
+    )[1];
+
+    const after = (await linesAfter(c, mark, '#room')).filter((l) => l.includes('deploy now'));
+    expect(after).toHaveLength(1);
+    // The web app's copy, not this client's own line come back.
+    expect(msgidOf(after[0])).toBe(fromTheWeb.msgid);
+  });
 });
 
 describe('a client that asked for echo-message', () => {
+  // Not a #612 guard — a missed key delivers this client's line too, since it
+  // asked for it. This is the double-delivery guard: the synthesised echo and
+  // the network's reflected copy must not both arrive.
   it('gets its own formatted message back exactly once', async () => {
     const live = await seedLive();
     const c = await attachIn(live, '#room', `${BASE_CAPS} echo-message`);
