@@ -11,73 +11,57 @@
   <section id="bouncer" class="settings-pane">
     <h2>bouncer</h2>
     <p class="section-desc">
-      Your networks stay connected here, so any IRC client can attach to them — same nick, same
-      channels, recent history replayed, and anything you send lands in Lurker too. Detaching never
-      disconnects you from IRC.
+      Lurker has an IRC bouncer built in that you can connect to with any IRC client instead of
+      using the Lurker clients.
     </p>
 
-    <dl class="connect">
-      <dt>server</dt>
-      <dd v-if="info">
-        <code>{{ host }}</code>
-        <span class="muted small"> port </span>
-        <code>{{ port }}</code>
-        <span class="muted small">{{ tls ? ' — connect in your client’s TLS/SSL mode' : '' }}</span>
-      </dd>
-      <dd v-else class="muted">
-        couldn’t be read just now — reload the page
-        <span class="small">(the login below is the same either way)</span>
-      </dd>
-      <dt>username</dt>
-      <dd>
-        <code>{{ username }}</code>
-        <span class="muted small"> for every network at once</span>
-      </dd>
-      <dt v-if="networkNames.length > 0">one network</dt>
-      <dd v-if="networkNames.length > 0">
-        <code>{{ username }}/{{ networkNames[0] }}</code>
-        <span v-if="networkNames.length > 1" class="muted small">
-          — or {{ networkNames.slice(1).join(', ') }}
-        </span>
-      </dd>
-      <dt>password</dt>
-      <dd>
-        your Lurker password, or a
-        <RouterLink :to="{ path: '/settings/api-tokens', query: { scope: 'read-write' } }"
-          >read-write API token</RouterLink
-        >
-      </dd>
-    </dl>
-
-    <p v-if="certificate?.selfSigned" class="muted small">
-      Lurker made its own certificate for this, so your client will ask whether to trust it the
-      first time. Its SHA-256 fingerprint is <code>{{ certificate.fingerprint }}</code
-      >.
+    <table v-if="info" class="connect">
+      <tbody>
+        <tr>
+          <td class="label">Server</td>
+          <td>
+            <code>{{ host }}</code>
+          </td>
+        </tr>
+        <tr>
+          <td class="label">Port</td>
+          <td>
+            <code>{{ port }}</code>
+          </td>
+        </tr>
+        <tr>
+          <td class="label">TLS</td>
+          <td>{{ tls ? 'Yes' : 'No' }}</td>
+        </tr>
+      </tbody>
+    </table>
+    <p v-else class="muted small">
+      The server and port couldn’t be read just now — reload the page.
     </p>
 
+    <h3 class="subhead">signing in</h3>
     <p class="muted small">
-      Some clients have a single “server password” box rather than separate fields. Put
-      <code>{{ username }}:your-password</code> in it. A password with a <code>:</code> in it can’t
-      be sent that way, so use a token.
+      Clients that support <code>soju.im/bouncer-networks</code> — Goguma, gamja, Halloy, SeraphIRC
+      and more — take every network at once: sign in as <code>{{ username }}</code> with your
+      password, and pick the network in the client.
     </p>
-
-    <p v-if="info && !pinned" class="muted small">
-      That’s this instance’s own hostname and listener. If your bouncer answers somewhere else — a
-      separate hostname, or TLS terminated in front of it — whoever runs this server can say so with
-      <code>LURKER_BOUNCER_PUBLIC_URL</code>.
-    </p>
-
     <p class="muted small">
-      A read-write API token is the better password here: IRC clients keep the server password in a
-      plaintext config file, and a token can be revoked on its own. Revoking it disconnects the
-      clients using it. A read-only token is refused.
+      Any other client attaches to one network at a time: sign in as
+      <code>{{ username }}/{{ exampleNetwork }}</code
+      >, with the network’s name as it appears in
+      <RouterLink to="/settings/networks">Networks</RouterLink>.
+    </p>
+    <p class="muted small">
+      For the password, a
+      <RouterLink :to="{ path: '/settings/api-tokens', query: { scope: 'read-write' } }"
+        >read-write API token</RouterLink
+      >
+      beats your account password: IRC clients store it in plain text, and a token can be revoked on
+      its own.
     </p>
 
-    <p class="muted small">
-      Clients that speak <code>soju.im/bouncer-networks</code> (Goguma, gamja, Halloy) list your
-      networks and pick one themselves, so plain <code>{{ username }}</code> is all they need.
-      Anything else (WeeChat, irssi, HexChat) lands on an idle connection that names the networks it
-      can attach to.
+    <p v-if="certificate?.selfSigned" class="muted small fingerprint">
+      Self-signed certificate, SHA-256 <code>{{ certificate.fingerprint }}</code>
     </p>
   </section>
 </template>
@@ -93,55 +77,58 @@ const auth = useAuthStore();
 const networks = useNetworksStore();
 
 // What the server says to connect to. `host` is null when the operator hasn't
-// pinned an address: the bouncer can't sit behind the HTTP reverse proxy (it
-// terminates its own TLS), so the web origin isn't reliably its address —
-// the hostname this page is on is the better guess, and `pinned` says which
-// of the two the pane is showing.
+// pinned an address (LURKER_BOUNCER_PUBLIC_URL): the bouncer can't sit behind
+// the HTTP reverse proxy — it terminates its own TLS — so the web origin isn't
+// reliably its address, and the host this page is on is the better guess.
 interface BouncerInfo {
   host: string | null;
   port: number;
   tls: boolean;
-  pinned: boolean;
   certificate: { selfSigned: boolean; fingerprint: string } | null;
 }
 const info = ref<BouncerInfo | null>(null);
 onMounted(async () => {
   // The networks are fetched by the chat socket, which a direct load of
   // /settings/bouncer — a bookmark, or a reload while setting a client up —
-  // never opens. Without this the login form for one network is missing, which
-  // reads as "this account has no networks".
+  // never opens.
   if (!networks.loaded) networks.fetchAll().catch(() => {});
   try {
     info.value = await api<BouncerInfo>('/api/bouncer');
   } catch {
-    /* the pane still explains the shape of a login; only the address is unknown */
+    /* the sign-in forms are the same either way; only the address is unknown */
   }
 });
 
-// Only ever read with `info` set (the server row is hidden without it): a
-// guessed port or a guessed "use TLS" is a login that doesn't work, which is
-// worse than saying the details couldn't be read.
+// Only read with `info` set: a guessed port, or a guessed "use TLS", is a
+// sign-in that doesn't work — worse than saying the address couldn't be read.
 const host = computed(() => info.value?.host || window.location.hostname);
 const port = computed(() => info.value?.port);
 const tls = computed(() => info.value?.tls !== false);
-const pinned = computed(() => info.value?.pinned === true);
 const certificate = computed(() => info.value?.certificate ?? null);
 const username = computed(() => auth.user?.username || 'username');
-const networkNames = computed(() => networks.networks.map((n) => n.name));
+// One of the user's own networks, so the form can be copied as it stands.
+const exampleNetwork = computed(() => networks.networks[0]?.name || 'network');
 </script>
 
 <style src="./panes.css"></style>
 <style scoped>
+/* The prose is muted like every other pane; the values a member copies out of
+   it are not, so they stay legible inside it. */
+code {
+  color: var(--fg);
+}
 .connect {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: var(--space-2) var(--space-5);
   margin: var(--space-6) 0;
+  border-collapse: collapse;
 }
-.connect dt {
-  color: var(--muted);
+.connect td {
+  padding: var(--space-1) var(--space-6) var(--space-1) 0;
 }
-.connect dd {
-  margin: 0;
+.connect .label {
+  color: var(--fg-muted);
+}
+.fingerprint {
+  margin-top: var(--space-8);
+  overflow-wrap: anywhere;
 }
 </style>
