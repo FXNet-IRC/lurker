@@ -21,12 +21,12 @@
 // must never write to the DB (systemLog). Operators read it via `docker logs`.
 // Cheap: the histogram samples in native code; the poll is one read per second.
 
-import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { envInt } from '../utils/envInt.js';
 import { parseTruthyEnv } from '../utils/truthyEnv.js';
 
 let timer: ReturnType<typeof setInterval> | null = null;
-let histogram: IntervalHistogram | null = null;
+let histogram: ReturnType<typeof monitorEventLoopDelay> | null = null;
 
 // intervalMs: how often we poll the histogram for its window max. warnMs:
 // minimum stall (max delay seen in a window) worth logging — below this is
