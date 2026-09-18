@@ -541,3 +541,29 @@ describe('the attach burst', () => {
     expect(motd(since(fresh, 2))).toHaveLength(1);
   });
 });
+
+describe('a disposed connection', () => {
+  it('relays nothing its socket still delivers, a reply to Lurker included (#936)', async () => {
+    const live = await seedLive();
+    const c = await attach(live);
+    // The network answers Lurker's WHO only after our QUIT: a reply still on
+    // its way when the connection was thrown away (a network edit, a reconnect).
+    let whoHeld = false;
+    ircd.hold = (cmd, p) => {
+      if (cmd === 'WHO' && p[0] === '#late') return (whoHeld = true);
+      if (cmd !== 'QUIT' || !whoHeld) return false;
+      ircd.sendRaw(live.nick, `:fake.test 315 ${live.nick} #late :End of WHO list`);
+      ircd.drop(live.nick);
+      return true;
+    };
+    live.conn.join('#late');
+    await until(() => whoHeld, 5000, "Lurker's WHO");
+    await sentinel(live, [c]);
+    live.conn.dispose();
+    await until(() => live.conn.state === 'disconnected', 5000, 'socket closed');
+    // The bouncer answers a PING itself, after anything it relayed before.
+    c.send('PING :after');
+    await c.waitFor((l) => l.endsWith(':after'));
+    expect(c.lines.filter((l) => commandOf(l) === '315')).toEqual([]);
+  });
+});

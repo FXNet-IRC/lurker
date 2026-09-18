@@ -1191,7 +1191,12 @@ export class IrcConnection {
   // the network's *current* name for the raw log, but `fields.networkId` carries
   // the stable id so the client can resolve the live name at render time — the
   // scope string is frozen at write time and goes stale after a rename (#355).
+  // Silent once disposed, like publish(): the socket's close still runs its
+  // handlers after dispose(), and on a deletion the user row is already gone —
+  // its "Disconnected" line failed the foreign key and took the process down
+  // (#936). A disposal writes its own line (ircManager's "Disposing: …").
   logNet(text: string, level?: string): void {
+    if (this.disposed) return;
     systemLog.log({
       userId: this.network.user_id,
       scope: this.logScope(),
@@ -1224,6 +1229,24 @@ export class IrcConnection {
 
   bind(): void {
     const c = this.client;
+    // Every handler registers through this but the socket's own teardown
+    // ('socket close', 'close'), and none of them runs once the connection is
+    // disposed (#936). A line the server sent before it read our QUIT still
+    // arrives, and plenty of handlers write straight to the DB — a tracked
+    // peer's QUIT writes its presence row. On a deletion the network and user
+    // rows are already gone, so the write fails its foreign key, and thrown
+    // from a socket event that exits the process. The teardown still runs: it
+    // releases what the socket held (the identd entry, the restore slot), and
+    // everything it writes goes through publish() or logNet(), both silent
+    // once disposed.
+    // Not an irc-framework raw middleware: middleware-handler runs the rest of
+    // the dispatch inside its try/catch, so installing one would turn every
+    // handler's exception into a console line instead of the fatal exit.
+    const on = (event: string, listener: (payload: never) => void): void => {
+      c.on(event, (payload: unknown) => {
+        if (!this.disposed) listener(payload as never);
+      });
+    };
 
     // The server buffer is the authentic log of everything the server sends:
     // we default to surfacing every numeric here (welcome banner, lusers, SASL
@@ -1234,7 +1257,7 @@ export class IrcConnection {
     // under the old curated allowlist (#342). Pretty surfaces (nicklist, topic
     // bar, whois modal) are rendered additively by their structured handlers;
     // they never replace the raw line here.
-    c.on('raw', (event: { from_server: boolean; line: string }) => {
+    on('raw', (event: { from_server: boolean; line: string }) => {
       if (!event?.from_server || typeof event.line !== 'string') return;
       // One time for everything this line produces (see lineArrivedAt). This
       // listener is registered before any bouncer client's, and irc-framework
@@ -1439,7 +1462,7 @@ export class IrcConnection {
     // display of unmodeled numerics now happens on the 'raw' handler above
     // (#342) — this handler only intercepts cases that belong on a channel/DM
     // surface instead of (or in addition to) the server buffer.
-    c.on('unknown command', (cmd: { command?: string; params?: string[] }) => {
+    on('unknown command', (cmd: { command?: string; params?: string[] }) => {
       const command = (cmd?.command || '').toString();
       const params = Array.isArray(cmd?.params) ? (cmd.params as string[]) : [];
       // These numerics arrive as [nick, <target>, reason] — usually a channel,
@@ -1490,7 +1513,7 @@ export class IrcConnection {
     // RPL_LOGGEDIN (900): the user identified to services mid-session (NickServ
     // or SASL). That's exactly what +R/+M channels were waiting on, so drop the
     // unsendable set and let the next message re-probe — typing resumes too (#283).
-    c.on('loggedin', () => {
+    on('loggedin', () => {
       // Also the gate stopAutojoining waits on: account-based channel access
       // (+I/+e $a:) only starts matching once the server considers us
       // identified, so a join rejection before this point says nothing durable.
@@ -1506,12 +1529,12 @@ export class IrcConnection {
     // socket does die we must not reconnect-loop into the same rejection (which
     // on a server that requires auth is a fast failed-login hammer). We don't
     // publish here — the server's own error/ERROR line surfaces the cause.
-    c.on('cap nak', (event: Record<string, unknown>) => {
+    on('cap nak', (event: Record<string, unknown>) => {
       const caps = (event?.capabilities as Record<string, unknown> | undefined) || {};
       for (const name of Object.keys(caps)) this.capsRefused.add(name);
     });
 
-    c.on('sasl failed', (event: Record<string, unknown>) => {
+    on('sasl failed', (event: Record<string, unknown>) => {
       const reason = (event?.reason as string | undefined) || undefined;
       if (isTerminalSaslFailure(reason)) {
         // PENDING, not terminal on sight (#617). On a network where SASL is
@@ -1539,7 +1562,7 @@ export class IrcConnection {
       }
     });
 
-    c.on('registered', (event: Record<string, unknown>) => {
+    on('registered', (event: Record<string, unknown>) => {
       this.userModes.clear();
       this.lagMs = null;
       // A full, registered connection is the only signal that the network is
@@ -1745,7 +1768,7 @@ export class IrcConnection {
     // fallback ladder (nick1, nick2, …, nick9) until the server accepts a
     // NICK or we exhaust attempts. Post-registration hits are user-driven
     // /nick attempts — surface a notice and leave the user in control.
-    c.on('nick in use', (event: Record<string, unknown>) => {
+    on('nick in use', (event: Record<string, unknown>) => {
       const requested = (event?.nick as string) || '';
       if (!this.preRegistered) {
         this.publish({
@@ -1786,7 +1809,7 @@ export class IrcConnection {
     // options.MONITOR === '100' (the per-connection watch limit). Without
     // this guard we'd send `MONITOR +` blind and trigger 421 on older
     // ircds, which our 'irc error' path surfaces to the user.
-    c.on('server options', () => {
+    on('server options', () => {
       // 005 lines arrive in multiple bursts; this handler fires once per
       // line as irc-framework accumulates options. The MONITOR token isn't
       // necessarily in the first line, so only act when we transition
@@ -1822,7 +1845,7 @@ export class IrcConnection {
     // state of each newly-added nick) and live when a watched peer
     // connects. The regain handler doesn't react to online events, so
     // there's no conflict to filter.
-    c.on('users online', (event: Record<string, unknown>) => {
+    on('users online', (event: Record<string, unknown>) => {
       const nicks: string[] = Array.isArray(event?.nicks) ? (event.nicks as string[]) : [];
       this.monitor.noteStatus(
         nicks.filter((n) => typeof n === 'string'),
@@ -1846,7 +1869,7 @@ export class IrcConnection {
     //      offline, write the transition. The two consumers never conflict:
     //      the regain target is never one of our own DM peers, and the
     //      tracked-peer gate inside markPeerEvent filters out anything else.
-    c.on('users offline', (event: Record<string, unknown>) => {
+    on('users offline', (event: Record<string, unknown>) => {
       const nicks: string[] = Array.isArray(event?.nicks) ? (event.nicks as string[]) : [];
       this.monitor.noteStatus(
         nicks.filter((n) => typeof n === 'string'),
@@ -1871,7 +1894,7 @@ export class IrcConnection {
       }
     });
 
-    c.on('pong', (event: Record<string, unknown>) => {
+    on('pong', (event: Record<string, unknown>) => {
       const token = event?.message as string | undefined;
       if (!token || token !== this.lagPendingToken) return;
       this.lagMs = Math.max(0, Date.now() - this.lagPendingSentAt);
@@ -1960,7 +1983,7 @@ export class IrcConnection {
     // "Connecting…" in the system buffer would describe a connect that isn't
     // happening; the manager already said "Attaching…" and the engine hook
     // says "Re-attached" when it lands.
-    c.on('connecting', () => {
+    on('connecting', () => {
       // Re-attaching to a connection the engine still holds isn't the network
       // connecting: the same flag, and the same silence for bouncer clients.
       const held = this.engineHoldsUs();
@@ -1983,7 +2006,7 @@ export class IrcConnection {
     // path. logNet is a single lightweight systemLog line (visible in the app's
     // system buffer), and console.warn lands in `docker logs` next to the
     // [event-loop] stall line for correlation.
-    c.on('ping timeout', () => {
+    on('ping timeout', () => {
       const text = `Ping timeout — no data from ${this.network.host} for the timeout window; reconnecting. If every network did this at once, the server event loop stalled (check logs for [event-loop]).`;
       this.logNet(text, 'warn');
       console.warn(`[irc] ping timeout on network ${this.network.id} (${this.network.host})`);
@@ -2005,7 +2028,7 @@ export class IrcConnection {
     // underlying socket here for exactly this purpose (its own comment:
     // "ideal to read socket pairs for identd"); localPort is already populated
     // at TCP-connect time on both plaintext and TLS sockets.
-    c.on(
+    on(
       'raw socket connected',
       (socket?: {
         localAddress?: string;
@@ -2054,7 +2077,7 @@ export class IrcConnection {
     // RPL_UMODEIS arrives when the server sends our current umode (e.g. on
     // login or in response to /MODE <self>). irc-framework normalises it to
     // 'user info' with the raw mode string ('+iwx').
-    c.on('user info', (event: Record<string, unknown>) => {
+    on('user info', (event: Record<string, unknown>) => {
       if (!c.user.nick || (event.nick as string).toLowerCase() !== c.user.nick.toLowerCase())
         return;
       this.userModes = new Set(((event.raw_modes as string) || '').replace(/^[+-]/, '').split(''));
@@ -2076,7 +2099,7 @@ export class IrcConnection {
     // nicklist host there, and renders ONE native line. No client synthesizes
     // the fake QUIT/rejoin — that's a server/bouncer compat shim (znc does it
     // only when relaying to a downstream that didn't negotiate the cap).
-    c.on('user updated', (event: Record<string, unknown>) => {
+    on('user updated', (event: Record<string, unknown>) => {
       if (!event || !event.nick) return;
       if (!event.new_hostname && !event.new_ident) return; // SETNAME — not ours
       const eventNick = event.nick as string;
@@ -2128,7 +2151,7 @@ export class IrcConnection {
     // per identify in every shared channel. chghost earns its line because it
     // regressed against the no-cap baseline (#591); this never showed anything.
     // halloy and gamja both treat ACCOUNT as a pure state update too.
-    c.on('account', (event: Record<string, unknown>) => {
+    on('account', (event: Record<string, unknown>) => {
       if (!event || !event.nick) return;
       const eventNick = event.nick as string;
       const lower = eventNick.toLowerCase();
@@ -2141,7 +2164,7 @@ export class IrcConnection {
       }
     });
 
-    c.on('motd', (event: Record<string, unknown>) => {
+    on('motd', (event: Record<string, unknown>) => {
       // The MOTD, or its absence, ends the registration burst after every 005.
       this.isupportComplete = true;
       // irc-framework also fires 'motd' for ERR_NOMOTD (no MOTD configured)
@@ -2152,7 +2175,7 @@ export class IrcConnection {
       this.publish({ type: 'motd', target: this.serverTarget(), text });
     });
 
-    c.on('message', (event: Record<string, unknown>) => {
+    on('message', (event: Record<string, unknown>) => {
       // Drop server-pushed history replays. Some networks (e.g. Ergo with
       // `relaymsg`/replay enabled, mansionNET) blindly resend recent messages
       // inside a CHATHISTORY (or ZNC playback) BATCH on every reconnect.
@@ -2401,7 +2424,7 @@ export class IrcConnection {
       if (eventNick) this.markPeerEvent(eventNick, 'online');
     });
 
-    c.on('batch end draft/multiline', (info: Record<string, unknown>) => {
+    on('batch end draft/multiline', (info: Record<string, unknown>) => {
       // irc-framework buffers a batch's PRIVMSGs and replays them (each firing
       // the 'message' handler above with event.batch set) before emitting this
       // close event — so accumulateMultiline already holds every fragment. (#381)
@@ -2414,7 +2437,7 @@ export class IrcConnection {
     // `.message` (framing stripped) and the first word in `.type`. We claim only
     // RPEE2E and hand the body to the manager, which returns the bodies to NOTICE
     // straight back to the sender's nick (re-framed) plus an optional user notice.
-    c.on('ctcp response', (event: Record<string, unknown>) => {
+    on('ctcp response', (event: Record<string, unknown>) => {
       // Under echo-message the server reflects our own CTCP-framed NOTICEs
       // (RPE2E handshake replies, standard CTCP answers) back to us — without
       // this guard our own KEYREQ/KEYRSP would re-enter handleHandshakeBody
@@ -2463,7 +2486,7 @@ export class IrcConnection {
 
     // Inbound CTCP request (a peer probed us over PRIVMSG, e.g. VERSION/PING).
     // ACTION never reaches here — irc-framework emits it as an 'action' message.
-    c.on('ctcp request', (event: Record<string, unknown>) => {
+    on('ctcp request', (event: Record<string, unknown>) => {
       if (event.type === CTCP_TAG) {
         // RPE2E rides NOTICE; an RPEE2E PRIVMSG is a misconfigured peer, not a
         // real CTCP query. Log it for interop debugging and don't auto-answer.
@@ -2476,7 +2499,7 @@ export class IrcConnection {
       this.handleInboundCtcpRequest(event);
     });
 
-    c.on('join', (event: Record<string, unknown>) => {
+    on('join', (event: Record<string, unknown>) => {
       const eventChannel = event.channel as string;
       const eventNick = event.nick as string;
       // Case-insensitive, like the part and kick handlers: a server that echoes
@@ -2615,7 +2638,7 @@ export class IrcConnection {
     // corrects that; the stashed join key is discarded since no echo for
     // `from` will ever consume it. The forward itself is still logged to the
     // server buffer verbatim by the 'raw' handler.
-    c.on('channel_redirect', (event: Record<string, unknown>) => {
+    on('channel_redirect', (event: Record<string, unknown>) => {
       const from = event?.from as string | undefined;
       if (!from) return;
       this.takeStashedJoinKey(from);
@@ -2624,7 +2647,7 @@ export class IrcConnection {
       this.evictChannel(from, { forget: true });
     });
 
-    c.on('part', (event: Record<string, unknown>) => {
+    on('part', (event: Record<string, unknown>) => {
       const eventChannel = event.channel as string;
       const eventNick = event.nick as string;
       // Resolve the canonical (joined-case) channel name *before* the self-part
@@ -2669,7 +2692,7 @@ export class IrcConnection {
       }
     });
 
-    c.on('kick', (event: Record<string, unknown>) => {
+    on('kick', (event: Record<string, unknown>) => {
       const eventChannel = event.channel as string;
       const eventNick = event.nick as string;
       const eventKicked = event.kicked as string;
@@ -2705,7 +2728,7 @@ export class IrcConnection {
       }
     });
 
-    c.on('invite', (event: Record<string, unknown>) => {
+    on('invite', (event: Record<string, unknown>) => {
       // irc-framework parses an inbound INVITE as { nick: inviter, invited:
       // target nick, channel }. Three cases land here (#261):
       const inviter = event.nick as string | undefined;
@@ -2743,7 +2766,7 @@ export class IrcConnection {
       this.publish({ type: 'invite', target: channel, nick: inviter, invited, time: event.time });
     });
 
-    c.on('invited', (event: Record<string, unknown>) => {
+    on('invited', (event: Record<string, unknown>) => {
       // RPL_INVITING (341): the server confirms OUR /invite was relayed.
       // irc-framework gives { nick: the invited nick, channel }. Render the same
       // persisted channel line as the op-visibility path, attributed to us — so
@@ -2757,7 +2780,7 @@ export class IrcConnection {
       this.publish({ type: 'invite', target: channel, nick: me, invited, time: event.time });
     });
 
-    c.on('quit', (event: Record<string, unknown>) => {
+    on('quit', (event: Record<string, unknown>) => {
       const eventNick = event.nick as string;
       const lower = eventNick.toLowerCase();
       const userhost = buildUserhost(event);
@@ -2779,7 +2802,7 @@ export class IrcConnection {
       this.markPeerEvent(eventNick, 'offline');
     });
 
-    c.on('nick', (event: Record<string, unknown>) => {
+    on('nick', (event: Record<string, unknown>) => {
       const eventNick = event.nick as string;
       const eventNewNick = event.new_nick as string;
       const oldLower = eventNick.toLowerCase();
@@ -2863,7 +2886,7 @@ export class IrcConnection {
       }
     });
 
-    c.on('topic', (event: Record<string, unknown>) => {
+    on('topic', (event: Record<string, unknown>) => {
       const eventChannel = event.channel as string;
       const eventTopic = event.topic as string | undefined;
       // A topic for a channel we are not in answers a query (/topic #elsewhere,
@@ -2890,7 +2913,7 @@ export class IrcConnection {
       }
     });
 
-    c.on('mode', (event: Record<string, unknown>) => {
+    on('mode', (event: Record<string, unknown>) => {
       const target = event.target as string | undefined;
 
       const eventModes = (event.modes as ModeEntry[] | undefined) || [];
@@ -3007,7 +3030,7 @@ export class IrcConnection {
     // RPL_CHANNELMODEIS (324) and friends. Sent on join by most servers and
     // on demand via `MODE #chan`. Captures the current flag set without
     // requiring us to have observed the +/− history.
-    c.on('channel info', (event: Record<string, unknown>) => {
+    on('channel info', (event: Record<string, unknown>) => {
       const eventChannel = event.channel as string | undefined;
       const eventModes = event.modes as ModeEntry[] | undefined;
       if (!eventChannel || !eventModes) return;
@@ -3029,7 +3052,7 @@ export class IrcConnection {
       }
     });
 
-    c.on('userlist', (event: Record<string, unknown>) => {
+    on('userlist', (event: Record<string, unknown>) => {
       const tHandler = Date.now();
       const eventChannel = event.channel as string;
       const eventUsers = (event.users as Record<string, unknown>[]) || [];
@@ -3111,7 +3134,7 @@ export class IrcConnection {
       }
     });
 
-    c.on('wholist', (event: Record<string, unknown>) => {
+    on('wholist', (event: Record<string, unknown>) => {
       const tHandler = Date.now();
       const eventTarget = event.target as string | undefined;
       const targetKey = eventTarget?.toLowerCase() ?? '';
@@ -3194,12 +3217,12 @@ export class IrcConnection {
     // Per-user away/back. away-notify drives the non-self events; self events
     // come from RPL_NOWAWAY/RPL_UNAWAY in response to our own /AWAY. We honor
     // both so the self nick also dims in the nicklist.
-    c.on('away', (event: Record<string, unknown>) => {
+    on('away', (event: Record<string, unknown>) => {
       if (!event || !event.nick) return;
       this.applyMemberAway(event.nick as string, true);
       this.markPeerEvent(event.nick as string, 'away', (event.message as string | null) || null);
     });
-    c.on('back', (event: Record<string, unknown>) => {
+    on('back', (event: Record<string, unknown>) => {
       if (!event || !event.nick) return;
       this.applyMemberAway(event.nick as string, false);
       this.markPeerEvent(event.nick as string, 'back');
@@ -3224,7 +3247,7 @@ export class IrcConnection {
     // rendered straight off the wire by the default-show 'raw' handler (#281,
     // #342), not the parsed JSON this event carries — so nothing whois-related
     // is published here beyond the modal payload.
-    c.on('whois', (event: Record<string, unknown>) => {
+    on('whois', (event: Record<string, unknown>) => {
       if (!event || !event.nick) return;
       // A bouncer client's /whois is its own, not the profile modal's (#931).
       if (!this.replyForUser()) return;
@@ -3238,7 +3261,7 @@ export class IrcConnection {
     // 6k-row libera.chat list off the wire and out of client memory. Only the
     // user's LIST touches the cache: a bouncer client's used to wipe and
     // rewrite it under the web app (#931).
-    c.on('channel list start', () => {
+    on('channel list start', () => {
       if (!this.replyForUser()) return;
       const nid = this.network.id;
       try {
@@ -3250,7 +3273,7 @@ export class IrcConnection {
       this.publishEphemeral({ type: 'chanlist-start' });
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    c.on('channel list', (channels: any) => {
+    on('channel list', (channels: any) => {
       if (!this.replyForUser()) return;
       const nid = this.network.id;
       try {
@@ -3262,7 +3285,7 @@ export class IrcConnection {
         console.warn(`[chanlist:${nid}] batch failed:`, (e as Error)?.message || e);
       }
     });
-    c.on('channel list end', () => {
+    on('channel list end', () => {
       if (!this.replyForUser()) return;
       const nid = this.network.id;
       let total = 0;
@@ -3279,7 +3302,7 @@ export class IrcConnection {
       this.publishEphemeral({ type: 'chanlist-end', total });
     });
 
-    c.on('irc error', (event: Record<string, unknown>) => {
+    on('irc error', (event: Record<string, unknown>) => {
       // irc-framework maps the IRC ERROR command (sent right before the
       // server drops you) and ERR_* numerics to this event. `error` is a
       // short tag like 'irc' / 'no_such_nick' / 'password_mismatch';
@@ -3510,7 +3533,7 @@ export class IrcConnection {
       });
     });
 
-    c.on('tagmsg', (event: Record<string, unknown>) => {
+    on('tagmsg', (event: Record<string, unknown>) => {
       const me = c.user?.nick;
       const eventNick = event.nick as string | undefined;
       // Case-folded, matching the message handler's self check — under

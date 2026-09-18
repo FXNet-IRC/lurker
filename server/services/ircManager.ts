@@ -510,6 +510,11 @@ class IrcManager extends EventEmitter {
     // is NOT in — a socket the engine registered on its own (no channels), or
     // one whose autojoin list grew while this process was away.
     const rejoin = (onlyMissing: boolean): void => {
+      // Registered directly on the client, outside IrcConnection's gate, so it
+      // checks for itself (#936): a network edit mid-registration disposes the
+      // connection with the 001 already on its way, and the rejoin would log
+      // an "Auto-joining" line for a connection that no longer exists.
+      if (connRef.disposed) return;
       const joined = listAutojoinChannels(networkId)
         .filter((b) => !onlyMissing || !connRef.isChannelJoined(b.target))
         .map((b) => ({ name: b.target, key: b.key }));
