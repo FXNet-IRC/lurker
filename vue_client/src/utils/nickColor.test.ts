@@ -12,6 +12,8 @@ import { getOption } from '../../../shared/settingsRegistry.js';
 
 // IRC formatting control bytes used to build test fixtures.
 const C = '\x03'; // colour
+const HEX = '\x04'; // truecolour
+const REV = '\x16'; // reverse
 const RESET = '\x0f'; // reset all
 const BOLD = '\x02';
 
@@ -107,6 +109,63 @@ describe('splitTextByTokens — spoiler detection', () => {
   it('does not treat differing fg/bg as a spoiler', () => {
     const segs = parse(`${C}01,02x${C}`);
     expect(segs).toEqual([{ text: 'x', fg: 1, bg: 2 }]);
+  });
+});
+
+// \x04RRGGBB[,RRGGBB] names its colour outright, and is kept like a \x03 slot
+// (#558): the same rules for a bare code and a foreground alone.
+describe('splitTextByTokens — truecolour', () => {
+  it('keeps both foreground and background, as lowercase #rrggbb', () => {
+    expect(parse(`${HEX}FF0000,00ff00hi${HEX}`)).toEqual([
+      { text: 'hi', fg: '#ff0000', bg: '#00ff00' },
+    ]);
+  });
+
+  it('leaves the background unchanged when it sets only a foreground', () => {
+    expect(parse(`${C}04,01a${HEX}ff0000b`)).toEqual([
+      { text: 'a', fg: 4, bg: 1 },
+      { text: 'b', fg: '#ff0000', bg: 1 },
+    ]);
+  });
+
+  it('resets both on a bare \\x04', () => {
+    expect(parse(`${HEX}ff0000,00ff00a${HEX}b`)).toEqual([
+      { text: 'a', fg: '#ff0000', bg: '#00ff00' },
+      { text: 'b' },
+    ]);
+  });
+
+  it('leaves a comma that no colour follows in the text', () => {
+    expect(parse(`${HEX}ff0000,zz`)).toEqual([{ text: ',zz', fg: '#ff0000' }]);
+  });
+
+  it('hides an equal pair, like an equal slot pair', () => {
+    expect(parse(`${HEX}112233,112233secret${HEX}`)).toEqual([
+      { text: 'secret', spoiler: true, fg: '#112233' },
+    ]);
+  });
+});
+
+// \x16 is a toggle the renderer applies (#558); the runs only carry it.
+describe('splitTextByTokens — reverse', () => {
+  it('toggles on and off', () => {
+    expect(parse(`a${REV}b${REV}c`)).toEqual([
+      { text: 'a' },
+      { text: 'b', reverse: true },
+      { text: 'c' },
+    ]);
+  });
+
+  it('is cleared by \\x0F', () => {
+    expect(parse(`${REV}a${RESET}b`)).toEqual([{ text: 'a', reverse: true }, { text: 'b' }]);
+  });
+
+  it("keeps the run's own colours for the renderer to swap", () => {
+    expect(parse(`${C}04,01${REV}x`)).toEqual([{ text: 'x', reverse: true, fg: 4, bg: 1 }]);
+  });
+
+  it('leaves an equal pair a spoiler', () => {
+    expect(parse(`${REV}${C}04,04x`)).toEqual([{ text: 'x', spoiler: true, fg: 4 }]);
   });
 });
 
@@ -231,6 +290,52 @@ describe('segmentInlineStyle / segmentHasStyle — background colour', () => {
   it('reports a background-only segment as styled', () => {
     expect(segmentHasStyle({ text: 'x', bg: 8 })).toBe(true);
     expect(segmentHasStyle({ text: 'x' })).toBe(false);
+  });
+});
+
+describe('segmentInlineStyle — truecolour and reverse', () => {
+  it('paints a truecolour pair as sent', () => {
+    expect(segmentInlineStyle({ text: 'x', fg: '#ff0000', bg: '#00ff00' }, null)).toEqual({
+      color: '#ff0000',
+      backgroundColor: '#00ff00',
+      padding: 'var(--mirc-bg-bleed) 0',
+    });
+  });
+
+  it('swaps a full pair', () => {
+    // Slot 4 is red, slot 8 is yellow.
+    expect(segmentInlineStyle({ text: 'x', fg: 4, bg: 8, reverse: true }, null)).toEqual({
+      color: '#ffd866',
+      backgroundColor: '#ff6188',
+      padding: 'var(--mirc-bg-bleed) 0',
+    });
+  });
+
+  // Reverse on plain text is the theme inverted, not nothing: what ASCII art
+  // uses \x16 for when it draws blocks in the reader's own colours.
+  it("swaps an unset side with the theme's own colour", () => {
+    expect(segmentInlineStyle({ text: 'x', reverse: true }, null)).toEqual({
+      color: 'var(--bg)',
+      backgroundColor: 'var(--fg)',
+      padding: 'var(--mirc-bg-bleed) 0',
+    });
+    const fgOnly = segmentInlineStyle({ text: 'x', fg: 4, reverse: true }, null);
+    expect(fgOnly.color).toBe('var(--bg)');
+    expect(fgOnly.backgroundColor).toBe('#ff6188');
+    // An unpaintable slot is as good as unset.
+    const defaultFg = segmentInlineStyle({ text: 'x', fg: 99, bg: 8, reverse: true }, null);
+    expect(defaultFg.color).toBe('#ffd866');
+    expect(defaultFg.backgroundColor).toBe('var(--fg)');
+  });
+
+  it("swaps a nick's colour, which is that text's foreground", () => {
+    const style = segmentInlineStyle({ text: 'bob', color: '#123456', reverse: true }, null);
+    expect(style.color).toBe('var(--bg)');
+    expect(style.backgroundColor).toBe('#123456');
+  });
+
+  it('reports a reversed segment as styled', () => {
+    expect(segmentHasStyle({ text: 'x', reverse: true })).toBe(true);
   });
 });
 

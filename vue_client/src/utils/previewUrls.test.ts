@@ -134,6 +134,13 @@ describe('previewableUrls — what counts as a URL', () => {
     ).toEqual(['https://e.test/fine.png']);
   });
 
+  // A truecolour pair paints like a slot pair (#558), so an equal one hides its link too.
+  it('never resolves a link hidden behind an equal truecolour pair', () => {
+    expect(previewableUrls('\x04112233,112233https://secret.example/leak.png\x04', BOTH)).toEqual(
+      [],
+    );
+  });
+
   it('strips formatting codes out of the URL rather than resolving them', () => {
     // A colour reset immediately after a link put \x03 INSIDE the matched token, so the
     // resolver was handed an address with a control character on the end.
@@ -434,6 +441,11 @@ describe('segmentsWithoutUrls — closing the gap', () => {
       { text: '.', bg: 4 },
     ];
     expect(segmentsWithoutUrls(segs, new Set([A]))).toEqual([{ text: '.', bg: 4 }]);
+    const reversed = [
+      { text: A, url: A },
+      { text: '.', reverse: true },
+    ];
+    expect(segmentsWithoutUrls(reversed, new Set([A]))).toEqual([{ text: '.', reverse: true }]);
   });
 
   it('trims the front too, so a leading link does not leave an indent', () => {
@@ -476,9 +488,10 @@ describe('segmentsWithoutUrls — whitespace that is actually ink', () => {
 
   // ⚠ /code-review high: the guard excluded `bg` and stopped there, while its own comment claimed
   // to cover "whitespace a reader can see". An underline or a strike paints a rule across spaces
-  // just as a background paints a block.
-  it('keeps an UNDERLINED or STRUCK run of spaces', () => {
-    for (const attr of [{ underline: true }, { strike: true }]) {
+  // just as a background paints a block. Reverse (#558) paints one even with no background set:
+  // the unset side is the theme's foreground.
+  it('keeps an UNDERLINED, STRUCK or REVERSED run of spaces', () => {
+    for (const attr of [{ underline: true }, { strike: true }, { reverse: true }]) {
       const segs = [
         { text: '   ', ...attr },
         { text: A, url: A },
@@ -489,7 +502,7 @@ describe('segmentsWithoutUrls — whitespace that is actually ink', () => {
 
   it('still trims ordinary whitespace that merely carries a colour', () => {
     // ⚠ The complement, so the guard cannot be "widened" into never trimming anything. A
-    // FOREGROUND colour paints nothing on a space — only bg/underline/strike do.
+    // FOREGROUND colour paints nothing on a space — only bg/underline/strike/reverse do.
     const segs = [
       { text: 'hi ', fg: 4 },
       { text: A, url: A },

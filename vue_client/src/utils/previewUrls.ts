@@ -5,6 +5,7 @@ import { createUrlRegex } from '../../../shared/urlPattern.js';
 import { mediaKindForUrl } from './uploadHostMatch.js';
 import {
   isBracketedUrl,
+  hidesText,
   parseIrcFormatting,
   trimTrailingPunctuation,
   type RenderSegment,
@@ -84,15 +85,15 @@ export function previewableUrls(
   let cardCount = 0;
 
   for (const run of parseIrcFormatting(text)) {
-    // Same test the renderer uses for the IRC spoiler convention: a run whose foreground and
-    // background are the same *renderable* colour is invisible text.
+    // The renderer's own test for the IRC spoiler convention (hidesText): a run whose
+    // foreground and background are the same *renderable* colour is invisible text.
     //
-    // ⚠ The `<= 15` half has to match splitTextByTokens exactly. Slots above 15 paint nothing,
-    // so such a run isn't hidden and its links are ordinary links — and since applySpoilerMarkup
-    // now closes a spoiler with `\x0399,99` when a digit follows, the tail of those messages is
-    // a 99,99 run. Without this, a URL anywhere after such a spoiler would silently lose its
-    // preview, which is a hard failure to trace back to a colour code.
-    if (run.fg != null && run.bg != null && run.fg === run.bg && run.fg <= 15) continue;
+    // ⚠ It has to be the renderer's test exactly. Slots above 15 paint nothing, so such a run
+    // isn't hidden and its links are ordinary links — and since applySpoilerMarkup now closes a
+    // spoiler with `\x0399,99` when a digit follows, the tail of those messages is a 99,99 run.
+    // A stricter test here would silently lose the preview of any URL after such a spoiler,
+    // which is a hard failure to trace back to a colour code.
+    if (hidesText(run.fg, run.bg)) continue;
 
     for (const match of run.text.matchAll(createUrlRegex())) {
       const raw = match[0];
@@ -193,7 +194,7 @@ function urlSpans(text: string): { visible: string; spans: UrlSpan[] } {
   for (const run of parseIrcFormatting(text)) {
     const base = visible.length;
     visible += run.text;
-    if (run.fg != null && run.bg != null && run.fg === run.bg && run.fg <= 15) continue;
+    if (hidesText(run.fg, run.bg)) continue;
     for (const match of run.text.matchAll(createUrlRegex())) {
       const raw = match[0];
       if (!/^https?:\/\//i.test(raw)) continue;
@@ -271,16 +272,23 @@ export function hideableUrls(
  * Whitespace in this segment is dead space rather than ink, so trimming it changes nothing a
  * reader can see.
  *
- * ⚠⚠ Three attributes make whitespace VISIBLE, not one. A mIRC background run paints its spaces,
+ * ⚠⚠ Four attributes make whitespace VISIBLE, not one. A mIRC background run paints its spaces,
  * so a colour block beside a hidden link is a drawing and collapsing it deletes part of the
  * message — that was the case this guard was written for. `underline` and `strike` do the same
  * thing with a rule instead of a fill: `look \x1f   \x1f https://x.png` draws a short line, and
  * trimming it takes the line away. Same class, and the first version was two conditions short of
- * the rule its own comment stated.
+ * the rule its own comment stated. Reverse (#558) paints a block with no `bg` at all: the side the
+ * run leaves unset is the theme's foreground.
  */
 function isTrimmableText(seg: RenderSegment): boolean {
   return (
-    !seg.url && !seg.channel && !seg.spoiler && seg.bg == null && !seg.underline && !seg.strike
+    !seg.url &&
+    !seg.channel &&
+    !seg.spoiler &&
+    seg.bg == null &&
+    !seg.reverse &&
+    !seg.underline &&
+    !seg.strike
   );
 }
 

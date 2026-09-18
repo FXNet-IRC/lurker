@@ -26,7 +26,7 @@
 import { ref, computed } from 'vue';
 import type { CSSProperties } from 'vue';
 import type { RenderSegment } from '../utils/nickColor.js';
-import { mircColor } from '../utils/nickColor.js';
+import { ircColor } from '../utils/nickColor.js';
 import { useMircPalette } from '../composables/useNickColors.js';
 
 // Renders an IRC spoiler run (fg===bg, i.e. text deliberately coloured to be
@@ -55,9 +55,10 @@ function reveal(e: Event): void {
   revealed.value = true;
 }
 
-// Resolve the sender's chosen mIRC colour to a CSS value. Null only when there
-// is no colour at all to honour — an absent fg, i.e. an older snapshot from
-// before the field existed — and then we fall back to the neutral gray box.
+// Resolve the sender's chosen colour (a mIRC slot or a truecolour hex) to a CSS
+// value. Null only when there is no colour at all to honour — an absent fg,
+// i.e. an older snapshot from before the field existed — and then we fall back
+// to the neutral gray box.
 //
 // Slot 1 used to be excluded here, on the reasoning that `\x0301,01` is the
 // canonical spoiler convention and therefore means "hide this" rather than
@@ -79,7 +80,7 @@ function reveal(e: Event): void {
 const color = computed(() => {
   const fg = props.seg.fg;
   if (fg == null) return null;
-  return mircColor(fg, mircPalette.value);
+  return ircColor(fg, mircPalette.value);
 });
 
 const wrapperStyle = computed<CSSProperties>(() => {
