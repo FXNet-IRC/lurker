@@ -39,12 +39,15 @@ const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
 let db: typeof import('./index.js').default;
 let users: typeof import('./users.js');
+let warnings = '';
 
 beforeAll(async () => {
   // Must not throw. That IS the assertion — an import-time throw here is a
   // crash-looping server in production.
   db = (await import('./index.js')).default;
   users = await import('./users.js');
+  // Read the import's warnings now: vitest clears mock calls before each test.
+  warnings = warn.mock.calls.map((c) => String(c[0])).join('\n');
 });
 
 afterAll(() => {
@@ -54,8 +57,7 @@ afterAll(() => {
 
 describe('a legacy DB with case-twin usernames', () => {
   it('boots instead of crash-looping, and says why in a warning', () => {
-    const messages = warn.mock.calls.map((c) => String(c[0])).join('\n');
-    expect(messages).toMatch(/case-insensitive username index not created/);
+    expect(warnings).toMatch(/case-insensitive username index not created/);
   });
 
   it('skips the index rather than dropping a row', () => {
