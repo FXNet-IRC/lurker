@@ -50,7 +50,6 @@ async function read() {
     host: string | null;
     port: number;
     tls: boolean;
-    pinned: boolean;
     certificate: { selfSigned: boolean; fingerprint: string } | null;
   };
 }
@@ -62,18 +61,12 @@ describe('GET /api/bouncer', () => {
 
   it("falls back to the listener's own port and TLS, with no hostname to give", async () => {
     process.env.LURKER_BOUNCER_PORT = '6668';
-    expect(await read()).toEqual({
-      host: null,
-      port: 6668,
-      tls: true,
-      pinned: false,
-      certificate: null,
-    });
+    expect(await read()).toEqual({ host: null, port: 6668, tls: true, certificate: null });
   });
 
   it('reports TLS off when Lurker does not terminate it', async () => {
     process.env.LURKER_BOUNCER_TLS = 'off';
-    expect(await read()).toMatchObject({ tls: false, pinned: false });
+    expect(await read()).toMatchObject({ tls: false });
   });
 
   it('prefers the address the operator pinned, TLS and all', async () => {
@@ -85,7 +78,6 @@ describe('GET /api/bouncer', () => {
       host: 'irc.example.com',
       port: 6697,
       tls: true,
-      pinned: true,
       certificate: null,
     });
   });
@@ -97,7 +89,6 @@ describe('GET /api/bouncer', () => {
       host: 'irc.example.com',
       port: 6668,
       tls: false,
-      pinned: true,
       certificate: null,
     });
   });

@@ -32,9 +32,6 @@ router.get('/', (_req: Request, res: Response) => {
     // Whether a client should connect in TLS mode — what the operator pinned,
     // else whether Lurker itself terminates TLS.
     tls: pinned?.tls ?? bouncerTerminatesTls(),
-    // Whether that's a statement about this deployment or a guess from Lurker's
-    // own listener, which the pane says out loud.
-    pinned: pinned !== null,
     // A self-signed certificate is the default, and a client refuses it until
     // the member accepts or pins it — so the pane warns, with the fingerprint to
     // check against. Null when the operator pinned an address (whatever answers
