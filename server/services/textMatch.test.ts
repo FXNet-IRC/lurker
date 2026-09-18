@@ -85,6 +85,19 @@ describe('stripFormatting / cleanForMatch', () => {
     );
   });
 
+  // The renderer's \x04 rules (#558): a background after the foreground, and a
+  // bare \x04 is a reset. Both were left in, so a highlight right after a hex
+  // background had digits glued to its front and missed.
+  it('removes a truecolour background and a bare \\x04, as the renderer does', () => {
+    expect(stripFormatting('\x04ff0000,00ff00brad\x04 hi')).toBe('brad hi');
+    expect(stripFormatting('a\x04b')).toBe('ab');
+    // A comma no colour follows is text, in the renderer too.
+    expect(stripFormatting('\x04ff0000,zz')).toBe(',zz');
+    expect(buildTextTest('brad', 'plain', false)!(cleanForMatch('\x04ff0000,00ff00brad'))).toBe(
+      true,
+    );
+  });
+
   it('lets whole-word matching see through formatting (the colored-QUACK bug)', () => {
     // Color code leaves a digit glued to the word, which broke the boundary.
     const test = buildTextTest('QUACK!', 'plain', false)!;
