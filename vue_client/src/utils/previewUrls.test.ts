@@ -134,6 +134,13 @@ describe('previewableUrls — what counts as a URL', () => {
     ).toEqual(['https://e.test/fine.png']);
   });
 
+  // A truecolour pair paints like a slot pair (#558), so an equal one hides its link too.
+  it('never resolves a link hidden behind an equal truecolour pair', () => {
+    expect(previewableUrls('\x04112233,112233https://secret.example/leak.png\x04', BOTH)).toEqual(
+      [],
+    );
+  });
+
   it('strips formatting codes out of the URL rather than resolving them', () => {
     // A colour reset immediately after a link put \x03 INSIDE the matched token, so the
     // resolver was handed an address with a control character on the end.

@@ -302,9 +302,10 @@ function colorNicksInText(
 // Fallback for the 16 mIRC colour slots, used when no caller-supplied palette
 // covers a given index. The chromatic slots match nick.colors defaults so a
 // renderer without a settings store (tests, MOTD pre-paint) still produces
-// theme-friendly colours. Indices 16-98 (extended) and the \x04 hex variant
-// aren't widely used and clash badly with custom themes, so we don't render
-// those — we just consume the escape so the digits don't leak into the output.
+// theme-friendly colours. Indices 16-98 (extended) aren't widely used, so we
+// don't render those — we just consume the escape so the digits don't leak into
+// the output. The \x04 truecolour variant names its colour outright and is
+// rendered as sent (see IrcColor).
 //
 // ⚠ EVERY slot is a literal, and none may become a theme reference again.
 //
@@ -343,8 +344,8 @@ export const MIRC_PALETTE_FALLBACK: readonly string[] = [
 
 // Look up a mIRC colour slot in a caller-supplied palette, falling back to
 // MIRC_PALETTE_FALLBACK when the palette is missing the entry or empty. Out-
-// of-range indices (16-98, plus the hex \x04 variant) return null so the
-// renderer can drop them without leaking digits into the output.
+// of-range indices (16-98) return null so the renderer can drop them without
+// leaking digits into the output.
 export function mircColor(
   index: number,
   palette: readonly string[] | null | undefined,
@@ -355,37 +356,70 @@ export function mircColor(
   return MIRC_PALETTE_FALLBACK[index] ?? null;
 }
 
+// A colour a formatting code named: a mIRC slot from \x03, or a '#rrggbb' from
+// \x04 truecolour (#558). A truecolour value is literal, like every slot.
+export type IrcColor = number | string;
+
+// The CSS colour for an IrcColor, or null for a slot the palette can't paint.
+export function ircColor(
+  color: IrcColor,
+  palette: readonly string[] | null | undefined,
+): string | null {
+  return typeof color === 'string' ? color : mircColor(color, palette);
+}
+
+// Whether a run's text is invisible: foreground and background the same
+// colour, which is the IRC spoiler convention (and how ASCII art fills a
+// block). The renderer draws it as a click-to-reveal box, and link previews
+// skip its URLs, so both ask here.
+// ⚠ The colour has to be one we can paint. The palette has sixteen slots, so
+// anything above resolves to null (see mircColor) and paints no box —
+// `\x0399,99text\x03` satisfied fg === bg while drawing nothing, so text
+// rendered in the clear became a neutral grey spoiler nobody could usefully
+// reveal. 99 is mIRC's "default", a common way to write a run, and it is also
+// what applySpoilerMarkup emits to close a spoiler before a digit: without this
+// check that close would turn the whole rest of the line into a spoiler box.
+export function hidesText(fg: IrcColor | null, bg: IrcColor | null): boolean {
+  if (fg == null || fg !== bg) return false;
+  return typeof fg === 'string' || fg <= 15;
+}
+
 export interface IrcRun {
   text: string;
   bold: boolean;
   italic: boolean;
   underline: boolean;
   strike: boolean;
-  fg: number | null;
-  bg: number | null;
+  // \x16: the renderer swaps fg and bg (#558). Kept as a flag rather than
+  // applied here, because an unset side swaps with the theme's own colour,
+  // which only the renderer knows.
+  reverse: boolean;
+  fg: IrcColor | null;
+  bg: IrcColor | null;
 }
 
 // Walk the IRC formatting state machine and emit runs of text, each tagged
 // with the formatting attrs in effect when that text was emitted. Codes:
 //   \x02 bold, \x1D italic, \x1F underline, \x1E strike  — toggles
-//   \x16 reverse                                         — consumed (no-op)
+//   \x16 reverse                                         — toggle
 //   \x11 monospace                                       — consumed (no-op,
 //                                                          we're already mono)
 //   \x0F                                                 — reset all
 //   \x03[FG[,BG]] mIRC colour                            — FG and BG kept
-//   \x04[hex6[,hex6]] truecolour                         — consumed, dropped
+//   \x04[hex6[,hex6]] truecolour                         — FG and BG kept
 export function parseIrcFormatting(text: string): IrcRun[] {
   const runs: IrcRun[] = [];
   let bold = false,
     italic = false,
     underline = false,
-    strike = false;
-  let fg: number | null = null;
-  let bg: number | null = null;
+    strike = false,
+    reverse = false;
+  let fg: IrcColor | null = null;
+  let bg: IrcColor | null = null;
   let buf = '';
   const flush = (): void => {
     if (!buf) return;
-    runs.push({ text: buf, bold, italic, underline, strike, fg, bg });
+    runs.push({ text: buf, bold, italic, underline, strike, reverse, fg, bg });
     buf = '';
   };
   let i = 0;
@@ -415,14 +449,20 @@ export function parseIrcFormatting(text: string): IrcRun[] {
       i++;
       continue;
     }
-    if (code === 0x11 || code === 0x16) {
+    if (code === 0x16) {
+      flush();
+      reverse = !reverse;
+      i++;
+      continue;
+    }
+    if (code === 0x11) {
       flush();
       i++;
       continue;
     }
     if (code === 0x0f) {
       flush();
-      bold = italic = underline = strike = false;
+      bold = italic = underline = strike = reverse = false;
       fg = null;
       bg = null;
       i++;
@@ -460,12 +500,18 @@ export function parseIrcFormatting(text: string): IrcRun[] {
       i++;
       const hex = /^[0-9A-Fa-f]{6}/.exec(text.slice(i));
       if (hex) {
+        fg = `#${hex[0].toLowerCase()}`;
         i += 6;
-        if (text[i] === ',' && /^[0-9A-Fa-f]{6}/.test(text.slice(i + 1))) {
+        const bgHex = text[i] === ',' ? /^[0-9A-Fa-f]{6}/.exec(text.slice(i + 1)) : null;
+        if (bgHex) {
+          bg = `#${bgHex[0].toLowerCase()}`;
           i += 7;
         }
+        // As with \x03, a foreground alone keeps the background in effect.
       } else {
+        // A bare \x04 closes the colour run, like a bare \x03.
         fg = null;
+        bg = null;
       }
       continue;
     }
@@ -494,8 +540,9 @@ export interface RenderSegment {
   italic?: boolean;
   underline?: boolean;
   strike?: boolean;
-  fg?: number | null;
-  bg?: number | null;
+  reverse?: boolean;
+  fg?: IrcColor | null;
+  bg?: IrcColor | null;
   // A run whose fg and bg are the same colour: invisible text the renderer
   // shows as a click-to-reveal spoiler. Carries no fg/bg — SpoilerText draws
   // its own box — but keeps any bold/italic/underline/strike for the reveal.
@@ -519,24 +566,24 @@ export function segmentInlineStyle(
   mircPalette: readonly string[] | null = null,
 ): TextSegmentStyle {
   const style: TextSegmentStyle = {};
-  const fg = seg.fg != null ? mircColor(seg.fg, mircPalette) : null;
-  if (fg) {
-    style.color = fg;
-  } else if (seg.color) {
-    style.color = seg.color;
-  } else if (seg.self && selfColor) {
-    style.color = selfColor;
-  }
-  if (seg.bg != null) {
-    const bg = mircColor(seg.bg, mircPalette);
-    if (bg) {
-      style.backgroundColor = bg;
-      // Bleed the fill into the line's leading so stacked coloured rows form a
-      // solid field rather than a striped one — see --mirc-bg-bleed. Only when
-      // there IS a background: on a foreground-only run this would paint
-      // nothing and merely widen the hit area.
-      style.padding = 'var(--mirc-bg-bleed) 0';
-    }
+  const fg =
+    (seg.fg != null ? ircColor(seg.fg, mircPalette) : null) ||
+    seg.color ||
+    (seg.self ? selfColor : null);
+  const bg = seg.bg != null ? ircColor(seg.bg, mircPalette) : null;
+  // Reverse (\x16) swaps the pair. A side the run leaves unset is the theme's
+  // own, so reversed plain text reads as the theme inverted rather than as
+  // nothing (#558).
+  const color = seg.reverse ? (bg ?? 'var(--bg)') : fg;
+  const background = seg.reverse ? (fg ?? 'var(--fg)') : bg;
+  if (color) style.color = color;
+  if (background) {
+    style.backgroundColor = background;
+    // Bleed the fill into the line's leading so stacked coloured rows form a
+    // solid field rather than a striped one — see --mirc-bg-bleed. Only when
+    // there IS a background: on a foreground-only run this would paint
+    // nothing and merely widen the hit area.
+    style.padding = 'var(--mirc-bg-bleed) 0';
   }
   if (seg.bold) style.fontWeight = 'bold';
   if (seg.italic) style.fontStyle = 'italic';
@@ -553,6 +600,7 @@ export function segmentHasStyle(seg: RenderSegment): boolean {
     seg.self ||
     seg.fg != null ||
     seg.bg != null ||
+    seg.reverse ||
     seg.bold ||
     seg.italic ||
     seg.underline ||
@@ -631,7 +679,7 @@ function splitRunIntoSegments(
 //   { url, text, ...fmt }               — clickable link (with formatting)
 //   { channel, text, ...fmt }           — clickable IRC channel name
 //   { text, color?, self?, ...fmt }     — nick / plain text / emoji glyph
-// where fmt is { bold?, italic?, underline?, strike?, fg?, bg? }.
+// where fmt is { bold?, italic?, underline?, strike?, reverse?, fg?, bg? }.
 export function splitTextByTokens(
   text: string | null | undefined,
   nickSet: Set<string> | null | undefined,
@@ -650,21 +698,17 @@ export function splitTextByTokens(
     if (run.underline) fmt.underline = true;
     if (run.strike) fmt.strike = true;
     // A run whose foreground and background are the same colour is invisible
-    // text — the IRC spoiler convention. Emit it as one opaque segment and
-    // skip URL / nick splitting: a linked URL or a coloured nick rendered
-    // inside the run would stay visible and leak the hidden content. Keep the
-    // chosen colour on the segment so SpoilerText can paint the box in the
-    // sender's colour rather than a generic gray.
-    // ⚠ `<= 15`, not just fg === bg. The palette has sixteen slots, so anything above resolves
-    // to null (see mircColor) and paints no box — `\x0399,99text\x03` satisfied fg === bg while
-    // drawing nothing, so text rendered in the clear became a neutral grey spoiler nobody could
-    // usefully reveal. 99 is mIRC's "default", a common way to write a run, and it is also what
-    // applySpoilerMarkup now emits to close a spoiler before a digit: without this check that
-    // close would turn the whole rest of the line into a spoiler box.
-    if (run.fg != null && run.bg != null && run.fg === run.bg && run.fg <= 15) {
+    // text — the IRC spoiler convention (see hidesText). Emit it as one opaque
+    // segment and skip URL / nick splitting: a linked URL or a coloured nick
+    // rendered inside the run would stay visible and leak the hidden content.
+    // Keep the chosen colour on the segment so SpoilerText can paint the box in
+    // the sender's colour rather than a generic gray. Reverse changes nothing
+    // about an equal pair, so it isn't carried.
+    if (hidesText(run.fg, run.bg)) {
       out.push({ text: run.text, spoiler: true, fg: run.fg, ...fmt });
       continue;
     }
+    if (run.reverse) fmt.reverse = true;
     if (run.fg != null) fmt.fg = run.fg;
     if (run.bg != null) fmt.bg = run.bg;
     for (const seg of splitRunIntoSegments(run.text, nickSet, selfLower, colorFn, emojiFn)) {
