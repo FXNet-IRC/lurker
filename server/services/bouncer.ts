@@ -1536,6 +1536,11 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // stream don't interleave out of order.
     this.onRawUpstream = (event) => {
       if (this.closed || !event?.from_server || typeof event.line !== 'string') return;
+      // A disposed connection (a network edit, a reconnect) acts on nothing its
+      // socket still delivers (#936), so its raw listener doesn't route the
+      // line either: owner and answerer below would read null and let a reply
+      // to Lurker through. This session is dead with it (see liveConn()).
+      if (conn.disposed) return;
       // An engine re-attach replays the session into the connection: the
       // registration burst, LUSERS, MOTD and a JOIN for every channel. What of it
       // reaches this client is decided below. The backlog after the replay is
@@ -1607,7 +1612,7 @@ class BouncerSession implements MonitorHolder, ReplyClient {
     // The network's caps can change under a live connection: its own CAP
     // NEW/DEL, or a REQ Lurker sends after registration (#888).
     this.onUpstreamCaps = () => {
-      if (!this.closed) this.updateSupportedCaps(this.currentNick() || '*');
+      if (!this.closed && !conn.disposed) this.updateSupportedCaps(this.currentNick() || '*');
     };
     conn.client.on('cap ack', this.onUpstreamCaps);
     conn.client.on('cap del', this.onUpstreamCaps);
