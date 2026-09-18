@@ -116,6 +116,12 @@
 
     <template v-else-if="allowUserDefined && addableDrivers.length">
       <h3 class="subhead">add your own uploader</h3>
+      <!-- #919: the server's catbox row has no edit, and nothing said where a
+           userhash goes instead. -->
+      <p class="muted small">
+        To upload to your own account (a catbox userhash, a Zipline token), add it here. The
+        server’s uploaders can’t be edited.
+      </p>
       <template v-if="addingDriver">
         <label class="driver-pick">
           <span>Type</span>
