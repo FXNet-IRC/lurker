@@ -16,6 +16,8 @@ import '../test-utils/isolateDb.js';
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { createUser, deleteUser } from '../db/users.js';
 import { createNetwork } from '../db/networks.js';
+import { ensureExists, setAutojoin } from '../db/buffers.js';
+import * as systemLog from './systemLog.js';
 import { FakeIrcd } from '../test-utils/fakeIrcd.js';
 import { until } from '../test-utils/until.js';
 
@@ -86,5 +88,47 @@ describe('a user deleted with a live connection', () => {
     deleteUser(user.id);
     await socketClosed(conn);
     expect(uncaught).toEqual([]);
+  });
+});
+
+describe('a connection disposed while it registers', () => {
+  it('rejoins nothing when the welcome arrives after the dispose', async () => {
+    // A network edit mid-registration: the network's 001 was already on its
+    // way when our QUIT went out. The rows are still there to rejoin from.
+    const nick = 'midreg';
+    const user = createUser(`disposed-${seq++}`);
+    const network = createNetwork(user.id, {
+      name: `disposed-${seq++}`,
+      host: '127.0.0.1',
+      port: ircd.port,
+      tls: false,
+      nick,
+      autoconnect: false,
+    })!;
+    ensureExists(user.id, network.id, '#kept', { kind: 'channel' });
+    setAutojoin(user.id, network.id, '#kept', true);
+    const logged: string[] = [];
+    const onLine = (line: unknown) => {
+      const l = line as systemLog.LogLine;
+      if (l.userId === user.id) logged.push(l.text);
+    };
+    systemLog.on('line', onLine);
+    let userSent = false;
+    ircd.hold = (cmd) => {
+      if (cmd === 'USER') return (userSent = true);
+      if (cmd !== 'QUIT' || !userSent) return false;
+      ircd.sendRaw(nick, `:fake.test 001 ${nick} :Welcome`);
+      ircd.drop(nick);
+      return true;
+    };
+    try {
+      const conn = ircManager.startNetwork(user.id, network.id)!;
+      await until(() => userSent, 5000, 'USER sent');
+      ircManager.disposeNetwork(user.id, network.id, 'reconnecting');
+      await socketClosed(conn);
+      expect(logged.filter((t) => t.startsWith('Auto-joining'))).toEqual([]);
+    } finally {
+      systemLog.off('line', onLine);
+    }
   });
 });
