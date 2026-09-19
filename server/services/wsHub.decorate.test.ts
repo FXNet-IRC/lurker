@@ -168,3 +168,71 @@ describe('decorateMessage notify fold', () => {
     expect(d.notify).toBe(false);
   });
 });
+
+// #965: the bell says "every message in this channel", not "every frame about
+// it". decorateMessage sees EVERY event a connection publishes — the nicklist
+// republish, the typing notice, the mode sync, ephemeral and persisted alike —
+// so without a type gate the notify-always flag turned channel bookkeeping into
+// notifications. The nick-less ones are how it surfaced: push composes them as
+// "someone in #channel" with an empty body, and the web client toasts on the
+// same flag.
+describe('decorateMessage notify-always is conversation-only (#965)', () => {
+  const chan = (overrides: Partial<MessageEvent> = {}) =>
+    ev({ target: '#lurker', nick: 'carol', userhost: 'carol!c@h', ...overrides });
+
+  beforeEach(() => {
+    setChannelNotifyAlways(userId, networkId, '#lurker', true);
+  });
+
+  it.each(['message', 'action', 'notice'])('notifies on a %s', (type) => {
+    const d = decorateMessage(userId, chan({ type }));
+    expect(d.notifyAlways).toBe(true);
+    expect(d.notify).toBe(true);
+  });
+
+  // The nick-less control events. The gate is an allow-list, so a type added to
+  // ircConnection later is excluded automatically and nothing forces it into
+  // this list — these are named individually because each is a real publish site
+  // that reached push, not because the enumeration is load-bearing.
+  it.each([
+    'names',
+    'member-update',
+    'channel-joined',
+    'channel-parted',
+    'channel-modes',
+    'channel-topic',
+    'join-error',
+    'typing',
+    'error',
+    'e2e',
+    'ctcp',
+  ])('does not notify on a %s', (type) => {
+    const d = decorateMessage(userId, chan({ type, nick: null, text: null }));
+    expect(d.notifyAlways).toBe(false);
+    expect(d.notify).toBe(false);
+  });
+
+  // The other half, and the louder one: persisted lifecycle rows DO carry a
+  // nick, so under the old gate every person entering or leaving a belled
+  // channel fired a real notification ("bob in #lurker", empty body). A kick or
+  // a topic change goes quiet too — deliberate, and the reason the rule is
+  // "conversation" rather than "has a sender".
+  it.each(['join', 'part', 'quit', 'nick', 'mode', 'topic', 'kick', 'invite'])(
+    'does not notify on a %s even though it has a sender',
+    (type) => {
+      const d = decorateMessage(userId, chan({ type, text: 'whatever' }));
+      expect(d.nick).toBe('carol');
+      expect(d.notifyAlways).toBe(false);
+      expect(d.notify).toBe(false);
+    },
+  );
+
+  it('leaves a DM and a highlight alone', () => {
+    // Both paths are already type-limited upstream (DM_ELIGIBLE_TYPES,
+    // matchEvent's eligible types), so the gate must be a no-op for them.
+    // With the bell OFF, so the highlight is carrying the notify on its own.
+    setChannelNotifyAlways(userId, networkId, '#lurker', false);
+    expect(decorateMessage(userId, ev()).notify).toBe(true);
+    expect(decorateMessage(userId, chan({ matched: true, matchedRuleId: 3 })).notify).toBe(true);
+  });
+});

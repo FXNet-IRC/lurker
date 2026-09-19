@@ -272,6 +272,60 @@ describe('maybePush gate chain', () => {
     }
   });
 
+  // #965. Every event a connection publishes reaches maybePush — `names`,
+  // `typing`, `member-update`, `channel-modes`, ephemeral or not — and the
+  // notify-always bell used to notify on all of them. The nick-less ones
+  // composed as "someone in #channel" with an empty body, which is how this
+  // was found: a `names` republish (away-notify flipping a member's away flag
+  // calls publishNames) pushed every time someone in the channel went away.
+  it.each(['names', 'typing', 'member-update', 'channel-modes', 'error'])(
+    'does not push a %s event in a notify_always channel',
+    async (type) => {
+      buffers.ensureExists(userId, networkId, '#lurker');
+      setChannelNotifyAlways(userId, networkId, '#lurker', true);
+      try {
+        // nick: undefined is the shape that produced "someone" — these events
+        // carry no sender at all.
+        emitChannel({ type, nick: undefined, text: undefined });
+        expect(await pushed()).toBe(false);
+      } finally {
+        setChannelNotifyAlways(userId, networkId, '#lurker', false);
+      }
+    },
+  );
+
+  // The louder half of #965: a lifecycle row HAS a sender, so under the old gate
+  // every person entering or leaving a belled channel fired a real push.
+  it.each(['join', 'part', 'quit', 'mode'])(
+    'does not push a %s in a notify_always channel',
+    async (type) => {
+      buffers.ensureExists(userId, networkId, '#lurker');
+      setChannelNotifyAlways(userId, networkId, '#lurker', true);
+      try {
+        emitChannel({ type });
+        expect(await pushed()).toBe(false);
+      } finally {
+        setChannelNotifyAlways(userId, networkId, '#lurker', false);
+      }
+    },
+  );
+
+  it('still pushes a NOTICE in a notify_always channel', async () => {
+    // The other half of #965: the gate is COUNTABLE_TYPES, not "message and
+    // action". A notice is conversation — it counts toward unread, and a bot
+    // answering in a channel you asked to hear everything from is exactly what
+    // the bell is for. If this flips, the fix was cut too deep.
+    buffers.ensureExists(userId, networkId, '#lurker');
+    setChannelNotifyAlways(userId, networkId, '#lurker', true);
+    try {
+      emitChannel({ type: 'notice' });
+      expect(await pushed()).toBe(true);
+      expect((await payload()).kind).toBe('always_notify');
+    } finally {
+      setChannelNotifyAlways(userId, networkId, '#lurker', false);
+    }
+  });
+
   it('does not push when a client is visible', async () => {
     const close = await connectWithPresence(true);
     try {
