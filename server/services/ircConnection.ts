@@ -2727,11 +2727,16 @@ export class IrcConnection {
       // nick we hold THEN, not the one we were wearing when it happened.
       // ⚠ Not `self`, which means "we sent this line": the kicker is someone
       // else. This says the kicked party is us (#968).
-      const selfKicked = !!(
-        eventKicked &&
-        c.user.nick &&
-        eventKicked.toLowerCase() === c.user.nick.toLowerCase()
-      );
+      //
+      // isSelfNick reads `this.currentNick` — the server-tracked nick — where
+      // this used to read `c.user.nick`. The framework lags: it fires the 'all'
+      // proxy that routes events to us BEFORE its own listener updates
+      // user.nick, which is why RPL_WELCOME and snapshot() already route around
+      // it (#362). A nick fallback at registration is the case that bites — the
+      // server lands you on `me_`, c.user.nick still says `me`, and a kick of
+      // `me_` reads as someone else's: no notification, and the buffer stays
+      // styled as joined with its autojoin intact.
+      const selfKicked = this.isSelfNick(eventKicked);
       this.publish({
         type: 'kick',
         target: channel,

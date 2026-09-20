@@ -3471,9 +3471,17 @@ describe('self-kick stamping (#968)', () => {
     });
   }
 
-  function kickEvents(kicked: string): Array<Record<string, unknown>> {
+  // `nick` is our server-tracked nick; `frameworkNick` is irc-framework's
+  // lagging copy, which defaults to the same thing and is only set apart in the
+  // fallback test below.
+  function kickEvents(
+    kicked: string,
+    nick = 'me',
+    frameworkNick = nick,
+  ): Array<Record<string, unknown>> {
     const conn = makeConn();
-    conn.client.user.nick = 'me';
+    conn.currentNick = nick;
+    conn.client.user.nick = frameworkNick;
     const publish = vi.fn<(event: unknown) => void>();
     conn.publish = publish;
     conn.client.emit('kick', {
@@ -3509,6 +3517,23 @@ describe('self-kick stamping (#968)', () => {
     // Absent, not false: the field only exists when it means something, so an
     // ordinary kick's wire shape is unchanged.
     expect(kick).not.toHaveProperty('selfKicked');
+  });
+
+  it("reads the server-tracked nick, not the framework's lagging copy", () => {
+    // The nick-fallback shape (#362): the server registered us as `me_` because
+    // the primary was taken, so currentNick says `me_` while c.user.nick still
+    // says `me`. irc-framework fires the 'all' proxy that routes events to us
+    // BEFORE its own listener updates user.nick, which is why RPL_WELCOME and
+    // snapshot() route around it too. Reading the stale copy here would drop
+    // the notification AND leave the channel styled as joined.
+    const events = kickEvents('me_', 'me_', 'me');
+    expect(events.find((e) => e.type === 'kick')?.selfKicked).toBe(true);
+    expect(events.some((e) => e.type === 'channel-parted')).toBe(true);
+    // ...and the stale nick is not itself a match: a kick of `me` once we are
+    // `me_` is a kick of whoever took the name, not of us.
+    const other = kickEvents('me', 'me_', 'me');
+    expect(other.find((e) => e.type === 'kick')).not.toHaveProperty('selfKicked');
+    expect(other.some((e) => e.type === 'channel-parted')).toBe(false);
   });
 
   it('still parts the buffer on a self-kick', () => {
