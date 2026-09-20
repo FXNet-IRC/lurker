@@ -3431,6 +3431,94 @@ describe('inbound INVITE handler (#261)', () => {
   });
 });
 
+// A kick of US is a notification signal (#968), and only the connection can say
+// so: it is the one place that holds both the kicked nick and the nick we are
+// currently wearing. Everything downstream — the notify fold, the push kind, the
+// toast — reads the flag stamped here, so if it stops being set, the whole
+// feature goes quiet with nothing else failing.
+describe('self-kick stamping (#968)', () => {
+  function makeConn(): IrcConnection {
+    return new IrcConnection({
+      network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
+        id: 1,
+        user_id: 1,
+        name: 'n',
+        host: 'irc.example.test',
+        port: 6697,
+        tls: 1,
+        trusted_certificates: 1,
+        nick: 'me',
+        username: null,
+        realname: null,
+        server_password: null,
+        autoconnect: 1,
+        sasl_account: null,
+        sasl_password: null,
+        connect_commands: null,
+        position: 0,
+        casemapping: null,
+        created_at: new Date().toISOString(),
+      },
+      onEvent: () => {},
+    });
+  }
+
+  function kickEvents(kicked: string): Array<Record<string, unknown>> {
+    const conn = makeConn();
+    conn.client.user.nick = 'me';
+    const publish = vi.fn<(event: unknown) => void>();
+    conn.publish = publish;
+    conn.client.emit('kick', {
+      channel: '#lurker',
+      nick: 'op',
+      kicked,
+      message: 'read the topic',
+    });
+    return publish.mock.calls.map((c) => c[0] as Record<string, unknown>);
+  }
+
+  it('stamps selfKicked on a kick of us, with the kicker and reason intact', () => {
+    const kick = kickEvents('me').find((e) => e.type === 'kick');
+    expect(kick).toMatchObject({
+      type: 'kick',
+      target: '#lurker',
+      // The KICKER — what the notification names. `kicked` is us.
+      nick: 'op',
+      kicked: 'me',
+      text: 'read the topic',
+      selfKicked: true,
+    });
+  });
+
+  it('matches our nick case-insensitively, as IRC does', () => {
+    const kick = kickEvents('ME').find((e) => e.type === 'kick');
+    expect(kick?.selfKicked).toBe(true);
+  });
+
+  it('leaves the flag off a kick of someone else', () => {
+    const kick = kickEvents('bob').find((e) => e.type === 'kick');
+    expect(kick).toMatchObject({ type: 'kick', kicked: 'bob' });
+    // Absent, not false: the field only exists when it means something, so an
+    // ordinary kick's wire shape is unchanged.
+    expect(kick).not.toHaveProperty('selfKicked');
+  });
+
+  it('still parts the buffer on a self-kick', () => {
+    // The flag is derived from the same comparison that drives the part, so a
+    // refactor that breaks one should be caught breaking the other.
+    expect(kickEvents('me').some((e) => e.type === 'channel-parted')).toBe(true);
+    expect(kickEvents('bob').some((e) => e.type === 'channel-parted')).toBe(false);
+  });
+});
+
 // Outbound /invite confirmation (RPL_INVITING 341 -> 'invited') and op-visibility
 // invite-notify lines (#261). Both render a persisted "X invited Y" channel line
 // via publish(); the self-echo is deduped against the 341 line.

@@ -236,3 +236,74 @@ describe('decorateMessage notify-always is conversation-only (#965)', () => {
     expect(decorateMessage(userId, chan({ matched: true, matchedRuleId: 3 })).notify).toBe(true);
   });
 });
+
+// #968. The one event ABOUT you that isn't conversation, so it rides beside the
+// COUNTABLE_TYPES gate rather than inside it. It is its own signal, not a
+// channel one: it fires with the bell off, because the thing people asked not to
+// happen is a channel vanishing from the sidebar with no word.
+describe('decorateMessage kick-of-us signal (#968)', () => {
+  const kick = (overrides: Partial<MessageEvent> = {}) =>
+    ev({
+      target: '#lurker',
+      type: 'kick',
+      nick: 'carol',
+      userhost: 'carol!c@h',
+      kicked: 'decorateuser',
+      selfKicked: true,
+      text: 'read the topic',
+      ...overrides,
+    });
+
+  it('notifies with the bell OFF', () => {
+    // The whole point: no notify-always flag is set on #lurker here.
+    const d = decorateMessage(userId, kick());
+    expect(d.notifyAlways).toBe(false);
+    expect(d.selfKicked).toBe(true);
+    expect(d.notify).toBe(true);
+  });
+
+  it('stays quiet for a kick of someone else', () => {
+    const d = decorateMessage(userId, kick({ kicked: 'bob', selfKicked: undefined }));
+    expect(d.selfKicked).toBeUndefined();
+    expect(d.notify).toBe(false);
+  });
+
+  it('overwrites a stray flag on a non-kick rather than passing it through', () => {
+    // The gate reads the type too, so a flag that arrived on another row can't
+    // smuggle a notification past the conversation rule — and the decorated
+    // row must not go on carrying it, since maybePush reads the decorate's
+    // answer, not the raw event's.
+    const d = decorateMessage(userId, kick({ type: 'part' }));
+    expect(d.selfKicked).toBeUndefined();
+    expect(d.notify).toBe(false);
+  });
+
+  it('costs nothing on the wire for the rows it does not apply to', () => {
+    // A snapshot ships ~200 rows per buffer across every buffer, so the flag
+    // must serialize away on the ordinary ones — `undefined` drops out of
+    // JSON.stringify where a `false` would not. This is the assertion that
+    // actually pins the claim; an in-process key set to undefined is fine.
+    const line = JSON.parse(JSON.stringify(decorateMessage(userId, ev())));
+    expect(line).not.toHaveProperty('selfKicked');
+    const stray = JSON.parse(
+      JSON.stringify(decorateMessage(userId, kick({ type: 'message', selfKicked: true }))),
+    );
+    expect(stray).not.toHaveProperty('selfKicked');
+    // ...and rides the one row that means it.
+    expect(JSON.parse(JSON.stringify(decorateMessage(userId, kick())))).toHaveProperty(
+      'selfKicked',
+      true,
+    );
+  });
+
+  it('a NONOTIFY mute on the channel still wins', () => {
+    // Asked and decided, not defaulted into: the mute is the user's own
+    // standing instruction about this channel, and `notify` stays the one
+    // authoritative gate rather than growing a per-signal exception. The
+    // settings copy says so out loud, so the two move together.
+    addChannelMute(['NONOTIFY']);
+    const d = decorateMessage(userId, kick());
+    expect(d.selfKicked).toBe(true);
+    expect(d.notify).toBe(false);
+  });
+});

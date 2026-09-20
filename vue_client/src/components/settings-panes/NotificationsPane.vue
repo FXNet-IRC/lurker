@@ -315,6 +315,11 @@ const NOTIFICATION_SIGNALS = [
     title: 'Friend online',
     help: 'When the peer of a DM in your FRIENDS section comes online.',
   },
+  {
+    key: 'kicked',
+    title: 'Kicks',
+    help: 'When you are kicked from a channel. No bell needed — but a muted channel stays silent.',
+  },
 ];
 
 const notificationSignals = computed(() =>

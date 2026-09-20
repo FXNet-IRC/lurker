@@ -357,6 +357,12 @@ interface FanOutOpts {
 interface DecoratedEvent extends MessageEvent {
   dm: boolean;
   notifyAlways: boolean;
+  /** This kick was of US — the signal behind the `kicked` push kind (#968).
+   *  Absent (not `false`) on everything else, matching the producer in
+   *  ircConnection and the reasoning behind `msgid`/`bookmarked`: a snapshot
+   *  ships ~200 rows per buffer across every buffer, and a `false` on each one
+   *  is pure wire weight for a flag that is true on almost no row. */
+  selfKicked?: true;
   notify: boolean;
   kind: string;
 }
@@ -547,13 +553,10 @@ export function decorateMessage(
   // subsets of it.
   //
   // It also takes the PERSISTED lifecycle rows — join/part/quit/nick/mode/
-  // topic/kick — out of the bell, which is the one deliberate loss here. They
-  // carry a real nick, so they pushed as "bob in #channel" with an empty body:
-  // a join flood in a belled channel was a notification each. A kick of
-  // yourself goes quiet with them. That's the right trade for a toggle whose
-  // promise is "every message in this channel" — telling someone they were
-  // kicked is worth doing everywhere, not only where the bell happens to be on,
-  // and that's its own feature rather than a carve-out here.
+  // topic/kick — out of the bell. They carry a real nick, so they pushed as
+  // "bob in #channel" with an empty body: a join flood in a belled channel was
+  // a notification each. That's the right trade for a toggle whose promise is
+  // "every message in this channel".
   const isConversation = COUNTABLE_TYPES.has(event.type);
   const notifyAlways =
     isConversation &&
@@ -562,9 +565,16 @@ export function decorateMessage(
     // `??`, not `||`: a hoisted `false` is a real answer and must not fall
     // through to the query it was computed to replace.
     (channelNotifyAlways ?? getChannelNotifyAlways(userId, event.networkId, target));
-  // Content says this line is notification-worthy: a highlight, a DM, or a
-  // notify-always channel.
-  const contentNotify = isConversation && (matched || dm || notifyAlways);
+  // Being kicked is the one event ABOUT you that isn't conversation, so it sits
+  // outside the gate above rather than inside it (#968). It's a signal in its
+  // own right, not a channel one: it fires whether or not the bell is on, for
+  // the same reason a DM does — the channel vanishing from your sidebar with no
+  // word is the thing people were asking not to happen. ircConnection decides
+  // `selfKicked`, since only it knows the nick we were wearing at the time.
+  const selfKicked = event.type === 'kick' && !!event.selfKicked;
+  // Content says this line is notification-worthy: a highlight, a DM, a
+  // notify-always channel, or a kick of us.
+  const contentNotify = (isConversation && (matched || dm || notifyAlways)) || selfKicked;
   // Fold the ignore/mute veto into `notify` so it is the single authoritative
   // "alert the user" gate every consumer can trust — push, the web toast, and
   // native clients all read this one flag instead of each re-deriving the
@@ -594,6 +604,12 @@ export function decorateMessage(
     matchedRuleId,
     dm,
     notifyAlways,
+    // `|| undefined`, not a conditional spread: `...event` may already carry a
+    // raw `selfKicked`, and every other signal here OVERWRITES what came in
+    // rather than letting it through. Undefined both clears a stray one and
+    // drops out of JSON.stringify, so the flag costs nothing on the wire for
+    // the ~every row where it doesn't apply.
+    selfKicked: selfKicked || undefined,
     notify,
     kind: event.kind ?? '',
   } as DecoratedEvent;
@@ -1973,11 +1989,20 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // render filter stay reactive client-side, so /unignore still reveals. A
     // NOHIGHLIGHT rule deliberately does NOT freeze push — the message is still
     // visible, it just doesn't highlight.
-    // Signal kind in priority order: DM beats matched beats always_notify.
-    // The `kind` doubles as the settings-key namespace, so picking a single
-    // priority winner here means a DM that also matched a rule still
-    // delivers as one notification, gated by the DM master toggle.
-    const kindKey = decorated.dm ? 'dm' : decorated.matched ? 'highlight' : 'always_notify';
+    // Signal kind in priority order: kicked beats DM beats matched beats
+    // always_notify. The `kind` doubles as the settings-key namespace, so
+    // picking a single priority winner here means a DM that also matched a rule
+    // still delivers as one notification, gated by the DM master toggle.
+    // `kicked` leads because it's the only one that can't overlap — a kick is
+    // never a DM and never matches a highlight — so its position is a statement
+    // about reading order, not a tiebreak.
+    const kindKey = decorated.selfKicked
+      ? 'kicked'
+      : decorated.dm
+        ? 'dm'
+        : decorated.matched
+          ? 'highlight'
+          : 'always_notify';
     if (!effectiveSetting(userId, `notifications.${kindKey}.enabled`)) return;
     if (pushQuietOrAway(userId)) return;
     const network = ircManager.getConnection(userId, decorated.networkId)?.network;

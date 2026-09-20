@@ -31,6 +31,9 @@ export interface NotifyEvent {
   dm?: boolean;
   matched?: boolean;
   notifyAlways?: boolean;
+  // This kick was of us — server-stamped, since only the connection knows the
+  // nick we were wearing when it landed (#968).
+  selfKicked?: boolean;
   nick?: string;
   networkId?: number;
   userhost?: string;
@@ -60,6 +63,10 @@ function getTemplate(choice: string): HTMLAudioElement {
 // notification, gated by the DM master toggle), so users don't get
 // double-fired or surprised by the wrong sound.
 function pickKindKey(event: NotifyEvent): ToastKind | null {
+  // Kicked leads, as it does in the push path's kindKey. Nothing else can
+  // apply to the same event — a kick is never a DM and never matches a
+  // highlight — so the order states the reading, not a tiebreak.
+  if (event.selfKicked) return 'kicked';
   if (event.dm) return 'dm';
   if (event.matched) return 'highlight';
   if (event.notifyAlways) return 'always_notify';
@@ -144,13 +151,30 @@ export function notifyForEvent(event: NotifyEvent | null | undefined): void {
     event.target && !event.target.startsWith(':server:')
       ? `${netName} ${META_SEPARATOR} ${event.target}`
       : netName;
+  // A kick is the room telling you you're out of it, not a line someone said in
+  // it, so it can't wear the "<nick> in <where>" shape (#968).
+  //
+  // It does NOT reuse the push title ("bob kicked you from #lurker (Libera)")
+  // either, and the difference is the surface, not the wording: `.title` is
+  // nowrap + ellipsis inside a stack capped at min(360px, …), so a sentence
+  // that opens with the kicker's nick pushes the channel past the clip — a
+  // toast reading "ChanServ kicked you from libera •…" loses the one fact it
+  // exists to deliver. Lead with the outcome, which is a fixed 12 characters,
+  // and move the kicker into the body where it can wrap. A lock screen has no
+  // such cap, so the push keeps the sentence that reads better there.
+  const isKick = kindKey === 'kicked';
+  // "op: read the topic" — the reason is the kicker's own words, so this reads
+  // as what it is. Either half may be missing: a server kick has no nick, and a
+  // kick with no reason is ordinary.
+  const reason = stripFormatting(event.text || '');
+  const kickBody = [event.nick, reason].filter(Boolean).join(': ');
   toasts.push({
     kind: kindKey,
-    title: `${event.nick || '?'} in ${where}`,
+    title: isKick ? `Kicked from ${where}` : `${event.nick || '?'} in ${where}`,
     // The toast renders body as plain text, so mIRC formatting codes (\x03
     // colors, \x02 bold, …) would show up as literal control chars. Strip them
     // — a toast is a glanceable summary, not the message view (#606).
-    body: stripFormatting(event.text || ''),
+    body: isKick ? kickBody : reason,
     networkId: event.networkId,
     target: event.target,
     messageId: event.id,

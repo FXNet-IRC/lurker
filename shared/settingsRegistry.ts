@@ -1581,6 +1581,55 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     description: 'Playback volume for the always-notify sound, 0–100.',
   },
 
+  {
+    // Not a channel signal, so it has no dependency on the notify-always bell:
+    // being removed from a channel is a thing that happened to YOU, and it is
+    // worth hearing about wherever it happens (#968).
+    key: 'notifications.kicked.enabled',
+    label: 'Kick notifications',
+    category: 'notifications',
+    group: 'alerts',
+    type: 'bool',
+    default: true,
+    description:
+      'Notify me when I am kicked from a channel. Independent of the notify-always ' +
+      'bell, so it applies to every channel — but a muted channel still stays silent.',
+  },
+  {
+    key: 'notifications.kicked.sound.enabled',
+    label: 'Kick sound',
+    category: 'notifications',
+    group: 'alerts',
+    type: 'bool',
+    default: true,
+    description:
+      'Play a short sound when I am kicked from a channel. Dependent on ' +
+      'notifications.kicked.enabled.',
+  },
+  {
+    key: 'notifications.kicked.sound.choice',
+    label: 'Kick sound choice',
+    category: 'notifications',
+    group: 'alerts',
+    type: 'enum',
+    choices: ['ping', 'chime', 'pop', 'beep', 'knock', 'plink'],
+    default: 'beep',
+    description:
+      'Which bundled sound to play when I am kicked. Distinct default from the ' +
+      'highlight/DM sounds so being removed from a channel is recognizable by ear.',
+  },
+  {
+    key: 'notifications.kicked.sound.volume',
+    label: 'Kick sound volume',
+    category: 'notifications',
+    group: 'alerts',
+    type: 'int',
+    min: 0,
+    max: 100,
+    default: 60,
+    description: 'Playback volume for the kick sound, 0–100.',
+  },
+
   // ─── Push-side filters ────────────────────────────────────────────────
   // These only affect push delivery — toasts are unaffected (toasts require a
   // visible client, which short-circuits push anyway). All off by default.

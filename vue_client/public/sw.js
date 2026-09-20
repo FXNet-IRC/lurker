@@ -52,12 +52,20 @@ function friendOnlineTitle(data) {
   return `${name} came online${parts.length ? ` (${parts.join(' · ')})` : ''}`;
 }
 
+function kickedTitle(data) {
+  const where = data.target || 'a channel';
+  const who = data.nick ? `${data.nick} kicked you` : 'You were kicked';
+  return `${who} from ${where}${data.networkName ? ` (${data.networkName})` : ''}`;
+}
+
 function legacyTitle(data) {
   return data.kind === 'dm'
     ? `${data.nick || 'someone'}${data.networkName ? ' (' + data.networkName + ')' : ''}`
     : data.kind === 'friend_online'
       ? friendOnlineTitle(data)
-      : `${data.nick || 'someone'} in ${data.target || ''}`;
+      : data.kind === 'kicked'
+        ? kickedTitle(data)
+        : `${data.nick || 'someone'} in ${data.target || ''}`;
 }
 
 self.addEventListener('push', (event) => {

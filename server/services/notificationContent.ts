@@ -21,7 +21,7 @@
 
 import { stripFormatting } from './textMatch.js';
 
-export type PushPayloadKind = 'dm' | 'highlight' | 'always_notify' | 'friend_online';
+export type PushPayloadKind = 'dm' | 'highlight' | 'always_notify' | 'friend_online' | 'kicked';
 
 /**
  * The semantic push payload wsHub hands to pushService. Deliberately typed (it
@@ -78,6 +78,19 @@ function friendOnlineTitle(payload: PushPayload): string {
   return `${name} came online${parts.length ? ` (${parts.join(' · ')})` : ''}`;
 }
 
+// "bob kicked you from #lurker (Libera)", with the kick reason as the body
+// (#968). `nick` is the KICKER — the one useful name here, since the kicked
+// party is by definition the reader. It's spelled out rather than folded into
+// the "<nick> in <target>" shape every other channel notification uses, because
+// this one is not a message someone sent to a room you're in: it's the room
+// telling you you're out of it, and it has to read that way at a glance on a
+// lock screen. A server-issued kick carries no nick, hence the second branch.
+function kickedTitle(payload: PushPayload): string {
+  const where = payload.target || 'a channel';
+  const who = payload.nick ? `${payload.nick} kicked you` : 'You were kicked';
+  return `${who} from ${where}${payload.networkName ? ` (${payload.networkName})` : ''}`;
+}
+
 function title(payload: PushPayload): string {
   // A DM is already identified by its sender, so the target would just repeat the
   // nick; a channel highlight needs to say where it happened.
@@ -85,6 +98,7 @@ function title(payload: PushPayload): string {
     return `${payload.nick || 'someone'}${payload.networkName ? ' (' + payload.networkName + ')' : ''}`;
   }
   if (payload.kind === 'friend_online') return friendOnlineTitle(payload);
+  if (payload.kind === 'kicked') return kickedTitle(payload);
   return `${payload.nick || 'someone'} in ${payload.target || ''}`;
 }
 
@@ -100,10 +114,15 @@ export function composeNotification(payload: PushPayload): NotificationContent {
     // message notifications: the shared per-buffer tag meant "bob came online"
     // silently REPLACED an unread "bob: hey" alert on a connection flap (the
     // collapse key swaps content instead of stacking). A contacts-era quirk,
-    // fixed on revival rather than inherited.
+    // fixed on revival rather than inherited. A kick gets its own suffix for the
+    // same reason and it matters more here: a collapse key shared with the
+    // channel would let the next line in a channel you were just removed from
+    // REPLACE the notification telling you that you were removed.
     tag:
       payload.kind === 'friend_online'
         ? `${payload.networkId || 0}::${payload.target || ''}::presence`
-        : `${payload.networkId || 0}::${payload.target || ''}`,
+        : payload.kind === 'kicked'
+          ? `${payload.networkId || 0}::${payload.target || ''}::kick`
+          : `${payload.networkId || 0}::${payload.target || ''}`,
   };
 }
