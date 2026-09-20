@@ -41,6 +41,7 @@ import {
   listSpeakers,
   countNewer,
   countServerBufferUnread,
+  COUNTABLE_TYPES,
   countHighlightsNewer,
   maxIdByBuffer,
   maxIdForBuffer,
@@ -513,7 +514,7 @@ export function bufferNotifyAlways(
 // pass the notify-always answer in, instead of paying a DB point query per row
 // for a value that's constant across the slice (#679 — 52k lookups / 51.9ms on
 // a 104-buffer resume, vs 19 lookups / 0.047ms hoisted). Only the DB answer is
-// hoisted; the per-event guards below (CTCP, self, channel) still run per row.
+// hoisted; the per-event guards below (type, self, channel) still run per row.
 // Omit it on the single-event live path, which is what the function was written
 // for, and on any slice spanning multiple buffers (search results) where the
 // answer genuinely varies per row.
@@ -527,12 +528,35 @@ export function decorateMessage(
   const dm = isDirect(event) && !event.self;
   const target = event.target || '';
   const isChannel = notifyAlwaysApplies(target);
-  // CTCP request/reply/echo lines are status, not conversation — never notify,
-  // even when routed to a notify-always channel (otherwise running /ctcp from
-  // such a channel would self-notify on your own echo). (#263)
-  const isStatus = event.type === 'ctcp';
+  // Only conversation can notify. Every event a connection publishes reaches
+  // here — persisted or ephemeral, `names` and `typing` and `channel-modes`
+  // alongside real chat — and notify-always says "every message in this
+  // channel", not "every frame about it". Without this gate the bell turned
+  // nicklist and lifecycle churn into notifications, and the nick-less ones
+  // (a `names` republish from away-notify, a channel-scoped `error`) pushed as
+  // "someone in #channel" with an empty body (#965).
+  //
+  // COUNTABLE_TYPES is already the "this line is conversation" set — the one a
+  // channel's unread count uses — so the two can't drift into disagreeing about
+  // what a user is meant to be told about. (`:server:` counts `error` on top of
+  // it, which never reaches here: notifyAlwaysApplies excludes that target.) It
+  // subsumes the older CTCP exclusion (request/reply/echo lines are status, and
+  // running /ctcp from a notify-always channel would otherwise self-notify on
+  // your own echo, #263), and leaves the DM and highlight paths exactly where
+  // they were: DM_ELIGIBLE_TYPES and matchEvent's eligible types are both
+  // subsets of it.
+  //
+  // It also takes the PERSISTED lifecycle rows — join/part/quit/nick/mode/
+  // topic/kick — out of the bell, which is the one deliberate loss here. They
+  // carry a real nick, so they pushed as "bob in #channel" with an empty body:
+  // a join flood in a belled channel was a notification each. A kick of
+  // yourself goes quiet with them. That's the right trade for a toggle whose
+  // promise is "every message in this channel" — telling someone they were
+  // kicked is worth doing everywhere, not only where the bell happens to be on,
+  // and that's its own feature rather than a carve-out here.
+  const isConversation = COUNTABLE_TYPES.has(event.type);
   const notifyAlways =
-    !isStatus &&
+    isConversation &&
     isChannel &&
     !event.self &&
     // `??`, not `||`: a hoisted `false` is a real answer and must not fall
@@ -540,7 +564,7 @@ export function decorateMessage(
     (channelNotifyAlways ?? getChannelNotifyAlways(userId, event.networkId, target));
   // Content says this line is notification-worthy: a highlight, a DM, or a
   // notify-always channel.
-  const contentNotify = !isStatus && (matched || dm || notifyAlways);
+  const contentNotify = isConversation && (matched || dm || notifyAlways);
   // Fold the ignore/mute veto into `notify` so it is the single authoritative
   // "alert the user" gate every consumer can trust — push, the web toast, and
   // native clients all read this one flag instead of each re-deriving the
