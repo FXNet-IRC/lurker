@@ -439,6 +439,9 @@ router.delete('/:id', (req: Request, res: Response) => {
     return;
   }
   ircManager.disposeNetwork(req.user!.id, id, 'network removed');
+  // Before the row goes: a chat that outlived a Disconnect is owned by a
+  // connection disposeNetwork can no longer see (see ircManager.endDccChats).
+  ircManager.endDccChats(req.user!.id, id, 'network removed');
   deleteNetwork(id, req.user!.id);
   ircManager.networkChanged(req.user!.id, id);
   // The network's buffers cascaded away and took their favorite rows with

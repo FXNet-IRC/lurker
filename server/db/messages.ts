@@ -726,13 +726,24 @@ export function listActiveTargetsInWindow(
   // carries the canonical casing rather than whichever casing the window's
   // rows happened to arrive under. Sentinels are excluded by kind — the
   // registry's classification, not a name-shape LIKE.
+  //
+  // ⚠ And by SHAPE, not just kind: #528 was public and minted `=nick` rows as
+  // kind 'dm' (it predates the 'dcc' kind), so an install that ever ran it has
+  // rows the kind filter alone would hand straight to bouncer clients and MCP.
+  //
+  // ⚠ 'dcc' is excluded for a different reason than the sentinels: this feeds
+  // the bouncer's CHATHISTORY TARGETS, and a `=nick` target advertised there is
+  // one an attached client will happily open a query on and then PRIVMSG — a
+  // name that must never reach the wire. A DCC chat is a live socket this
+  // process owns, not account state to mirror to other clients.
   return db
     .prepare(
       `SELECT b.target AS target, MAX(m.time) AS lastMessageAt
          FROM messages m
          JOIN buffers b ON b.id = m.buffer_id
         WHERE b.network_id = ?
-          AND b.kind NOT IN ('server', 'system')
+          AND b.kind NOT IN ('server', 'system', 'dcc')
+          AND substr(b.target, 1, 1) <> '='
           AND ${filter.sql}
           AND m.time > ? AND m.time < ?
         GROUP BY b.id
@@ -770,10 +781,12 @@ export function listBufferTargets(networkId: number): string[] {
   return (listBufferTargetsStmt.all(networkId) as Array<{ target: string }>).map((r) => r.target);
 }
 
-// Per-(network, target) summary for the MCP list_buffers verb. Aggregates
-// every buffer that has at least one message, with the freshest message
-// timestamp. Sentinel buffers are filtered by kind so they never leak into
-// the agent-facing surface; clients reach them via the snapshot only.
+// Per-(network, target) summary for the MCP list_buffers verb and the bouncer's
+// DM playback. Aggregates every buffer that has at least one message, with the
+// freshest message timestamp. Sentinel buffers are filtered by kind so they
+// never leak into the agent-facing surface; clients reach them via the snapshot
+// only. 'dcc' is filtered for the same reason it is in listActiveTargetsInWindow
+// — neither an agent nor an attached IRC client may be handed a `=nick` target.
 export function listBuffersForNetwork(networkId: number): BufferSummary[] {
   return db
     .prepare(
@@ -781,7 +794,8 @@ export function listBuffersForNetwork(networkId: number): BufferSummary[] {
          FROM buffers b
          JOIN messages m ON m.buffer_id = b.id
         WHERE b.network_id = ?
-          AND b.kind NOT IN ('server', 'system')
+          AND b.kind NOT IN ('server', 'system', 'dcc')
+          AND substr(b.target, 1, 1) <> '='
         GROUP BY b.id
         ORDER BY lastMessageAt DESC`,
     )

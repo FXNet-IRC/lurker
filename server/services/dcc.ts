@@ -8,10 +8,9 @@
 // this module parses — is `SEND <file> ...`). irc-framework gives us only the
 // CTCP plumbing; the DCC grammar is ours.
 //
-// Phase 0 handles the inbound `SEND` offer (the only thing the download manager
-// reacts to); the other subtypes (ACCEPT/RESUME for resume, CHAT) are recognised
-// but reported as `unsupported` so the caller can ignore them cleanly — they'll
-// grow real parsing when resume lands (phase 3).
+// Handles the inbound `SEND` offer (the download manager), `ACCEPT` (the resume
+// confirmation) and `CHAT`; anything else is reported as `unsupported` so the
+// caller can ignore it cleanly.
 //
 // References cloned for parity (see ~/Coding/irc-clients): irssi
 // (src/irc/dcc/dcc-get.c — the SEND param parse + IPv4/IPv6 address handling) and
@@ -19,7 +18,19 @@
 // filename rule). The protocol's fiddly bits: the IPv4 address is a uint32 in
 // network byte order (NOT dotted-quad), a port of 0 means passive/reverse DCC and
 // carries a token, and a filename with spaces must be double-quoted.
+//
+// ⚠ The CHAT grammar's second token (`chat`) is the "protocol" slot, and we must
+// be LIBERAL about it: four of the six implementations that speak DCC CHAT never
+// read it at all (irssi literally labels it `<unused>`, dcc-chat.c:622; so do
+// HexChat, HexDroid and repartee). Only WeeChat validates it, case-insensitively
+// (irc-ctcp.c:1349). Rejecting an unexpected value here would only lose us peers.
+//
+// ⚠ A port of 0 is passive ONLY when a token follows. Port 0 with no token is a
+// malformed offer and must be REFUSED, never dialled — HexChat gets this right
+// (dcc.c:2500-2504) and it is the one case where a naive parser tries to open a
+// TCP connection to port 0.
 
+import net from 'net';
 import zlib from 'zlib';
 import { isBlockedIpLiteral } from '../utils/ipGuard.js';
 
@@ -49,12 +60,27 @@ export interface DccAccept {
   token: number | null;
 }
 
+/** A parsed inbound `DCC CHAT` offer — a request to open a direct line-oriented
+ *  chat. `host`/`port` are where the offerer is listening (active); `passive`
+ *  (port 0) means the offerer is firewalled and wants US to listen, correlated
+ *  by `token`. The `protocol` field is almost always `chat` (the only widely
+ *  used subtype). */
+export interface DccChat {
+  kind: 'chat';
+  protocol: string;
+  host: string;
+  port: number;
+  token: number | null;
+  passive: boolean;
+}
+
 /** Result of parsing a CTCP DCC body: a `SEND` offer, an `ACCEPT` (resume
  *  confirmation), a recognised-but-unhandled subtype (CHAT/RESUME/…), or a
  *  structural rejection with a reason for logging. */
 export type DccParse =
   | DccSend
   | DccAccept
+  | DccChat
   | { kind: 'unsupported'; subtype: string }
   | { kind: 'invalid'; reason: string };
 
@@ -77,12 +103,13 @@ function parseUint(s: string): number | null {
 export function decodeDccAddress(addr: string): string | null {
   const s = addr.trim();
   if (s === '') return null;
-  // IPv6 literal — sent as-is; a colon is the giveaway (a valid v6 literal has at
-  // least two). Allow the v4-mapped `::ffff:1.2.3.4` form's dot too.
-  if (s.includes(':')) {
-    const colons = s.match(/:/g)?.length ?? 0;
-    return /^[0-9a-fA-F:.]+$/.test(s) && colons >= 2 ? s : null;
-  }
+  // IPv6 literal — sent as-is; a colon is the giveaway.
+  //
+  // ⚠ Validated with net.isIPv6, not a character-class guess. The old check —
+  // hex, colons and dots, at least two colons — let `:::` and `f:f:f` through,
+  // which then reached the dialler and were refused as "private or reserved",
+  // a misleading reason for what was simply not an address.
+  if (s.includes(':')) return net.isIPv6(s) ? s : null;
   // Dotted-quad IPv4.
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s)) {
     return s.split('.').every((o) => Number(o) <= 255) ? s : null;
@@ -109,7 +136,43 @@ export function parseDcc(args: string): DccParse {
   const rest = sp === -1 ? '' : body.slice(sp + 1).trim();
   if (subtype === 'SEND') return parseDccSend(rest);
   if (subtype === 'ACCEPT') return parseDccAccept(rest);
+  if (subtype === 'CHAT') return parseDccChat(rest);
   return { kind: 'unsupported', subtype };
+}
+
+// `DCC CHAT <protocol> <ip> <port> [token]` — an offer to open a direct chat.
+// `protocol` is conventionally the literal `chat`, but its value is NOT checked
+// (see the ⚠ in the module header): irssi, HexChat, HexDroid and repartee all
+// ignore it, so a mismatch is their business, not ours. We keep it verbatim in
+// case a caller ever wants it as a hint.
+//
+// ⚠ Trailing junk past the token is IGNORED rather than rejected — irssi accepts
+// a 5th+ field (dcc-chat.c:627 only tests `paramcount < 3`), so refusing one
+// would drop offers that a real client considers well-formed.
+function parseDccChat(rest: string): DccParse {
+  if (rest === '') return { kind: 'invalid', reason: 'missing DCC CHAT parameters' };
+  const fields = rest.split(/\s+/).filter(Boolean);
+  if (fields.length < 3) {
+    return { kind: 'invalid', reason: 'expected <protocol> <ip> <port> [token]' };
+  }
+  const [protocol, hostStr, portStr, tokenStr] = fields;
+  const host = decodeDccAddress(hostStr);
+  if (host === null) return { kind: 'invalid', reason: `bad address: ${hostStr}` };
+  const port = parseUint(portStr);
+  if (port === null || port > 65535) return { kind: 'invalid', reason: `bad port: ${portStr}` };
+  let token: number | null = null;
+  if (tokenStr !== undefined) {
+    token = parseUint(tokenStr);
+    if (token === null) return { kind: 'invalid', reason: `bad token: ${tokenStr}` };
+  }
+  // ⚠⚠ Port 0 means "I am firewalled, YOU listen" and is only meaningful with a
+  // token to correlate the reverse reply. Port 0 with no token is malformed, and
+  // the one shape a careless parser turns into a dial to port 0 — refuse it here
+  // so no caller can. (HexChat does the same: dcc.c:2500-2504.)
+  if (port === 0 && token === null) {
+    return { kind: 'invalid', reason: 'passive DCC CHAT offer carries no token' };
+  }
+  return { kind: 'chat', protocol, host, port, token, passive: port === 0 };
 }
 
 // `DCC ACCEPT <filename> <port> <position> [token]` — the sender's go-ahead for a
@@ -191,6 +254,111 @@ function parseDccSend(rest: string): DccParse {
   }
 
   return { kind: 'send', filename, host, port, size, token, passive: port === 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Outgoing DCC CHAT — building the CTCP bodies WE send when offering a chat.
+// These return the CTCP *body* (the part after `DCC`); the caller frames it as a
+// CTCP request of type DCC. Pure + unit-tested.
+//
+// ⚠⚠ The IPv4 address MUST go out as a uint32 in network byte order, never a
+// dotted quad. irssi decodes a colon-free address with `strtoul` (dcc.c:185-190),
+// so `192.168.1.5` would reach it as 0.0.0.192; HexChat does the same and
+// repartee refuses outright. Only WeeChat/HexDroid/halloy accept a dotted quad.
+// An IPv6 offerer sends the literal, which every implementation detects by colon.
+//
+// ⚠ The protocol token goes out LOWERCASE (`chat`). irssi and repartee emit
+// `CHAT`; everyone else emits `chat`. Nothing rejects either — WeeChat's is the
+// only check and it's case-insensitive — but lowercase is what the majority
+// sends and what znc's bouncedcc regenerates when it rewrites an offer.
+//
+// ⚠ An active offer is EXACTLY five tokens (`DCC CHAT chat <addr> <port>`).
+// Never append anything: HexChat reads a 6th token on a non-zero port as the
+// third leg of a passive handshake and answers `dcc_malformed` when it has no
+// matching record (dcc.c:2491-2521).
+// ---------------------------------------------------------------------------
+
+/** Encode a host for a DCC offer field: IPv4 → its uint32 (network byte order)
+ *  as a decimal string; an IPv6 literal is passed through verbatim (detected by
+ *  a colon). Returns null if it's neither a dotted-quad nor a v6 literal. */
+export function encodeDccAddress(host: string): string | null {
+  const h = host.trim();
+  // ⚠⚠ net.isIPv6, not "hex, colons and dots". That class accepted `1:2`, `:::`,
+  // `abc:def` — and `1.2.3.4:5`, which is what pasting host:port into
+  // LURKER_DCC_EXTERNAL_HOST produces. Since dccActiveListenAvailable asks this
+  // function whether the configured host is usable, any of those passed as
+  // configured and then went out in every offer as an address nobody can dial.
+  if (h.includes(':')) return net.isIPv6(h) ? h : null;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (!m) return null;
+  const o = m.slice(1).map((x) => Number(x));
+  if (o.some((x) => x > 255)) return null;
+  const n = ((o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3]) >>> 0;
+  return String(n);
+}
+
+/** Build the body of an active `DCC CHAT` offer — `CHAT chat <addr> <port>`. */
+export function buildDccChat(host: string, port: number): string | null {
+  const addr = encodeDccAddress(host);
+  if (addr === null) return null;
+  return `CHAT chat ${addr} ${port}`;
+}
+
+/** Build the body of a passive/reverse `DCC CHAT` offer —
+ *  `CHAT chat <addr> 0 <token>` (the peer listens and replies). */
+export function buildDccChatPassive(host: string, token: number): string | null {
+  const addr = encodeDccAddress(host);
+  if (addr === null) return null;
+  return `CHAT chat ${addr} 0 ${token}`;
+}
+
+/** Reverse reply to a peer's PASSIVE `DCC CHAT`: our listening address/port +
+ *  their token — `CHAT chat <addr> <port> <token>`. */
+export function buildDccChatReverse(host: string, port: number, token: number): string | null {
+  const addr = encodeDccAddress(host);
+  if (addr === null) return null;
+  return `CHAT chat ${addr} ${port} ${token}`;
+}
+
+/**
+ * The placeholder address a PASSIVE `DCC CHAT` offer advertises. The peer is
+ * meant to ignore it — they reply with the address we should dial — but it still
+ * has to look like a real IPv4, because some receivers reject an unroutable one.
+ * 1.1.1.1 is what irssi (dcc-chat.c:530-533) and repartee (protocol.rs:5) both
+ * send; HexChat's `199` (0.0.0.199) is the outlier and is deliberately not used.
+ */
+export const PASSIVE_DCC_FAKE_HOST = '1.1.1.1';
+
+/**
+ * Split an inbound DCC CHAT line into display text plus whether it was an
+ * action. Two dialects are in the wild and we accept both:
+ *
+ *   - mIRC style, bare `\x01ACTION waves\x01` — WeeChat (xfer-chat.c:169-179),
+ *     HexChat, HexDroid and repartee emit and parse only this;
+ *   - the ircII/BitchX style irssi defaults to, the same payload behind a
+ *     `CTCP_MESSAGE ` (or `CTCP_REPLY `) prefix — dcc-chat.c:150-170. Nothing
+ *     else understands it, so irssi flips to the bare form the moment it sees
+ *     one from us (dcc-chat.c:685-687); we only ever SEND the bare form.
+ *
+ * A non-ACTION CTCP is unwrapped to its payload rather than dropped, matching
+ * WeeChat — the alternative is showing the user control characters.
+ */
+export function parseDccChatLine(line: string): { text: string; action: boolean } {
+  let body = line;
+  for (const prefix of ['CTCP_MESSAGE ', 'CTCP_REPLY ']) {
+    if (body.startsWith(prefix)) {
+      body = body.slice(prefix.length);
+      break;
+    }
+  }
+  if (body.length >= 2 && body.startsWith('\u0001') && body.endsWith('\u0001')) {
+    const inner = body.slice(1, -1);
+    if (/^ACTION(\s|$)/i.test(inner)) {
+      return { text: inner.slice(6).replace(/^\s/, ''), action: true };
+    }
+    return { text: inner, action: false };
+  }
+  return { text: body, action: false };
 }
 
 /** Human-readable byte size for status lines — 1024-based, one decimal place

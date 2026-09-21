@@ -41,6 +41,12 @@ const fakeManager = {
   disposeNetwork(userId: number, networkId: number, reason: string) {
     this.calls.push(['disposeNetwork', userId, networkId, reason]);
   },
+  // Records whether the row still existed: a DCC chat socket that outlived a
+  // Disconnect has to be ended BEFORE the row goes, or the peer's next line
+  // publishes into a network that no longer exists.
+  endDccChats(userId: number, networkId: number, reason: string) {
+    this.calls.push(['endDccChats', userId, networkId, reason, rowExists(networkId)]);
+  },
   // Records whether the row was there when the change was announced: a bouncer
   // client is told about a new or edited network from its row, and a deleted
   // one by its absence.
@@ -328,6 +334,14 @@ describe('DELETE /api/networks/:id', () => {
     const res = await aliceAgent.delete(`/api/networks/${net.body.network.id}`);
     expect(res.status).toBe(200);
     expect(fakeManager.calls.some(([m]) => m === 'disposeNetwork')).toBe(true);
+    // DCC chats end while the row is still there (the trailing `true`).
+    expect(fakeManager.calls).toContainEqual([
+      'endDccChats',
+      alice.id,
+      net.body.network.id,
+      'network removed',
+      true,
+    ]);
     // Announced once the row is gone, so the bouncer reads it as deleted.
     expect(fakeManager.calls).toContainEqual([
       'networkChanged',

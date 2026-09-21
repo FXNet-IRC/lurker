@@ -3,6 +3,7 @@
 
 import { defineStore } from 'pinia';
 import { socketSend } from '../composables/useSocket.js';
+import { dccChatPeer } from '../../../shared/channels.js';
 
 // Per-(network, nick) free-form notes about a contact. Server is the source
 // of truth — saves ship over WS and a `nick-note-updated` echo fans out to
@@ -14,8 +15,13 @@ import { socketSend } from '../composables/useSocket.js';
 // top of the chat view and watches `editor.open`, so any call site
 // (nicklist menu, DM context menu, sidebar) can open it without owning the
 // component.
+// ⚠ A `=bob` DCC chat is a conversation with bob, so its note IS bob's note.
+// Normalized in the key (every lookup) and again wherever the nick leaves this
+// store (the editor, the server write) — otherwise a note written from a DCC
+// buffer is persisted under `=bob`, a second note about the same person that
+// the DM with bob never shows.
 function key(networkId: number | string, nick: string) {
-  return `${networkId}::${(nick || '').toLowerCase()}`;
+  return `${networkId}::${dccChatPeer(nick || '').toLowerCase()}`;
 }
 
 export interface NickNoteEntry {
@@ -71,11 +77,11 @@ export const useNickNotesStore = defineStore('nickNotes', {
     },
     setNote(networkId: number | string, nick: string, note: string) {
       if (!networkId || !nick) return;
-      socketSend({ type: 'set-nick-note', networkId, nick, note: note || '' });
+      socketSend({ type: 'set-nick-note', networkId, nick: dccChatPeer(nick), note: note || '' });
     },
     openEditor(networkId: number | string, nick: string) {
       if (!networkId || !nick) return;
-      this.editor = { open: true, networkId: Number(networkId), nick };
+      this.editor = { open: true, networkId: Number(networkId), nick: dccChatPeer(nick) };
     },
     closeEditor() {
       this.editor = { open: false, networkId: null, nick: '' };

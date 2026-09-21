@@ -2485,6 +2485,9 @@ const COMMANDS_LINES = [
   '      connect <name>   ·   disconnect <name>   (Lurker folds irssi /server into these)',
   '  /dcc [list]            — DCC downloads: list, or accept/reject/cancel <id>',
   '      e.g. /dcc   ·   /dcc accept 3   ·   /dcc reject 3   ·   /dcc cancel 3',
+  '  /dcc chat <nick>       — open a direct peer-to-peer chat, in a =nick buffer',
+  '      also accepts an offer someone made you; /dcc close chat <nick> ends or declines',
+  '      e.g. /dcc chat bob   ·   /dcc chat -passive bob   ·   /dcc close chat bob',
   '  /set <key> <value…>    — change a setting; /set (or /set ?) lists all keys',
   '  /get <key>             — read a setting back (output in the system buffer)',
   '  /theme [list]          — theme presets: apply/save/delete <name>, mode [single|system]',
@@ -2717,6 +2720,36 @@ async function runDcc(argLine: string, networkId: number | null, target: string)
       }
     } catch (e: any) {
       localInfo(networkId, target, `/dcc: ${e?.message || 'failed to load'}`);
+    }
+    return;
+  }
+  // ⚠ chat verbs ride a specific network's connection, so they cannot run from
+  // the network-agnostic system buffer the way the transfer verbs can. Refuse
+  // with a hint rather than POSTing a null networkId.
+  if (cmd.kind === 'chat' || cmd.kind === 'chatClose') {
+    if (networkId == null) {
+      localInfo(
+        networkId,
+        target,
+        `/dcc ${cmd.kind === 'chat' ? 'chat' : 'close'}: run this from a network buffer`,
+      );
+      return;
+    }
+    if (cmd.kind === 'chat') {
+      try {
+        await dcc.openChat(networkId, cmd.nick, cmd.passive);
+        // The `=nick` buffer materializes from the server's first notice, so
+        // activate by target — it may not exist locally for another tick.
+        buffers.activate(networkId, `=${cmd.nick}`);
+      } catch (e: any) {
+        localInfo(networkId, target, `/dcc chat: ${e?.message || 'failed'}`);
+      }
+      return;
+    }
+    try {
+      await dcc.closeChat(networkId, cmd.nick);
+    } catch (e: any) {
+      localInfo(networkId, target, `/dcc close: ${e?.message || 'failed'}`);
     }
     return;
   }

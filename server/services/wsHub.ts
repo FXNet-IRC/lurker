@@ -9,7 +9,7 @@ import type { LogLine } from './systemLog.js';
 import type { MessageEvent } from '../db/messages.js';
 import type { PageUnit } from '../../shared/eventFilter.js';
 import { asPageUnit } from '../../shared/eventFilter.js';
-import { isChannelTarget } from '../../shared/channels.js';
+import { isChannelTarget, isDccChatTarget } from '../../shared/channels.js';
 import { WS_CLOSE_SESSION_REVOKED } from '../../shared/wsCloseCodes.js';
 import { WebSocketServer } from 'ws';
 import cookie from 'cookie';
@@ -3360,8 +3360,10 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         if (addr === null) break;
         const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
         const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
-        // Server/system pseudo-buffers aren't favoritable rows.
-        if (!networkId || !target || target.startsWith(':')) break;
+        // Server/system pseudo-buffers aren't favoritable rows, and neither is a
+        // `=nick` DCC chat: a favorite files a DM under FRIENDS with a presence
+        // dot, and a DCC peer has no presence — the socket is the whole story.
+        if (!networkId || !target || target.startsWith(':') || isDccChatTarget(target)) break;
         if (favoriteBuffer(userId, networkId, target)) {
           fanOut(userId, favoritesChangedFrame(userId));
           // Favorite implies unpin (the mirror of close⇒unpin): a favorited

@@ -1318,6 +1318,58 @@ check before uploading.
 `GET /?limit` list · `POST /:id/accept|reject|cancel`. Live updates via
 `dcc-transfer` frames; file bytes move over IRC, not HTTP.
 
+`POST /chat` (`{networkId, nick, passive?}`) opens a DCC CHAT; `POST /chat/close`
+(`{networkId, nick}`) ends one. Both return as soon as the offer is away — a DCC
+handshake takes as long as the peer takes to answer, so the outcome arrives as
+notices in the chat's own buffer rather than in the response.
+
+**An inbound offer is never auto-accepted.** It is recorded and surfaced as a
+notice, and `POST /chat` for that peer accepts it instead of making a
+counter-offer (the same doubling irssi's `/dcc chat <nick>` has), while
+`POST /chat/close` declines it. Accepting is what makes the server dial an
+address the peer chose, so it stays a deliberate act — as it is in WeeChat
+(`xfer.file.auto_accept_chats`, off) and irssi (`dcc_autochat_masks`, empty).
+Offers expire after ten minutes.
+
+A DCC chat is surfaced as a buffer named `=nick` (the irssi convention), with
+`kind: "dcc"`. **A `=` target is a buffer name, not an IRC target**: the server
+routes anything sent to one over the direct socket instead of the wire, and such
+buffers are deliberately absent from the bouncer's playback, CHATHISTORY TARGETS
+and read markers, and from the MCP `list_buffers` surface. A client should treat
+`kind: "dcc"` as its own thing rather than folding it into `dm` — a DCC peer has
+no presence, so probing one is both meaningless and a way to put a non-nick on
+the wire.
+
+Sessions are process-bound: a chat survives a reconnect (the socket is
+independent of IRC) but not a server restart, while the buffer and its history
+persist. Sending into a chat the server no longer holds fails and says so in the
+buffer.
+
+Three ephemeral events, each targeting the network's `:server:` buffer and naming
+the peer in `from` (not `target`), carry DCC chat state to a client:
+
+| Event                   | Fields            | Meaning                                                        |
+| ----------------------- | ----------------- | -------------------------------------------------------------- |
+| `dcc-chat-offer`        | `from`, `passive` | A peer offered a chat; nothing is dialled until accepted.      |
+| `dcc-chat-offer-closed` | `from`            | That offer is gone — accepted, declined, expired or torn down. |
+| `dcc-chat-state`        | `from`, `live`    | A session with `from` opened (`true`) or ended (`false`).      |
+
+An offer surface should be retired on `dcc-chat-offer-closed` rather than on a
+timer, so it never outlives the offer it names. That event can be missed — the
+client's socket drops, or the server restarts, while an offer is pending — so the
+offers still awaiting an answer also ride every snapshot, as `dccChatOffers` (peer
+display nicks) on each network's state. Reconcile against it on every snapshot and
+retire anything no longer listed; otherwise a stale offer's Accept action sends the
+peer a _new_ offer instead.
+
+The current set of live sessions also rides every snapshot, as `dccChats` (peer
+display nicks) on each network's state — **including a disconnected network's**,
+because a chat outlives its IRC link. A client should seed from the snapshot and
+apply `dcc-chat-state` on top; the events alone leave a freshly loaded client
+unable to tell a live chat from a dead one. Whether a chat is live is independent
+of the network's `state`, which is the reverse of a DM: a DM's peer reads as
+offline the moment our link drops, a DCC chat does not.
+
 ### Export / import
 
 `GET /api/exports/preview` · `POST /api/exports` (`{include_messages}`, allowed

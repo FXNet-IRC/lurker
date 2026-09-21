@@ -7,7 +7,7 @@ import { useToastsStore } from './toasts.js';
 import { socketSend } from '../composables/useSocket.js';
 import { SYSTEM_KEY } from '../lib/virtualBuffers.js';
 import { historyCountBy } from '../lib/historyPaging.js';
-import { isChannelTarget } from '../../../shared/channels.js';
+import { isChannelTarget, isDccChatTarget } from '../../../shared/channels.js';
 
 const MAX_PER_BUFFER = 500;
 // The most rows one INCREMENTAL merge (prepend/append) may take from a single
@@ -192,14 +192,21 @@ export interface BufferMessage {
 // What a buffer *is*, so capabilities (sendable, input, nicklist, server
 // round-trips) dispatch off an explicit discriminant instead of sniffing the
 // target string. 'system' is the app-scoped buffer with no network.
-export type BufferKind = 'channel' | 'dm' | 'server' | 'system';
+export type BufferKind = 'channel' | 'dm' | 'dcc' | 'server' | 'system';
 
 // Classify a buffer from its identity. App-scoped buffers (networkId == null)
 // are the system buffer today; network buffers split by target shape.
+//
+// ⚠ Mirrors the server's kindForTarget (server/db/buffers.ts) and must keep
+// mirroring it — the two tiers disagreeing about a target's shape is the exact
+// failure the note on CHANNEL_PREFIX_CHARS describes. A `=nick` DCC chat classed
+// as a DM here gets the DM treatment throughout: a presence probe fired at a
+// name that is not a nick, a Friends entry, nick colouring, a whois menu.
 function deriveKind(networkId: number | null, target: string): BufferKind {
   if (networkId == null) return 'system';
   if (isChannelTarget(target)) return 'channel';
   if (target.startsWith(':server:')) return 'server';
+  if (isDccChatTarget(target)) return 'dcc';
   return 'dm';
 }
 
@@ -1539,7 +1546,15 @@ export const useBuffersStore = defineStore('buffers', {
       // resulting peer-presence event flows back to update local state.
       // DMs only — channels (#…) and the flat sentinels (:server:, :system:) have
       // no peer to probe.
-      if (canonTarget && !isChannelTarget(canonTarget) && !canonTarget.startsWith(':')) {
+      // ⚠ A `=nick` DCC chat is excluded for a stronger reason than the others:
+      // the probe reaches trackDmPeer on the server and from there MONITOR, so
+      // firing one here would put a name that is not a nick on the IRC wire.
+      if (
+        canonTarget &&
+        !isChannelTarget(canonTarget) &&
+        !canonTarget.startsWith(':') &&
+        !isDccChatTarget(canonTarget)
+      ) {
         socketSend({ type: 'probe-presence', networkId, nick: canonTarget });
       }
     },

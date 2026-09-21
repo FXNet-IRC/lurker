@@ -198,6 +198,18 @@ export const useDccStore = defineStore('dcc', {
       }
     },
 
+    // Offer a DCC chat to a peer. Resolves as soon as the offer is away — the
+    // outcome (connected, refused, timed out) arrives as notices in the `=nick`
+    // buffer, which materializes from those notices, so there is nothing useful
+    // to await here.
+    async openChat(networkId: number, nick: string, passive = false): Promise<void> {
+      await api('/api/dcc/chat', { method: 'POST', body: { networkId, nick, passive } });
+    },
+
+    async closeChat(networkId: number, nick: string): Promise<void> {
+      await api('/api/dcc/chat/close', { method: 'POST', body: { networkId, nick } });
+    },
+
     // Open the Transfers modal and (re)load the list. Used by the sidebar button
     // and `/dcc list`. Load errors surface via listError in the modal.
     open(): void {

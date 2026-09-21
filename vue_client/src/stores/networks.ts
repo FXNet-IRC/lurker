@@ -5,6 +5,7 @@ import { defineStore } from 'pinia';
 import { api } from '../api.js';
 import { useAuthStore } from './auth.js';
 import { isVirtualKey } from '../lib/virtualBuffers.js';
+import { dccChatPeer, isDccChatTarget } from '../../../shared/channels.js';
 import type { MultilineLimits } from '../utils/messageSplit.js';
 
 export interface Network {
@@ -58,6 +59,13 @@ export interface NetworkState {
   userModes?: string;
   away?: AwayState | null;
   peerPresence?: Record<string, PeerPresenceEntry>;
+  // Display nicks of peers with a live DCC chat session on this network. Seeded
+  // by every snapshot — including a disconnected network's, since a chat socket
+  // outlives the IRC link — and kept current by `dcc-chat-state` events.
+  dccChats?: string[];
+  // Peers whose DCC chat offer to us is still awaiting an answer. Used to
+  // retire an offer toast whose offer disappeared while this tab was offline.
+  dccChatOffers?: string[];
   lagMs?: number | null;
   // Advertised draft/multiline limits when the network negotiated the cap,
   // else null/absent. Drives the composer's multiline-aware SPLIT/FLOOD hint
@@ -115,13 +123,31 @@ export const useNetworksStore = defineStore('networks', {
     // cached rows are stale, so report a synthetic 'offline'. Connected with no
     // row stays null (unknown = "potentially online", the no-MONITOR case).
     // Single source of truth for the sidebar, status bar, and profile.
+    //
+    // ⚠⚠ A `=nick` DCC chat has NO peer presence and must never be given the
+    // synthetic offline. Its reachability has nothing to do with the IRC link —
+    // the socket is peer-to-peer and keeps working while the network is down —
+    // so "=bob is offline" the moment you disconnect is both wrong and exactly
+    // backwards. Nothing MONITORs a DCC peer either, so there is no real row to
+    // fall through to. Handled here rather than in each of the sidebar, status
+    // bar and profile, because this getter is where they all agree.
     peerFor:
       (state) =>
       (networkId: number | string, nick: string): PeerPresenceEntry | null => {
+        if (isDccChatTarget(nick)) return null;
         const netState = state.states[networkId];
         if (netState && netState.state !== 'connected')
           return { nick, state: 'offline', stateAt: null, awayMessage: null };
         return netState?.peerPresence?.[nick.toLowerCase()] ?? null;
+      },
+    // Whether a `=nick` buffer (or a bare peer nick) has a live DCC session.
+    // The DCC counterpart to peerFor, and deliberately independent of the IRC
+    // link's state: the chat keeps working while the network is down.
+    isDccChatLive:
+      (state) =>
+      (networkId: number | string, target: string): boolean => {
+        const peer = dccChatPeer(target).toLowerCase();
+        return (state.states[networkId]?.dccChats ?? []).some((n) => n.toLowerCase() === peer);
       },
     activeBuffer(state): ActiveBuffer | null {
       if (!state.activeKey) return null;
@@ -295,6 +321,13 @@ export const useNetworksStore = defineStore('networks', {
         awayMessage: payload?.awayMessage || null,
       };
       this.states[networkId] = { ...existing, peerPresence };
+    },
+    applyDccChatState(networkId: number | string, nick: string, live: boolean) {
+      if (!networkId || !nick) return;
+      const existing = this.states[networkId] || { networkId: Number(networkId), channels: [] };
+      const lower = nick.toLowerCase();
+      const others = (existing.dccChats ?? []).filter((n) => n.toLowerCase() !== lower);
+      this.states[networkId] = { ...existing, dccChats: live ? [...others, nick] : others };
     },
     applyLag(event: any) {
       const existing = this.states[event.networkId] || { networkId: event.networkId, channels: [] };

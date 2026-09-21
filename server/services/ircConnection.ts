@@ -94,17 +94,38 @@ import {
 import { attachedIrcClients } from './attachedIrcClients.js';
 import fs from 'fs';
 import path from 'path';
+import net from 'net';
 import {
+  buildDccChat,
+  buildDccChatPassive,
+  buildDccChatReverse,
   crc32Hex,
+  encodeDccAddress,
   formatBytes,
   formatDccOfferLine,
   isBlockedDccHost,
   parseCrcFromFilename,
   parseDcc,
+  parseDccChatLine,
+  PASSIVE_DCC_FAKE_HOST,
 } from './dcc.js';
-import type { DccAccept, DccSend } from './dcc.js';
-import { dccAllowPrivateHosts, dccEnabledForUser, dccMaxFileBytes } from './dccConfig.js';
+import type { DccAccept, DccChat as DccChatOffer, DccSend } from './dcc.js';
+import {
+  dccActiveListenAvailable,
+  dccAllowPrivateHosts,
+  dccEnabledForUser,
+  dccExternalHost,
+  dccMaxFileBytes,
+} from './dccConfig.js';
 import { hasFreeSpaceFor, resolveDccDestination } from './dccPaths.js';
+import { DccChat } from './dccChat.js';
+import { openDccListener, type DccListenHandle } from './dccListener.js';
+import {
+  dccChatHostFor,
+  dccChatKey,
+  registerDccChatHost,
+  unregisterDccChatHost,
+} from './dccChatSessions.js';
 import { DccReceiver } from './dccReceiver.js';
 import {
   type DccTransferRow,
@@ -122,7 +143,12 @@ import {
 import { getChannelConfig as getE2eChannelConfig } from '../db/e2e.js';
 import type { ChannelMode } from '../db/e2e.js';
 import { randomBytes } from 'node:crypto';
-import { isChannelTarget, CHANNEL_PREFIX_CLASS } from '../../shared/channels.js';
+import {
+  isChannelTarget,
+  isDccChatTarget,
+  CHANNEL_PREFIX_CLASS,
+  DCC_CHAT_PREFIX,
+} from '../../shared/channels.js';
 
 // Optional source address for outbound IRC connections (LURKER_OUTGOING_ADDR),
 // passed to irc-framework as `outgoing_addr` → the socket's localAddress. Lets a
@@ -224,6 +250,24 @@ const ENGINE_REATTACH_WAIT_MS = 10_000;
 // System-buffer line for a shutdown detach, in place of "Disconnected" — which
 // is exactly what did not happen.
 const DETACHED_LOG = 'Detached — the engine is keeping this connection open for the next start';
+
+// How long a passive DCC chat offer waits for the peer to reply with a port
+// before we stop expecting one. Matches the listener's own default so the two
+// halves of an offer time out together.
+const PASSIVE_DCC_TIMEOUT_MS = 120_000;
+
+// Bound the dial to a peer's advertised address so an unreachable one fails
+// promptly instead of hanging until the OS SYN timeout (~1-2 minutes).
+const DCC_CHAT_CONNECT_TIMEOUT_MS = 15_000;
+
+// How long an unsolicited inbound chat offer stays acceptable. Generous, because
+// the cost of a stale one is only a dial that fails — but not unbounded, so a
+// drive-by offer doesn't sit accepted-able forever.
+const INBOUND_DCC_CHAT_OFFER_TTL_MS = 10 * 60_000;
+
+// Matches the rate limiter's own backoff, so the user is told once per period
+// rather than once per dropped offer.
+const DCC_FLOOD_WARN_GAP_MS = 5 * 60_000;
 
 const NON_PERSISTED_TYPES = new Set([
   'state',
@@ -406,9 +450,17 @@ interface EnrichedEvent extends IrcEvent {
 // Module-level helpers
 // ---------------------------------------------------------------------------
 
+// "Is this target a nick we could address on the wire?" — NOT merely "is it not
+// a channel". Two shapes are buffers without being IRC targets: the `:server:`
+// console, and a `=nick` DCC chat.
+//
+// ⚠⚠ Every caller of this is a place that would otherwise put the target into an
+// IRC command: say/action/notice mark a DM peer from it, probePresence feeds it
+// to MONITOR, sendTyping puts it in a TAGMSG. Adding a shape here is how a new
+// pseudo-target stays off the wire.
 function isDmTargetName(target: string | undefined | null): boolean {
   if (!target) return false;
-  return !isChannelTarget(target) && !target.startsWith(':server:');
+  return !isChannelTarget(target) && !target.startsWith(':server:') && !isDccChatTarget(target);
 }
 
 // Persisted timestamps prefer IRCv3 server-time (#450): irc-framework parses
@@ -642,6 +694,43 @@ export class IrcConnection {
   // Active DCC downloads (#270), keyed by dcc_transfers.id, so their sockets
   // aren't GC'd mid-transfer and can be cancelled on dispose.
   private readonly dccReceivers = new Map<number, DccReceiver>();
+  // Live DCC CHAT sessions, keyed by the peer's lowercased nick. Each is a
+  // direct TCP line-chat surfaced as a `=nick` buffer. Process-bound: the socket
+  // is independent of the IRC connection (so it survives a reconnect, exactly as
+  // irssi's does) but cannot outlive the process, while the buffer and its
+  // history persist — hence the once-per-peer notice in dccChatSend when a line
+  // is typed into a chat this process no longer holds.
+  private readonly dccChats = new Map<string, { nick: string; chat: DccChat }>();
+  // Peers we've already told "that chat is gone" since their last live session,
+  // so typing repeatedly into a dead `=nick` buffer doesn't repeat the notice.
+  private readonly dccChatDeadWarned = new Set<string>();
+  // Peer key -> when we last said "too many DCC requests", so the warning about
+  // a flood can't itself become one.
+  private readonly dccFloodWarnedAt = new Map<string, number>();
+  // Listeners for offers we've made that nobody has answered yet; closed on
+  // dispose so their bound ports are released rather than leaked.
+  // handle -> the peer it was opened for, so /dcc close can cancel it.
+  private readonly dccChatListeners = new Map<DccListenHandle, string>();
+  // Listener requests still binding a port, keyed by lowercased peer. The value
+  // is a per-request token, so a request that was cancelled and then re-made
+  // before the first bind returned can't be mistaken for the new one.
+  private readonly dccListenerRequests = new Map<string, object>();
+  // Inbound chat offers awaiting the user's acceptance, keyed by lowercased
+  // nick. ⚠ An offer is NOT auto-accepted: dialling would have this server open
+  // a TCP connection to an address a stranger chose, and hand them its IP, on
+  // nothing but a PRIVMSG. Both mature references refuse by default too —
+  // WeeChat's xfer.file.auto_accept_chats is "off" ("use carefully!",
+  // xfer-config.c:333-338) and irssi's dcc_autochat_masks is empty
+  // (dcc-chat.c:835) — and Lurker's own file path already requires approval.
+  private readonly pendingInboundChats = new Map<
+    string,
+    { nick: string; offer: DccChatOffer; timer: ReturnType<typeof setTimeout> }
+  >();
+  // Passive chat offers awaiting the peer's reverse reply, keyed by our token.
+  private readonly pendingPassiveChats = new Map<
+    number,
+    { nick: string; timer: ReturnType<typeof setTimeout> }
+  >();
   // Resumes awaiting the sender's DCC ACCEPT, keyed by nick|filename. Each holds
   // a timeout so a bot that never accepts fails the transfer cleanly.
   private readonly dccPendingResume = new Map<
@@ -1654,6 +1743,12 @@ export class IrcConnection {
           ) {
             continue;
           }
+          // ⚠⚠ Belt to kindForTarget's braces. This loop reads listOpenDms —
+          // raw SQL on `kind = 'dm'` — so it never passes through a shape
+          // predicate, and it runs on EVERY reconnect with no user action. A
+          // `=nick` row minted before the 'dcc' kind existed would still be
+          // 'dm' here and would seed `MONITOR + =nick` upstream.
+          if (isDccChatTarget(buf.target)) continue;
           this.addPeerReason(buf.target.toLowerCase(), 'dm');
         }
         this.sweepUntrackedPresenceRows();
@@ -5457,6 +5552,21 @@ export class IrcConnection {
   // A stable per-peer key for rate limiting inbound CTCP: the sender's
   // ident@host when known, else the nick (lowercased). Mirrors how the E2E path
   // keys peers, so a nick-churning flooder still maps to bounded state.
+  // One line per backoff window per peer. The limiter's backoff is five minutes,
+  // so re-warning on every dropped offer would just move the flood into the
+  // user's buffer.
+  private warnDccFlood(nick: string, event: Record<string, unknown>): void {
+    const key = this.ctcpPeerKey(event);
+    const now = Date.now();
+    const last = this.dccFloodWarnedAt.get(key);
+    if (last !== undefined && now - last < DCC_FLOOD_WARN_GAP_MS) return;
+    this.dccFloodWarnedAt.set(key, now);
+    this.routeCtcpStatus(
+      event,
+      `Ignoring further DCC requests from ${nick} for a few minutes — too many arrived at once.`,
+    );
+  }
+
   private ctcpPeerKey(event: Record<string, unknown>): string {
     const ident = (event.ident as string) || '';
     const host = (event.hostname as string) || '';
@@ -5697,11 +5807,19 @@ export class IrcConnection {
         this.ctcpAnswererFor(type, event))
       : null;
     if (answerer === 'nobody') return;
-    if (answerer === null && !this.ctcpLimiter.allowIncoming(this.ctcpPeerKey(event))) return;
     // DCC rides CTCP but is never an auto-reply type. When DCC is enabled for
     // this user, hand the offer to the download manager instead of the generic
     // probe path; when disabled, fall through so it surfaces as an ordinary
     // unsupported CTCP ("requested CTCP DCC (no reply)"), unchanged from today.
+    //
+    // ⚠⚠ Ahead of the shared incoming-CTCP limiter, and with a bucket of its
+    // own. That limiter exists to stop us ANSWERING a VERSION/PING storm, and
+    // its budget is 3 per minute per peer followed by a five-minute silent
+    // backoff — fine for noise nobody asked for, ruinous for a DCC offer, which
+    // is a user-facing action the peer will naturally retry while getting their
+    // own client configured. Sharing the bucket meant a fourth `/dcc chat` in a
+    // minute vanished with no trace on either side, which is exactly how it
+    // presented in QA.
     if (type === 'DCC' && dccEnabledForUser(this.network.user_id)) {
       // Say why, rather than letting it fall through to the generic
       // "requested CTCP DCC (no reply)". Only reached when DCC is otherwise
@@ -5714,15 +5832,29 @@ export class IrcConnection {
         });
         return;
       }
+      // Still bounded — a DCC offer flood is a real nuisance vector — but on its
+      // own key, and NEVER silently: a dropped offer the user can't see is
+      // indistinguishable from a broken feature.
+      if (!this.ctcpLimiter.allowIncoming(`dcc:${this.ctcpPeerKey(event)}`)) {
+        this.warnDccFlood(nick, event);
+        return;
+      }
       // DCC handling (parse + DB writes + socket setup) must never throw out of
       // the CTCP event path and disrupt the connection.
       try {
         this.handleInboundDccRequest(nick, args, event);
-      } catch {
-        /* malformed offer / transient DB error — drop it, keep the connection */
+      } catch (e) {
+        // ⚠ Swallowed so a malformed offer can't kill the connection, but say
+        // SOMETHING — a bare catch here made a bug in the DCC path look
+        // identical to the offer never arriving.
+        this.routeCtcpStatus(
+          event,
+          `Couldn't handle a DCC request from ${nick}: ${(e as Error)?.message || e}`,
+        );
       }
       return;
     }
+    if (answerer === null && !this.ctcpLimiter.allowIncoming(this.ctcpPeerKey(event))) return;
     if (answerer === 'clients') {
       this.routeCtcpStatus(event, formatCtcpForwardedLine(nick, type));
       return;
@@ -5814,6 +5946,10 @@ export class IrcConnection {
     const parsed = parseDcc(args);
     if (parsed.kind === 'accept') {
       this.handleDccAccept(nick, parsed);
+      return;
+    }
+    if (parsed.kind === 'chat') {
+      this.handleInboundDccChat(nick, parsed, event);
       return;
     }
     if (parsed.kind !== 'send') {
@@ -6190,6 +6326,710 @@ export class IrcConnection {
       this.dccPendingResume.delete(key);
       return;
     }
+  }
+
+  // --- DCC CHAT (#270) -------------------------------------------------------
+  //
+  // A DCC chat is a direct TCP conversation with one peer, surfaced as a `=nick`
+  // buffer. Nothing about it touches the IRC connection except the CTCP offer
+  // that sets it up, so a live chat survives a reconnect the way irssi's does —
+  // but it cannot outlive the process, while the buffer and its history do.
+  //
+  // ⚠⚠ `=nick` is a buffer name, never an IRC target. ircManager's send paths are
+  // the guard that keeps it off the wire; see the note there.
+
+  // Bind a listening port for a chat with `nick`, handing it back only if the
+  // chat is still wanted once the port is bound — else null, port released.
+  //
+  // ⚠⚠ The gap between "may we offer?" and the port actually being bound is
+  // real, and everything that ends an offer used to miss it: the listener only
+  // joins dccChatListeners once bound, so a `/dcc close chat` landing in the gap
+  // found nothing ("no live DCC chat") while the offer went out anyway, and a
+  // dispose() there sent the offer on a connection being torn down and leaked
+  // the port for its full timeout. So the request is registered BEFORE binding,
+  // cancel and teardown remove it, and the resolution re-checks it — along with
+  // the link, which a CTCP offer or reverse reply needs and which can drop in
+  // the gap too.
+  private openDccChatListener(nick: string): Promise<DccListenHandle | null> {
+    const key = nick.toLowerCase();
+    const request = {};
+    this.dccListenerRequests.set(key, request);
+    const settle = (): boolean => {
+      const current = this.dccListenerRequests.get(key) === request;
+      if (current) this.dccListenerRequests.delete(key);
+      return current;
+    };
+    return openDccListener().then(
+      (handle) => {
+        const current = settle();
+        if (current && !this.disposed && this.state === 'connected') return handle;
+        handle.close();
+        // Cancelled or torn down: nothing to say — the canceller said it. A
+        // link that dropped by itself mid-bind would otherwise vanish silently.
+        if (current && !this.disposed) {
+          this.dccChatNotice(
+            nick,
+            `Couldn't send the DCC chat offer — ${this.network.name} disconnected.`,
+          );
+        }
+        return null;
+      },
+      (err) => {
+        if (!settle() || this.disposed) return null; // cancelled: stay quiet
+        throw err;
+      },
+    );
+  }
+
+  // A token correlating a passive offer with its reverse reply. irssi and
+  // repartee both mint `rand() % 64` (dcc-chat.c:527, handlers_dcc.rs:204), and
+  // staying in that range keeps us inside what every implementation round-trips.
+  private mintDccToken(): number {
+    // ⚠ Only 6 bits, so two outstanding passive offers collide about 1 time in
+    // 64. Skip a token already in flight: reusing one would have the displaced
+    // offer's timer fire against the NEW entry (timing out the wrong chat, and
+    // naming the wrong peer), and the real reply arrive with nothing to match.
+    for (let i = 0; i < 64; i++) {
+      const token = Math.floor(Math.random() * 64);
+      if (!this.pendingPassiveChats.has(token)) return token;
+    }
+    return -1; // every token in flight — caller reports it
+  }
+
+  private dccChatTarget(nick: string): string {
+    return `${DCC_CHAT_PREFIX}${nick}`;
+  }
+
+  // Chat lifecycle status (offered / connected / closed / failed). PERSISTED via
+  // publish rather than surfaceCtcp's ephemeral path, and deliberately: the
+  // `=nick` buffer only exists because something was written to it, so an
+  // ephemeral line would leave a failed or still-pending chat with no buffer at
+  // all and the user with no idea what happened.
+  private dccChatNotice(nick: string, text: string): void {
+    this.publish({ type: 'notice', target: this.dccChatTarget(nick), nick: 'DCC', text });
+  }
+
+  // A chat line, persisted + fanned out so the buffer has real history like a DM.
+  // `kind: 'dcc-chat'` marks the row's transport; the column is free-form.
+  private publishDccChatLine(nick: string, text: string, self: boolean, action = false): void {
+    this.publish({
+      type: action ? 'action' : 'message',
+      target: this.dccChatTarget(nick),
+      nick: self ? this.currentNick || 'me' : nick,
+      text,
+      kind: 'dcc-chat',
+      self,
+    });
+  }
+
+  /** Whether a live DCC chat with `nick` exists. */
+  hasDccChat(nick: string): boolean {
+    return this.dccChats.has(nick.toLowerCase());
+  }
+
+  /** Display nicks of every peer with a live session right now. */
+  liveDccChatPeers(): string[] {
+    return Array.from(this.dccChats.values(), (e) => e.nick);
+  }
+
+  // Tell the client whether the `=nick` buffer has a live session behind it, so
+  // it can say so the way a DM says its peer is offline. Ephemeral: the current
+  // state also rides every snapshot (ircManager.snapshotForUser), which is what
+  // a reloaded tab reads — a live event alone would leave it guessing.
+  private publishDccChatState(nick: string, live: boolean): void {
+    this.publishEphemeral({
+      type: 'dcc-chat-state',
+      target: this.serverTarget(),
+      from: nick,
+      live,
+    });
+  }
+
+  // Both tiers of the DCC gate plus the proxy rule, checked at every chat entry
+  // point. The gate is per-entry-point by doctrine (routes/dcc.ts), and the proxy
+  // rule matters because DCC bypasses the tunnel in BOTH directions — a chat dial
+  // or listen leaks the real address exactly as a file transfer would.
+  // Sending a DCC offer or reverse reply rides the IRC link. During reconnect
+  // backoff irc-framework silently DROPS the write, so without this the user
+  // was told "offered … waiting for them to connect", a listening port from the
+  // configured range was held for the full 120s, and the eventual timeout
+  // blamed the peer. Accepting an ACTIVE offer needs no link — it only dials —
+  // so this guards the sends alone.
+  private dccCanSendOffer(nick: string): boolean {
+    if (this.state === 'connected') return true;
+    this.dccChatNotice(
+      nick,
+      `Can't send a DCC chat offer while ${this.network.name} is not connected.`,
+    );
+    return false;
+  }
+
+  private dccChatAllowed(nick: string, verb: string): boolean {
+    if (this.disposed) return false;
+    if (!dccEnabledForUser(this.network.user_id)) return false;
+    if (this.dccBlockedByProxy()) {
+      this.dccChatNotice(nick, `Can't ${verb} — DCC does not go through this network's proxy.`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Offer a DCC chat to `nick`.
+   *
+   * Active by default: we listen and advertise a port. Passive (we ask the peer
+   * to listen) is opt-in via `/dcc chat -passive`, NOT an automatic fallback —
+   * WeeChat leaves the untokenized tail in its port field, so it reads our
+   * passive offer's port as 0 and quietly dials nowhere (irc-ctcp.c:1332-1345,
+   * :1381), and HexDroid does the same. Silently degrading into that is worse
+   * than refusing, so an unconfigured server says so instead.
+   */
+  offerDccChat(nick: string, opts: { passive?: boolean } = {}): void {
+    // ⚠⚠ A peer, never a channel. The offer goes out as a CTCP to `nick`, so a
+    // channel name here broadcasts it to everyone in the channel — and an
+    // active offer also opens a listening port any of them can race for. All
+    // four sigils, via isChannelTarget: a `#`-only test is this codebase's most
+    // repeated bug. Guarded here rather than at the route alone because this is
+    // where every caller converges.
+    if (isChannelTarget(nick)) return;
+    if (!this.dccChatAllowed(nick, 'offer a DCC chat')) return;
+    const key = nick.toLowerCase();
+    // ⚠ Across every owner, not just this connection: after a Disconnect and
+    // reconnect the live chat belongs to the OLD connection, and checking only
+    // our own map would open a second socket to the same peer.
+    if (
+      this.dccChats.has(key) ||
+      dccChatHostFor(dccChatKey(this.network.user_id, this.network.id), nick)
+    ) {
+      this.dccChatNotice(nick, `Already in a DCC chat with ${nick}.`);
+      return;
+    }
+    // `/dcc chat <nick>` doubles as "accept the offer they already made", which
+    // is how irssi spells it too — making a fresh offer at someone who is
+    // already waiting for us would just deadlock the two halves.
+    const inbound = this.clearPendingInboundChat(key);
+    if (inbound) {
+      this.acceptInboundDccChat(inbound.nick, inbound.offer);
+      return;
+    }
+    if (!this.dccCanSendOffer(nick)) return;
+    if (opts.passive) {
+      this.offerPassiveDccChat(nick);
+      return;
+    }
+    if (!dccActiveListenAvailable()) {
+      this.dccChatNotice(
+        nick,
+        "Can't offer a DCC chat: this server has no public address and listening port range " +
+          'configured (LURKER_DCC_EXTERNAL_HOST, LURKER_DCC_LISTEN_PORT_MIN/_MAX). ' +
+          `Accepting a chat ${nick} offers you still works. ` +
+          '`/dcc chat -passive` asks them to listen instead, but only irssi, HexChat and ' +
+          'repartee handle that correctly.',
+      );
+      return;
+    }
+    const externalHost = dccExternalHost();
+    if (!externalHost || encodeDccAddress(externalHost) === null) {
+      this.dccChatNotice(
+        nick,
+        `DCC chat: LURKER_DCC_EXTERNAL_HOST is not a usable address (${externalHost ?? 'unset'}).`,
+      );
+      return;
+    }
+    this.openDccChatListener(nick)
+      .then((handle) => {
+        if (!handle) return;
+        const body = buildDccChat(externalHost, handle.port);
+        if (body === null) {
+          handle.close();
+          this.dccChatNotice(nick, 'DCC chat: external host is misconfigured.');
+          return;
+        }
+        this.dccChatListeners.set(handle, nick);
+        this.client.ctcpRequest(nick, 'DCC', body);
+        this.dccChatNotice(nick, `Offered a DCC chat to ${nick} — waiting for them to connect…`);
+        handle.accepted
+          .then((socket) => {
+            this.dccChatListeners.delete(handle);
+            this.startDccChat(nick, socket);
+          })
+          .catch((err) => {
+            // ⚠ Gone already means someone removed it on purpose — /dcc close chat
+            // cancelling the offer, or teardown. Reporting that as "failed: DCC
+            // listener closed" right after "Cancelled the pending DCC chat offer"
+            // told the user their own cancel had broken something.
+            if (!this.dccChatListeners.delete(handle)) return;
+            this.dccChatNotice(
+              nick,
+              `DCC chat offer to ${nick} failed: ${err instanceof Error ? err.message : err}`,
+            );
+          });
+      })
+      .catch((err) => {
+        this.dccChatNotice(
+          nick,
+          `Couldn't open a DCC listening port: ${err instanceof Error ? err.message : err}`,
+        );
+      });
+  }
+
+  // Passive/reverse offer: port 0 + a token, and the peer listens. The address we
+  // advertise is a placeholder the peer is meant to ignore — irssi and repartee
+  // both send 1.1.1.1 (16843009) here, so we match rather than HexChat's `199`,
+  // which some receivers reject as unroutable.
+  private offerPassiveDccChat(nick: string): void {
+    const token = this.mintDccToken();
+    if (token < 0) {
+      this.dccChatNotice(nick, 'Too many passive DCC chat offers are already pending.');
+      return;
+    }
+    // Always the placeholder. The peer replies with the address to dial and
+    // ignores this one — irssi hardcodes 16843009 here — so advertising the
+    // real host only added a way to fail: a hostname in LURKER_DCC_EXTERNAL_HOST
+    // can't be encoded, and made `-passive`, the mode meant for servers WITHOUT
+    // a usable external address, refuse with "misconfigured".
+    const body = buildDccChatPassive(PASSIVE_DCC_FAKE_HOST, token);
+    if (body === null) {
+      this.dccChatNotice(nick, 'DCC chat: external host is misconfigured.');
+      return;
+    }
+    this.client.ctcpRequest(nick, 'DCC', body);
+    this.dccChatNotice(
+      nick,
+      `Offered a passive DCC chat to ${nick} — waiting for them to connect back… ` +
+        '(passive chat only works if their client supports it: irssi, HexChat and repartee do; ' +
+        'WeeChat and HexDroid do not.)',
+    );
+    const timer = setTimeout(() => {
+      if (this.pendingPassiveChats.delete(token)) {
+        this.dccChatNotice(nick, `Passive DCC chat offer to ${nick} timed out.`);
+      }
+    }, PASSIVE_DCC_TIMEOUT_MS);
+    timer.unref?.();
+    this.pendingPassiveChats.set(token, { nick, timer });
+  }
+
+  /**
+   * An inbound `DCC CHAT` offer. Three shapes reach here:
+   *   - a reply to OUR passive offer (real port carrying a token we minted) → dial;
+   *   - a peer's own passive offer (port 0 + their token) → we listen and reply;
+   *   - a plain active offer (real port) → dial.
+   *
+   * Port 0 with no token never reaches this method: parseDcc refuses it, because
+   * it is the one shape that turns into a dial to port 0.
+   */
+  private handleInboundDccChat(
+    nick: string,
+    offer: DccChatOffer,
+    event: Record<string, unknown>,
+  ): void {
+    if (!this.dccChatAllowed(nick, 'accept a DCC chat')) return;
+    // Our own passive offer being answered? That we DO proceed with — we
+    // initiated it, and the token proves this is the reply to ours.
+    if (!offer.passive && offer.token !== null) {
+      const pending = this.pendingPassiveChats.get(offer.token);
+      if (pending && pending.nick.toLowerCase() === nick.toLowerCase()) {
+        clearTimeout(pending.timer);
+        this.pendingPassiveChats.delete(offer.token);
+        this.dialDccChat(nick, offer.host, offer.port);
+        return;
+      }
+    }
+    // ⚠⚠ Our OWN offer echoed back to us, which a network with echo-message will
+    // do. A token we minted can only appear in a line we sent, so a PASSIVE
+    // offer carrying one is ours — note the asymmetry with the branch above,
+    // which matches a non-passive REPLY to our offer. Without this the echo
+    // fell through as "unsolicited" and prompted the user to accept a chat
+    // with themselves, which is how it turned up in QA.
+    //
+    // Checked on the token rather than the sender because it holds regardless
+    // of nick tracking. In the QA case that found this, the generic self-echo
+    // guard in handleInboundCtcpRequest missed because currentNick had been
+    // lost in a netsplit collision — that root cause is fixed (#972), but the
+    // token is proof of authorship that no nick bookkeeping can get wrong, so
+    // it stays the decisive check for our own passive offer.
+    if (offer.passive && offer.token !== null && this.pendingPassiveChats.has(offer.token)) {
+      return;
+    }
+    // Belt and braces for the active shape, which carries no token of ours.
+    //
+    // ⚠⚠ isSelfNick — currentNick ONLY, never the configured nick as well.
+    // currentNick follows the server, including through a netsplit collision
+    // that SAVEs us to our UID (#972), so it names who we are right now. The
+    // configured nick names who we ASKED to be, and when that was taken and we
+    // registered as `alice_`, the configured `alice` belongs to someone else —
+    // treating it as us would silently drop that person's genuine chat offer
+    // as if it were our own echo. The token check above covers our own passive
+    // offer however we are named.
+    if (this.isSelfNick(nick)) return;
+    if (this.dccChats.has(nick.toLowerCase())) {
+      this.dccChatNotice(nick, `${nick} offered a DCC chat, but one is already open.`);
+      return;
+    }
+    // Anything else is an unsolicited offer: record it and ask. `/dcc chat
+    // <nick>` accepts, exactly as it does in irssi.
+    const key = nick.toLowerCase();
+    const prior = this.pendingInboundChats.get(key);
+    if (prior) clearTimeout(prior.timer);
+    const timer = setTimeout(() => {
+      if (this.clearPendingInboundChat(key)) {
+        // Ephemeral, and to the server buffer: the prompt never created a
+        // `=nick` buffer, so its expiry must not create one either.
+        this.surfaceCtcp(this.serverTarget(), `The DCC chat offer from ${nick} expired.`);
+      }
+    }, INBOUND_DCC_CHAT_OFFER_TTL_MS);
+    timer.unref?.();
+    this.pendingInboundChats.set(key, { nick, offer, timer });
+    // ⚠ routeCtcpStatus, NOT dccChatNotice: the prompt is a CTCP surface like
+    // any other, so it honours ctcp.msgbuffer — and, more to the point, a
+    // persisted notice would MINT a `=stranger` buffer into the sidebar on
+    // nothing but an unsolicited PRIVMSG. The `=nick` buffer appears when the
+    // user accepts, which is also when irssi opens its window.
+    this.routeCtcpStatus(
+      event,
+      `${nick} wants to start a DCC chat — /dcc chat ${nick} to accept` +
+        (offer.passive ? ' (they are firewalled, so this server would listen)' : ''),
+    );
+    // …and an actionable toast, the same shape a channel invite uses: ephemeral,
+    // routed through the server pseudo-buffer, read by the client from `from`
+    // rather than `target`. An offer is a decision someone has to make, so the
+    // client makes this one sticky — which is only safe because the offer's own
+    // lifecycle is broadcast too (see clearPendingInboundChat).
+    this.publishEphemeral({
+      type: 'dcc-chat-offer',
+      target: this.serverTarget(),
+      from: nick,
+      passive: offer.passive,
+    });
+  }
+
+  // Drop a pending inbound offer and tell the client, whatever the reason —
+  // accepted, declined, expired or torn down. ⚠ Without this the sticky toast
+  // outlives the offer, and its Accept button silently stops meaning "accept"
+  // and starts meaning "make a fresh offer at them", which is a different act.
+  private clearPendingInboundChat(key: string): { nick: string; offer: DccChatOffer } | null {
+    const pending = this.pendingInboundChats.get(key);
+    if (!pending) return null;
+    clearTimeout(pending.timer);
+    this.pendingInboundChats.delete(key);
+    this.publishEphemeral({
+      type: 'dcc-chat-offer-closed',
+      target: this.serverTarget(),
+      from: pending.nick,
+    });
+    return { nick: pending.nick, offer: pending.offer };
+  }
+
+  // Accept an offer already recorded by handleInboundDccChat. Active: dial them.
+  // Passive: they are firewalled, so we listen and reverse-reply with our port
+  // and their token.
+  private acceptInboundDccChat(nick: string, offer: DccChatOffer): void {
+    if (offer.passive) {
+      if (!this.dccCanSendOffer(nick)) return;
+      // The peer is firewalled and wants US to listen.
+      if (!dccActiveListenAvailable() || offer.token === null) {
+        this.dccChatNotice(
+          nick,
+          `${nick} offered a passive DCC chat, but this server has no listening port range ` +
+            'configured so it cannot accept one.',
+        );
+        return;
+      }
+      const externalHost = dccExternalHost();
+      if (!externalHost) return;
+      const token = offer.token;
+      // ⚠ No expectPeerHost pin: a passive offer's advertised address is a
+      // placeholder (1.1.1.1 / 0.0.0.199) and the peer dials from its real,
+      // often NAT'd, source — pinning would reject exactly the peers this path
+      // exists for. This is JawshTheDark's fix from #528 (73c76fc4).
+      this.openDccChatListener(nick)
+        .then((handle) => {
+          if (!handle) return;
+          const body = buildDccChatReverse(externalHost, handle.port, token);
+          if (body === null) {
+            handle.close();
+            // The active path reports this same condition; staying silent here
+            // meant a port was bound, released, and nothing was ever said.
+            this.dccChatNotice(nick, 'DCC chat: external host is misconfigured.');
+            return;
+          }
+          this.dccChatListeners.set(handle, nick);
+          this.client.ctcpRequest(nick, 'DCC', body);
+          this.dccChatNotice(nick, `${nick} wants to DCC chat — waiting for them to connect…`);
+          handle.accepted
+            .then((socket) => {
+              this.dccChatListeners.delete(handle);
+              this.startDccChat(nick, socket);
+            })
+            .catch((err) => {
+              // ⚠ Gone already means someone removed it on purpose — /dcc close chat
+              // cancelling the offer, or teardown. Reporting that as "failed: DCC
+              // listener closed" right after "Cancelled the pending DCC chat offer"
+              // told the user their own cancel had broken something.
+              if (!this.dccChatListeners.delete(handle)) return;
+              this.dccChatNotice(
+                nick,
+                `DCC chat with ${nick} failed: ${err instanceof Error ? err.message : err}`,
+              );
+            });
+        })
+        .catch((err) => {
+          this.dccChatNotice(
+            nick,
+            `Couldn't open a DCC listening port for ${nick}: ${
+              err instanceof Error ? err.message : err
+            }`,
+          );
+        });
+      return;
+    }
+    this.dialDccChat(nick, offer.host, offer.port);
+  }
+
+  private dialDccChat(nick: string, host: string, port: number): void {
+    if (port === 0) return; // parseDcc refuses this; belt and braces
+    if (!dccAllowPrivateHosts() && isBlockedDccHost(host)) {
+      this.dccChatNotice(
+        nick,
+        `Refusing a DCC chat with ${nick} — ${host} is a private or reserved address.`,
+      );
+      return;
+    }
+    this.dccChatNotice(nick, `Connecting to ${nick} at ${host}:${port} for DCC chat…`);
+    const sock = net.connect({ host, port });
+    // Bound the connect so an unreachable peer fails promptly and legibly
+    // instead of hanging until the OS SYN timeout (~1–2 minutes).
+    sock.setTimeout(DCC_CHAT_CONNECT_TIMEOUT_MS);
+    const onDialTimeout = (): void => {
+      sock.destroy(new Error('connection timed out'));
+    };
+    sock.once('timeout', onDialTimeout);
+    sock.once('connect', () => {
+      sock.setTimeout(0);
+      // ⚠ These belong to the DIAL. Past connect the socket is DccChat's and it
+      // does its own error handling, so leaving ours attached means a peer
+      // dropping mid-session prints the real error AND a "couldn't connect,
+      // check your port forwarding" paragraph that is nonsense by then.
+      sock.off('timeout', onDialTimeout);
+      sock.off('error', onDialError);
+      this.startDccChat(nick, sock);
+    });
+    const onDialError = (err: Error): void => {
+      // DCC is peer-to-peer and Lurker runs on the SERVER, so the peer's
+      // advertised address:port has to be reachable FROM the server. A refusal
+      // here is usually a topology problem, not a Lurker one — say so, because
+      // the alternative is a user retrying forever.
+      this.dccChatNotice(
+        nick,
+        `Couldn't connect to ${nick} at ${host}:${port} — ${err.message}. ` +
+          'DCC connects from the Lurker server, so that address and port must be reachable ' +
+          'from it; a peer behind home NAT needs the port forwarded, or must offer a passive ' +
+          'chat instead.',
+      );
+    };
+    sock.once('error', onDialError);
+  }
+
+  private startDccChat(nick: string, socket: net.Socket): void {
+    const key = nick.toLowerCase();
+    // ⚠ Glare: we can offer a chat AND accept theirs, so both halves complete
+    // and a second socket arrives for a peer we're already chatting with. Keep
+    // the established session and drop the newcomer — overwriting the map would
+    // orphan the live socket (still publishing into the buffer, never closed)
+    // and its eventual onClose would then delete the REPLACEMENT's entry,
+    // leaving a live chat that every send reports as dead.
+    if (this.dccChats.has(key)) {
+      socket.destroy();
+      return;
+    }
+    const chat = new DccChat({
+      socket,
+      onLine: (line) => {
+        const parsed = parseDccChatLine(line);
+        this.publishDccChatLine(nick, parsed.text, false, parsed.action);
+      },
+      onClose: () => {
+        if (this.forgetDccChat(key, chat)) {
+          this.dccChatNotice(nick, `DCC chat with ${nick} closed.`);
+        }
+      },
+      onError: (err) => {
+        if (this.forgetDccChat(key, chat)) {
+          this.dccChatNotice(nick, `DCC chat with ${nick} ended: ${err.message}`);
+        }
+      },
+    });
+    this.dccChats.set(key, { nick, chat });
+    this.dccChatDeadWarned.delete(key);
+    // Reachable even after ircManager drops this connection from its map on a
+    // user-initiated disconnect — the socket outlives the IRC link, as irssi's
+    // does (dcc.c:300-312).
+    registerDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
+    chat.start();
+    this.dccChatNotice(nick, `DCC chat with ${nick} connected.`);
+    this.publishDccChatState(nick, true);
+  }
+
+  // Drop `key` only if it still maps to `chat` — an identity check, not a bare
+  // delete, so a late callback from a superseded session can't evict the live
+  // one (see the glare note in startDccChat).
+  private forgetDccChat(key: string, chat: DccChat): boolean {
+    const entry = this.dccChats.get(key);
+    if (entry?.chat !== chat) return false;
+    this.dccChats.delete(key);
+    this.releaseDccChatHost();
+    this.publishDccChatState(entry.nick, false);
+    return true;
+  }
+
+  // Stop holding this connection open for DCC once its last chat is gone.
+  private releaseDccChatHost(): void {
+    if (this.dccChats.size > 0) return;
+    unregisterDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
+  }
+
+  /**
+   * Send a line in a live DCC chat and echo it into the `=nick` buffer. Returns
+   * false when there is no session, which is how the caller distinguishes "typed
+   * into a dead chat" from a successful send.
+   *
+   * An action goes out as bare `\x01ACTION text\x01` — the only form WeeChat,
+   * HexChat, HexDroid and repartee parse. irssi's own default is to prefix
+   * `CTCP_MESSAGE `, which nothing else understands, but it switches to this
+   * form the moment it sees a bare \x01 from us (dcc-chat.c:685-687).
+   */
+  dccChatSend(nick: string, text: string, opts: { action?: boolean } = {}): boolean {
+    // A bare `=` target yields no peer. It must still be refused — it's a
+    // pseudo-target, never a wire target — just not announced as a dead chat.
+    if (!nick) return false;
+    const key = nick.toLowerCase();
+    const entry = this.dccChats.get(key);
+    if (!entry) {
+      // ⚠ A chat dies with the process but its buffer and history persist, so
+      // this is the ordinary state of every `=nick` buffer after a restart.
+      // Saying nothing leaves the user typing into a buffer that silently eats
+      // their lines; the composer's own not-sent toast doesn't explain why.
+      if (!this.dccChatDeadWarned.has(key)) {
+        this.dccChatDeadWarned.add(key);
+        this.dccChatNotice(
+          nick,
+          `No live DCC chat with ${nick} — a chat ends when this server restarts, and cannot ` +
+            `be resumed. \`/dcc chat ${nick}\` starts a new one.`,
+        );
+      }
+      return false;
+    }
+    const wire = opts.action ? `\u0001ACTION ${text}\u0001` : text;
+    if (!entry.chat.send(wire)) return false;
+    this.publishDccChatLine(nick, text, true, !!opts.action);
+    return true;
+  }
+
+  /** Close a live DCC chat (`/dcc close chat <nick>`, irssi's syntax). */
+  closeDccChat(nick: string): boolean {
+    const key = nick.toLowerCase();
+    const entry = this.dccChats.get(key);
+    // Also cancels a still-unaccepted inbound offer, which is the other thing
+    // "close this chat" can reasonably mean.
+    const pending = this.clearPendingInboundChat(key);
+    if (pending) {
+      this.surfaceCtcp(this.serverTarget(), `Declined the DCC chat offer from ${pending.nick}.`);
+      if (!entry) return true;
+    }
+    // An offer WE made is cancellable too. Without this a mistyped
+    // `/dcc chat bbo` holds one of the configured listening ports for the whole
+    // 120s timeout, and the range IS the documented concurrency cap.
+    // A bind still in flight counts: without this, cancelling in that window
+    // answered "no live DCC chat" and the offer went out anyway.
+    let cancelledOutgoing = this.dccListenerRequests.delete(key);
+    for (const [token, pending] of this.pendingPassiveChats) {
+      if (pending.nick.toLowerCase() !== key) continue;
+      clearTimeout(pending.timer);
+      this.pendingPassiveChats.delete(token);
+      cancelledOutgoing = true;
+    }
+    for (const [handle, forNick] of this.dccChatListeners) {
+      if (forNick.toLowerCase() !== key) continue;
+      this.dccChatListeners.delete(handle);
+      handle.close();
+      cancelledOutgoing = true;
+    }
+    if (cancelledOutgoing) {
+      this.dccChatNotice(nick, `Cancelled the pending DCC chat offer to ${nick}.`);
+      if (!entry) return true;
+    }
+    if (!entry) return false;
+    this.dccChats.delete(key);
+    this.releaseDccChatHost();
+    entry.chat.close();
+    this.dccChatNotice(entry.nick, `DCC chat with ${entry.nick} closed.`);
+    this.publishDccChatState(entry.nick, false);
+    return true;
+  }
+
+  // A deliberate disconnect (stopNetwork, account suspend, shutdown — never the
+  // auto-reconnect ladder, which reuses this object and keeps its place in the
+  // map) ends the HANDSHAKES in flight on this connection, but not established
+  // chats.
+  //
+  // ⚠⚠ Why the line falls there. An established chat is a socket that needs no
+  // IRC, so it survives, as irssi's does. A pending offer is different: it is
+  // only reachable through this connection, and stopNetwork is about to drop
+  // it from the map, so after the user reconnects the NEW connection knows
+  // nothing about it. Left alone, the offer toast stayed up and its Accept went
+  // to the new connection, which found no offer and sent the peer a FRESH one
+  // — a different act than the button names. Our own passive offers go too:
+  // their reply can only arrive over IRC, and it would land on the new
+  // connection, which never minted the token. Ending them here retires the
+  // toast immediately and says why; the peer can offer again.
+  private endDccChatHandshakes(): void {
+    const dropped = this.pendingDccChatOffers();
+    for (const key of this.pendingInboundChats.keys()) this.clearPendingInboundChat(key);
+    for (const pending of this.pendingPassiveChats.values()) clearTimeout(pending.timer);
+    this.pendingPassiveChats.clear();
+    this.dccListenerRequests.clear(); // an offer still binding is a handshake too
+    for (const nick of dropped) {
+      this.surfaceCtcp(
+        this.serverTarget(),
+        `Dropped the DCC chat offer from ${nick} — ${this.network.name} was disconnected.`,
+      );
+    }
+  }
+
+  /** End every session this connection owns. ircManager's dispose paths call
+   *  this through the session registry, because after a user Disconnect the
+   *  connection holding a chat is no longer in the map they walk. */
+  closeAllDccChats(reason: string): void {
+    this.teardownDccChats(reason);
+  }
+
+  /** Peers with an offer to us still awaiting an answer. Rides the snapshot so
+   *  a client can retire an offer toast whose offer has gone. */
+  pendingDccChatOffers(): string[] {
+    return Array.from(this.pendingInboundChats.values(), (p) => p.nick);
+  }
+
+  // Tear down every chat session, listener and pending passive offer. Called
+  // from dispose() — and ⚠ called BEFORE `disposed` is set, because publish()
+  // and publishEphemeral() both return silently once it is, which would swallow
+  // the very notice that tells the user their chats went away.
+  private teardownDccChats(reason: string): void {
+    for (const [key, entry] of this.dccChats) {
+      this.dccChats.delete(key);
+      entry.chat.close();
+      this.dccChatNotice(entry.nick, `DCC chat ended — ${reason}.`);
+      this.publishDccChatState(entry.nick, false);
+    }
+    // Deleting the current key mid-iteration is well-defined for a Map, and
+    // clearPendingInboundChat is what tells the client to retire its toast —
+    // so this must go through it rather than a bare clear().
+    for (const key of this.pendingInboundChats.keys()) this.clearPendingInboundChat(key);
+    unregisterDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
+    this.dccListenerRequests.clear(); // binds in flight resolve, see this, and release
+    for (const handle of this.dccChatListeners.keys()) handle.close();
+    this.dccChatListeners.clear();
+    for (const pending of this.pendingPassiveChats.values()) clearTimeout(pending.timer);
+    this.pendingPassiveChats.clear();
   }
 
   // Surface an inbound CTCP reply (a peer answered a query we sent), routed back
@@ -7160,6 +8000,7 @@ export class IrcConnection {
   }
 
   disconnect(reason?: string, opts: { announceCancelledRetry?: boolean } = {}): void {
+    this.endDccChatHandshakes();
     // The user/system asked to disconnect — record intent BEFORE quit() so the
     // 'close' handler doesn't fight them by auto-reconnecting, and drop any
     // pending backoff so an earlier drop's retry can't resurrect the connection.
@@ -7356,6 +8197,12 @@ export class IrcConnection {
   }
 
   dispose(reason: string = 'network removed'): void {
+    // ⚠⚠ BEFORE `disposed` is set. publish() and publishEphemeral() both return
+    // silently once it is, so a "your chat ended" notice written after the flag
+    // is swallowed and the user's `=nick` buffer just goes quiet. DCC chats are
+    // the only teardown that has something to say to a buffer, so this is the
+    // one place the ordering matters.
+    this.teardownDccChats(reason);
     this.disposed = true;
     this.clearReconnectTimer();
     this.stopLagPinger();

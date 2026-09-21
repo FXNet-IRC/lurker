@@ -94,7 +94,7 @@ import {
   certFingerprint,
   keyMatchesCert,
 } from '../utils/bouncerCert.js';
-import { isChannelTarget } from '../../shared/channels.js';
+import { isChannelTarget, isDccChatTarget } from '../../shared/channels.js';
 import { stripFormatting } from './textMatch.js';
 import {
   bouncerBindHost,
@@ -2935,10 +2935,14 @@ function selfJoinChannel(line: string, nick: string | null): string | null {
 
 // A read pointer moved, in the apps or over IRC. Every client on that network
 // that negotiated read markers hears it, the one whose MARKREAD moved it included
-// (the spec's reply). The :server: and system buffers aren't IRC targets.
+// (the spec's reply). The :server: and system buffers aren't IRC targets, and
+// neither is a `=nick` DCC chat — its buffer is deliberately invisible to
+// attached clients (they never see it in playback or CHATHISTORY TARGETS), so
+// a MARKREAD naming one would be the single place a name they can't resolve,
+// and must never PRIVMSG, still reached them.
 function dispatchReadMarker(move: ReadMarkerMove): void {
   const { networkId, target } = move;
-  if (networkId == null || target.startsWith(':')) return;
+  if (networkId == null || target.startsWith(':') || isDccChatTarget(target)) return;
   const set = registry.get(registryKey(move.userId, networkId));
   if (!set) return;
   // The apps mark read on every line into a focused buffer, so the time is only
@@ -3034,7 +3038,13 @@ function dispatchIrcEvent(event: Record<string, unknown>): void {
   if (!event.self) return;
   if (type !== 'message' && type !== 'action' && type !== 'notice') return;
   const target = typeof event.target === 'string' ? event.target : '';
-  if (!target || target.startsWith(':server:')) return;
+  // ⚠⚠ `=nick` is a DCC chat buffer, not an IRC target. Without this, a line the
+  // user types in the web UI is echoed to attached clients as `PRIVMSG =alice`,
+  // they open a query window named `=alice`, and a reply typed there comes back
+  // through handleClientMessage and onto the wire. This is the one remaining
+  // door in the "a `=` target never reaches IRC" invariant — playback,
+  // CHATHISTORY TARGETS and read markers all exclude these buffers already.
+  if (!target || target.startsWith(':server:') || isDccChatTarget(target)) return;
   const text = typeof event.text === 'string' ? event.text : '';
   if (!text) return;
   const time = typeof event.time === 'string' ? event.time : null;

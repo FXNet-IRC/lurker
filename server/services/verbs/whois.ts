@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
+import { dccChatPeer } from '../../../shared/channels.js';
 import { registerVerb } from '../verbRegistry.js';
 import { writableConnection } from './liveConn.js';
 import { singleToken } from './args.js';
@@ -36,9 +37,15 @@ registerVerb({
       malformed: 'nick-must-be-single-token',
     });
     if ('error' in nick) return { ok: false, error: nick.error };
+    // ⚠ A `=bob` DCC chat means bob. This goes out as a RAW line, which bypasses
+    // every `=` guard in ircManager, so an agent handing us a buffer target put
+    // `WHOIS =bob` on the wire. The web client's whois store normalizes the same
+    // way; this is the door it doesn't cover. A bare `=` names nobody.
+    const who = dccChatPeer(nick.value);
+    if (!who) return { ok: false, error: 'empty-nick' };
     const conn = writableConnection(ctx.userId, networkId);
     if (!conn) return { ok: false, error: 'not-connected' };
-    conn.raw(`WHOIS ${nick.value}`);
+    conn.raw(`WHOIS ${who}`);
     // Hand back the concrete buffer target rather than describing it. The
     // server buffer is deliberately filtered out of list_buffers, so an agent
     // told only "read the server buffer" has no way to name it.
