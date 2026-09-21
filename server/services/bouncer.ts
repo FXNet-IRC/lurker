@@ -3038,7 +3038,13 @@ function dispatchIrcEvent(event: Record<string, unknown>): void {
   if (!event.self) return;
   if (type !== 'message' && type !== 'action' && type !== 'notice') return;
   const target = typeof event.target === 'string' ? event.target : '';
-  if (!target || target.startsWith(':server:')) return;
+  // ⚠⚠ `=nick` is a DCC chat buffer, not an IRC target. Without this, a line the
+  // user types in the web UI is echoed to attached clients as `PRIVMSG =alice`,
+  // they open a query window named `=alice`, and a reply typed there comes back
+  // through handleClientMessage and onto the wire. This is the one remaining
+  // door in the "a `=` target never reaches IRC" invariant — playback,
+  // CHATHISTORY TARGETS and read markers all exclude these buffers already.
+  if (!target || target.startsWith(':server:') || isDccChatTarget(target)) return;
   const text = typeof event.text === 'string' ? event.text : '';
   if (!text) return;
   const time = typeof event.time === 'string' ? event.time : null;

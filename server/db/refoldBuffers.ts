@@ -52,10 +52,12 @@ interface Row {
 }
 
 // Sentinels (kind server/system) never re-fold — their ':'-prefixed names are
-// ours, not the network's.
+// ours, not the network's. A 'dcc' row DOES: `=Nick` folds like any other
+// target, so leaving it out would strand a stale target_folded and let the next
+// ensureBuffer('=Nick') mint a duplicate buffer under the new mapping.
 const rowsStmt = db.prepare(`
   SELECT id, target, target_folded, state FROM buffers
-  WHERE user_id = ? AND network_id = ? AND kind IN ('channel', 'dm')
+  WHERE user_id = ? AND network_id = ? AND kind IN ('channel', 'dm', 'dcc')
 `);
 const lastMessageStmt = db.prepare(`SELECT MAX(id) AS m FROM messages WHERE buffer_id = ?`);
 const setFoldedStmt = db.prepare(`UPDATE buffers SET target_folded = ? WHERE id = ?`);

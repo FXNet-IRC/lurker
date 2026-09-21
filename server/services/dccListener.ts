@@ -113,8 +113,14 @@ export function openDccListener(opts: DccListenOptions = {}): Promise<DccListenH
       accepted.catch(() => {});
 
       let timer: ReturnType<typeof setTimeout> | null = null;
+      // ⚠ Only this attempt's own reservation may be released. The port enters
+      // `inUse` in the listen callback, so an EADDRINUSE failure never owns it —
+      // and deleting it there would erase the reservation of the concurrent
+      // caller that just won the race for that same port.
+      let reserved = false;
       const release = (): void => {
-        inUse.delete(port);
+        if (reserved) inUse.delete(port);
+        reserved = false;
         if (timer) {
           clearTimeout(timer);
           timer = null;
@@ -181,6 +187,7 @@ export function openDccListener(opts: DccListenOptions = {}): Promise<DccListenH
 
       server.listen(port, bind, () => {
         inUse.add(port);
+        reserved = true;
         timer = setTimeout(() => {
           if (settled) return;
           settled = true;

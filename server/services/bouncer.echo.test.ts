@@ -260,3 +260,42 @@ describe('a client that asked for echo-message', () => {
     expect(mine[0]).toContain(`PRIVMSG #room :`);
   });
 });
+
+// ⚠⚠ A `=nick` DCC chat buffer is not an IRC target, and the self-echo path was
+// the last door through which one could still reach an attached client. If it
+// does, the client opens a query window literally named `=bob`, and a reply
+// typed there comes back through handleClientMessage and goes on the wire as
+// `PRIVMSG =bob`. Playback, CHATHISTORY TARGETS and read markers already
+// exclude these buffers; this is the same invariant.
+describe('a DCC chat buffer is never echoed to an attached client', () => {
+  it('relays a self-message for a DM but not for a =nick buffer', async () => {
+    const live = await seedLive();
+    const c = await attachIn(live, '#room', `${BASE_CAPS} echo-message`);
+    const conn = ircManager.getConnection(live.userId, live.networkId)!;
+
+    const mark = c.lines.length;
+    // The DCC line goes first: if it were relayed at all, it would arrive
+    // before the DM that follows it, so the DM's arrival proves the window was
+    // open rather than merely that we didn't wait long enough.
+    conn.publish({
+      type: 'message',
+      target: '=bob',
+      nick: conn.currentNick,
+      text: 'dcc-secret',
+      self: true,
+    });
+    conn.publish({
+      type: 'message',
+      target: 'carol',
+      nick: conn.currentNick,
+      text: 'dm-visible',
+      self: true,
+    });
+
+    await c.waitFor((l) => l.includes('dm-visible'));
+    const after = c.lines.slice(mark);
+    expect(after.filter((l) => l.includes('dm-visible'))).toHaveLength(1);
+    expect(after.filter((l) => l.includes('dcc-secret'))).toEqual([]);
+    expect(after.filter((l) => l.includes('=bob'))).toEqual([]);
+  });
+});

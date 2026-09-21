@@ -21,7 +21,7 @@ import { CAPABILITY_DCC, setUserCapability } from '../db/userCapabilities.js';
 import { encodeDccAddress } from './dcc.js';
 import { IrcConnection } from './ircConnection.js';
 import ircManager from './ircManager.js';
-import { resetDccListeners } from './dccListener.js';
+import { activeDccListenerCount, resetDccListeners } from './dccListener.js';
 
 beforeAll(() => {
   createUser('dcc-chat-alice'); // id 1
@@ -90,12 +90,16 @@ function harness() {
   const say = vi.fn<(target: string, text: string) => void>();
   const raw = vi.fn<(line: string) => void>();
   const published: Array<Record<string, unknown>> = [];
+  const ephemeral: Array<Record<string, unknown>> = [];
   conn.client.ctcpRequest = ctcpRequest;
   conn.client.say = say;
   conn.raw = raw;
   conn.publish = (event: Record<string, unknown>) => {
     published.push(event);
     return undefined;
+  };
+  conn.publishEphemeral = (event: Record<string, unknown>) => {
+    ephemeral.push(event);
   };
   // The body of the last outgoing CTCP DCC request: ctcpRequest(target,'DCC',body).
   const lastOffer = (): string | null => {
@@ -104,13 +108,17 @@ function harness() {
   };
   const notices = () =>
     published.filter((e) => e.type === 'notice').map((e) => String(e.text ?? ''));
+  // CTCP status lines are ephemeral and are where an unsolicited offer is
+  // surfaced — deliberately not a persisted notice, which would mint a buffer.
+  const ctcpLines = () =>
+    ephemeral.filter((e) => e.type === 'ctcp').map((e) => String(e.text ?? ''));
   const chatLines = () =>
     published.filter((e) => e.type === 'message' && e.kind === 'dcc-chat') as Array<{
       text: string;
       self?: boolean;
       target: string;
     }>;
-  return { conn, ctcpRequest, say, raw, published, lastOffer, notices, chatLines };
+  return { conn, ctcpRequest, say, raw, published, lastOffer, notices, ctcpLines, chatLines };
 }
 
 function enableDcc() {
@@ -302,8 +310,11 @@ describe('an inbound offer is not auto-accepted', () => {
     offerFrom(h.conn, 'bob', 'CHAT chat 16843009 5000');
     expect(h.conn.hasDccChat('bob')).toBe(false);
     expect(dialled(h)).toBe(false);
-    expect(h.notices().at(-1)).toMatch(/wants to start a DCC chat/);
-    expect(h.notices().at(-1)).toContain('/dcc chat bob');
+    expect(h.ctcpLines().at(-1)).toMatch(/wants to start a DCC chat/);
+    expect(h.ctcpLines().at(-1)).toContain('/dcc chat bob');
+    // ⚠ And no `=bob` buffer: an unsolicited offer must not put a row in the
+    // sidebar. A persisted notice would have minted one.
+    expect(h.published).toHaveLength(0);
   });
 
   it('says who would be doing the listening when the offer is passive', () => {
@@ -312,7 +323,7 @@ describe('an inbound offer is not auto-accepted', () => {
     const h = harness();
     offerFrom(h.conn, 'bob', 'CHAT chat 16843009 0 42');
     expect(h.ctcpRequest).not.toHaveBeenCalled(); // no reverse reply until accepted
-    expect(h.notices().at(-1)).toMatch(/firewalled, so this server would do the listening/);
+    expect(h.ctcpLines().at(-1)).toMatch(/firewalled, so this server would listen/);
   });
 
   // `/dcc chat <nick>` doubles as accept, as it does in irssi — offering back at
@@ -339,7 +350,7 @@ describe('an inbound offer is not auto-accepted', () => {
     const h = harness();
     offerFrom(h.conn, 'bob', 'CHAT chat 16843009 5000');
     expect(h.conn.closeDccChat('bob')).toBe(true);
-    expect(h.notices().at(-1)).toMatch(/Declined the DCC chat offer/);
+    expect(h.ctcpLines().at(-1)).toMatch(/Declined the DCC chat offer/);
     // Declined means gone: a later accept must not resurrect it.
     h.conn.offerDccChat('bob');
     expect(dialled(h)).toBe(false);
@@ -353,7 +364,7 @@ describe('an inbound offer is not auto-accepted', () => {
       const h = harness();
       offerFrom(h.conn, 'bob', 'CHAT chat 16843009 5000');
       vi.advanceTimersByTime(10 * 60_000 + 1000);
-      expect(h.notices().at(-1)).toMatch(/expired/);
+      expect(h.ctcpLines().at(-1)).toMatch(/expired/);
       h.conn.offerDccChat('bob');
       expect(dialled(h)).toBe(false);
     } finally {
@@ -366,7 +377,7 @@ describe('an inbound offer is not auto-accepted', () => {
     allowLoopback();
     const h = harness();
     offerFrom(h.conn, 'BoB', 'CHAT chat 16843009 5000');
-    expect(h.notices().at(-1)).toContain('BoB');
+    expect(h.ctcpLines().at(-1)).toContain('BoB');
   });
 });
 
@@ -554,5 +565,112 @@ describe('a = target never reaches the IRC wire', () => {
     expect(ircManager.send(1, 1, '=bob', 'hello?')).toBe(false);
     expect(h.notices().filter((t) => /No live DCC chat/.test(t))).toHaveLength(1);
     expect(h.say).not.toHaveBeenCalled();
+  });
+});
+
+// Fixes from the pre-PR review. Each of these is a state-machine edge that only
+// shows up when two halves of a handshake race, or when an offer is abandoned.
+describe('chat session lifecycle edges', () => {
+  // Glare: we accept bob's active offer AND bob answers a listener we opened, so
+  // two sockets arrive for one peer. The established session must survive — the
+  // old code overwrote the map, orphaning the live socket, and that orphan's
+  // eventual onClose then deleted the REPLACEMENT's entry.
+  it('keeps the established session when a second socket arrives for the same peer', async () => {
+    enableDcc();
+    allowLoopback();
+    enableListening();
+    const h = harness();
+
+    // A listener of ours, opened by accepting bob's passive offer.
+    offerAndAccept(h.conn, 'bob', 'CHAT chat 16843009 0 42');
+    await waitFor(() => h.lastOffer() !== null);
+    const ourPort = Number(h.lastOffer()!.split(' ')[3]);
+
+    // Meanwhile bob's active offer gets accepted too, and that one connects.
+    const peer = await startPeer();
+    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    h.conn.offerDccChat('bob');
+    const sockA = await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+
+    // Now bob's client also reaches our listener. The newcomer must be dropped.
+    const late = net.connect({ host: '127.0.0.1', port: ourPort });
+    late.on('error', () => {});
+    await waitFor(() => late.destroyed || late.readyState === 'open');
+
+    // Session A is still the live one, and still works.
+    const got = new Promise<string>((r) => sockA.once('data', (d) => r(d.toString())));
+    expect(h.conn.dccChatSend('bob', 'still session A')).toBe(true);
+    expect(await got).toBe('still session A\r\n');
+
+    // And when the dropped socket finally closes, it must not evict session A.
+    late.destroy();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(h.conn.hasDccChat('bob')).toBe(true);
+    h.conn.closeDccChat('bob');
+  });
+
+  // The dial's error handler must not outlive the dial: past connect the socket
+  // belongs to DccChat, so a mid-session reset would otherwise print the real
+  // error AND a "check your port forwarding" paragraph that is nonsense by then.
+  it('reports a mid-session drop once, without the connect-failure advice', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    const peer = await startPeer();
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    const sock = await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+
+    const before = h.notices().length;
+    sock.destroy(new Error('ECONNRESET'));
+    await waitFor(() => h.notices().length > before);
+    await new Promise((r) => setTimeout(r, 50)); // let any second notice land
+
+    const after = h.notices().slice(before);
+    expect(after.filter((t) => /Couldn't connect to/.test(t))).toEqual([]);
+    expect(after).toHaveLength(1);
+  });
+
+  // The token is 6 bits, so collisions are a 1-in-64 event, not a theoretical
+  // one. Reusing a live token would have the displaced offer's timer fire
+  // against the new entry and time out the wrong chat.
+  it('refuses to mint a passive token that is already in flight', () => {
+    enableDcc();
+    const h = harness();
+    const spy = vi.spyOn(Math, 'random').mockReturnValue(0.5); // always the same token
+    try {
+      h.conn.offerDccChat('alice', { passive: true });
+      const first = h.lastOffer()!.split(' ')[4];
+      h.conn.offerDccChat('bob', { passive: true });
+      // No second offer went out, and the user was told why.
+      expect(h.lastOffer()!.split(' ')[4]).toBe(first);
+      expect(h.notices().at(-1)).toMatch(/Too many passive DCC chat offers/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // A mistyped `/dcc chat bbo` otherwise pins one of the configured ports for
+  // the full 120s timeout — and the range is the documented concurrency cap.
+  it('releases the listening port when an unanswered offer is closed', async () => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+
+    h.conn.offerDccChat('bbo');
+    await waitFor(() => activeDccListenerCount() === 1);
+
+    expect(h.conn.closeDccChat('bbo')).toBe(true);
+    expect(activeDccListenerCount()).toBe(0);
+    expect(h.notices().at(-1)).toMatch(/Cancelled the pending DCC chat offer/);
+  });
+
+  it('cancels a pending passive offer too', () => {
+    enableDcc();
+    const h = harness();
+    h.conn.offerDccChat('bbo', { passive: true });
+    expect(h.conn.closeDccChat('bbo')).toBe(true);
+    expect(h.notices().at(-1)).toMatch(/Cancelled the pending DCC chat offer/);
   });
 });

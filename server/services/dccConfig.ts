@@ -14,6 +14,7 @@
 
 import { CAPABILITY_DCC, userHasCapability } from '../db/userCapabilities.js';
 import { parseTruthyEnv } from '../utils/truthyEnv.js';
+import { encodeDccAddress } from './dcc.js';
 
 /** Parse a raw LURKER_DCC_ENABLED value to a boolean. Pure (no env access) so
  *  the rule is unit-testable. Unset / empty / anything-else is OFF — DCC must be
@@ -58,10 +59,13 @@ export function dccAllowPrivateHosts(): boolean {
 
 /** The public host to advertise in outgoing DCC offers (LURKER_DCC_EXTERNAL_HOST)
  *  — the address a peer on the internet connects back to, i.e. the host's public
- *  IPv4 (or a hostname that resolves to it), NOT the container's private IP. An
- *  IPv6 literal is allowed too. Unset means active/listening DCC can't advertise
- *  a usable address, so the offer path falls back to passive/reverse where the
- *  peer listens instead. Returns the trimmed value or null. */
+ *  IPv4, NOT the container's private IP. An IPv6 literal works too.
+ *
+ *  ⚠ It must be a LITERAL address, not a hostname. The DCC wire format carries
+ *  IPv4 as a uint32 with no room for a name, so encodeDccAddress refuses a
+ *  hostname — and a config that looks set but can't be encoded is worse than an
+ *  unset one, which is why dccActiveListenAvailable checks encodability rather
+ *  than mere presence. Returns the trimmed value or null. */
 export function dccExternalHost(): string | null {
   const h = (process.env.LURKER_DCC_EXTERNAL_HOST ?? '').trim();
   return h || null;
@@ -88,9 +92,14 @@ export function dccListenPortRange(): { min: number; max: number } | null {
   return { min, max };
 }
 
-/** Whether Lurker can open active (listening) DCC — needs both a public host to
- *  advertise and a port range to listen on. When false, the offer/passive paths
- *  fall back to reverse DCC (peer listens, Lurker dials out). */
+/** Whether Lurker can open active (listening) DCC — needs a port range to listen
+ *  on AND a public address that can actually go on the wire.
+ *
+ *  ⚠ Encodability, not just presence: a hostname in LURKER_DCC_EXTERNAL_HOST
+ *  passes a null check and then fails at offer time, which left `/dcc chat` and
+ *  the passive-accept path reporting a misconfiguration the operator had already
+ *  been told was fine. Refusing here makes the fallbacks honest. */
 export function dccActiveListenAvailable(): boolean {
-  return dccExternalHost() !== null && dccListenPortRange() !== null;
+  const host = dccExternalHost();
+  return host !== null && encodeDccAddress(host) !== null && dccListenPortRange() !== null;
 }
