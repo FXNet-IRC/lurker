@@ -613,6 +613,14 @@ export class IrcConnection {
   // same four things that answer a JOIN: the echo, a forward (470), a
   // rejection naming the channel, and the socket dying.
   private pendingJoins = new Set<string>();
+  // The mirror: channels whose PART is on the wire with no answer yet, folded.
+  // Membership is echo-written in BOTH directions, so between a PART and its
+  // echo the map still says we are in a channel we have already left — and a
+  // caller that acts on that sends a second PART, which the server answers 442
+  // (#967). Emptied wherever membership leaves the map (deleteChannel: the
+  // echo, a kick, a 442's eviction, the engine's prune) and by a JOIN for the
+  // same channel, which supersedes it.
+  private pendingParts = new Set<string>();
   userModes: Set<string>;
   awayState: AwayState;
   // Caps this socket's server has answered a REQ for with a NAK. A refusal is
@@ -4366,15 +4374,22 @@ export class IrcConnection {
    *  channel they closed. isChannelJoined stays the probe for rendering what
    *  we know now.
    *
+   *  ⚠ And a PART on the wire takes it back off. Membership is echo-written in
+   *  both directions, so the map still says yes for a channel we have already
+   *  parted — from an attached client, from another tab, or from this very
+   *  close a moment ago. Acting on that is the second PART and the 442 all over
+   *  again, which also makes a close of an already-closed buffer idempotent on
+   *  the wire.
+   *
    *  ⚠ `restoring` is deliberately NOT part of this. A restore's replayed
    *  self-JOIN already reconciles a channel whose row says autojoin=0 or
    *  closed by PARTing it ("this is that PART, late", in the join handler), so
    *  a caller that also parted would send it twice and the loser would draw
    *  the 442. The replay owns that window; nobody else writes into it. */
   mayBeJoined(name: string): boolean {
-    return (
-      this.isChannelJoined(name) || this.pendingJoins.has(foldTargetFor(this.network.id, name))
-    );
+    const folded = foldTargetFor(this.network.id, name);
+    if (this.pendingParts.has(folded)) return false;
+    return this.isChannelJoined(name) || this.pendingJoins.has(folded);
   }
 
   /** The live ChannelState for `name`, resolved the same fold-aware way
@@ -4408,6 +4423,12 @@ export class IrcConnection {
   }
 
   private deleteChannel(key: string): boolean {
+    // The one place membership leaves the map, so the one place a part awaiting
+    // its answer has been answered: the PART echo, a kick, a 442's eviction, the
+    // engine's prune on re-attach. Unconditional — the mark must go even when
+    // there was no entry to delete, or a PART for a channel we had already left
+    // would leave one behind forever.
+    this.pendingParts.delete(foldTargetFor(this.network.id, key));
     const deleted = this.channels.delete(key);
     if (deleted) this.joinedFoldedCache = null;
     return deleted;
@@ -4430,6 +4451,7 @@ export class IrcConnection {
     // exactly the case with none.
     this.pendingJoinKeys.clear();
     this.pendingJoins.clear();
+    this.pendingParts.clear();
     if (this.channels.size === 0) return;
     const names = Array.from(this.channels.values(), (ch) => ch.name);
     this.channels.clear();
@@ -5271,7 +5293,12 @@ export class IrcConnection {
     // close would PART a channel we had left. That is #967 again, from the
     // guard meant to prevent it. We are in it, so membership already answers.
     for (const one of channel.split(',')) {
-      if (one && !this.isChannelJoined(one)) {
+      if (!one) continue;
+      this.pendingParts.delete(foldTargetFor(this.network.id, one));
+      // A JOIN supersedes a PART still in flight for the same channel: rejoining
+      // is the whole point, and a stale part mark would have the next close send
+      // nothing and leave us in it.
+      if (!this.isChannelJoined(one)) {
         this.pendingJoins.add(foldTargetFor(this.network.id, one));
       }
     }
@@ -5281,7 +5308,9 @@ export class IrcConnection {
     // Leaving ends any join we were still waiting on: a JOIN the server never
     // answered leaves its mark behind (nothing else clears one), and the next
     // close would read it as "maybe in there" and PART again.
-    this.pendingJoins.delete(foldTargetFor(this.network.id, channel));
+    const folded = foldTargetFor(this.network.id, channel);
+    this.pendingJoins.delete(folded);
+    this.pendingParts.add(folded);
     this.client.part(channel, reason);
   }
   say(target: string, text: string): void {

@@ -397,6 +397,107 @@ describe('closeBuffer parts only a channel we are on', () => {
     ircManager.connectionsForUser(userId).delete(network.id);
   });
 
+  it('sends nothing when a PART is already on the wire, before its echo', async () => {
+    // Membership is echo-written in both directions, so between a PART and its
+    // echo the map still says we are in a channel we have left. An attached
+    // client parting and the web app closing inside that round trip is the
+    // reported flow, just faster than the echo.
+    const { network, conn } = await connected('closeinflight', ['#inflightpart']);
+    ircd.hold = (cmd) => cmd === 'PART'; // no echo, no 442
+    ircManager.partChannel(userId, network.id, '#inflightpart');
+    await until(() => partsSent('closeinflight').length > 0, 5000, 'PART sent');
+    // The map has not caught up, which is the whole point.
+    expect(conn.isChannelJoined('#inflightpart')).toBe(true);
+    expect(conn.mayBeJoined('#inflightpart')).toBe(false);
+
+    closeBuffer(userId, network.id, '#inflightpart');
+    await probe(conn, 'closeinflight', 'inflightprobe');
+
+    expect(partsSent('closeinflight')).toEqual(['PART #inflightpart']);
+    ircd.hold = null;
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
+  it('closing twice puts one PART on the wire', async () => {
+    // Two devices with the buffer open, both closing. The row transition is
+    // idempotent on its own; the wire has to be too.
+    const { network, conn } = await connected('closetwice', ['#twiceclosed']);
+    ircd.hold = (cmd) => cmd === 'PART';
+
+    closeBuffer(userId, network.id, '#twiceclosed');
+    await until(() => partsSent('closetwice').length > 0, 5000, 'first PART');
+    closeBuffer(userId, network.id, '#twiceclosed');
+    await probe(conn, 'closetwice', 'twiceprobe');
+
+    expect(partsSent('closetwice')).toEqual(['PART #twiceclosed']);
+    ircd.hold = null;
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
+  it('parts again after the echo lands and the channel is re-joined', async () => {
+    // The mark cannot outlive the PART it belongs to, or a channel you left and
+    // came back to could never be closed properly again.
+    const { network, conn } = await connected('closerejoin', ['#rejoined']);
+    ircManager.partChannel(userId, network.id, '#rejoined');
+    await until(() => !conn.isChannelJoined('#rejoined'), 5000, 'parted');
+    ircManager.joinChannel(userId, network.id, '#rejoined');
+    await until(() => conn.isChannelJoined('#rejoined'), 5000, 'rejoined');
+    const before = partsSent('closerejoin').length;
+
+    closeBuffer(userId, network.id, '#rejoined');
+    await until(() => partsSent('closerejoin').length > before, 5000, 'PART sent');
+
+    expect(partsSent('closerejoin')).toHaveLength(before + 1);
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
+  it('parts a channel a JOIN echo we did not ask for put us back in', async () => {
+    // The echo answered the PART, and then something else made us a member
+    // again without going through join() — another client on the bouncer, or an
+    // engine replay. Only deleteChannel clearing the mark covers this; the join
+    // path never ran.
+    const { network, conn } = await connected('closeforeignjoin', ['#foreign']);
+    ircManager.partChannel(userId, network.id, '#foreign');
+    await until(() => !conn.isChannelJoined('#foreign'), 5000, 'part echoed');
+    const before = partsSent('closeforeignjoin').length;
+
+    // A self-JOIN nobody here requested: membership back, no join() call.
+    conn.client.emit('join', { channel: '#foreign', nick: conn.currentNick });
+    await until(() => conn.isChannelJoined('#foreign'), 5000, 'member again');
+
+    closeBuffer(userId, network.id, '#foreign');
+    await until(() => partsSent('closeforeignjoin').length > before, 5000, 'PART sent');
+
+    expect(partsSent('closeforeignjoin')).toHaveLength(before + 1);
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
+  it('parts after a rejoin that overtakes an unanswered PART', async () => {
+    // Part, then rejoin, with the PART never answered — so deleteChannel never
+    // ran and only the JOIN can supersede the mark. Without that, the channel
+    // could never be closed properly again.
+    const { network, conn } = await connected('closeovertake', ['#overtake']);
+    ircd.hold = (cmd) => cmd === 'PART';
+    ircManager.partChannel(userId, network.id, '#overtake');
+    await until(() => partsSent('closeovertake').length > 0, 5000, 'PART sent');
+    expect(conn.mayBeJoined('#overtake')).toBe(false);
+
+    ircManager.joinChannel(userId, network.id, '#overtake');
+    expect(conn.mayBeJoined('#overtake')).toBe(true);
+
+    closeBuffer(userId, network.id, '#overtake');
+    await until(() => partsSent('closeovertake').length > 1, 5000, 'second PART sent');
+
+    expect(partsSent('closeovertake')).toHaveLength(2);
+    ircd.hold = null;
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
   it('lowers autojoin on a network with no connection at all', async () => {
     // The disconnected fallback: no socket to PART on, but the channel must
     // not come back the next time the network connects.
