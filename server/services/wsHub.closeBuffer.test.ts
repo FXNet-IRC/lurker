@@ -20,7 +20,14 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createUser } from '../db/users.js';
 import { createNetwork } from '../db/networks.js';
 import type { Network } from '../db/networks.js';
-import { getState, isAutojoin, ensureOpen, close as closeRow } from '../db/buffers.js';
+import {
+  getState,
+  isAutojoin,
+  ensureOpen,
+  close as closeRow,
+  invalidateCasemappingCache,
+} from '../db/buffers.js';
+import db from '../db/index.js';
 import { FakeIrcd } from '../test-utils/fakeIrcd.js';
 import { until } from '../test-utils/until.js';
 
@@ -494,6 +501,36 @@ describe('closeBuffer parts only a channel we are on', () => {
 
     expect(partsSent('closeovertake')).toHaveLength(2);
     ircd.hold = null;
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
+  it('sends nothing after a PART echoed under a fold variant of the name', async () => {
+    // On rfc1459 `[` and `{` are the same character, so an ircd may echo the
+    // PART for a `#foo[bar]` we are in as `#foo{bar}`. Membership has to fold
+    // both sides to see that as the channel leaving — an exact-key delete
+    // misses it, and the map then claims we are in a channel we left for the
+    // life of the connection, so every close of it PARTs again for another 442.
+    const network = makeNetwork('foldpart');
+    const conn = ircManager.startNetwork(userId, network.id)!;
+    await until(() => conn.state === 'connected', 5000, 'connected');
+    // After registration: the connection captures ISUPPORT CASEMAPPING on the
+    // way in, and the fake ircd declares `ascii`, which would overwrite this.
+    db.prepare('UPDATE networks SET casemapping = ? WHERE id = ?').run('rfc1459', network.id);
+    invalidateCasemappingCache(network.id);
+    ircManager.joinChannel(userId, network.id, '#foo[bar]');
+    await until(() => conn.isChannelJoined('#foo[bar]'), 5000, 'joined');
+    const before = partsSent('foldpart').length;
+
+    // Somebody else's client parted it; the server relays the other spelling.
+    conn.client.emit('part', { channel: '#foo{bar}', nick: conn.currentNick });
+    expect(conn.isChannelJoined('#foo[bar]')).toBe(false);
+    expect(conn.mayBeJoined('#foo[bar]')).toBe(false);
+
+    closeBuffer(userId, network.id, '#foo[bar]');
+    await probe(conn, 'foldpart', 'foldprobe');
+
+    expect(partsSent('foldpart')).toHaveLength(before);
     conn.dispose();
     ircManager.connectionsForUser(userId).delete(network.id);
   });

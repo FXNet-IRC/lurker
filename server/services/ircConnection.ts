@@ -4423,13 +4423,33 @@ export class IrcConnection {
   }
 
   private deleteChannel(key: string): boolean {
+    const folded = foldTargetFor(this.network.id, key);
     // The one place membership leaves the map, so the one place a part awaiting
     // its answer has been answered: the PART echo, a kick, a 442's eviction, the
     // engine's prune on re-attach. Unconditional — the mark must go even when
     // there was no entry to delete, or a PART for a channel we had already left
     // would leave one behind forever.
-    this.pendingParts.delete(foldTargetFor(this.network.id, key));
-    const deleted = this.channels.delete(key);
+    this.pendingParts.delete(folded);
+    // ⚠ Fold-aware, like isChannelJoined and channelState (#707). Every caller
+    // hands this a raw `.toLowerCase()` of whatever the SERVER said, while the
+    // map is keyed by the name we joined under — and those differ whenever an
+    // ircd echoes a fold variant, `#foo{bar}` for a `#foo[bar]` we are in on an
+    // rfc1459 network. An exact-key delete misses that entry, so membership
+    // goes on claiming we are in a channel we have left for the life of the
+    // connection: the next close sends a second PART, the server answers 442,
+    // and that is #967 by another road. Exact hit first, so the ordinary case
+    // stays one probe; the fallback scans the joined channels, a handful, for
+    // the same reason channelState is deliberately a scan.
+    let actual = key;
+    if (!this.channels.has(key)) {
+      for (const k of this.channels.keys()) {
+        if (foldTargetFor(this.network.id, k) === folded) {
+          actual = k;
+          break;
+        }
+      }
+    }
+    const deleted = this.channels.delete(actual);
     if (deleted) this.joinedFoldedCache = null;
     return deleted;
   }
