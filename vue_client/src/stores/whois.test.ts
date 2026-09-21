@@ -103,3 +103,35 @@ describe('whois store — in-flight tracking', () => {
     expect(store.refreshingKey).toBeNull();
   });
 });
+
+// ⚠⚠ A `=bob` buffer is a DCC chat with bob, and the lookup goes out as a RAW
+// line — which bypasses every `=` guard in ircManager by design (it is what
+// /quote uses). So the DCC chat header, which passes its buffer target, put
+// `WHOIS =bob` straight on the wire. Normalized in the store so no entry point
+// can reintroduce it.
+describe('whois store — DCC chat targets', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    send.mockReset();
+    send.mockReturnValue(true);
+  });
+
+  it('looks up the peer, never the =nick buffer name', () => {
+    const store = useWhoisStore();
+    store.openViewer(1, '=bob');
+    expect(send).toHaveBeenCalledWith({ type: 'raw', networkId: 1, line: 'WHOIS bob' });
+    expect(store.viewer.nick).toBe('bob');
+  });
+
+  it('shares the cache and in-flight slot with a plain whois of the same peer', () => {
+    const store = useWhoisStore();
+    store.openViewer(1, '=bob');
+    store.openViewer(1, 'bob'); // same person, same lookup still out
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves an ordinary nick alone', () => {
+    useWhoisStore().openViewer(1, 'alice');
+    expect(send).toHaveBeenCalledWith({ type: 'raw', networkId: 1, line: 'WHOIS alice' });
+  });
+});
