@@ -116,3 +116,70 @@ describe('notifyForEvent notify gate', () => {
     expect((push.mock.calls[0][0] as { body: string }).body).toBe('red and bold text');
   });
 });
+
+// #968. The toast side of the kick signal. A kick is the room telling you you're
+// out of it, so it can't wear the "<nick> in <where>" title every other alert
+// here uses — that would read as something bob said in the channel.
+describe('notifyForEvent kick-of-us', () => {
+  beforeEach(() => vi.resetModules());
+
+  function kick(overrides: Record<string, unknown> = {}) {
+    return dm({
+      target: '#lurker',
+      type: 'kick',
+      nick: 'op',
+      kicked: 'me',
+      selfKicked: true,
+      text: 'read the topic',
+      dm: false,
+      ...overrides,
+    });
+  }
+
+  it('leads with the outcome and moves the kicker into the body', async () => {
+    // The title is nowrap + ellipsis in a 360px stack, so a sentence opening
+    // with the kicker's nick would clip the channel — the one fact the toast
+    // exists to deliver. The push title has no such cap and keeps the sentence.
+    const { notifyForEvent } = await load();
+    notifyForEvent(kick());
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(push.mock.calls[0][0]).toMatchObject({
+      kind: 'kicked',
+      title: 'Kicked from libera • #lurker',
+      body: 'op: read the topic',
+    });
+  });
+
+  it('drops whichever half of the body is missing', async () => {
+    const { notifyForEvent } = await load();
+    // A server kick has no nick...
+    notifyForEvent(kick({ nick: null }));
+    expect(push.mock.calls[0][0]).toMatchObject({
+      title: 'Kicked from libera • #lurker',
+      body: 'read the topic',
+    });
+    // ...and a kick with no reason is ordinary.
+    notifyForEvent(kick({ text: '' }));
+    expect((push.mock.calls[1][0] as { body: string }).body).toBe('op');
+  });
+
+  it('strips formatting codes out of the kick reason too', async () => {
+    const { notifyForEvent } = await load();
+    notifyForEvent(kick({ text: '\x0304read\x03 the \x02topic\x02' }));
+    expect((push.mock.calls[0][0] as { body: string }).body).toBe('op: read the topic');
+  });
+
+  it('reads its own master toggle, not the channel signals', async () => {
+    const { notifyForEvent } = await load();
+    notifyForEvent(kick());
+    expect(effective).toHaveBeenCalledWith('notifications.kicked.enabled');
+  });
+
+  it('still defers to the server verdict', async () => {
+    // A NONOTIFY-muted channel arrives as notify:false and stays silent, same
+    // as every other signal — the client never re-derives the veto.
+    const { notifyForEvent } = await load();
+    notifyForEvent(kick({ notify: false }));
+    expect(push).not.toHaveBeenCalled();
+  });
+});

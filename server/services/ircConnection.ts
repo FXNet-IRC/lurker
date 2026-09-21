@@ -446,7 +446,10 @@ function extractExtras(event: IrcEvent): Record<string, unknown> | null {
   let extras: Record<string, unknown> | null = null;
   switch (event.type) {
     case 'kick':
-      extras = { kicked: event.kicked };
+      // `selfKicked` is persisted alongside the kicked nick so a backlog row
+      // carries the same shape the live frame did. It records that the kick
+      // was of US at the time, which no later nick comparison can recover.
+      extras = { kicked: event.kicked, selfKicked: event.selfKicked };
       break;
     case 'invite':
       // The invited nick — `nick` (the standard actor column) holds the
@@ -2718,6 +2721,22 @@ export class IrcConnection {
       const channel = canonicalChannelTarget(eventChannel, this.channels) ?? eventChannel;
       const ch = this.channels.get(eventChannel.toLowerCase());
       if (ch) ch.members.delete(eventKicked.toLowerCase());
+      // Were WE the one kicked? Decided here because this is the only place
+      // that knows both the kicked nick and our current one — decorateMessage
+      // sees neither, and a nick comparison made later would answer for the
+      // nick we hold THEN, not the one we were wearing when it happened.
+      // ⚠ Not `self`, which means "we sent this line": the kicker is someone
+      // else. This says the kicked party is us (#968).
+      //
+      // isSelfNick reads `this.currentNick` — the server-tracked nick — where
+      // this used to read `c.user.nick`. The framework lags: it fires the 'all'
+      // proxy that routes events to us BEFORE its own listener updates
+      // user.nick, which is why RPL_WELCOME and snapshot() already route around
+      // it (#362). A nick fallback at registration is the case that bites — the
+      // server lands you on `me_`, c.user.nick still says `me`, and a kick of
+      // `me_` reads as someone else's: no notification, and the buffer stays
+      // styled as joined with its autojoin intact.
+      const selfKicked = this.isSelfNick(eventKicked);
       this.publish({
         type: 'kick',
         target: channel,
@@ -2726,12 +2745,13 @@ export class IrcConnection {
         text: event.message as string | undefined,
         userhost: buildUserhost(event),
         time: event.time,
+        ...(selfKicked ? { selfKicked: true } : {}),
       });
       // Mirror the self-PART path when we ourselves are the one kicked, so
       // the buffer dims in the sidebar instead of staying styled as joined.
       // Lowering autojoin also prevents the reconnect replay — rejoining a
       // channel that just kicked you reads as ban evasion to ops.
-      if (eventKicked && c.user.nick && eventKicked.toLowerCase() === c.user.nick.toLowerCase()) {
+      if (selfKicked) {
         this.deleteChannel(eventChannel.toLowerCase());
         try {
           setBufferAutojoin(this.network.user_id, this.network.id, channel, false);

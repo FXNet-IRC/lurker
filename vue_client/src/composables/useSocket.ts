@@ -236,6 +236,11 @@ function applyEvent(event: any): void {
     case 'kick':
       if (!buffers.pushMessage(event)) break;
       buffers.removeMember(event.networkId, event.target, event.kicked);
+      // Only a kick of US notifies, and the server already decided that — this
+      // call is gated on `event.notify` like every other one, so a kick of
+      // someone else falls straight back out (#968). Behind the dedupe, so a
+      // resume gap can't re-toast a kick we've already been told about.
+      notifyForEvent(event);
       break;
     case 'nick':
       if (!buffers.pushMessage(event)) break;

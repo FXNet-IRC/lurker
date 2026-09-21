@@ -126,6 +126,7 @@ beforeEach(() => {
     'notifications.dm.enabled',
     'notifications.highlight.enabled',
     'notifications.always_notify.enabled',
+    'notifications.kicked.enabled',
     'notifications.push.mute_when_away',
     'notifications.push.quiet_hours.enabled',
     'notifications.push.quiet_hours.start',
@@ -309,6 +310,39 @@ describe('maybePush gate chain', () => {
       }
     },
   );
+
+  // #968: a kick of us is its own signal — no bell required, because a channel
+  // disappearing from your sidebar with no word is the thing people asked not to
+  // happen.
+  it('pushes a kick of us with the bell OFF, gated by its own toggle', async () => {
+    emitChannel({ type: 'kick', nick: 'op', kicked: 'pushuser', selfKicked: true, text: 'bye' });
+    expect(await pushed()).toBe(true);
+    const p = await payload();
+    expect(p.kind).toBe('kicked');
+    // The KICKER and the reason — what composeNotification builds the alert
+    // from. If either stops riding, the notification renders wrong with
+    // nothing else failing.
+    expect(p).toMatchObject({ nick: 'op', target: '#lurker', text: 'bye' });
+
+    deliverMock = freshDeliver();
+    setUserSetting(userId, 'notifications.kicked.enabled', false);
+    emitChannel({ type: 'kick', nick: 'op', kicked: 'pushuser', selfKicked: true, text: 'bye' });
+    expect(await pushed()).toBe(false);
+  });
+
+  it('does not push a kick of someone else', async () => {
+    emitChannel({ type: 'kick', nick: 'op', kicked: 'bob', text: 'bye' });
+    expect(await pushed()).toBe(false);
+  });
+
+  it('pushes a kick even while a NOTICE-quiet always_notify bell is off', async () => {
+    // Belt and braces on the independence claim: the always_notify master
+    // toggle must not gate the kick, or "turn off busy channels" would also
+    // turn off being told you were removed from one.
+    setUserSetting(userId, 'notifications.always_notify.enabled', false);
+    emitChannel({ type: 'kick', nick: 'op', kicked: 'pushuser', selfKicked: true, text: 'bye' });
+    expect((await payload()).kind).toBe('kicked');
+  });
 
   it('still pushes a NOTICE in a notify_always channel', async () => {
     // The other half of #965: the gate is COUNTABLE_TYPES, not "message and
