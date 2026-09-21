@@ -392,6 +392,11 @@ function applyEvent(event: any): void {
       );
       break;
     }
+    case 'dcc-chat-state': {
+      const from = String(event.from ?? '');
+      if (from) networks.applyDccChatState(event.networkId, from, !!event.live);
+      break;
+    }
     case 'dcc-chat-offer-closed': {
       const from = String(event.from ?? '');
       if (from) dismissDccOfferToast(dccOfferKey(event.networkId as number, from));

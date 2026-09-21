@@ -114,6 +114,10 @@ function harness() {
   // surfaced — deliberately not a persisted notice, which would mint a buffer.
   const ctcpLines = () =>
     ephemeral.filter((e) => e.type === 'ctcp').map((e) => String(e.text ?? ''));
+  const stateEvents = () =>
+    ephemeral
+      .filter((e) => e.type === 'dcc-chat-state')
+      .map((e) => ({ from: e.from, live: e.live }));
   const offerEvents = () =>
     ephemeral.filter(
       (e) => e.type === 'dcc-chat-offer' || e.type === 'dcc-chat-offer-closed',
@@ -134,6 +138,7 @@ function harness() {
     notices,
     ctcpLines,
     offerEvents,
+    stateEvents,
     chatLines,
   };
 }
@@ -929,5 +934,70 @@ describe('our own offer echoed back is not an offer', () => {
     // Dialled, not prompted — the reply is the answer to a chat we started.
     expect(h.ctcpLines().join(' ')).not.toMatch(/wants to start a DCC chat/);
     h.conn.closeDccChat('bob');
+  });
+});
+
+// QA: "put an affordance in the dcc chat buffer, similar to when a user is
+// offline, if the session is disconnected". The client can't infer liveness —
+// sessions live on the server and survive a page reload — so the server
+// reports it: live events for changes, and the list itself in every snapshot.
+describe('the client is told whether a chat is live', () => {
+  it('announces a session opening and closing', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    const peer = await startPeer();
+    offerAndAccept(h.conn, 'BoB', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('BoB'));
+    expect(h.stateEvents()).toEqual([{ from: 'BoB', live: true }]);
+
+    h.conn.closeDccChat('BoB');
+    expect(h.stateEvents().at(-1)).toEqual({ from: 'BoB', live: false });
+  });
+
+  it('announces the peer hanging up', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    const peer = await startPeer();
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    const sock = await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+    sock.end();
+    await waitFor(() => h.stateEvents().some((e) => e.live === false));
+    expect(h.stateEvents().at(-1)).toEqual({ from: 'bob', live: false });
+  });
+
+  // ⚠⚠ The case a naive version gets wrong. A user-initiated disconnect drops
+  // the connection from ircManager's map, and that network's snapshot blob is
+  // then synthesized from the DB — while the chat socket is still up. Reading
+  // the live list off the connection alone would tell a reloaded tab the chat
+  // was dead.
+  it('reports a live chat in the snapshot even after the network is disconnected', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    inject(h.conn);
+    const peer = await startPeer();
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+
+    ircManager.connectionsForUser(1).delete(1); // what stopNetwork does
+    const snap = ircManager.snapshotForUser(1) as Array<{
+      networkId: number;
+      state: string;
+      dccChats: string[];
+    }>;
+    const net = snap.find((n) => n.networkId === 1)!;
+    expect(net.state).toBe('disconnected'); // the synthesized, DB-built blob…
+    expect(net.dccChats).toEqual(['bob']); // …still knows the chat is live
+    h.conn.closeDccChat('bob');
+  });
+
+  it('reports no live chats once they have ended', () => {
+    const snap = ircManager.snapshotForUser(1) as Array<{ networkId: number; dccChats: string[] }>;
+    expect(snap.find((n) => n.networkId === 1)!.dccChats).toEqual([]);
   });
 });

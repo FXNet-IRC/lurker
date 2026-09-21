@@ -6375,6 +6375,24 @@ export class IrcConnection {
     return this.dccChats.has(nick.toLowerCase());
   }
 
+  /** Display nicks of every peer with a live session right now. */
+  liveDccChatPeers(): string[] {
+    return Array.from(this.dccChats.values(), (e) => e.nick);
+  }
+
+  // Tell the client whether the `=nick` buffer has a live session behind it, so
+  // it can say so the way a DM says its peer is offline. Ephemeral: the current
+  // state also rides every snapshot (ircManager.snapshotForUser), which is what
+  // a reloaded tab reads — a live event alone would leave it guessing.
+  private publishDccChatState(nick: string, live: boolean): void {
+    this.publishEphemeral({
+      type: 'dcc-chat-state',
+      target: this.serverTarget(),
+      from: nick,
+      live,
+    });
+  }
+
   // Both tiers of the DCC gate plus the proxy rule, checked at every chat entry
   // point. The gate is per-entry-point by doctrine (routes/dcc.ts), and the proxy
   // rule matters because DCC bypasses the tunnel in BOTH directions — a chat dial
@@ -6752,15 +6770,18 @@ export class IrcConnection {
     registerDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
     chat.start();
     this.dccChatNotice(nick, `DCC chat with ${nick} connected.`);
+    this.publishDccChatState(nick, true);
   }
 
   // Drop `key` only if it still maps to `chat` — an identity check, not a bare
   // delete, so a late callback from a superseded session can't evict the live
   // one (see the glare note in startDccChat).
   private forgetDccChat(key: string, chat: DccChat): boolean {
-    if (this.dccChats.get(key)?.chat !== chat) return false;
+    const entry = this.dccChats.get(key);
+    if (entry?.chat !== chat) return false;
     this.dccChats.delete(key);
     this.releaseDccChatHost();
+    this.publishDccChatState(entry.nick, false);
     return true;
   }
 
@@ -6840,6 +6861,7 @@ export class IrcConnection {
     this.releaseDccChatHost();
     entry.chat.close();
     this.dccChatNotice(entry.nick, `DCC chat with ${entry.nick} closed.`);
+    this.publishDccChatState(entry.nick, false);
     return true;
   }
 
@@ -6852,6 +6874,7 @@ export class IrcConnection {
       this.dccChats.delete(key);
       entry.chat.close();
       this.dccChatNotice(entry.nick, `DCC chat ended — ${reason}.`);
+      this.publishDccChatState(entry.nick, false);
     }
     // Deleting the current key mid-iteration is well-defined for a Map, and
     // clearPendingInboundChat is what tells the client to retire its toast —

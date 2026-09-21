@@ -1244,6 +1244,13 @@ class IrcManager extends EventEmitter {
         ignoredMasks: ignoresByNetwork.get(networkId) || [],
         nickNotes: notesByNetwork.get(networkId) || [],
         relayBots: relayBotsByNetwork.get(networkId) || [],
+        // ⚠ Here, not in conn.snapshot(), because a DCC chat outlives its
+        // connection's place in the map: a user-initiated disconnect drops the
+        // connection but the chat socket stays up, and that network's blob is
+        // then synthesized below from the DB. The session registry is what
+        // still knows, so reading it here keeps a reloaded tab from showing a
+        // live chat as disconnected.
+        dccChats: dccChatHost(dccChatKey(userId, networkId))?.liveDccChatPeers() ?? [],
       };
     };
     const live = this.listConnections(userId);

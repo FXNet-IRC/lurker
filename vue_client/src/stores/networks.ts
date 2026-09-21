@@ -5,7 +5,7 @@ import { defineStore } from 'pinia';
 import { api } from '../api.js';
 import { useAuthStore } from './auth.js';
 import { isVirtualKey } from '../lib/virtualBuffers.js';
-import { isDccChatTarget } from '../../../shared/channels.js';
+import { dccChatPeer, isDccChatTarget } from '../../../shared/channels.js';
 import type { MultilineLimits } from '../utils/messageSplit.js';
 
 export interface Network {
@@ -59,6 +59,10 @@ export interface NetworkState {
   userModes?: string;
   away?: AwayState | null;
   peerPresence?: Record<string, PeerPresenceEntry>;
+  // Display nicks of peers with a live DCC chat session on this network. Seeded
+  // by every snapshot — including a disconnected network's, since a chat socket
+  // outlives the IRC link — and kept current by `dcc-chat-state` events.
+  dccChats?: string[];
   lagMs?: number | null;
   // Advertised draft/multiline limits when the network negotiated the cap,
   // else null/absent. Drives the composer's multiline-aware SPLIT/FLOOD hint
@@ -132,6 +136,15 @@ export const useNetworksStore = defineStore('networks', {
         if (netState && netState.state !== 'connected')
           return { nick, state: 'offline', stateAt: null, awayMessage: null };
         return netState?.peerPresence?.[nick.toLowerCase()] ?? null;
+      },
+    // Whether a `=nick` buffer (or a bare peer nick) has a live DCC session.
+    // The DCC counterpart to peerFor, and deliberately independent of the IRC
+    // link's state: the chat keeps working while the network is down.
+    isDccChatLive:
+      (state) =>
+      (networkId: number | string, target: string): boolean => {
+        const peer = dccChatPeer(target).toLowerCase();
+        return (state.states[networkId]?.dccChats ?? []).some((n) => n.toLowerCase() === peer);
       },
     activeBuffer(state): ActiveBuffer | null {
       if (!state.activeKey) return null;
@@ -305,6 +318,13 @@ export const useNetworksStore = defineStore('networks', {
         awayMessage: payload?.awayMessage || null,
       };
       this.states[networkId] = { ...existing, peerPresence };
+    },
+    applyDccChatState(networkId: number | string, nick: string, live: boolean) {
+      if (!networkId || !nick) return;
+      const existing = this.states[networkId] || { networkId: Number(networkId), channels: [] };
+      const lower = nick.toLowerCase();
+      const others = (existing.dccChats ?? []).filter((n) => n.toLowerCase() !== lower);
+      this.states[networkId] = { ...existing, dccChats: live ? [...others, nick] : others };
     },
     applyLag(event: any) {
       const existing = this.states[event.networkId] || { networkId: event.networkId, channels: [] };

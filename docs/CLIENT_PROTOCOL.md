@@ -1345,6 +1345,26 @@ independent of IRC) but not a server restart, while the buffer and its history
 persist. Sending into a chat the server no longer holds fails and says so in the
 buffer.
 
+Three ephemeral events, each targeting the network's `:server:` buffer and naming
+the peer in `from` (not `target`), carry DCC chat state to a client:
+
+| Event                   | Fields            | Meaning                                                        |
+| ----------------------- | ----------------- | -------------------------------------------------------------- |
+| `dcc-chat-offer`        | `from`, `passive` | A peer offered a chat; nothing is dialled until accepted.      |
+| `dcc-chat-offer-closed` | `from`            | That offer is gone — accepted, declined, expired or torn down. |
+| `dcc-chat-state`        | `from`, `live`    | A session with `from` opened (`true`) or ended (`false`).      |
+
+An offer surface should be retired on `dcc-chat-offer-closed` rather than on a
+timer, so it never outlives the offer it names.
+
+The current set of live sessions also rides every snapshot, as `dccChats` (peer
+display nicks) on each network's state — **including a disconnected network's**,
+because a chat outlives its IRC link. A client should seed from the snapshot and
+apply `dcc-chat-state` on top; the events alone leave a freshly loaded client
+unable to tell a live chat from a dead one. Whether a chat is live is independent
+of the network's `state`, which is the reverse of a DM: a DM's peer reads as
+offline the moment our link drops, a DCC chat does not.
+
 ### Export / import
 
 `GET /api/exports/preview` · `POST /api/exports` (`{include_messages}`, allowed

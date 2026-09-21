@@ -23,6 +23,8 @@
  *  IrcConnection import here would close an ircManager ↔ ircConnection cycle. */
 export interface DccChatHost {
   hasDccChat(nick: string): boolean;
+  /** Display nicks of every peer with a live session right now. */
+  liveDccChatPeers(): string[];
   dccChatSend(nick: string, text: string, opts?: { action?: boolean }): boolean;
   closeDccChat(nick: string): boolean;
 }
