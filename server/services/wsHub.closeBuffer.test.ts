@@ -565,6 +565,64 @@ describe('closeBuffer parts only a channel we are on', () => {
     ircManager.connectionsForUser(userId).delete(network.id);
   });
 
+  it('sends nothing after a raw PART the user typed themselves', async () => {
+    // `/quote PART #x` and `/raw PART #x` go to the socket verbatim, not
+    // through part(), so nothing would record the PART — and the close right
+    // after it would send the duplicate. The user reaching for a raw command
+    // is not a reason to hand their other clients a 442.
+    const { network, conn } = await connected('closerawpart', ['#rawpart']);
+    ircd.hold = (cmd) => cmd === 'PART';
+    conn.raw('PART #rawpart :bye');
+    await until(() => partsSent('closerawpart').length > 0, 5000, 'raw PART sent');
+    expect(conn.isChannelJoined('#rawpart')).toBe(true); // echo still owed
+    expect(conn.mayBeJoined('#rawpart')).toBe(false);
+
+    closeBuffer(userId, network.id, '#rawpart');
+    await probe(conn, 'closerawpart', 'rawpartprobe');
+
+    expect(partsSent('closerawpart')).toEqual(['PART #rawpart :bye']);
+    ircd.hold = null;
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
+  it('treats JOIN 0 as a part of every channel', async () => {
+    // JOIN 0 leaves them all at once (RFC 2812 3.2.1), which is what a bouncer
+    // client's JOIN 0 relays to. Every channel is on its way out, so none of
+    // them owes a PART.
+    const { network, conn } = await connected('closejoinzero', ['#zeroa', '#zerob']);
+    ircd.hold = (cmd) => cmd === 'JOIN';
+    conn.raw('JOIN 0');
+    expect(conn.mayBeJoined('#zeroa')).toBe(false);
+    expect(conn.mayBeJoined('#zerob')).toBe(false);
+    const before = partsSent('closejoinzero').length;
+
+    closeBuffer(userId, network.id, '#zeroa');
+    await probe(conn, 'closejoinzero', 'zeroprobe');
+
+    expect(partsSent('closejoinzero')).toHaveLength(before);
+    ircd.hold = null;
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
+  it('parts a channel a raw JOIN is still waiting on', async () => {
+    // The other direction: a raw JOIN is as much a pending join as join()'s,
+    // and closing before its echo still owes the PART.
+    const { network, conn } = await connected('closerawjoin');
+    ircd.hold = (cmd) => cmd === 'JOIN';
+    conn.raw('JOIN #rawjoin');
+    expect(conn.mayBeJoined('#rawjoin')).toBe(true);
+
+    closeBuffer(userId, network.id, '#rawjoin');
+    await until(() => partsSent('closerawjoin').length > 0, 5000, 'PART sent');
+
+    expect(partsSent('closerawjoin')).toEqual(['PART #rawjoin']);
+    ircd.hold = null;
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
   it('lowers autojoin on a network with no connection at all', async () => {
     // The disconnected fallback: no socket to PART on, but the channel must
     // not come back the next time the network connects.

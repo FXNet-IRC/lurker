@@ -4490,6 +4490,70 @@ export class IrcConnection {
     return ch;
   }
 
+  /** Mark a JOIN put on the wire, for every channel in a comma list.
+   *
+   *  A JOIN supersedes a PART still in flight for the same channel: rejoining is
+   *  the whole point, and a stale part mark would have the next close send
+   *  nothing and leave us in it.
+   *
+   *  ⚠ And superseding one is itself the reason to track this JOIN. While that
+   *  PART is unanswered the map still says joined, so the membership test reads
+   *  "already in it" and marks nothing — then the PART echo lands, membership
+   *  goes false, and NOTHING says a JOIN is outstanding. A close in that gap
+   *  sends no PART and the JOIN echo reopens the buffer it closed. A cycle has
+   *  to be tracked even though we look like a member: we are about to stop
+   *  being one, briefly.
+   *
+   *  ⚠ Only a channel whose outcome is UNKNOWN otherwise. A JOIN for one we are
+   *  already in is answered by nothing — no echo, as ircManager.joinChannel says
+   *  in the branch that sends it — so a mark would never be cleared, and after
+   *  the user later parted, mayBeJoined would still say yes and the close would
+   *  PART a channel we had left. That is #967 again, from the guard meant to
+   *  prevent it. */
+  private noteJoinSent(channelList: string): void {
+    for (const one of channelList.split(',')) {
+      if (!one) continue;
+      const folded = foldTargetFor(this.network.id, one);
+      const supersededPart = this.pendingParts.delete(folded);
+      if (supersededPart || !this.isChannelJoined(one)) this.pendingJoins.add(folded);
+    }
+  }
+
+  /** Mark a PART put on the wire, for every channel in a comma list. Leaving
+   *  also ends any join we were still waiting on: a JOIN the server never
+   *  answered leaves its mark behind (nothing else clears one), and the next
+   *  close would read it as "maybe in there" and PART again. */
+  private notePartSent(channelList: string): void {
+    for (const one of channelList.split(',')) {
+      if (!one) continue;
+      const folded = foldTargetFor(this.network.id, one);
+      this.pendingJoins.delete(folded);
+      this.pendingParts.add(folded);
+    }
+  }
+
+  /** The same marks for a JOIN or PART that reaches the socket as a raw line.
+   *
+   *  ⚠ `/quote PART #x` and `/raw JOIN #x` do not go through part() or join() —
+   *  they are handed to raw() verbatim (wsHub's 'raw' verb) — so without this
+   *  the marks are simply missing, and a close right after a raw PART sends the
+   *  duplicate this all exists to stop. Read on the way out, like
+   *  takeRawMonitor and noteOutgoingCommand beside it: raw() is the one path
+   *  every slash command and member-menu action takes. */
+  private noteRawMembership(line: string): void {
+    const parsed = /^\s*(JOIN|PART)\s+(\S+)/i.exec(line);
+    if (!parsed) return;
+    const targets = parsed[2];
+    if (parsed[1].toUpperCase() === 'PART') return this.notePartSent(targets);
+    // `JOIN 0` leaves every channel at once (RFC 2812 3.2.1) — it is a PART of
+    // all of them, and it is what a bouncer client's `JOIN 0` relays to.
+    if (targets === '0') {
+      for (const ch of this.channels.values()) this.notePartSent(ch.name);
+      return;
+    }
+    this.noteJoinSent(targets);
+  }
+
   /** Hold a join key until its echo (see pendingJoinKeys). */
   stashJoinKey(channel: string, key: string): void {
     this.pendingJoinKeys.set(channel.toLowerCase(), key);
@@ -5312,33 +5376,11 @@ export class IrcConnection {
     // after the user later parted, mayBeJoined would still say yes and the
     // close would PART a channel we had left. That is #967 again, from the
     // guard meant to prevent it. We are in it, so membership already answers.
-    for (const one of channel.split(',')) {
-      if (!one) continue;
-      const oneFolded = foldTargetFor(this.network.id, one);
-      // A JOIN supersedes a PART still in flight for the same channel: rejoining
-      // is the whole point, and a stale part mark would have the next close send
-      // nothing and leave us in it.
-      const supersededPart = this.pendingParts.delete(oneFolded);
-      // ⚠ And superseding one is itself the reason to track this JOIN. While
-      // that PART is unanswered the map still says joined, so the membership
-      // test below reads "already in it" and marks nothing — then the PART echo
-      // lands, membership goes false, and NOTHING says a JOIN is outstanding.
-      // A close in that gap sends no PART and the JOIN echo reopens the buffer
-      // it closed. Which is why a cycle has to be tracked even though we look
-      // like a member: we are about to stop being one, briefly.
-      if (supersededPart || !this.isChannelJoined(one)) {
-        this.pendingJoins.add(oneFolded);
-      }
-    }
+    this.noteJoinSent(channel);
     this.client.join(channel, typeof key === 'string' ? key : undefined);
   }
   part(channel: string, reason?: string): void {
-    // Leaving ends any join we were still waiting on: a JOIN the server never
-    // answered leaves its mark behind (nothing else clears one), and the next
-    // close would read it as "maybe in there" and PART again.
-    const folded = foldTargetFor(this.network.id, channel);
-    this.pendingJoins.delete(folded);
-    this.pendingParts.add(folded);
+    this.notePartSent(channel);
     this.client.part(channel, reason);
   }
   say(target: string, text: string): void {
@@ -7006,6 +7048,9 @@ export class IrcConnection {
     // in the channel it was aimed at (#434). Cheap and total: this is the one
     // path every slash command and member-menu action takes.
     this.noteOutgoingCommand(clean);
+    // A raw JOIN/PART changes membership just as join()/part() do, and nothing
+    // else would record it.
+    this.noteRawMembership(clean);
     // A query waits its turn, and its reply goes to `asker` (replyRouter.ts).
     this.replies.send(asker, clean);
   }
