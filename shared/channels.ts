@@ -38,6 +38,37 @@ export function isChannelTarget(target: string | null | undefined): boolean {
 }
 
 /**
+ * The DCC CHAT buffer sigil. `=alice` is a direct peer-to-peer conversation with alice carried
+ * on a TCP socket THIS PROCESS owns — it is not a channel, not a nick, and **never an IRC
+ * target**. The convention is irssi's (dcc-chat.c:179, fe-dcc-chat.c:58) and repartee's
+ * (app/dcc.rs:121); both also route `/msg =nick` to the socket, so it carries addressing
+ * meaning rather than being a display label.
+ *
+ * ⚠⚠ Lives here, next to `isChannelTarget`, for the reason that comment already gives: the
+ * damage comes from the two tiers disagreeing about a target's shape. `=` is the THIRD answer
+ * to "what is this target", after channel and DM, and every site that used to treat
+ * "not a channel" as "therefore a nick I can put on the wire" is now wrong.
+ *
+ * ⚠⚠ A `=` target reaching the IRC socket is the failure mode to guard against — as `PRIVMSG
+ * =alice`, `MONITOR + =alice` or `TAGMSG =alice`. The structural defence is that these buffers
+ * are minted `kind: 'dcc'` (server/db/buffers.ts), which keeps them out of the kind-keyed SQL
+ * that feeds presence tracking and bouncer playback; the guards in ircManager's send paths are
+ * the second line, covering the composer, MCP and attached bouncer clients alike.
+ */
+export const DCC_CHAT_PREFIX = '=';
+
+// ⚠ A plain boolean for the same reason `isChannelTarget` is one — see its note.
+export function isDccChatTarget(target: string | null | undefined): boolean {
+  return typeof target === 'string' && target.startsWith(DCC_CHAT_PREFIX) && target.length > 1;
+}
+
+/** The peer nick a `=nick` buffer is chatting with. Returns the target unchanged if it isn't
+ *  a DCC chat target, so callers can pass either without a shape test first. */
+export function dccChatPeer(target: string): string {
+  return isDccChatTarget(target) ? target.slice(1) : target;
+}
+
+/**
  * The prefix set as a regex character-class BODY (no brackets), for callers that must match a
  * channel name inside a larger pattern rather than test a whole target.
  *

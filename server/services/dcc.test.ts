@@ -18,6 +18,8 @@ import {
   isBlockedDccHost,
   parseCrcFromFilename,
   parseDcc,
+  parseDccChatLine,
+  PASSIVE_DCC_FAKE_HOST,
 } from './dcc.js';
 
 // Convenience: assert a parse succeeded as a CHAT and return it narrowed.
@@ -457,5 +459,57 @@ describe('DCC CHAT offer builders', () => {
       passive: true,
       token: 7,
     });
+  });
+});
+
+describe('parseDccChatLine', () => {
+  it('passes ordinary text through', () => {
+    expect(parseDccChatLine('just talking')).toEqual({ text: 'just talking', action: false });
+  });
+
+  // The mIRC dialect — the only one WeeChat, HexChat, HexDroid and repartee parse.
+  it('reads a bare \\x01ACTION\\x01', () => {
+    expect(parseDccChatLine('\u0001ACTION waves\u0001')).toEqual({ text: 'waves', action: true });
+  });
+
+  // irssi's default (dcc_mirc_ctcp = FALSE, dcc-chat.c:154-157). Nothing else
+  // emits it, but refusing to read it would render irssi's /me as literal junk.
+  it("reads irssi's CTCP_MESSAGE-prefixed action", () => {
+    expect(parseDccChatLine('CTCP_MESSAGE \u0001ACTION nods\u0001')).toEqual({
+      text: 'nods',
+      action: true,
+    });
+    expect(parseDccChatLine('CTCP_REPLY \u0001ACTION nods\u0001')).toEqual({
+      text: 'nods',
+      action: true,
+    });
+  });
+
+  it('is case-insensitive on ACTION and handles an empty one', () => {
+    expect(parseDccChatLine('\u0001action waves\u0001').action).toBe(true);
+    expect(parseDccChatLine('\u0001ACTION\u0001')).toEqual({ text: '', action: true });
+  });
+
+  // WeeChat strips the delimiters from any CTCP and shows the payload rather
+  // than dropping the line; showing the user control characters is worse.
+  it('unwraps a non-ACTION CTCP instead of dropping it', () => {
+    expect(parseDccChatLine('\u0001VERSION\u0001')).toEqual({ text: 'VERSION', action: false });
+  });
+
+  it('leaves a half-delimited line alone', () => {
+    expect(parseDccChatLine('\u0001ACTION unterminated')).toEqual({
+      text: '\u0001ACTION unterminated',
+      action: false,
+    });
+  });
+});
+
+describe('PASSIVE_DCC_FAKE_HOST', () => {
+  // irssi (dcc-chat.c:530-533) and repartee (protocol.rs:5) both use 1.1.1.1;
+  // HexChat's 199 decodes to 0.0.0.199, which a receiver validating the address
+  // as routable can reject.
+  it('is the 1.1.1.1 placeholder irssi and repartee use', () => {
+    expect(PASSIVE_DCC_FAKE_HOST).toBe('1.1.1.1');
+    expect(encodeDccAddress(PASSIVE_DCC_FAKE_HOST)).toBe('16843009');
   });
 });

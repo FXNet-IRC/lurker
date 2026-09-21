@@ -4,7 +4,7 @@
 import db from './index.js';
 import { encryptSecret, decryptSecret } from '../utils/secretCrypto.js';
 import { foldTargetWith, normalizeCasemapping } from './casemapping.js';
-import { isChannelTarget } from '../../shared/channels.js';
+import { isChannelTarget, isDccChatTarget } from '../../shared/channels.js';
 import type { Casemapping } from './casemapping.js';
 
 // The buffer registry — the single owner of "does this buffer exist" and "is it
@@ -33,7 +33,7 @@ import type { Casemapping } from './casemapping.js';
 //   - part/kick/470/442    → setAutojoin(false) — row and history persist
 //   - MODE +k/-k           → setChannelKey()
 
-export type BufferKind = 'channel' | 'dm' | 'server' | 'system';
+export type BufferKind = 'channel' | 'dm' | 'dcc' | 'server' | 'system';
 export type BufferState = 'open' | 'closed';
 
 export interface BufferRecord {
@@ -101,10 +101,18 @@ export function foldTargetFor(networkId: number | null, raw: string): string {
   return foldTargetWith(networkCasemapping(networkId), raw);
 }
 
-/** channel/dm classification by target shape (server/system rows are minted
- *  explicitly by their owners, never inferred). */
+/** channel/dm/dcc classification by target shape (server/system rows are minted
+ *  explicitly by their owners, never inferred).
+ *
+ *  ⚠⚠ The 'dcc' arm is load-bearing, not cosmetic. A `=nick` DCC chat classed as
+ *  a 'dm' is picked up by the kind-keyed SQL that drives presence tracking
+ *  (listOpenDms → MONITOR) and bouncer playback (listBuffersForNetwork), neither
+ *  of which consults a target-shape predicate — so `MONITOR + =alice` would go
+ *  upstream on every reconnect with no user action. Classifying it here is what
+ *  keeps a non-IRC target out of those queries by construction. */
 export function kindForTarget(target: string): BufferKind {
-  return isChannelTarget(target) ? 'channel' : 'dm';
+  if (isChannelTarget(target)) return 'channel';
+  return isDccChatTarget(target) ? 'dcc' : 'dm';
 }
 
 interface BufferRow {

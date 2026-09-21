@@ -315,6 +315,47 @@ export function buildDccChatReverse(host: string, port: number, token: number): 
   return `CHAT chat ${addr} ${port} ${token}`;
 }
 
+/**
+ * The placeholder address a PASSIVE `DCC CHAT` offer advertises. The peer is
+ * meant to ignore it — they reply with the address we should dial — but it still
+ * has to look like a real IPv4, because some receivers reject an unroutable one.
+ * 1.1.1.1 is what irssi (dcc-chat.c:530-533) and repartee (protocol.rs:5) both
+ * send; HexChat's `199` (0.0.0.199) is the outlier and is deliberately not used.
+ */
+export const PASSIVE_DCC_FAKE_HOST = '1.1.1.1';
+
+/**
+ * Split an inbound DCC CHAT line into display text plus whether it was an
+ * action. Two dialects are in the wild and we accept both:
+ *
+ *   - mIRC style, bare `\x01ACTION waves\x01` — WeeChat (xfer-chat.c:169-179),
+ *     HexChat, HexDroid and repartee emit and parse only this;
+ *   - the ircII/BitchX style irssi defaults to, the same payload behind a
+ *     `CTCP_MESSAGE ` (or `CTCP_REPLY `) prefix — dcc-chat.c:150-170. Nothing
+ *     else understands it, so irssi flips to the bare form the moment it sees
+ *     one from us (dcc-chat.c:685-687); we only ever SEND the bare form.
+ *
+ * A non-ACTION CTCP is unwrapped to its payload rather than dropped, matching
+ * WeeChat — the alternative is showing the user control characters.
+ */
+export function parseDccChatLine(line: string): { text: string; action: boolean } {
+  let body = line;
+  for (const prefix of ['CTCP_MESSAGE ', 'CTCP_REPLY ']) {
+    if (body.startsWith(prefix)) {
+      body = body.slice(prefix.length);
+      break;
+    }
+  }
+  if (body.length >= 2 && body.startsWith('\u0001') && body.endsWith('\u0001')) {
+    const inner = body.slice(1, -1);
+    if (/^ACTION(\s|$)/i.test(inner)) {
+      return { text: inner.slice(6).replace(/^\s/, ''), action: true };
+    }
+    return { text: inner, action: false };
+  }
+  return { text: body, action: false };
+}
+
 /** Human-readable byte size for status lines — 1024-based, one decimal place
  *  (whole bytes under 1 KiB). "5.0 GB", "1.5 MB", "512 B". */
 export function formatBytes(n: number): string {

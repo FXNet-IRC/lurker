@@ -180,13 +180,15 @@ describe('inbound DCC SEND — enabled', () => {
     expect(row.state).toBe('pending_approval');
   });
 
+  // CHAT used to land here too; it has its own handler now (dccChatWiring.test.ts).
+  // RESUME is the remaining subtype we recognise but never receive.
   it('records nothing for a non-SEND subtype but still surfaces it', () => {
     enableDcc();
     const { conn, ctcpLines } = harness();
     conn.client.emit('ctcp request', {
       nick: 'bob',
       type: 'DCC',
-      message: 'DCC CHAT chat 16843009 5000',
+      message: 'DCC RESUME show.mkv 50612 1024',
     });
     expect(listDccTransfers(1)).toHaveLength(0);
     expect(ctcpLines().at(-1)?.text).toBe('bob requested CTCP DCC (no reply)');

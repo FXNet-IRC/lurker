@@ -52,6 +52,7 @@ import { e2eManager } from './e2e/manager.js';
 import { contextKey, isChannelContext } from './e2e/context.js';
 import { e2eDbg } from './e2e/debug.js';
 import db from '../db/index.js';
+import { isDccChatTarget, dccChatPeer } from '../../shared/channels.js';
 
 // A buffer's read pointer moved forward: what markRead emits as 'read-marker'.
 export interface ReadMarkerMove {
@@ -712,12 +713,50 @@ class IrcManager extends EventEmitter {
     return true;
   }
 
+  /** Offer a DCC chat to a peer. False when the network has no connection object
+   *  at all; a connection that merely isn't registered still reports its own
+   *  failure into the `=nick` buffer, which is more useful than a bare false. */
+  dccChatOpen(
+    userId: number,
+    networkId: number,
+    nick: string,
+    opts: { passive?: boolean } = {},
+  ): boolean {
+    const conn = this.getConnection(userId, networkId);
+    if (!conn) return false;
+    conn.offerDccChat(nick, opts);
+    return true;
+  }
+
+  /** Close a live DCC chat. False when there was no session to close. */
+  dccChatClose(userId: number, networkId: number, nick: string): boolean {
+    const conn = this.getConnection(userId, networkId);
+    if (!conn) return false;
+    return conn.closeDccChat(nick);
+  }
+
   // Long messages need to be split: irc-framework breaks anything past ~350
   // bytes into separate PRIVMSGs on the wire, but we used to publish the full
   // text as a single self-message event — so the sender saw one bubble while
   // peers saw N. Splitting on our side and publishing per chunk keeps the
   // local view symmetric with what was actually transmitted.
   send(userId: number, networkId: number, target: string, text: string): boolean {
+    // ⚠⚠ A `=nick` buffer is a DCC CHAT, not IRC. Its text rides a TCP socket we
+    // own and must NEVER reach the wire as a target. This is THE chokepoint for
+    // that: the composer (wsHub `send`), the MCP `send_message` verb — which
+    // validates only that the target is non-empty — and an attached bouncer
+    // client's PRIVMSG all converge here, so guarding the composer alone would
+    // leave two open doors.
+    //
+    // ⚠ Ahead of the writable/connected gate on purpose: a DCC chat is an
+    // independent socket, so it keeps working while the IRC network is down or
+    // in reconnect backoff. Only getConnection (which returns a connection in any
+    // state) is needed to reach the session map.
+    if (isDccChatTarget(target)) {
+      const dcc = this.getConnection(userId, networkId);
+      return dcc ? dcc.dccChatSend(dccChatPeer(target), text) : false;
+    }
+
     // writableConnection, not getConnection: a network in reconnect backoff still
     // has a connection object, and every line written to it is silently dropped.
     // Reporting success there persisted a self row and fanned it out to every
@@ -853,6 +892,22 @@ class IrcManager extends EventEmitter {
   }
 
   action(userId: number, networkId: number, target: string, text: string): boolean {
+    // ⚠⚠ A `=nick` buffer is a DCC CHAT, not IRC. Its text rides a TCP socket we
+    // own and must NEVER reach the wire as a target. This is THE chokepoint for
+    // that: the composer (wsHub `send`), the MCP `send_message` verb — which
+    // validates only that the target is non-empty — and an attached bouncer
+    // client's PRIVMSG all converge here, so guarding the composer alone would
+    // leave two open doors.
+    //
+    // ⚠ Ahead of the writable/connected gate on purpose: a DCC chat is an
+    // independent socket, so it keeps working while the IRC network is down or
+    // in reconnect backoff. Only getConnection (which returns a connection in any
+    // state) is needed to reach the session map.
+    if (isDccChatTarget(target)) {
+      const dcc = this.getConnection(userId, networkId);
+      return dcc ? dcc.dccChatSend(dccChatPeer(target), text, { action: true }) : false;
+    }
+
     // Same phantom-send gate as send() — see the comment there (#809).
     const conn = this.writableConnection(userId, networkId);
     if (!conn) return false;
@@ -882,6 +937,22 @@ class IrcManager extends EventEmitter {
   // send/action. splitSay applies because NOTICE shares PRIVMSG's length
   // budget.
   notice(userId: number, networkId: number, target: string, text: string): boolean {
+    // ⚠⚠ A `=nick` buffer is a DCC CHAT, not IRC. Its text rides a TCP socket we
+    // own and must NEVER reach the wire as a target. This is THE chokepoint for
+    // that: the composer (wsHub `send`), the MCP `send_message` verb — which
+    // validates only that the target is non-empty — and an attached bouncer
+    // client's PRIVMSG all converge here, so guarding the composer alone would
+    // leave two open doors.
+    //
+    // ⚠ Ahead of the writable/connected gate on purpose: a DCC chat is an
+    // independent socket, so it keeps working while the IRC network is down or
+    // in reconnect backoff. Only getConnection (which returns a connection in any
+    // state) is needed to reach the session map.
+    if (isDccChatTarget(target)) {
+      const dcc = this.getConnection(userId, networkId);
+      return dcc ? dcc.dccChatSend(dccChatPeer(target), text) : false;
+    }
+
     // Same phantom-send gate as send() — see the comment there (#809).
     const conn = this.writableConnection(userId, networkId);
     if (!conn) return false;
@@ -906,7 +977,10 @@ class IrcManager extends EventEmitter {
   typing(userId: number, networkId: number, target: string, state: string): boolean {
     const conn = this.getConnection(userId, networkId);
     if (!conn) return false;
-    if (!target || target.startsWith(':server:')) return false;
+    // No typing notifications on the server pseudo-buffer or a DCC chat. DCC
+    // CHAT has no TAGMSG — and `=nick` is not a nick, so a TAGMSG carrying it
+    // would be a wire leak fired on every keystroke.
+    if (!target || target.startsWith(':server:') || isDccChatTarget(target)) return false;
     if (!['active', 'paused', 'done'].includes(state)) return false;
     conn.sendTyping(target, state);
     return true;
