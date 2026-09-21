@@ -5,6 +5,7 @@ import { defineStore } from 'pinia';
 import { api } from '../api.js';
 import { useAuthStore } from './auth.js';
 import { isVirtualKey } from '../lib/virtualBuffers.js';
+import { isDccChatTarget } from '../../../shared/channels.js';
 import type { MultilineLimits } from '../utils/messageSplit.js';
 
 export interface Network {
@@ -115,9 +116,18 @@ export const useNetworksStore = defineStore('networks', {
     // cached rows are stale, so report a synthetic 'offline'. Connected with no
     // row stays null (unknown = "potentially online", the no-MONITOR case).
     // Single source of truth for the sidebar, status bar, and profile.
+    //
+    // ⚠⚠ A `=nick` DCC chat has NO peer presence and must never be given the
+    // synthetic offline. Its reachability has nothing to do with the IRC link —
+    // the socket is peer-to-peer and keeps working while the network is down —
+    // so "=bob is offline" the moment you disconnect is both wrong and exactly
+    // backwards. Nothing MONITORs a DCC peer either, so there is no real row to
+    // fall through to. Handled here rather than in each of the sidebar, status
+    // bar and profile, because this getter is where they all agree.
     peerFor:
       (state) =>
       (networkId: number | string, nick: string): PeerPresenceEntry | null => {
+        if (isDccChatTarget(nick)) return null;
         const netState = state.states[networkId];
         if (netState && netState.state !== 'connected')
           return { nick, state: 'offline', stateAt: null, awayMessage: null };
