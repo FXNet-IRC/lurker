@@ -535,6 +535,36 @@ describe('closeBuffer parts only a channel we are on', () => {
     ircManager.connectionsForUser(userId).delete(network.id);
   });
 
+  it('parts a cycle whose old PART echo lands before the new JOIN echo', async () => {
+    // /part then /join, close in between. While the PART is unanswered the map
+    // still says joined, so the JOIN looks redundant and goes untracked — and
+    // when the PART echo then lands, membership goes false with nothing left
+    // saying a JOIN is outstanding. A close there sends no PART and the JOIN
+    // echo reopens the buffer it just closed, leaving the user in a channel
+    // they closed.
+    const { network, conn } = await connected('closecycle', ['#cyc']);
+    ircd.hold = (cmd) => cmd === 'PART' || cmd === 'JOIN'; // we drive the echoes
+    ircManager.partChannel(userId, network.id, '#cyc');
+    await until(() => partsSent('closecycle').length > 0, 5000, 'PART sent');
+    ircManager.joinChannel(userId, network.id, '#cyc');
+    // Still a member as far as the map knows — that is what hid the JOIN.
+    expect(conn.isChannelJoined('#cyc')).toBe(true);
+
+    // The PART we sent first, answered at last.
+    conn.client.emit('part', { channel: '#cyc', nick: conn.currentNick });
+    expect(conn.isChannelJoined('#cyc')).toBe(false);
+    expect(conn.mayBeJoined('#cyc')).toBe(true); // the JOIN is still owed one
+
+    const before = partsSent('closecycle').length;
+    closeBuffer(userId, network.id, '#cyc');
+    await until(() => partsSent('closecycle').length > before, 5000, 'PART sent');
+
+    expect(partsSent('closecycle')).toHaveLength(before + 1);
+    ircd.hold = null;
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
   it('lowers autojoin on a network with no connection at all', async () => {
     // The disconnected fallback: no socket to PART on, but the channel must
     // not come back the next time the network connects.

@@ -5314,12 +5314,20 @@ export class IrcConnection {
     // guard meant to prevent it. We are in it, so membership already answers.
     for (const one of channel.split(',')) {
       if (!one) continue;
-      this.pendingParts.delete(foldTargetFor(this.network.id, one));
+      const oneFolded = foldTargetFor(this.network.id, one);
       // A JOIN supersedes a PART still in flight for the same channel: rejoining
       // is the whole point, and a stale part mark would have the next close send
       // nothing and leave us in it.
-      if (!this.isChannelJoined(one)) {
-        this.pendingJoins.add(foldTargetFor(this.network.id, one));
+      const supersededPart = this.pendingParts.delete(oneFolded);
+      // ⚠ And superseding one is itself the reason to track this JOIN. While
+      // that PART is unanswered the map still says joined, so the membership
+      // test below reads "already in it" and marks nothing — then the PART echo
+      // lands, membership goes false, and NOTHING says a JOIN is outstanding.
+      // A close in that gap sends no PART and the JOIN echo reopens the buffer
+      // it closed. Which is why a cycle has to be tracked even though we look
+      // like a member: we are about to stop being one, briefly.
+      if (supersededPart || !this.isChannelJoined(one)) {
+        this.pendingJoins.add(oneFolded);
       }
     }
     this.client.join(channel, typeof key === 'string' ? key : undefined);
