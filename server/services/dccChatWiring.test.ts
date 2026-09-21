@@ -114,13 +114,28 @@ function harness() {
   // surfaced — deliberately not a persisted notice, which would mint a buffer.
   const ctcpLines = () =>
     ephemeral.filter((e) => e.type === 'ctcp').map((e) => String(e.text ?? ''));
+  const offerEvents = () =>
+    ephemeral.filter(
+      (e) => e.type === 'dcc-chat-offer' || e.type === 'dcc-chat-offer-closed',
+    ) as Array<{ type: string; from: string; passive?: boolean }>;
   const chatLines = () =>
     published.filter((e) => e.type === 'message' && e.kind === 'dcc-chat') as Array<{
       text: string;
       self?: boolean;
       target: string;
     }>;
-  return { conn, ctcpRequest, say, raw, published, lastOffer, notices, ctcpLines, chatLines };
+  return {
+    conn,
+    ctcpRequest,
+    say,
+    raw,
+    published,
+    lastOffer,
+    notices,
+    ctcpLines,
+    offerEvents,
+    chatLines,
+  };
 }
 
 function enableDcc() {
@@ -784,5 +799,60 @@ describe('a chat survives the network being stopped', () => {
     h.conn.closeDccChat('bob');
     // Registry released, so a stale connection isn't kept alive by it.
     expect(ircManager.send(1, 1, '=bob', 'nobody home')).toBe(false);
+  });
+});
+
+// The offer toast is sticky, so the client needs to be told when the offer is
+// no longer live. Otherwise its Accept button outlives the offer and quietly
+// stops meaning "accept" — `/dcc chat <nick>` with nothing pending sends the
+// peer a NEW offer, which is a different act than the button names.
+describe('the inbound offer broadcasts its whole lifecycle', () => {
+  it('announces an offer, then its acceptance', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    const peer = await startPeer();
+    offerFrom(h.conn, 'BoB', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    expect(h.offerEvents()).toHaveLength(1);
+    expect(h.offerEvents()[0]).toMatchObject({
+      type: 'dcc-chat-offer',
+      from: 'BoB', // display casing preserved, so the toast reads right
+      passive: false,
+    });
+
+    h.conn.offerDccChat('BoB');
+    await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('BoB'));
+    expect(h.offerEvents().at(-1)).toMatchObject({ type: 'dcc-chat-offer-closed', from: 'BoB' });
+    h.conn.closeDccChat('BoB');
+  });
+
+  it('announces a decline', () => {
+    enableDcc();
+    const h = harness();
+    offerFrom(h.conn, 'bob', 'CHAT chat 16843009 5000');
+    h.conn.closeDccChat('bob');
+    expect(h.offerEvents().at(-1)).toMatchObject({ type: 'dcc-chat-offer-closed', from: 'bob' });
+  });
+
+  it('announces an expiry', () => {
+    vi.useFakeTimers();
+    try {
+      enableDcc();
+      const h = harness();
+      offerFrom(h.conn, 'bob', 'CHAT chat 16843009 5000');
+      vi.advanceTimersByTime(10 * 60_000 + 1000);
+      expect(h.offerEvents().at(-1)).toMatchObject({ type: 'dcc-chat-offer-closed', from: 'bob' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('flags a passive offer so the toast can say who listens', () => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+    offerFrom(h.conn, 'bob', 'CHAT chat 16843009 0 42');
+    expect(h.offerEvents()[0]).toMatchObject({ type: 'dcc-chat-offer', passive: true });
   });
 });

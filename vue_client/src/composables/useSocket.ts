@@ -32,6 +32,23 @@ import { useDccStore } from '../stores/dcc.js';
 import { useUploadsStore } from '../stores/uploads.js';
 import { makeClientId } from '../utils/clientId.js';
 import { useToastsStore } from '../stores/toasts.js';
+
+// Live DCC-chat offer toasts, keyed by network + peer. Module-local rather than
+// in a store for the same reason the toast action handlers are: this is
+// transport bookkeeping, not state anything renders. An offer is sticky, so it
+// needs an explicit way to be retired when the server says it is over.
+const dccOfferToasts = new Map<string, number>();
+
+function dccOfferKey(networkId: number, from: string): string {
+  return `${networkId}::${from.toLowerCase()}`;
+}
+
+function dismissDccOfferToast(key: string): void {
+  const id = dccOfferToasts.get(key);
+  if (id === undefined) return;
+  dccOfferToasts.delete(key);
+  useToastsStore().dismiss(id);
+}
 import { downloadTextFile } from '../utils/download.js';
 import { notifyForEvent, playSound } from './useHighlightNotifier.js';
 import { isChannelTarget } from '../../../shared/channels.js';
@@ -332,6 +349,52 @@ function applyEvent(event: any): void {
         ttlMs: 15000,
         action: { label: 'Join', onClick: () => buffers.joinOrActivate(event.networkId, channel) },
       });
+      break;
+    }
+    // A peer wants to open a DCC chat. Same shape as the invite above —
+    // ephemeral, server-pseudo-buffer target, read from `from` — but STICKY
+    // (ttlMs 0): an invite you miss can be re-requested and the channel isn't
+    // going anywhere, whereas a chat offer is one peer waiting on an answer,
+    // and the window is finite. Dismissing is a real "no".
+    //
+    // Safe to make sticky only because the server broadcasts the offer's
+    // lifecycle: accepted, declined, expired or torn down all send
+    // `dcc-chat-offer-closed`, which retires the toast below. Otherwise the
+    // Accept button would outlive the offer and quietly become "send THEM a
+    // fresh offer", which is a different act than the one it names.
+    case 'dcc-chat-offer': {
+      const from = String(event.from ?? '');
+      if (!from) break;
+      const networkId = event.networkId as number;
+      const toasts = useToastsStore();
+      const key = dccOfferKey(networkId, from);
+      dismissDccOfferToast(key);
+      dccOfferToasts.set(
+        key,
+        toasts.push({
+          kind: 'notify',
+          title: `DCC chat from ${from}`,
+          body: event.passive
+            ? `${from} wants to chat directly (they're firewalled, so this server listens)`
+            : `${from} wants to chat directly`,
+          ttlMs: 0,
+          action: {
+            label: 'Accept',
+            onClick: () => {
+              dccOfferToasts.delete(key);
+              void useDccStore()
+                .openChat(networkId, from)
+                .then(() => buffers.activate(networkId, `=${from}`))
+                .catch(() => {});
+            },
+          },
+        }),
+      );
+      break;
+    }
+    case 'dcc-chat-offer-closed': {
+      const from = String(event.from ?? '');
+      if (from) dismissDccOfferToast(dccOfferKey(event.networkId as number, from));
       break;
     }
     case 'channel-parted':

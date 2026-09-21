@@ -6409,10 +6409,8 @@ export class IrcConnection {
     // `/dcc chat <nick>` doubles as "accept the offer they already made", which
     // is how irssi spells it too — making a fresh offer at someone who is
     // already waiting for us would just deadlock the two halves.
-    const inbound = this.pendingInboundChats.get(key);
+    const inbound = this.clearPendingInboundChat(key);
     if (inbound) {
-      clearTimeout(inbound.timer);
-      this.pendingInboundChats.delete(key);
       this.acceptInboundDccChat(inbound.nick, inbound.offer);
       return;
     }
@@ -6538,7 +6536,7 @@ export class IrcConnection {
     const prior = this.pendingInboundChats.get(key);
     if (prior) clearTimeout(prior.timer);
     const timer = setTimeout(() => {
-      if (this.pendingInboundChats.delete(key)) {
+      if (this.clearPendingInboundChat(key)) {
         // Ephemeral, and to the server buffer: the prompt never created a
         // `=nick` buffer, so its expiry must not create one either.
         this.surfaceCtcp(this.serverTarget(), `The DCC chat offer from ${nick} expired.`);
@@ -6556,6 +6554,34 @@ export class IrcConnection {
       `${nick} wants to start a DCC chat — /dcc chat ${nick} to accept` +
         (offer.passive ? ' (they are firewalled, so this server would listen)' : ''),
     );
+    // …and an actionable toast, the same shape a channel invite uses: ephemeral,
+    // routed through the server pseudo-buffer, read by the client from `from`
+    // rather than `target`. An offer is a decision someone has to make, so the
+    // client makes this one sticky — which is only safe because the offer's own
+    // lifecycle is broadcast too (see clearPendingInboundChat).
+    this.publishEphemeral({
+      type: 'dcc-chat-offer',
+      target: this.serverTarget(),
+      from: nick,
+      passive: offer.passive,
+    });
+  }
+
+  // Drop a pending inbound offer and tell the client, whatever the reason —
+  // accepted, declined, expired or torn down. ⚠ Without this the sticky toast
+  // outlives the offer, and its Accept button silently stops meaning "accept"
+  // and starts meaning "make a fresh offer at them", which is a different act.
+  private clearPendingInboundChat(key: string): { nick: string; offer: DccChatOffer } | null {
+    const pending = this.pendingInboundChats.get(key);
+    if (!pending) return null;
+    clearTimeout(pending.timer);
+    this.pendingInboundChats.delete(key);
+    this.publishEphemeral({
+      type: 'dcc-chat-offer-closed',
+      target: this.serverTarget(),
+      from: pending.nick,
+    });
+    return { nick: pending.nick, offer: pending.offer };
   }
 
   // Accept an offer already recorded by handleInboundDccChat. Active: dial them.
@@ -6757,10 +6783,8 @@ export class IrcConnection {
     const entry = this.dccChats.get(key);
     // Also cancels a still-unaccepted inbound offer, which is the other thing
     // "close this chat" can reasonably mean.
-    const pending = this.pendingInboundChats.get(key);
+    const pending = this.clearPendingInboundChat(key);
     if (pending) {
-      clearTimeout(pending.timer);
-      this.pendingInboundChats.delete(key);
       this.surfaceCtcp(this.serverTarget(), `Declined the DCC chat offer from ${pending.nick}.`);
       if (!entry) return true;
     }
@@ -6802,8 +6826,10 @@ export class IrcConnection {
       entry.chat.close();
       this.dccChatNotice(entry.nick, `DCC chat ended — ${reason}.`);
     }
-    for (const pending of this.pendingInboundChats.values()) clearTimeout(pending.timer);
-    this.pendingInboundChats.clear();
+    // Deleting the current key mid-iteration is well-defined for a Map, and
+    // clearPendingInboundChat is what tells the client to retire its toast —
+    // so this must go through it rather than a bare clear().
+    for (const key of this.pendingInboundChats.keys()) this.clearPendingInboundChat(key);
     unregisterDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
     for (const handle of this.dccChatListeners.keys()) handle.close();
     this.dccChatListeners.clear();
