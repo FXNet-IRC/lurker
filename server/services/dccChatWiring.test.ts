@@ -856,3 +856,61 @@ describe('the inbound offer broadcasts its whole lifecycle', () => {
     expect(h.offerEvents()[0]).toMatchObject({ type: 'dcc-chat-offer', passive: true });
   });
 });
+
+// ⚠⚠ QA: `/dcc chat -passive ami|shellter` produced a toast in Lurker saying
+// the user's OWN nick wanted to chat. A network with echo-message sends our
+// PRIVMSG back to us, and the passive offer we just sent then looked like an
+// unsolicited inbound one — the token-matching branch only covers a non-passive
+// REPLY to our offer, not the offer itself coming home.
+describe('our own offer echoed back is not an offer', () => {
+  it('ignores a passive offer carrying a token we minted', () => {
+    enableDcc();
+    const h = harness();
+    h.conn.offerDccChat('bob', { passive: true });
+    const body = h.lastOffer()!; // CHAT chat 16843009 0 <token>
+    const token = body.split(' ')[4];
+    const before = h.offerEvents().length;
+
+    // ⚠ Deliberately NOT our own nick. The sender check would catch that, and
+    // then this test would not be testing the token at all. A server that
+    // renamed us — IRCnet truncates long nicks — echoes our line back under a
+    // name we don't recognise as ourselves, and the minted token is then the
+    // only thing that still identifies the line as ours.
+    offerFrom(h.conn, 'someone-we-do-not-know', `CHAT chat 16843009 0 ${token}`);
+
+    expect(h.offerEvents().slice(before)).toEqual([]);
+    expect(h.ctcpLines().join(' ')).not.toMatch(/wants to start a DCC chat/);
+  });
+
+  // The token is the decisive signal, but an ACTIVE offer carries none of ours,
+  // so the sender check still has to hold for that shape.
+  it('ignores an active offer that appears to come from ourselves', () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    const before = h.offerEvents().length;
+    // ⚠ currentNick is unset here — the connection never registered — which is
+    // exactly the case isSelfNick answers false for. The configured nick is
+    // what has to carry it.
+    offerFrom(h.conn, 'alice', 'CHAT chat 16843009 5000');
+    expect(h.offerEvents().slice(before)).toEqual([]);
+  });
+
+  // ...and a real peer answering our passive offer must still get through,
+  // which is what stops the guard from swallowing the flow it sits next to.
+  it('still accepts a genuine reply to our passive offer', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    const peer = await startPeer();
+    h.conn.offerDccChat('bob', { passive: true });
+    const token = h.lastOffer()!.split(' ')[4];
+    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port} ${token}`);
+    await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+    expect(h.conn.hasDccChat('bob')).toBe(true);
+    // Dialled, not prompted — the reply is the answer to a chat we started.
+    expect(h.ctcpLines().join(' ')).not.toMatch(/wants to start a DCC chat/);
+    h.conn.closeDccChat('bob');
+  });
+});

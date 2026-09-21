@@ -5536,6 +5536,14 @@ export class IrcConnection {
     return `${nick.toLowerCase()} ${type.toUpperCase()}`;
   }
 
+  // "Is this us?", for deciding whether an inbound DCC offer is our own line
+  // coming back. Deliberately wider than isSelfNick — see its call site.
+  private isSelfDccNick(nick: string | undefined): boolean {
+    if (!nick) return false;
+    const lower = nick.toLowerCase();
+    return [this.currentNick, this.network.nick].some((n) => !!n && n.toLowerCase() === lower);
+  }
+
   private isSelfNick(nick: string | undefined): boolean {
     return !!nick && !!this.currentNick && nick.toLowerCase() === this.currentNick.toLowerCase();
   }
@@ -6526,6 +6534,27 @@ export class IrcConnection {
         return;
       }
     }
+    // ⚠⚠ Our OWN offer echoed back to us, which a network with echo-message will
+    // do. A token we minted can only appear in a line we sent, so a PASSIVE
+    // offer carrying one is ours — note the asymmetry with the branch above,
+    // which matches a non-passive REPLY to our offer. Without this the echo
+    // fell through as "unsolicited" and prompted the user to accept a chat
+    // with themselves, which is how it turned up in QA.
+    //
+    // Checked on the token rather than the sender because it holds regardless
+    // of nick tracking: the generic self-echo guard in handleInboundCtcpRequest
+    // compares against currentNick, and in the case that produced this bug it
+    // evidently did not match.
+    if (offer.passive && offer.token !== null && this.pendingPassiveChats.has(offer.token)) {
+      return;
+    }
+    // Belt and braces for the active shape, which carries no token of ours.
+    //
+    // ⚠ Not isSelfNick: that answers false whenever `currentNick` is unset
+    // (`!!this.currentNick &&` …), so it is a no-op before registration
+    // completes and any time nick tracking has drifted — which is precisely
+    // when an echo would slip through. Fall back to the configured nick too.
+    if (this.isSelfDccNick(nick)) return;
     if (this.dccChats.has(nick.toLowerCase())) {
       this.dccChatNotice(nick, `${nick} offered a DCC chat, but one is already open.`);
       return;
