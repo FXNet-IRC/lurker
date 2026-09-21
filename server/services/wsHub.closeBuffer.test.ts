@@ -78,8 +78,10 @@ function sentTo(nick: string): string[] {
   return client.sent;
 }
 
+/** Every PART on the wire, tag block and all — the filter has to see what the
+ *  code under test sees, or a tagged line silently counts as no PART at all. */
 function partsSent(nick: string): string[] {
-  return sentTo(nick).filter((line) => line.startsWith('PART '));
+  return sentTo(nick).filter((line) => /^\s*(?:@\S+\s+)?PART\s/i.test(line));
 }
 
 /**
@@ -618,6 +620,49 @@ describe('closeBuffer parts only a channel we are on', () => {
     await until(() => partsSent('closerawjoin').length > 0, 5000, 'PART sent');
 
     expect(partsSent('closerawjoin')).toEqual(['PART #rawjoin']);
+    ircd.hold = null;
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
+  it('reads a raw PART that carries an IRCv3 tag block', async () => {
+    const { network, conn } = await connected('closetagged', ['#tagged']);
+    ircd.hold = (cmd) => cmd === 'PART';
+    conn.raw('@label=abc PART #tagged');
+    await until(() => partsSent('closetagged').length > 0, 5000, 'raw PART sent');
+    expect(conn.mayBeJoined('#tagged')).toBe(false);
+
+    closeBuffer(userId, network.id, '#tagged');
+    await probe(conn, 'closetagged', 'taggedprobe');
+
+    expect(partsSent('closetagged')).toHaveLength(1);
+    ircd.hold = null;
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
+  it('JOIN 0 abandons a JOIN that has not echoed yet', async () => {
+    // The channel is not in the map, so the leave-all loop can't see it — but
+    // JOIN 0 abandons it all the same, and a mark left behind would have the
+    // close PART the very channel this command is walking away from. It has to
+    // survive the JOIN echo too, which briefly makes us a member.
+    const { network, conn } = await connected('closezeropending');
+    ircd.hold = (cmd) => cmd === 'JOIN';
+    ircManager.joinChannel(userId, network.id, '#pendingzero');
+    expect(conn.mayBeJoined('#pendingzero')).toBe(true);
+
+    conn.raw('JOIN 0');
+    expect(conn.mayBeJoined('#pendingzero')).toBe(false);
+
+    // Its JOIN lands anyway — the server saw it before the leave-all.
+    conn.client.emit('join', { channel: '#pendingzero', nick: conn.currentNick });
+    expect(conn.isChannelJoined('#pendingzero')).toBe(true);
+    expect(conn.mayBeJoined('#pendingzero')).toBe(false);
+
+    closeBuffer(userId, network.id, '#pendingzero');
+    await probe(conn, 'closezeropending', 'zeropendingprobe');
+
+    expect(partsSent('closezeropending')).toEqual([]);
     ircd.hold = null;
     conn.dispose();
     ircManager.connectionsForUser(userId).delete(network.id);

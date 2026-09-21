@@ -4541,7 +4541,8 @@ export class IrcConnection {
    *  takeRawMonitor and noteOutgoingCommand beside it: raw() is the one path
    *  every slash command and member-menu action takes. */
   private noteRawMembership(line: string): void {
-    const parsed = /^\s*(JOIN|PART)\s+(\S+)/i.exec(line);
+    // The verb, past an IRCv3 tag block the caller may have put in front of it.
+    const parsed = /^\s*(?:@\S+\s+)?(JOIN|PART)\s+(\S+)/i.exec(line);
     if (!parsed) return;
     const targets = parsed[2];
     if (parsed[1].toUpperCase() === 'PART') return this.notePartSent(targets);
@@ -4549,6 +4550,13 @@ export class IrcConnection {
     // all of them, and it is what a bouncer client's `JOIN 0` relays to.
     if (targets === '0') {
       for (const ch of this.channels.values()) this.notePartSent(ch.name);
+      // Including channels whose own JOIN is still in flight: those are not in
+      // the map yet, so the loop above misses them, and the mark left behind
+      // would have a close PART the very channel this command is abandoning.
+      // Moved rather than dropped, so the answer still holds once their JOIN
+      // echo lands and briefly makes them members.
+      for (const folded of this.pendingJoins) this.pendingParts.add(folded);
+      this.pendingJoins.clear();
       return;
     }
     this.noteJoinSent(targets);
