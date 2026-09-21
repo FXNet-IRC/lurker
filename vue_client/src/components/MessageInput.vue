@@ -2442,7 +2442,7 @@ const COMMANDS_LINES = [
   '  /cs <text>             — message ChanServ',
   '  /join <#chan>          — join a channel (alias: /j)',
   '  /part [#chan] [reason] — leave channel (keeps buffer; aliases: /leave, /p)',
-  '  /close                 — close current buffer (parts if channel)',
+  '  /close                 — close current buffer (parts if joined)',
   '  /clear [off]           — hide buffer up to now (off = undo, show again)',
   '  /retention [n|off|default] — per-buffer history cap (no arg = show current)',
   '  /away [message]        — set away across every network (no arg clears)',

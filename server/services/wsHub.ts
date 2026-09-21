@@ -1619,6 +1619,89 @@ export function broadcastReadState(
 }
 
 /**
+ * Close a buffer: the whole of what `/close`, the Close menu item and a
+ * bouncer client's second PART all mean. One implementation because the
+ * bookkeeping is easy to half-do — a close that forgets the pin leaves an
+ * invisible orphan, one that forgets the PART leaves the channel joined.
+ *
+ * ⚠ The PART is gated on MEMBERSHIP, which is what makes a close of a channel
+ * we already left silent on the wire. Parting a channel the server knows we
+ * are not on answers 442, and that 442 reaches every attached bouncer client
+ * (it answers no tracked query, so replyRouter calls it 'unasked') as well as
+ * the server buffer, where it badges the tab — so closing the window of a
+ * channel some other client had already parted reported an error for a
+ * command the user never issued (#967). gamja gates its own close the same
+ * way (`if (buf.joined)`, app.js), and ZNC never forwards a PART for a
+ * channel it isn't on (CClient::OnPartMessage).
+ *
+ * Autojoin comes down either way: partChannel lowers it, and with no
+ * connection (or no membership) this does it directly, so a closed channel
+ * doesn't come back on the next connect. Update-only — closing a buffer that
+ * has no row must never conjure one.
+ */
+export function closeBuffer(
+  userId: number,
+  networkId: number,
+  target: string,
+  opts: { reason?: string; bufferId?: number | null; originWs?: unknown } = {},
+): void {
+  // Resolved BEFORE the close so the buffer-closed frame can carry the id even
+  // though the row's state just flipped.
+  const closedBufferId = opts.bufferId ?? resolveBuffer(userId, networkId, target)?.id ?? null;
+  closeBufferRow(userId, networkId, target);
+  // The client renders the pinned section by intersecting pins with open
+  // buffers, so a pin on a now-closed buffer is invisible — and leaving the
+  // row would diverge the client's pin set from ours (issue #112). Close
+  // implies unpin. Match case-insensitively: the registry hides closed buffers
+  // folded, so a differently-cased close would otherwise hide the buffer while
+  // leaving the exact-cased pin row stranded — an invisible orphan (issue #405).
+  if (unpinBufferCaseInsensitive(userId, networkId, target)) {
+    fanOut(userId, pinsChangedFrame(userId, networkId));
+  }
+  // Same reasoning for favorites: the sections render favorites ∩ open
+  // buffers, so a favorite on a closed buffer is an invisible orphan.
+  // Close implies unfavorite.
+  if (unfavoriteBuffer(userId, networkId, target)) {
+    fanOut(userId, favoritesChangedFrame(userId));
+  }
+  if (isChannelTarget(target)) {
+    const conn = ircManager.getConnection(userId, networkId);
+    // mayBeJoined, not isChannelJoined: a close owes a PART for a channel we
+    // are about to be in as well as one we are in, since the channels map
+    // reads "no" between a JOIN and its echo. Without that, closing in the
+    // gap sent nothing, the echo reopened the buffer (reopensClosedBuffer)
+    // and the user was left in a channel they had just closed.
+    //
+    // Nothing goes out mid-restore, though — hence the explicit `restoring`
+    // check rather than leaving it to membership. The map is PRUNED against
+    // the engine's channel set on `attached`, not cleared, so after a link
+    // blip we still read as joined and would PART here; the replay then PARTs
+    // the same channel again for its closed row, and one of the two draws the
+    // 442. The replay's is the one that's owed: lowering the flag IS the
+    // close, and the PART follows when that channel's JOIN is replayed. A
+    // reconnect's gap is a third thing again — there the socket really died,
+    // we really are out, and the lowered autojoin is all that's owed.
+    //
+    // Fold-aware, so closing `#foo{1}` while joined as `#foo[1]` is the same
+    // channel and still owes its PART (#707).
+    if (conn && !conn.restoring && conn.mayBeJoined(target)) {
+      ircManager.partChannel(userId, networkId, target, opts.reason);
+    } else {
+      setBufferAutojoin(userId, networkId, target, false);
+    }
+  } else {
+    // Closing a DM means we stop tracking this peer. Drop them from the
+    // in-memory tracker and the DB row so a future reopen starts from a clean
+    // probe instead of inheriting stale state.
+    ircManager.getConnection(userId, networkId)?.untrackDmPeer(target);
+  }
+  // Drop any draft for the now-closed buffer. The client mirror also drops it
+  // on `buffer-closed`, so the cleanup happens on both sides.
+  draftsService.clear(userId, networkId, target, opts.originWs ?? null);
+  fanOut(userId, { kind: 'buffer-closed', networkId, target, bufferId: closedBufferId });
+}
+
+/**
  * Close every open socket for a user, so a revoked session stops streaming.
  *
  * Session checks happen at the /ws upgrade and nowhere after it — the handler
@@ -3000,49 +3083,11 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         // Server pseudo-buffer can't be closed (it's the per-network log).
         if (!networkId || !target || target.startsWith(':server:')) break;
-        // Resolved BEFORE the close so the buffer-closed frame below can carry
-        // the id even though the row's state just flipped.
-        const closedBufferId =
-          addr?.bufferId ?? resolveBuffer(userId, networkId, target)?.id ?? null;
-        closeBufferRow(userId, networkId, target);
-        // The client renders the pinned section by intersecting pins with open
-        // buffers, so a pin on a now-closed buffer is invisible — and leaving
-        // the row would diverge the client's pin set from ours (issue #112).
-        // Close implies unpin. Match case-insensitively: the registry hides
-        // closed buffers folded, so a differently-cased close would otherwise
-        // hide the buffer while leaving the exact-cased pin row stranded — an
-        // invisible orphan (issue #405).
-        if (unpinBufferCaseInsensitive(userId, networkId, target)) {
-          fanOut(userId, pinsChangedFrame(userId, networkId));
-        }
-        // Same reasoning for favorites: the sections render favorites ∩ open
-        // buffers, so a favorite on a closed buffer is an invisible orphan.
-        // Close implies unfavorite.
-        if (unfavoriteBuffer(userId, networkId, target)) {
-          fanOut(userId, favoritesChangedFrame(userId));
-        }
-        if (isChannelTarget(target)) {
-          // Send PART if connected; partChannel also lowers autojoin. If
-          // disconnected, partChannel is a no-op, so lower autojoin here to
-          // keep the channel from auto-rejoining the next time the network
-          // connects. Update-only — closing a buffer that has no row must not
-          // conjure one (the last of the old upsertChannel conjure sites).
-          if (
-            !ircManager.partChannel(userId, networkId, target, msg.reason as string | undefined)
-          ) {
-            setBufferAutojoin(userId, networkId, target, false);
-          }
-        } else {
-          // Closing a DM means we stop tracking this peer. Drop them from
-          // the in-memory tracker and the DB row so a future reopen starts
-          // from a clean probe instead of inheriting stale state.
-          const conn = ircManager.getConnection(userId, networkId);
-          if (conn) conn.untrackDmPeer(target);
-        }
-        // Drop any draft for the now-closed buffer. The client mirror also
-        // drops it on `buffer-closed`, so the cleanup happens on both sides.
-        draftsService.clear(userId, networkId, target, ws);
-        fanOut(userId, { kind: 'buffer-closed', networkId, target, bufferId: closedBufferId });
+        closeBuffer(userId, networkId, target, {
+          reason: typeof msg.reason === 'string' ? msg.reason : undefined,
+          bufferId: addr?.bufferId,
+          originWs: ws,
+        });
         break;
       }
       case 'snapshot':

@@ -80,7 +80,8 @@ export class FakeUpstream {
   currentNick = 'tester';
   registrationLines: string[] = [];
   channels = new Map<string, FakeChannel>();
-  // Lines the bouncer forwarded to the upstream network via conn.raw().
+  // Lines the bouncer forwarded to the upstream network via conn.raw(), plus
+  // the PART lines conn.part() puts on the wire.
   rawSent: string[] = [];
   // Whether this fake network negotiated IRCv3 message-tags. The bouncer gates
   // client-only tag relay on it (mirrors IrcConnection.supportsMessageTags);
@@ -110,6 +111,11 @@ export class FakeUpstream {
   membersPending = (name: string): boolean => this.pendingNames.has(name.toLowerCase());
   // IrcConnection.channelState, folding with toLowerCase.
   channelState = (name: string): FakeChannel | undefined => this.channels.get(name.toLowerCase());
+  // IrcConnection.isChannelJoined: membership, folded the same way.
+  isChannelJoined = (name: string): boolean => this.channels.has(name.toLowerCase());
+  // IrcConnection.mayBeJoined: membership plus any JOIN still awaiting its
+  // echo. The fake has none in flight, so it reduces to membership.
+  mayBeJoined = (name: string): boolean => this.isChannelJoined(name);
   // IrcConnection.restoring: true while an engine re-attach replays the session.
   restoring = false;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -138,6 +144,16 @@ export class FakeUpstream {
 
   raw(line: string): void {
     this.rawSent.push(line);
+  }
+
+  // IrcConnection.part, which on a real connection is irc-framework's
+  // client.part() — the PART line on the wire. Recorded with the rest so a
+  // test can assert on everything the network was sent, in order. Membership
+  // is NOT dropped here: on a real connection the PART *echo* is what leaves
+  // the channel, so a test models that itself (channels.delete) rather than
+  // having the fake quietly do the ircd's half of the exchange.
+  part(channel: string, reason?: string): void {
+    this.rawSent.push(reason ? `PART ${channel} :${reason}` : `PART ${channel}`);
   }
 
   // IrcConnection.dispose: it marks itself disposed before it quits, so it

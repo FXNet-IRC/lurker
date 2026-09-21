@@ -227,6 +227,17 @@ Implementation notes worth knowing if you're writing against it:
   on its one list, including Lurker's DM contacts and other clients' watches (soju
   sends them to every client). Both names are offered while the network has either.
   <br>`server/services/bouncerClientFilter.ts:401`
+- `PART` leaves the channel and the channel stays in Lurker's list, dimmed, with its
+  scrollback — the same thing `/part` does in the web app, and no longer rejoining on
+  connect. Closing that window (in the web or iOS app; there's no way to ask for it
+  from here) sends no second `PART`, because a network answers one for a channel it
+  knows you left with `442`, and every attached client would be handed that error for
+  a command nobody issued. A `PART` you send is forwarded either way — it's your
+  command, and the server's answer to it is yours to see. ZNC and gamja both decline
+  to send a `PART` for a channel they aren't on; soju and The Lounge never get there,
+  because their own `PART` drops the channel outright.
+  <br>`server/services/wsHub.ts` (`closeBuffer`), `server/services/bouncer.ts:2415`
+
 - Read markers are the account's, the same unread position the web and iOS apps show.
   `MARKREAD` with a time moves it to the newest message at or before that time, and
   every client on the network that negotiated `draft/read-marker` hears the move, as do
