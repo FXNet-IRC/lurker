@@ -5536,17 +5536,6 @@ export class IrcConnection {
     return `${nick.toLowerCase()} ${type.toUpperCase()}`;
   }
 
-  // "Is this us?", for deciding whether an inbound DCC offer is our own line
-  // coming back. Deliberately wider than isSelfNick — see its call site. Both
-  // names are checked because they can disagree: `currentNick` follows the
-  // server, `network.nick` is what we asked for, and a server that renamed us
-  // (IRCnet truncates a long nick) leaves the two apart.
-  private isSelfDccNick(nick: string | undefined): boolean {
-    if (!nick) return false;
-    const lower = nick.toLowerCase();
-    return [this.currentNick, this.network.nick].some((n) => !!n && n.toLowerCase() === lower);
-  }
-
   private isSelfNick(nick: string | undefined): boolean {
     return !!nick && !!this.currentNick && nick.toLowerCase() === this.currentNick.toLowerCase();
   }
@@ -6545,23 +6534,25 @@ export class IrcConnection {
     // with themselves, which is how it turned up in QA.
     //
     // Checked on the token rather than the sender because it holds regardless
-    // of nick tracking: the generic self-echo guard in handleInboundCtcpRequest
-    // compares against currentNick, and in the case that produced this bug it
-    // evidently did not match.
+    // of nick tracking. In the QA case that found this, the generic self-echo
+    // guard in handleInboundCtcpRequest missed because currentNick had been
+    // lost in a netsplit collision — that root cause is fixed (#972), but the
+    // token is proof of authorship that no nick bookkeeping can get wrong, so
+    // it stays the decisive check for our own passive offer.
     if (offer.passive && offer.token !== null && this.pendingPassiveChats.has(offer.token)) {
       return;
     }
     // Belt and braces for the active shape, which carries no token of ours.
     //
-    // ⚠ Not isSelfNick, which compares only against `currentNick`. That is a
-    // mirror of what the server last told us (set from the network row, then
-    // from the registered nick, then from self NICK events), so it is right
-    // until it drifts — and a drifted one is precisely when an echo slips
-    // through, because the echo arrives under the name the SERVER thinks we
-    // have. Accepting the configured nick as well doesn't fix drift, but it
-    // widens the net at no cost. The token check above is the guard that
-    // actually holds when the name is unrecognisable.
-    if (this.isSelfDccNick(nick)) return;
+    // ⚠⚠ isSelfNick — currentNick ONLY, never the configured nick as well.
+    // currentNick follows the server, including through a netsplit collision
+    // that SAVEs us to our UID (#972), so it names who we are right now. The
+    // configured nick names who we ASKED to be, and when that was taken and we
+    // registered as `alice_`, the configured `alice` belongs to someone else —
+    // treating it as us would silently drop that person's genuine chat offer
+    // as if it were our own echo. The token check above covers our own passive
+    // offer however we are named.
+    if (this.isSelfNick(nick)) return;
     if (this.dccChats.has(nick.toLowerCase())) {
       this.dccChatNotice(nick, `${nick} offered a DCC chat, but one is already open.`);
       return;

@@ -896,6 +896,23 @@ describe('our own offer echoed back is not an offer', () => {
     expect(h.offerEvents().slice(before)).toEqual([]);
   });
 
+  // ⚠⚠ The self check must use currentNick ALONE. Registering under a fallback
+  // (the configured nick was taken) leaves the configured nick in someone
+  // ELSE'S hands; treating it as us silently dropped their genuine offer as if
+  // it were our own echo. A hedge added here back when currentNick could still
+  // drift (#972 has since fixed that) did exactly this.
+  it('hears an offer from whoever holds our configured nick while we use a fallback', () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness(); // configured as 'alice'
+    h.conn.currentNick = 'alice_'; // …but the server registered us as this
+    const before = h.offerEvents().length;
+    offerFrom(h.conn, 'alice', 'CHAT chat 16843009 5000'); // the real alice
+    expect(h.offerEvents().slice(before)).toMatchObject([
+      { type: 'dcc-chat-offer', from: 'alice' },
+    ]);
+  });
+
   // ...and a real peer answering our passive offer must still get through,
   // which is what stops the guard from swallowing the flow it sits next to.
   it('still accepts a genuine reply to our passive offer', async () => {
