@@ -889,9 +889,9 @@ describe('our own offer echoed back is not an offer', () => {
     allowLoopback();
     const h = harness();
     const before = h.offerEvents().length;
-    // ⚠ currentNick is unset here — the connection never registered — which is
-    // exactly the case isSelfNick answers false for. The configured nick is
-    // what has to carry it.
+    // The harness never registers, so `currentNick` is still the configured
+    // nick the constructor seeded it with — which is the name the echo carries
+    // in the ordinary case.
     offerFrom(h.conn, 'alice', 'CHAT chat 16843009 5000');
     expect(h.offerEvents().slice(before)).toEqual([]);
   });

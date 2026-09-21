@@ -5537,7 +5537,10 @@ export class IrcConnection {
   }
 
   // "Is this us?", for deciding whether an inbound DCC offer is our own line
-  // coming back. Deliberately wider than isSelfNick — see its call site.
+  // coming back. Deliberately wider than isSelfNick — see its call site. Both
+  // names are checked because they can disagree: `currentNick` follows the
+  // server, `network.nick` is what we asked for, and a server that renamed us
+  // (IRCnet truncates a long nick) leaves the two apart.
   private isSelfDccNick(nick: string | undefined): boolean {
     if (!nick) return false;
     const lower = nick.toLowerCase();
@@ -6550,10 +6553,14 @@ export class IrcConnection {
     }
     // Belt and braces for the active shape, which carries no token of ours.
     //
-    // ⚠ Not isSelfNick: that answers false whenever `currentNick` is unset
-    // (`!!this.currentNick &&` …), so it is a no-op before registration
-    // completes and any time nick tracking has drifted — which is precisely
-    // when an echo would slip through. Fall back to the configured nick too.
+    // ⚠ Not isSelfNick, which compares only against `currentNick`. That is a
+    // mirror of what the server last told us (set from the network row, then
+    // from the registered nick, then from self NICK events), so it is right
+    // until it drifts — and a drifted one is precisely when an echo slips
+    // through, because the echo arrives under the name the SERVER thinks we
+    // have. Accepting the configured nick as well doesn't fix drift, but it
+    // widens the net at no cost. The token check above is the guard that
+    // actually holds when the name is unrecognisable.
     if (this.isSelfDccNick(nick)) return;
     if (this.dccChats.has(nick.toLowerCase())) {
       this.dccChatNotice(nick, `${nick} offered a DCC chat, but one is already open.`);
