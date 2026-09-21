@@ -9,6 +9,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createUser } from '../db/users.js';
 import { CAPABILITY_DCC, setUserCapability } from '../db/userCapabilities.js';
 import {
+  dccActiveListenAvailable,
   dccAllowPrivateHosts,
   dccEnabledForUser,
   dccMasterEnabled,
@@ -89,4 +90,36 @@ describe('dccAllowPrivateHosts', () => {
     process.env.LURKER_DCC_ALLOW_PRIVATE_HOSTS = '1';
     expect(dccAllowPrivateHosts()).toBe(true);
   });
+});
+
+// Copilot's second pass on #973: "invalid IPv6 configuration validation".
+// dccActiveListenAvailable is what decides whether the server may make active
+// offers, so a host that can't go on the wire has to read as NOT configured —
+// otherwise every offer advertises an address nobody can dial.
+describe('dccActiveListenAvailable', () => {
+  const setRange = () => {
+    process.env.LURKER_DCC_LISTEN_PORT_MIN = '30000';
+    process.env.LURKER_DCC_LISTEN_PORT_MAX = '30009';
+  };
+  afterEach(() => {
+    delete process.env.LURKER_DCC_EXTERNAL_HOST;
+    delete process.env.LURKER_DCC_LISTEN_PORT_MIN;
+    delete process.env.LURKER_DCC_LISTEN_PORT_MAX;
+  });
+
+  it.each(['203.0.113.5', '2001:db8::1'])('is available with a usable address: %s', (host) => {
+    setRange();
+    process.env.LURKER_DCC_EXTERNAL_HOST = host;
+    expect(dccActiveListenAvailable()).toBe(true);
+  });
+
+  // ⚠ `1.2.3.4:5` — host:port pasted into the setting — is the realistic slip.
+  it.each(['1.2.3.4:5', '1:2', ':::', 'dcc.example.com'])(
+    'is NOT available when the host cannot go on the wire: %s',
+    (host) => {
+      setRange();
+      process.env.LURKER_DCC_EXTERNAL_HOST = host;
+      expect(dccActiveListenAvailable()).toBe(false);
+    },
+  );
 });

@@ -711,6 +711,10 @@ export class IrcConnection {
   // dispose so their bound ports are released rather than leaked.
   // handle -> the peer it was opened for, so /dcc close can cancel it.
   private readonly dccChatListeners = new Map<DccListenHandle, string>();
+  // Listener requests still binding a port, keyed by lowercased peer. The value
+  // is a per-request token, so a request that was cancelled and then re-made
+  // before the first bind returned can't be mistaken for the new one.
+  private readonly dccListenerRequests = new Map<string, object>();
   // Inbound chat offers awaiting the user's acceptance, keyed by lowercased
   // nick. ⚠ An offer is NOT auto-accepted: dialling would have this server open
   // a TCP connection to an address a stranger chose, and hand them its IP, on
@@ -6334,6 +6338,49 @@ export class IrcConnection {
   // ⚠⚠ `=nick` is a buffer name, never an IRC target. ircManager's send paths are
   // the guard that keeps it off the wire; see the note there.
 
+  // Bind a listening port for a chat with `nick`, handing it back only if the
+  // chat is still wanted once the port is bound — else null, port released.
+  //
+  // ⚠⚠ The gap between "may we offer?" and the port actually being bound is
+  // real, and everything that ends an offer used to miss it: the listener only
+  // joins dccChatListeners once bound, so a `/dcc close chat` landing in the gap
+  // found nothing ("no live DCC chat") while the offer went out anyway, and a
+  // dispose() there sent the offer on a connection being torn down and leaked
+  // the port for its full timeout. So the request is registered BEFORE binding,
+  // cancel and teardown remove it, and the resolution re-checks it — along with
+  // the link, which a CTCP offer or reverse reply needs and which can drop in
+  // the gap too.
+  private openDccChatListener(nick: string): Promise<DccListenHandle | null> {
+    const key = nick.toLowerCase();
+    const request = {};
+    this.dccListenerRequests.set(key, request);
+    const settle = (): boolean => {
+      const current = this.dccListenerRequests.get(key) === request;
+      if (current) this.dccListenerRequests.delete(key);
+      return current;
+    };
+    return openDccListener().then(
+      (handle) => {
+        const current = settle();
+        if (current && !this.disposed && this.state === 'connected') return handle;
+        handle.close();
+        // Cancelled or torn down: nothing to say — the canceller said it. A
+        // link that dropped by itself mid-bind would otherwise vanish silently.
+        if (current && !this.disposed) {
+          this.dccChatNotice(
+            nick,
+            `Couldn't send the DCC chat offer — ${this.network.name} disconnected.`,
+          );
+        }
+        return null;
+      },
+      (err) => {
+        if (!settle() || this.disposed) return null; // cancelled: stay quiet
+        throw err;
+      },
+    );
+  }
+
   // A token correlating a passive offer with its reverse reply. irssi and
   // repartee both mint `rand() % 64` (dcc-chat.c:527, handlers_dcc.rs:204), and
   // staying in that range keeps us inside what every implementation round-trips.
@@ -6489,8 +6536,9 @@ export class IrcConnection {
       );
       return;
     }
-    openDccListener()
+    this.openDccChatListener(nick)
       .then((handle) => {
+        if (!handle) return;
         const body = buildDccChat(externalHost, handle.port);
         if (body === null) {
           handle.close();
@@ -6694,8 +6742,9 @@ export class IrcConnection {
       // placeholder (1.1.1.1 / 0.0.0.199) and the peer dials from its real,
       // often NAT'd, source — pinning would reject exactly the peers this path
       // exists for. This is JawshTheDark's fix from #528 (73c76fc4).
-      openDccListener()
+      this.openDccChatListener(nick)
         .then((handle) => {
+          if (!handle) return;
           const body = buildDccChatReverse(externalHost, handle.port, token);
           if (body === null) {
             handle.close();
@@ -6887,7 +6936,9 @@ export class IrcConnection {
     // An offer WE made is cancellable too. Without this a mistyped
     // `/dcc chat bbo` holds one of the configured listening ports for the whole
     // 120s timeout, and the range IS the documented concurrency cap.
-    let cancelledOutgoing = false;
+    // A bind still in flight counts: without this, cancelling in that window
+    // answered "no live DCC chat" and the offer went out anyway.
+    let cancelledOutgoing = this.dccListenerRequests.delete(key);
     for (const [token, pending] of this.pendingPassiveChats) {
       if (pending.nick.toLowerCase() !== key) continue;
       clearTimeout(pending.timer);
@@ -6933,6 +6984,7 @@ export class IrcConnection {
     for (const key of this.pendingInboundChats.keys()) this.clearPendingInboundChat(key);
     for (const pending of this.pendingPassiveChats.values()) clearTimeout(pending.timer);
     this.pendingPassiveChats.clear();
+    this.dccListenerRequests.clear(); // an offer still binding is a handshake too
     for (const nick of dropped) {
       this.surfaceCtcp(
         this.serverTarget(),
@@ -6970,6 +7022,7 @@ export class IrcConnection {
     // so this must go through it rather than a bare clear().
     for (const key of this.pendingInboundChats.keys()) this.clearPendingInboundChat(key);
     unregisterDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
+    this.dccListenerRequests.clear(); // binds in flight resolve, see this, and release
     for (const handle of this.dccChatListeners.keys()) handle.close();
     this.dccChatListeners.clear();
     for (const pending of this.pendingPassiveChats.values()) clearTimeout(pending.timer);

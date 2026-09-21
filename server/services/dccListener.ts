@@ -28,8 +28,24 @@ export function activeDccListenerCount(): number {
   return inUse.size;
 }
 
+// Every server still bound, so a reset can actually close them.
+const live = new Set<net.Server>();
+
 // Tests reset between cases; production never calls this.
+//
+// ⚠ Closes the servers, not just the bookkeeping. Clearing only `inUse` left a
+// listener that one test leaked still BOUND into the next — so a regression that
+// leaks a port showed up as failures in whichever test ran after it, rather than
+// in the test that exercises the bug.
 export function resetDccListeners(): void {
+  for (const server of live) {
+    try {
+      server.close();
+    } catch {
+      /* already closing */
+    }
+  }
+  live.clear();
   inUse.clear();
 }
 
@@ -101,6 +117,8 @@ export function openDccListener(opts: DccListenOptions = {}): Promise<DccListenH
       }
       const port = candidates[idx++];
       const server = net.createServer();
+      live.add(server);
+      server.once('close', () => live.delete(server));
       let settled = false; // the `accepted` promise's fate
       let acceptResolve!: (s: net.Socket) => void;
       let acceptReject!: (e: Error) => void;

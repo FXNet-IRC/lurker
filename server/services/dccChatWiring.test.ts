@@ -1260,3 +1260,77 @@ describe('review #973: a deliberate disconnect ends in-flight handshakes', () =>
     h.conn.closeDccChat('bob');
   });
 });
+
+// Copilot's second pass on #973 named "listener teardown races". The gap is
+// between deciding we may offer and the port actually being bound: the
+// listener only joined dccChatListeners once bound, so anything ending the
+// offer inside that gap found nothing to end.
+describe('review #973: ending an offer while its port is still binding', () => {
+  // `offerDccChat` returns before the bind resolves; these act in that gap.
+  const settle = () => new Promise((r) => setTimeout(r, 50));
+
+  it('a cancel in the gap stops the offer, frees the port, and says so', async () => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+    h.conn.offerDccChat('bob');
+    expect(h.conn.closeDccChat('bob')).toBe(true); // was false: "no live DCC chat"
+    await settle();
+    expect(h.ctcpRequest).not.toHaveBeenCalled(); // was: the offer went out anyway
+    expect(activeDccListenerCount()).toBe(0); // was: held until its timeout
+    expect(h.notices().join(' ')).toMatch(/Cancelled the pending DCC chat offer/);
+  });
+
+  it('a teardown in the gap sends nothing and leaks no port', async () => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+    h.conn.client.quit = vi.fn<(m?: string) => void>();
+    h.conn.offerDccChat('bob');
+    h.conn.dispose('network removed');
+    await settle();
+    expect(h.ctcpRequest).not.toHaveBeenCalled();
+    expect(activeDccListenerCount()).toBe(0);
+  });
+
+  // Not a disconnect() — the link dropping on its own, so nothing cancelled the
+  // request. The offer can't go out, and the user shouldn't be left waiting.
+  it('a link that drops in the gap sends nothing, frees the port, and explains', async () => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+    h.conn.offerDccChat('bob');
+    h.conn.state = 'reconnecting';
+    await settle();
+    expect(h.ctcpRequest).not.toHaveBeenCalled();
+    expect(activeDccListenerCount()).toBe(0);
+    expect(h.notices().at(-1)).toMatch(/Couldn't send the DCC chat offer/);
+  });
+
+  // The per-request token: a cancel then an immediate re-offer must leave the
+  // SECOND one live — a plain per-nick flag would let the first bind, resolving
+  // late, be mistaken for it.
+  it('a cancel then an immediate re-offer sends exactly the second', async () => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+    h.conn.offerDccChat('bob');
+    h.conn.closeDccChat('bob');
+    h.conn.offerDccChat('bob');
+    await settle();
+    expect(h.ctcpRequest).toHaveBeenCalledTimes(1);
+    expect(activeDccListenerCount()).toBe(1);
+    h.conn.closeDccChat('bob');
+  });
+
+  it('the reverse reply to a passive offer honours a cancel in the gap too', async () => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+    offerAndAccept(h.conn, 'bob', 'CHAT chat 16843009 0 42'); // accept → binds for the reply
+    h.conn.closeDccChat('bob');
+    await settle();
+    expect(h.ctcpRequest).not.toHaveBeenCalled();
+    expect(activeDccListenerCount()).toBe(0);
+  });
+});

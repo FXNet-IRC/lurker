@@ -30,6 +30,7 @@
 // (dcc.c:2500-2504) and it is the one case where a naive parser tries to open a
 // TCP connection to port 0.
 
+import net from 'net';
 import zlib from 'zlib';
 import { isBlockedIpLiteral } from '../utils/ipGuard.js';
 
@@ -102,12 +103,13 @@ function parseUint(s: string): number | null {
 export function decodeDccAddress(addr: string): string | null {
   const s = addr.trim();
   if (s === '') return null;
-  // IPv6 literal — sent as-is; a colon is the giveaway (a valid v6 literal has at
-  // least two). Allow the v4-mapped `::ffff:1.2.3.4` form's dot too.
-  if (s.includes(':')) {
-    const colons = s.match(/:/g)?.length ?? 0;
-    return /^[0-9a-fA-F:.]+$/.test(s) && colons >= 2 ? s : null;
-  }
+  // IPv6 literal — sent as-is; a colon is the giveaway.
+  //
+  // ⚠ Validated with net.isIPv6, not a character-class guess. The old check —
+  // hex, colons and dots, at least two colons — let `:::` and `f:f:f` through,
+  // which then reached the dialler and were refused as "private or reserved",
+  // a misleading reason for what was simply not an address.
+  if (s.includes(':')) return net.isIPv6(s) ? s : null;
   // Dotted-quad IPv4.
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s)) {
     return s.split('.').every((o) => Number(o) <= 255) ? s : null;
@@ -281,9 +283,12 @@ function parseDccSend(rest: string): DccParse {
  *  a colon). Returns null if it's neither a dotted-quad nor a v6 literal. */
 export function encodeDccAddress(host: string): string | null {
   const h = host.trim();
-  if (h.includes(':')) {
-    return /^[0-9a-fA-F:.]+$/.test(h) ? h : null;
-  }
+  // ⚠⚠ net.isIPv6, not "hex, colons and dots". That class accepted `1:2`, `:::`,
+  // `abc:def` — and `1.2.3.4:5`, which is what pasting host:port into
+  // LURKER_DCC_EXTERNAL_HOST produces. Since dccActiveListenAvailable asks this
+  // function whether the configured host is usable, any of those passed as
+  // configured and then went out in every offer as an address nobody can dial.
+  if (h.includes(':')) return net.isIPv6(h) ? h : null;
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
   if (!m) return null;
   const o = m.slice(1).map((x) => Number(x));

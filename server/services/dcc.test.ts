@@ -513,3 +513,29 @@ describe('PASSIVE_DCC_FAKE_HOST', () => {
     expect(encodeDccAddress(PASSIVE_DCC_FAKE_HOST)).toBe('16843009');
   });
 });
+
+// Copilot's second pass on #973 named "invalid IPv6 configuration validation".
+// Both directions took anything of hex, colons and dots as an IPv6 literal.
+describe('IPv6 literals are validated, not pattern-matched', () => {
+  // ⚠⚠ `1.2.3.4:5` is the realistic one: host:port pasted into
+  // LURKER_DCC_EXTERNAL_HOST. It passed as configured and went out in offers.
+  it.each(['1.2.3.4:5', '1:2', ':::', 'abc:def', ':', 'f:f:f'])(
+    'refuses to advertise %s',
+    (bad) => {
+      expect(encodeDccAddress(bad)).toBeNull();
+      expect(buildDccChat(bad, 5000)).toBeNull();
+    },
+  );
+
+  // The inbound side reached the dialler, which called them "private or
+  // reserved" — a misleading reason for what simply isn't an address.
+  it.each([':::', 'f:f:f'])('refuses to parse %s from an offer', (bad) => {
+    expect(decodeDccAddress(bad)).toBeNull();
+    expect(parseDcc(`CHAT chat ${bad} 5000`).kind).toBe('invalid');
+  });
+
+  it.each(['::1', '2001:db8::1', '::ffff:1.2.3.4', 'fe80::1'])('still accepts %s', (good) => {
+    expect(encodeDccAddress(good)).toBe(good);
+    expect(decodeDccAddress(good)).toBe(good);
+  });
+});
