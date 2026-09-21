@@ -541,4 +541,90 @@ describe('ircManager optimistic-publish gating', () => {
       e2e: true,
     });
   });
+
+  // ⚠⚠ Who a self row is attributed TO, during a netsplit nick collision
+  // (#972). The server SAVEs us to our UID, and irc-framework refuses to store
+  // a digit-leading nick (client.js:266) — so its `user.nick` keeps our OLD
+  // nick, which is now free, and if a stranger takes that nick and renames,
+  // the framework writes THEIR new nick into our copy. `currentNick` is the
+  // only record that is still us.
+  //
+  // Every case above asserts type/text/self and never `nick`, so the
+  // attribution could have regressed on any of these paths with the suite
+  // still green. Each mode has its own publish site, hence one case per mode.
+  describe('self rows are attributed to currentNick, not the framework copy', () => {
+    const COLLIDED = {
+      currentNick: '042AAEL37',
+      client: { user: { nick: 'mallory' } }, // hijacked by a stranger's rename
+      echoActive: () => false, // no echo cap, so the optimistic publish is the row
+    };
+
+    const cases: Array<{
+      mode: string;
+      overrides?: Record<string, unknown>;
+      run: () => void;
+      type: string;
+    }> = [
+      {
+        mode: 'plain say',
+        run: () => ircManager.send(userId, networkId, '#gate', 'hi'),
+        type: 'message',
+      },
+      {
+        mode: 'multiline',
+        overrides: {
+          supportsMultiline: () => true,
+          sendMultiline: () => ['a\nb'],
+        },
+        run: () => ircManager.send(userId, networkId, '#gate', 'a\nb'),
+        type: 'message',
+      },
+      {
+        mode: 'action',
+        run: () => ircManager.action(userId, networkId, '#gate', 'waves'),
+        type: 'action',
+      },
+      {
+        mode: 'notice',
+        run: () => ircManager.notice(userId, networkId, '#gate', 'psst'),
+        type: 'notice',
+      },
+    ];
+
+    it.each(cases)('$mode', (c) => {
+      const { conn, publish } = fakeConn({ ...COLLIDED, ...c.overrides });
+      vi.spyOn(ircManager, 'getConnection').mockReturnValue(conn);
+      try {
+        c.run();
+        expect(publish).toHaveBeenCalled();
+        for (const [event] of publish.mock.calls) {
+          expect(event).toMatchObject({ type: c.type, self: true, nick: '042AAEL37' });
+        }
+      } finally {
+        vi.restoreAllMocks();
+      }
+    });
+
+    // The E2E branch is its own publish site: it shows the sender the
+    // plaintext locally regardless of echo, so it needs its own case.
+    it('E2E', () => {
+      const { conn, publish } = fakeConn(COLLIDED);
+      vi.spyOn(ircManager, 'getConnection').mockReturnValue(conn);
+      vi.spyOn(e2eManager, 'encryptOutgoing').mockReturnValue({
+        kind: 'encrypted',
+        lines: ['CIPHERTEXT'],
+      } as never);
+      try {
+        ircManager.send(userId, networkId, '#gate', 'secret');
+        expect(publish).toHaveBeenCalledTimes(1);
+        expect(publish.mock.calls[0][0]).toMatchObject({
+          self: true,
+          e2e: true,
+          nick: '042AAEL37',
+        });
+      } finally {
+        vi.restoreAllMocks();
+      }
+    });
+  });
 });
