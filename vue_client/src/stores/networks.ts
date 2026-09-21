@@ -63,6 +63,9 @@ export interface NetworkState {
   // by every snapshot — including a disconnected network's, since a chat socket
   // outlives the IRC link — and kept current by `dcc-chat-state` events.
   dccChats?: string[];
+  // Peers whose DCC chat offer to us is still awaiting an answer. Used to
+  // retire an offer toast whose offer disappeared while this tab was offline.
+  dccChatOffers?: string[];
   lagMs?: number | null;
   // Advertised draft/multiline limits when the network negotiated the cap,
   // else null/absent. Drives the composer's multiline-aware SPLIT/FLOOD hint

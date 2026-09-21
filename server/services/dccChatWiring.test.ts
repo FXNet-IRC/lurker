@@ -88,6 +88,10 @@ function makeConn(networkFields: Record<string, unknown> = {}): IrcConnection {
 // vitest clears mocks between cases.
 function harness() {
   const conn = makeConn();
+  // A live IRC link by default: sending a DCC offer or reverse reply rides it,
+  // and a connection in backoff now refuses rather than having irc-framework
+  // silently drop the CTCP. Tests about a down link set this themselves.
+  conn.state = 'connected';
   const ctcpRequest = vi.fn<(target: string, type: string, ...p: string[]) => void>();
   const say = vi.fn<(target: string, text: string) => void>();
   const raw = vi.fn<(line: string) => void>();
@@ -571,7 +575,9 @@ describe('a = target never reaches the IRC wire', () => {
     const sock = await peer.socket;
     await waitFor(() => h.conn.hasDccChat('bob'));
 
-    // writableConnection() would reject this connection — it never registered.
+    // The IRC link drops into reconnect backoff mid-chat. writableConnection()
+    // now rejects it — the DCC socket must not care.
+    h.conn.state = 'reconnecting';
     expect(ircManager.writableConnection(1, 1)).toBeNull();
 
     const got = new Promise<string>((r) => sock.once('data', (d) => r(d.toString())));
@@ -999,5 +1005,185 @@ describe('the client is told whether a chat is live', () => {
   it('reports no live chats once they have ended', () => {
     const snap = ircManager.snapshotForUser(1) as Array<{ networkId: number; dccChats: string[] }>;
     expect(snap.find((n) => n.networkId === 1)!.dccChats).toEqual([]);
+  });
+});
+
+// Findings from the pre-PR review of the whole branch.
+describe('review: chats that outlive their connection', () => {
+  // A second connection object for the same network, as startNetwork builds on
+  // reconnect when a Disconnect has already dropped the first from the map.
+  function reconnectedConn() {
+    const conn = makeConn();
+    conn.state = 'connected';
+    const published: Array<Record<string, unknown>> = [];
+    conn.publish = (e: Record<string, unknown>) => {
+      published.push(e);
+      return undefined;
+    };
+    conn.publishEphemeral = () => {};
+    conn.client.ctcpRequest = vi.fn<(t: string, type: string, ...p: string[]) => void>();
+    conn.client.say = vi.fn<(t: string, text: string) => void>();
+    const notices = () =>
+      published.filter((e) => e.type === 'notice').map((e) => String(e.text ?? ''));
+    return { conn, notices };
+  }
+
+  async function liveChatThenDisconnect(h: ReturnType<typeof harness>) {
+    const peer = await startPeer();
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    const sock = await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+    ircManager.connectionsForUser(1).delete(1); // what stopNetwork does
+    return sock;
+  }
+
+  // ⚠⚠ #1. After Disconnect + reconnect the chat's owner and the mapped
+  // connection are different objects. Asking the mapped one first sent every
+  // line to the new connection, which has no session ("No live DCC chat").
+  it('routes a send to the session owner, not the reconnected connection', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    inject(h.conn);
+    const sock = await liveChatThenDisconnect(h);
+    const fresh = reconnectedConn();
+    inject(fresh.conn); // the reconnect
+
+    const got = new Promise<string>((r) => sock.once('data', (d) => r(d.toString())));
+    expect(ircManager.send(1, 1, '=bob', 'still reachable')).toBe(true);
+    expect(await got).toBe('still reachable\r\n');
+    expect(fresh.notices().join(' ')).not.toMatch(/No live DCC chat/);
+    ircManager.dccChatClose(1, 1, 'bob');
+  });
+
+  it('refuses a second chat with the same peer from the reconnected connection', async () => {
+    enableDcc();
+    allowLoopback();
+    enableListening();
+    const h = harness();
+    inject(h.conn);
+    await liveChatThenDisconnect(h);
+    const fresh = reconnectedConn();
+    inject(fresh.conn);
+
+    fresh.conn.offerDccChat('bob');
+    expect(fresh.notices().at(-1)).toMatch(/Already in a DCC chat with bob/);
+    expect(fresh.conn.client.ctcpRequest).not.toHaveBeenCalled();
+    ircManager.dccChatClose(1, 1, 'bob');
+  });
+
+  it('closes a chat whose owner the map no longer holds', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    inject(h.conn);
+    await liveChatThenDisconnect(h);
+    inject(reconnectedConn().conn);
+    expect(ircManager.dccChatClose(1, 1, 'bob')).toBe(true);
+    expect(h.conn.hasDccChat('bob')).toBe(false);
+  });
+
+  // ⚠⚠ #2. disposeNetwork only reaches the mapped connection, so a network
+  // deleted after a Disconnect left the owner's socket publishing into a
+  // network that no longer existed.
+  it('ends a chat on network delete even when its owner is out of the map', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    inject(h.conn);
+    await liveChatThenDisconnect(h);
+    ircManager.endDccChats(1, 1, 'network removed');
+    expect(h.conn.hasDccChat('bob')).toBe(false);
+  });
+
+  it('ends a chat on user delete even when its owner is out of the map', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    inject(h.conn);
+    await liveChatThenDisconnect(h);
+    ircManager.disposeUser(1, 'user deleted');
+    expect(h.conn.hasDccChat('bob')).toBe(false);
+  });
+
+  // …while Reconnect, which runs through disposeNetwork, must NOT end it: the
+  // whole point of surviving a Disconnect is surviving the reconnect after.
+  it('keeps the chat across a Reconnect after a Disconnect', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    inject(h.conn);
+    await liveChatThenDisconnect(h);
+    ircManager.disposeNetwork(1, 1, 'reconnecting'); // what restartNetwork does first
+    expect(h.conn.hasDccChat('bob')).toBe(true);
+    ircManager.dccChatClose(1, 1, 'bob');
+  });
+});
+
+describe('review: offers on a link that is down', () => {
+  // #3. irc-framework drops a write during reconnect backoff, so an offer
+  // there was announced as sent, held a port for 120s, then blamed the peer.
+  it('refuses to send an offer, and holds no port, while the link is down', () => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+    h.conn.state = 'reconnecting';
+    h.conn.offerDccChat('bob');
+    expect(h.ctcpRequest).not.toHaveBeenCalled();
+    expect(h.notices().at(-1)).toMatch(/not connected/);
+    expect(activeDccListenerCount()).toBe(0);
+  });
+
+  it('refuses a passive offer too', () => {
+    enableDcc();
+    const h = harness();
+    h.conn.state = 'reconnecting';
+    h.conn.offerDccChat('bob', { passive: true });
+    expect(h.ctcpRequest).not.toHaveBeenCalled();
+  });
+
+  // Accepting an ACTIVE offer only dials — no CTCP rides the link — so it has
+  // to keep working while IRC is down.
+  it('still accepts an active offer while the link is down', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    const peer = await startPeer();
+    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    h.conn.state = 'reconnecting';
+    h.conn.offerDccChat('bob');
+    await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+    expect(h.conn.hasDccChat('bob')).toBe(true);
+    expect(h.notices().join(' ')).not.toMatch(/not connected/);
+    h.conn.closeDccChat('bob');
+  });
+});
+
+describe('review: small ones', () => {
+  // #4. A deliberate cancel rejects the listener's accepted promise, and its
+  // catch used to report "failed: DCC listener closed" on top of "Cancelled".
+  it('cancelling an offer does not also report it as failed', async () => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+    h.conn.offerDccChat('bbo');
+    await waitFor(() => activeDccListenerCount() === 1);
+    h.conn.closeDccChat('bbo');
+    await new Promise((r) => setTimeout(r, 20)); // let the rejection settle
+    expect(h.notices().at(-1)).toMatch(/Cancelled the pending DCC chat offer/);
+    expect(h.notices().join(' ')).not.toMatch(/failed/);
+  });
+
+  // #5. A passive offer's address is a placeholder the peer ignores, so a
+  // hostname in LURKER_DCC_EXTERNAL_HOST — which can't be encoded — must not
+  // stop the mode meant for servers without a usable external address.
+  it('sends a passive offer even when the external host is a hostname', () => {
+    enableDcc();
+    process.env.LURKER_DCC_EXTERNAL_HOST = 'dcc.example.com';
+    const h = harness();
+    h.conn.offerDccChat('bob', { passive: true });
+    expect(h.lastOffer()).toMatch(/^CHAT chat 16843009 0 \d+$/);
+    expect(h.notices().join(' ')).not.toMatch(/misconfigured/);
   });
 });

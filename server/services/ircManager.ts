@@ -53,7 +53,13 @@ import { contextKey, isChannelContext } from './e2e/context.js';
 import { e2eDbg } from './e2e/debug.js';
 import db from '../db/index.js';
 import { isDccChatTarget, dccChatPeer } from '../../shared/channels.js';
-import { dccChatHost, dccChatKey, type DccChatHost } from './dccChatSessions.js';
+import {
+  dccChatHostFor,
+  dccChatHostsFor,
+  dccChatHostsForUser,
+  dccChatKey,
+  type DccChatHost,
+} from './dccChatSessions.js';
 
 // A buffer's read pointer moved forward: what markRead emits as 'read-marker'.
 export interface ReadMarkerMove {
@@ -714,11 +720,19 @@ class IrcManager extends EventEmitter {
     return true;
   }
 
-  // The thing that can reach a live DCC chat on this network: normally the
-  // connection, but a user-initiated disconnect drops that from the map while
-  // the chat's socket stays up, so fall back to the session registry.
-  private dccChatOwner(userId: number, networkId: number): DccChatHost | null {
-    return this.getConnection(userId, networkId) ?? dccChatHost(dccChatKey(userId, networkId));
+  // Whatever can reach the DCC chat with `peer` on this network.
+  //
+  // ⚠⚠ The host that OWNS that peer's session first, the mapped connection only
+  // as a fallback. After a Disconnect and reconnect those are different
+  // objects: startNetwork builds a new IrcConnection while the old one still
+  // holds the chat socket. Asking the mapped connection first sent every line
+  // to the new one ("No live DCC chat with bob") while bob's lines kept arriving
+  // through the old. The fallback exists so a send with no live chat anywhere
+  // still reaches a connection that can say so.
+  private dccChatOwner(userId: number, networkId: number, peer: string): DccChatHost | null {
+    return (
+      dccChatHostFor(dccChatKey(userId, networkId), peer) ?? this.getConnection(userId, networkId)
+    );
   }
 
   /** Offer a DCC chat to a peer. False when the network has no connection object
@@ -738,11 +752,36 @@ class IrcManager extends EventEmitter {
 
   /** Close a live DCC chat. False when there was no session to close. */
   dccChatClose(userId: number, networkId: number, nick: string): boolean {
-    // Closeable without a connection too — otherwise a chat still running past
-    // a disconnect could never be ended.
-    const owner = this.dccChatOwner(userId, networkId);
-    if (!owner) return false;
-    return owner.closeDccChat(nick);
+    // Both the session's owner and the mapped connection, because they can be
+    // different objects and each can hold something `/dcc close chat` means to
+    // end: the live session on the owner, and on the mapped connection a
+    // pending offer — ours to them, or theirs to us.
+    const owner = dccChatHostFor(dccChatKey(userId, networkId), nick);
+    const mapped = this.getConnection(userId, networkId);
+    let closed = false;
+    for (const host of new Set([owner, mapped])) {
+      if (host && host.closeDccChat(nick)) closed = true;
+    }
+    return closed;
+  }
+
+  /** End every DCC chat on a network, whoever owns it. For a network being
+   *  DELETED — deliberately not part of disposeNetwork, which Reconnect also
+   *  runs through (restartNetwork), and a chat that survived a Disconnect
+   *  should survive the reconnect too.
+   *
+   *  ⚠⚠ Required before the row goes: after a Disconnect the connection that
+   *  owns a chat is no longer in the map disposeNetwork walks, so its socket
+   *  kept running — and the peer's next line published into a network that no
+   *  longer existed, throwing from a socket 'data' handler. */
+  endDccChats(userId: number, networkId: number, reason: string): void {
+    for (const host of dccChatHostsFor(dccChatKey(userId, networkId))) {
+      try {
+        host.closeAllDccChats(reason);
+      } catch (_) {
+        /* ignore — teardown must reach the rest */
+      }
+    }
   }
 
   // Long messages need to be split: irc-framework breaks anything past ~350
@@ -763,7 +802,7 @@ class IrcManager extends EventEmitter {
     // in reconnect backoff. Only getConnection (which returns a connection in any
     // state) is needed to reach the session map.
     if (isDccChatTarget(target)) {
-      const dcc = this.dccChatOwner(userId, networkId);
+      const dcc = this.dccChatOwner(userId, networkId, dccChatPeer(target));
       return dcc ? dcc.dccChatSend(dccChatPeer(target), text) : false;
     }
 
@@ -914,7 +953,7 @@ class IrcManager extends EventEmitter {
     // in reconnect backoff. Only getConnection (which returns a connection in any
     // state) is needed to reach the session map.
     if (isDccChatTarget(target)) {
-      const dcc = this.dccChatOwner(userId, networkId);
+      const dcc = this.dccChatOwner(userId, networkId, dccChatPeer(target));
       return dcc ? dcc.dccChatSend(dccChatPeer(target), text, { action: true }) : false;
     }
 
@@ -959,7 +998,7 @@ class IrcManager extends EventEmitter {
     // in reconnect backoff. Only getConnection (which returns a connection in any
     // state) is needed to reach the session map.
     if (isDccChatTarget(target)) {
-      const dcc = this.dccChatOwner(userId, networkId);
+      const dcc = this.dccChatOwner(userId, networkId, dccChatPeer(target));
       return dcc ? dcc.dccChatSend(dccChatPeer(target), text) : false;
     }
 
@@ -1159,6 +1198,15 @@ class IrcManager extends EventEmitter {
       }
       this.byUser.delete(userId);
     }
+    // Chats owned by connections a Disconnect already dropped from the map —
+    // disposing the mapped ones above never reaches them (see endDccChats).
+    for (const host of dccChatHostsForUser(userId)) {
+      try {
+        host.closeAllDccChats(reason);
+      } catch (_) {
+        /* ignore */
+      }
+    }
     this.connectionErrors.delete(userId);
     this.emit('user-disposed', { userId });
   }
@@ -1250,7 +1298,14 @@ class IrcManager extends EventEmitter {
         // then synthesized below from the DB. The session registry is what
         // still knows, so reading it here keeps a reloaded tab from showing a
         // live chat as disconnected.
-        dccChats: dccChatHost(dccChatKey(userId, networkId))?.liveDccChatPeers() ?? [],
+        dccChats: dccChatHostsFor(dccChatKey(userId, networkId)).flatMap((h) =>
+          h.liveDccChatPeers(),
+        ),
+        // Offers still awaiting an answer. The client's offer toast is sticky,
+        // and a toast whose offer expired or was lost while the tab was
+        // disconnected never gets the live close event — so it reconciles
+        // against this on every snapshot instead.
+        dccChatOffers: this.getConnection(userId, networkId)?.pendingDccChatOffers() ?? [],
       };
     };
     const live = this.listConnections(userId);

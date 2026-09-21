@@ -43,6 +43,23 @@ function dccOfferKey(networkId: number, from: string): string {
   return `${networkId}::${from.toLowerCase()}`;
 }
 
+// ⚠ The offer toast is sticky, and normally the live `dcc-chat-offer-closed`
+// event retires it. But that event can be missed: the tab's socket drops, or
+// the server restarts, while an offer is pending — and then the toast outlives
+// its offer, with an Accept button that now sends the peer a FRESH offer, a
+// different act than the one it names. Every snapshot carries the offers still
+// pending, so reconcile against it. (Deliberately dismiss-only: re-showing a
+// pending offer here would re-pop a toast the user had already dismissed.)
+function retireStaleDccOfferToasts(snapshot: any[]): void {
+  const pending = new Set<string>();
+  for (const net of snapshot || []) {
+    for (const nick of net?.dccChatOffers ?? []) pending.add(dccOfferKey(net.networkId, nick));
+  }
+  for (const key of dccOfferToasts.keys()) {
+    if (!pending.has(key)) dismissDccOfferToast(key);
+  }
+}
+
 function dismissDccOfferToast(key: string): void {
   const id = dccOfferToasts.get(key);
   if (id === undefined) return;
@@ -654,6 +671,7 @@ function applySnapshot(snapshot: any[], globalIgnores: any[] = []): void {
   ignores.applySnapshot(snapshot, globalIgnores);
   nickNotes.applySnapshot(snapshot);
   relayBots.applySnapshot(snapshot);
+  retireStaleDccOfferToasts(snapshot);
   // Highlight rules aren't in the snapshot; load them now so client-side
   // render-time highlight evaluation (#349) works app-wide, not just after the
   // settings pane has been opened.
@@ -1216,6 +1234,10 @@ export function socketSendWithAck(payload: Record<string, unknown>): Promise<Ack
 // logout (and any other session reset). Strips handlers before closing so the
 // `onclose` reconnect arm can't fire even if `auth.user` is briefly truthy.
 export function resetSocket(): void {
+  // Offer toasts belong to the session. Their ids point into a toast store the
+  // next session won't share, so carrying them across a logout would have the
+  // first snapshot "retire" toasts that aren't there.
+  dccOfferToasts.clear();
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;

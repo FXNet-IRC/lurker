@@ -12,12 +12,21 @@
 // Hanging the sessions off IrcConnection alone did not survive that, because
 // ircManager.stopNetwork (the user pressing Disconnect, /disconnect, the REST
 // endpoint, the disconnect_network verb) drops the connection out of its map
-// while `disconnect()` deliberately does NO DCC teardown. The socket stayed
-// open and became unreachable: not sendable, not closeable, invisible until the
-// process exited. This registry is the seam that keeps it addressable.
+// while `disconnect()` deliberately does NO DCC teardown. This registry is the
+// seam that keeps those sessions addressable.
 //
-// The registry holds a connection only while it actually has a live chat, so a
-// disconnected connection is not kept alive past its last session.
+// ⚠⚠ Several hosts per network, not one. A reconnect after a user Disconnect
+// builds a NEW IrcConnection (startNetwork finds nothing in the map), while the
+// OLD one still owns the chat socket. So there can be two live owners for one
+// network at once, and every lookup has to find the one that owns a given peer:
+// routing by network alone sent sends to the new connection ("no live chat")
+// and let a fresh chat overwrite the old owner's entry, orphaning its socket.
+// And teardown has to reach ALL of them — ircManager's dispose paths only see
+// the mapped connection, so a network deleted after a Disconnect left the old
+// socket publishing into a network that no longer existed.
+//
+// A connection is held only while it owns a live chat, so a disconnected one
+// is not kept alive past its last session.
 
 /** What ircManager needs of a live chat's owner. Deliberately narrow — a full
  *  IrcConnection import here would close an ircManager ↔ ircConnection cycle. */
@@ -27,9 +36,11 @@ export interface DccChatHost {
   liveDccChatPeers(): string[];
   dccChatSend(nick: string, text: string, opts?: { action?: boolean }): boolean;
   closeDccChat(nick: string): boolean;
+  /** End every session this host owns — for network/user teardown. */
+  closeAllDccChats(reason: string): void;
 }
 
-const hosts = new Map<string, DccChatHost>();
+const hosts = new Map<string, Set<DccChatHost>>();
 
 export function dccChatKey(userId: number, networkId: number): string {
   return `${userId}:${networkId}`;
@@ -37,18 +48,36 @@ export function dccChatKey(userId: number, networkId: number): string {
 
 /** Called when a session opens. Idempotent. */
 export function registerDccChatHost(key: string, host: DccChatHost): void {
-  hosts.set(key, host);
+  let set = hosts.get(key);
+  if (!set) hosts.set(key, (set = new Set()));
+  set.add(host);
 }
 
-/** Called when a connection's last session ends, or it is disposed. Identity
- *  checked, so a superseded connection can't evict its replacement's entry. */
+/** Called when a host's last session ends, or it is disposed. */
 export function unregisterDccChatHost(key: string, host: DccChatHost): void {
-  if (hosts.get(key) === host) hosts.delete(key);
+  const set = hosts.get(key);
+  if (!set) return;
+  set.delete(host);
+  if (set.size === 0) hosts.delete(key);
 }
 
-/** The owner of any live chat on this network, or null. */
-export function dccChatHost(key: string): DccChatHost | null {
-  return hosts.get(key) ?? null;
+/** The host that owns a live session with `peer` on this network, or null. */
+export function dccChatHostFor(key: string, peer: string): DccChatHost | null {
+  for (const host of hosts.get(key) ?? []) if (host.hasDccChat(peer)) return host;
+  return null;
+}
+
+/** Every host holding a live session on this network. */
+export function dccChatHostsFor(key: string): DccChatHost[] {
+  return [...(hosts.get(key) ?? [])];
+}
+
+/** Every host holding a live session for this user, across all networks. */
+export function dccChatHostsForUser(userId: number): DccChatHost[] {
+  const prefix = `${userId}:`;
+  const out: DccChatHost[] = [];
+  for (const [key, set] of hosts) if (key.startsWith(prefix)) out.push(...set);
+  return out;
 }
 
 /** Tests only — production never calls this. */

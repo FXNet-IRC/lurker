@@ -120,7 +120,12 @@ import {
 import { hasFreeSpaceFor, resolveDccDestination } from './dccPaths.js';
 import { DccChat } from './dccChat.js';
 import { openDccListener, type DccListenHandle } from './dccListener.js';
-import { dccChatKey, registerDccChatHost, unregisterDccChatHost } from './dccChatSessions.js';
+import {
+  dccChatHostFor,
+  dccChatKey,
+  registerDccChatHost,
+  unregisterDccChatHost,
+} from './dccChatSessions.js';
 import { DccReceiver } from './dccReceiver.js';
 import {
   type DccTransferRow,
@@ -6397,6 +6402,21 @@ export class IrcConnection {
   // point. The gate is per-entry-point by doctrine (routes/dcc.ts), and the proxy
   // rule matters because DCC bypasses the tunnel in BOTH directions — a chat dial
   // or listen leaks the real address exactly as a file transfer would.
+  // Sending a DCC offer or reverse reply rides the IRC link. During reconnect
+  // backoff irc-framework silently DROPS the write, so without this the user
+  // was told "offered … waiting for them to connect", a listening port from the
+  // configured range was held for the full 120s, and the eventual timeout
+  // blamed the peer. Accepting an ACTIVE offer needs no link — it only dials —
+  // so this guards the sends alone.
+  private dccCanSendOffer(nick: string): boolean {
+    if (this.state === 'connected') return true;
+    this.dccChatNotice(
+      nick,
+      `Can't send a DCC chat offer while ${this.network.name} is not connected.`,
+    );
+    return false;
+  }
+
   private dccChatAllowed(nick: string, verb: string): boolean {
     if (this.disposed) return false;
     if (!dccEnabledForUser(this.network.user_id)) return false;
@@ -6420,7 +6440,13 @@ export class IrcConnection {
   offerDccChat(nick: string, opts: { passive?: boolean } = {}): void {
     if (!this.dccChatAllowed(nick, 'offer a DCC chat')) return;
     const key = nick.toLowerCase();
-    if (this.dccChats.has(key)) {
+    // ⚠ Across every owner, not just this connection: after a Disconnect and
+    // reconnect the live chat belongs to the OLD connection, and checking only
+    // our own map would open a second socket to the same peer.
+    if (
+      this.dccChats.has(key) ||
+      dccChatHostFor(dccChatKey(this.network.user_id, this.network.id), nick)
+    ) {
       this.dccChatNotice(nick, `Already in a DCC chat with ${nick}.`);
       return;
     }
@@ -6432,6 +6458,7 @@ export class IrcConnection {
       this.acceptInboundDccChat(inbound.nick, inbound.offer);
       return;
     }
+    if (!this.dccCanSendOffer(nick)) return;
     if (opts.passive) {
       this.offerPassiveDccChat(nick);
       return;
@@ -6472,7 +6499,11 @@ export class IrcConnection {
             this.startDccChat(nick, socket);
           })
           .catch((err) => {
-            this.dccChatListeners.delete(handle);
+            // ⚠ Gone already means someone removed it on purpose — /dcc close chat
+            // cancelling the offer, or teardown. Reporting that as "failed: DCC
+            // listener closed" right after "Cancelled the pending DCC chat offer"
+            // told the user their own cancel had broken something.
+            if (!this.dccChatListeners.delete(handle)) return;
             this.dccChatNotice(
               nick,
               `DCC chat offer to ${nick} failed: ${err instanceof Error ? err.message : err}`,
@@ -6497,7 +6528,12 @@ export class IrcConnection {
       this.dccChatNotice(nick, 'Too many passive DCC chat offers are already pending.');
       return;
     }
-    const body = buildDccChatPassive(dccExternalHost() || PASSIVE_DCC_FAKE_HOST, token);
+    // Always the placeholder. The peer replies with the address to dial and
+    // ignores this one — irssi hardcodes 16843009 here — so advertising the
+    // real host only added a way to fail: a hostname in LURKER_DCC_EXTERNAL_HOST
+    // can't be encoded, and made `-passive`, the mode meant for servers WITHOUT
+    // a usable external address, refuse with "misconfigured".
+    const body = buildDccChatPassive(PASSIVE_DCC_FAKE_HOST, token);
     if (body === null) {
       this.dccChatNotice(nick, 'DCC chat: external host is misconfigured.');
       return;
@@ -6634,6 +6670,7 @@ export class IrcConnection {
   // and their token.
   private acceptInboundDccChat(nick: string, offer: DccChatOffer): void {
     if (offer.passive) {
+      if (!this.dccCanSendOffer(nick)) return;
       // The peer is firewalled and wants US to listen.
       if (!dccActiveListenAvailable() || offer.token === null) {
         this.dccChatNotice(
@@ -6669,7 +6706,11 @@ export class IrcConnection {
               this.startDccChat(nick, socket);
             })
             .catch((err) => {
-              this.dccChatListeners.delete(handle);
+              // ⚠ Gone already means someone removed it on purpose — /dcc close chat
+              // cancelling the offer, or teardown. Reporting that as "failed: DCC
+              // listener closed" right after "Cancelled the pending DCC chat offer"
+              // told the user their own cancel had broken something.
+              if (!this.dccChatListeners.delete(handle)) return;
               this.dccChatNotice(
                 nick,
                 `DCC chat with ${nick} failed: ${err instanceof Error ? err.message : err}`,
@@ -6863,6 +6904,19 @@ export class IrcConnection {
     this.dccChatNotice(entry.nick, `DCC chat with ${entry.nick} closed.`);
     this.publishDccChatState(entry.nick, false);
     return true;
+  }
+
+  /** End every session this connection owns. ircManager's dispose paths call
+   *  this through the session registry, because after a user Disconnect the
+   *  connection holding a chat is no longer in the map they walk. */
+  closeAllDccChats(reason: string): void {
+    this.teardownDccChats(reason);
+  }
+
+  /** Peers with an offer to us still awaiting an answer. Rides the snapshot so
+   *  a client can retire an offer toast whose offer has gone. */
+  pendingDccChatOffers(): string[] {
+    return Array.from(this.pendingInboundChats.values(), (p) => p.nick);
   }
 
   // Tear down every chat session, listener and pending passive offer. Called

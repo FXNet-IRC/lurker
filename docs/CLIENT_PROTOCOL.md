@@ -1355,7 +1355,12 @@ the peer in `from` (not `target`), carry DCC chat state to a client:
 | `dcc-chat-state`        | `from`, `live`    | A session with `from` opened (`true`) or ended (`false`).      |
 
 An offer surface should be retired on `dcc-chat-offer-closed` rather than on a
-timer, so it never outlives the offer it names.
+timer, so it never outlives the offer it names. That event can be missed — the
+client's socket drops, or the server restarts, while an offer is pending — so the
+offers still awaiting an answer also ride every snapshot, as `dccChatOffers` (peer
+display nicks) on each network's state. Reconcile against it on every snapshot and
+retire anything no longer listed; otherwise a stale offer's Accept action sends the
+peer a _new_ offer instead.
 
 The current set of live sessions also rides every snapshot, as `dccChats` (peer
 display nicks) on each network's state — **including a disconnected network's**,
