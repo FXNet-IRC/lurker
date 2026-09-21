@@ -1305,6 +1305,12 @@ class IrcManager extends EventEmitter {
         // and a toast whose offer expired or was lost while the tab was
         // disconnected never gets the live close event — so it reconciles
         // against this on every snapshot instead.
+        //
+        // ⚠ The mapped connection alone is correct, not an oversight: a pending
+        // offer only ever lives on a mapped connection, because disconnect()
+        // ends a connection's handshakes before stopNetwork unmaps it (see
+        // endDccChatHandshakes). Live CHATS are different — they do outlive
+        // the map, which is why `dccChats` above reads the registry instead.
         dccChatOffers: this.getConnection(userId, networkId)?.pendingDccChatOffers() ?? [],
       };
     };

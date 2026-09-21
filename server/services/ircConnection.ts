@@ -6438,6 +6438,13 @@ export class IrcConnection {
    * than refusing, so an unconfigured server says so instead.
    */
   offerDccChat(nick: string, opts: { passive?: boolean } = {}): void {
+    // ⚠⚠ A peer, never a channel. The offer goes out as a CTCP to `nick`, so a
+    // channel name here broadcasts it to everyone in the channel — and an
+    // active offer also opens a listening port any of them can race for. All
+    // four sigils, via isChannelTarget: a `#`-only test is this codebase's most
+    // repeated bug. Guarded here rather than at the route alone because this is
+    // where every caller converges.
+    if (isChannelTarget(nick)) return;
     if (!this.dccChatAllowed(nick, 'offer a DCC chat')) return;
     const key = nick.toLowerCase();
     // ⚠ Across every owner, not just this connection: after a Disconnect and
@@ -6904,6 +6911,34 @@ export class IrcConnection {
     this.dccChatNotice(entry.nick, `DCC chat with ${entry.nick} closed.`);
     this.publishDccChatState(entry.nick, false);
     return true;
+  }
+
+  // A deliberate disconnect (stopNetwork, account suspend, shutdown — never the
+  // auto-reconnect ladder, which reuses this object and keeps its place in the
+  // map) ends the HANDSHAKES in flight on this connection, but not established
+  // chats.
+  //
+  // ⚠⚠ Why the line falls there. An established chat is a socket that needs no
+  // IRC, so it survives, as irssi's does. A pending offer is different: it is
+  // only reachable through this connection, and stopNetwork is about to drop
+  // it from the map, so after the user reconnects the NEW connection knows
+  // nothing about it. Left alone, the offer toast stayed up and its Accept went
+  // to the new connection, which found no offer and sent the peer a FRESH one
+  // — a different act than the button names. Our own passive offers go too:
+  // their reply can only arrive over IRC, and it would land on the new
+  // connection, which never minted the token. Ending them here retires the
+  // toast immediately and says why; the peer can offer again.
+  private endDccChatHandshakes(): void {
+    const dropped = this.pendingDccChatOffers();
+    for (const key of this.pendingInboundChats.keys()) this.clearPendingInboundChat(key);
+    for (const pending of this.pendingPassiveChats.values()) clearTimeout(pending.timer);
+    this.pendingPassiveChats.clear();
+    for (const nick of dropped) {
+      this.surfaceCtcp(
+        this.serverTarget(),
+        `Dropped the DCC chat offer from ${nick} — ${this.network.name} was disconnected.`,
+      );
+    }
   }
 
   /** End every session this connection owns. ircManager's dispose paths call
@@ -7909,6 +7944,7 @@ export class IrcConnection {
   }
 
   disconnect(reason?: string, opts: { announceCancelledRetry?: boolean } = {}): void {
+    this.endDccChatHandshakes();
     // The user/system asked to disconnect — record intent BEFORE quit() so the
     // 'close' handler doesn't fight them by auto-reconnecting, and drop any
     // pending backoff so an earlier drop's retry can't resurrect the connection.

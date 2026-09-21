@@ -137,4 +137,10 @@ describe('parseDccCommand', () => {
     expect(parseDccCommand('chat =bob')).toMatchObject({ kind: 'error' });
     expect(parseDccCommand('close =bob')).toMatchObject({ kind: 'error' });
   });
+
+  // Copilot review on #973: `/dcc chat #room` would broadcast the offer to the
+  // whole channel. All four sigils.
+  it.each(['#room', '&local', '+nomodes', '!safe'])('refuses a channel: %s', (target) => {
+    expect(parseDccCommand(`chat ${target}`)).toMatchObject({ kind: 'error' });
+  });
 });

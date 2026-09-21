@@ -15,6 +15,7 @@ import ircManager from '../services/ircManager.js';
 import { dccEnabledForUser } from '../services/dccConfig.js';
 import { getDccTransfer, listDccTransfers } from '../db/dccTransfers.js';
 import { getNetwork } from '../db/networks.js';
+import { isChannelTarget } from '../../shared/channels.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -108,6 +109,13 @@ function chatTarget(req: Request, res: Response): { networkId: number; nick: str
   // eslint-disable-next-line no-control-regex
   if (/[\s\u0000-\u001f]/.test(nick) || nick.startsWith('=')) {
     res.status(400).json({ error: 'not a valid nick' });
+    return null;
+  }
+  // A DCC chat is with a peer. A channel name would broadcast the offer to the
+  // whole channel (ircConnection.offerDccChat refuses it too — this is the
+  // early, explained refusal).
+  if (isChannelTarget(nick)) {
+    res.status(400).json({ error: 'a DCC chat is with a person, not a channel' });
     return null;
   }
   if (!getNetwork(networkId, req.user!.id)) {

@@ -1234,10 +1234,11 @@ export function socketSendWithAck(payload: Record<string, unknown>): Promise<Ack
 // logout (and any other session reset). Strips handlers before closing so the
 // `onclose` reconnect arm can't fire even if `auth.user` is briefly truthy.
 export function resetSocket(): void {
-  // Offer toasts belong to the session. Their ids point into a toast store the
-  // next session won't share, so carrying them across a logout would have the
-  // first snapshot "retire" toasts that aren't there.
-  dccOfferToasts.clear();
+  // ⚠⚠ DISMISS the offer toasts, don't just forget them. resetSession never
+  // clears the toast store, and every other toast expires within seconds — but
+  // an offer toast is sticky, so it would sit on the NEXT user's screen after a
+  // logout, with an Accept button bound to the previous account's session.
+  for (const key of dccOfferToasts.keys()) dismissDccOfferToast(key);
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;

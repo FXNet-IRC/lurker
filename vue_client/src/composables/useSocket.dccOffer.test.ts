@@ -141,4 +141,16 @@ describe('DCC chat offer toast — reconciled against every snapshot', () => {
     ws.deliver({ kind: 'snapshot', networks: [netSnapshot(['BOB'])] });
     expect(offerToasts()).toHaveLength(1);
   });
+
+  // ⚠⚠ Copilot review on #973. resetSession never clears the toast store, and
+  // every other toast expires within seconds — but this one is sticky, so it
+  // would sit on the NEXT user's screen after a logout, with an Accept button
+  // bound to the previous account's session.
+  it('is dismissed on logout, not just forgotten', async () => {
+    const ws = await openSocket();
+    ws.deliver(offerFrame);
+    expect(offerToasts()).toHaveLength(1);
+    resetSocket(); // what resetSession runs on logout
+    expect(offerToasts()).toHaveLength(0);
+  });
 });

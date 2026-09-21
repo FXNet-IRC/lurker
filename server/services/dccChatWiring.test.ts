@@ -1187,3 +1187,76 @@ describe('review: small ones', () => {
     expect(h.notices().join(' ')).not.toMatch(/misconfigured/);
   });
 });
+
+// Copilot review on #973.
+describe('review #973: a chat is with a person, never a channel', () => {
+  // The offer is a CTCP to `nick`, so a channel name broadcasts it to everyone
+  // there — and an active offer opens a port any of them can race for. All
+  // four sigils: a `#`-only test is this codebase's most repeated bug.
+  it.each(['#room', '&local', '+nomodes', '!safe'])('refuses to offer to %s', (target) => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+    h.conn.offerDccChat(target);
+    h.conn.offerDccChat(target, { passive: true });
+    expect(h.ctcpRequest).not.toHaveBeenCalled();
+    expect(activeDccListenerCount()).toBe(0);
+  });
+});
+
+describe('review #973: a deliberate disconnect ends in-flight handshakes', () => {
+  function stubQuit(h: ReturnType<typeof harness>) {
+    h.conn.client.quit = vi.fn<(msg?: string) => void>();
+  }
+
+  // After stopNetwork unmaps this connection, a reconnect builds a new one that
+  // knows nothing of the offer — so its Accept would send the peer a FRESH
+  // offer. Ending it here retires the toast now, and says why.
+  it('drops a pending inbound offer and tells the client it is closed', () => {
+    enableDcc();
+    const h = harness();
+    stubQuit(h);
+    offerFrom(h.conn, 'bob', 'CHAT chat 16843009 5000');
+    expect(h.conn.pendingDccChatOffers()).toEqual(['bob']);
+
+    h.conn.disconnect('user disconnected');
+    expect(h.conn.pendingDccChatOffers()).toEqual([]);
+    expect(h.offerEvents().at(-1)).toMatchObject({ type: 'dcc-chat-offer-closed', from: 'bob' });
+    expect(h.ctcpLines().join(' ')).toMatch(/Dropped the DCC chat offer from bob/);
+  });
+
+  // Our own passive offer's reply can only arrive over IRC, and it would land
+  // on the new connection, which never minted the token.
+  it('forgets our own pending passive offer', () => {
+    enableDcc();
+    const h = harness();
+    stubQuit(h);
+    h.conn.offerDccChat('bob', { passive: true });
+    const token = h.lastOffer()!.split(' ')[4];
+    h.conn.disconnect('user disconnected');
+    // A late "reply" with our old token is no longer treated as one: it's an
+    // unsolicited offer now, and asks rather than dials.
+    h.conn.state = 'connected';
+    offerFrom(h.conn, 'bob', `CHAT chat 16843009 5000 ${token}`);
+    expect(h.notices().join(' ')).not.toMatch(/Connecting to bob/);
+  });
+
+  // …but an ESTABLISHED chat is a socket that needs no IRC, and survives.
+  it('leaves an established chat running', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    stubQuit(h);
+    const peer = await startPeer();
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    const sock = await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+
+    h.conn.disconnect('user disconnected');
+    expect(h.conn.hasDccChat('bob')).toBe(true);
+    const got = new Promise<string>((r) => sock.once('data', (d) => r(d.toString())));
+    h.conn.dccChatSend('bob', 'still here');
+    expect(await got).toBe('still here\r\n');
+    h.conn.closeDccChat('bob');
+  });
+});

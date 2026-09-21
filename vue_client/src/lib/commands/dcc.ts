@@ -13,6 +13,8 @@
 // network's connection — so the SFC has to refuse a chat verb issued from the
 // network-agnostic system buffer rather than routing it with a null networkId.
 
+import { isChannelTarget } from '../../../../shared/channels.js';
+
 export type DccCommand =
   | { kind: 'list' }
   | { kind: 'accept'; id: number }
@@ -35,9 +37,13 @@ const USAGE =
 // leading `=` is refused here because that is a DCC-chat BUFFER name, and
 // `/dcc chat =bob` almost certainly means the user typed the buffer rather than
 // the peer — accepting it would open a chat with a peer literally called "=bob".
+//
+// ⚠ A channel is refused too: `/dcc chat #room` would broadcast the offer to
+// the whole channel. All four sigils — a `#`-only test is this codebase's most
+// repeated bug.
 function parseNick(raw: string | undefined): string | null {
   const n = (raw || '').trim();
-  if (!n || n.startsWith('=')) return null;
+  if (!n || n.startsWith('=') || isChannelTarget(n)) return null;
   return n;
 }
 
