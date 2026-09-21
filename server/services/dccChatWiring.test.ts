@@ -674,3 +674,60 @@ describe('chat session lifecycle edges', () => {
     expect(h.notices().at(-1)).toMatch(/Cancelled the pending DCC chat offer/);
   });
 });
+
+// The shared incoming-CTCP limiter allows 3 per minute per peer and then backs
+// off for five minutes. It exists to stop us ANSWERING a VERSION/PING storm;
+// DCC is never answered, so sharing that budget meant a user's fourth `/dcc
+// chat` in a minute vanished with no trace at either end.
+describe('a DCC offer does not spend the CTCP reply budget', () => {
+  it('still surfaces a fourth offer in a minute', () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    // Three unanswerable CTCPs from this peer exhaust the shared bucket.
+    for (let i = 0; i < 3; i++) {
+      h.conn.client.emit('ctcp request', {
+        nick: 'bob',
+        ident: 'u',
+        hostname: 'host',
+        type: 'FROBNICATE',
+        message: 'FROBNICATE',
+      });
+    }
+    const before = h.ctcpLines().length;
+    h.conn.client.emit('ctcp request', {
+      nick: 'bob',
+      ident: 'u',
+      hostname: 'host',
+      type: 'DCC',
+      message: 'DCC CHAT chat 16843009 5000',
+    });
+    expect(h.ctcpLines().slice(before).join(' ')).toMatch(/wants to start a DCC chat/);
+  });
+
+  it('bounds DCC offers on their own key, and says so rather than going quiet', () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    const offer = () =>
+      h.conn.client.emit('ctcp request', {
+        nick: 'bob',
+        ident: 'u',
+        hostname: 'host',
+        type: 'DCC',
+        message: 'DCC CHAT chat 16843009 5000',
+      });
+    offer();
+    offer();
+    offer();
+    const before = h.ctcpLines().length;
+    offer(); // over the DCC bucket
+    const after = h.ctcpLines().slice(before);
+    expect(after.join(' ')).toMatch(/Ignoring further DCC requests/);
+    // And the warning itself is rate-limited — it must not become the flood.
+    const mark = h.ctcpLines().length;
+    offer();
+    offer();
+    expect(h.ctcpLines().slice(mark)).toEqual([]);
+  });
+});

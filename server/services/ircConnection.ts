@@ -259,6 +259,10 @@ const DCC_CHAT_CONNECT_TIMEOUT_MS = 15_000;
 // drive-by offer doesn't sit accepted-able forever.
 const INBOUND_DCC_CHAT_OFFER_TTL_MS = 10 * 60_000;
 
+// Matches the rate limiter's own backoff, so the user is told once per period
+// rather than once per dropped offer.
+const DCC_FLOOD_WARN_GAP_MS = 5 * 60_000;
+
 const NON_PERSISTED_TYPES = new Set([
   'state',
   'names',
@@ -694,6 +698,9 @@ export class IrcConnection {
   // Peers we've already told "that chat is gone" since their last live session,
   // so typing repeatedly into a dead `=nick` buffer doesn't repeat the notice.
   private readonly dccChatDeadWarned = new Set<string>();
+  // Peer key -> when we last said "too many DCC requests", so the warning about
+  // a flood can't itself become one.
+  private readonly dccFloodWarnedAt = new Map<string, number>();
   // Listeners for offers we've made that nobody has answered yet; closed on
   // dispose so their bound ports are released rather than leaked.
   // handle -> the peer it was opened for, so /dcc close can cancel it.
@@ -5535,6 +5542,21 @@ export class IrcConnection {
   // A stable per-peer key for rate limiting inbound CTCP: the sender's
   // ident@host when known, else the nick (lowercased). Mirrors how the E2E path
   // keys peers, so a nick-churning flooder still maps to bounded state.
+  // One line per backoff window per peer. The limiter's backoff is five minutes,
+  // so re-warning on every dropped offer would just move the flood into the
+  // user's buffer.
+  private warnDccFlood(nick: string, event: Record<string, unknown>): void {
+    const key = this.ctcpPeerKey(event);
+    const now = Date.now();
+    const last = this.dccFloodWarnedAt.get(key);
+    if (last !== undefined && now - last < DCC_FLOOD_WARN_GAP_MS) return;
+    this.dccFloodWarnedAt.set(key, now);
+    this.routeCtcpStatus(
+      event,
+      `Ignoring further DCC requests from ${nick} for a few minutes — too many arrived at once.`,
+    );
+  }
+
   private ctcpPeerKey(event: Record<string, unknown>): string {
     const ident = (event.ident as string) || '';
     const host = (event.hostname as string) || '';
@@ -5775,11 +5797,19 @@ export class IrcConnection {
         this.ctcpAnswererFor(type, event))
       : null;
     if (answerer === 'nobody') return;
-    if (answerer === null && !this.ctcpLimiter.allowIncoming(this.ctcpPeerKey(event))) return;
     // DCC rides CTCP but is never an auto-reply type. When DCC is enabled for
     // this user, hand the offer to the download manager instead of the generic
     // probe path; when disabled, fall through so it surfaces as an ordinary
     // unsupported CTCP ("requested CTCP DCC (no reply)"), unchanged from today.
+    //
+    // ⚠⚠ Ahead of the shared incoming-CTCP limiter, and with a bucket of its
+    // own. That limiter exists to stop us ANSWERING a VERSION/PING storm, and
+    // its budget is 3 per minute per peer followed by a five-minute silent
+    // backoff — fine for noise nobody asked for, ruinous for a DCC offer, which
+    // is a user-facing action the peer will naturally retry while getting their
+    // own client configured. Sharing the bucket meant a fourth `/dcc chat` in a
+    // minute vanished with no trace on either side, which is exactly how it
+    // presented in QA.
     if (type === 'DCC' && dccEnabledForUser(this.network.user_id)) {
       // Say why, rather than letting it fall through to the generic
       // "requested CTCP DCC (no reply)". Only reached when DCC is otherwise
@@ -5792,15 +5822,29 @@ export class IrcConnection {
         });
         return;
       }
+      // Still bounded — a DCC offer flood is a real nuisance vector — but on its
+      // own key, and NEVER silently: a dropped offer the user can't see is
+      // indistinguishable from a broken feature.
+      if (!this.ctcpLimiter.allowIncoming(`dcc:${this.ctcpPeerKey(event)}`)) {
+        this.warnDccFlood(nick, event);
+        return;
+      }
       // DCC handling (parse + DB writes + socket setup) must never throw out of
       // the CTCP event path and disrupt the connection.
       try {
         this.handleInboundDccRequest(nick, args, event);
-      } catch {
-        /* malformed offer / transient DB error — drop it, keep the connection */
+      } catch (e) {
+        // ⚠ Swallowed so a malformed offer can't kill the connection, but say
+        // SOMETHING — a bare catch here made a bug in the DCC path look
+        // identical to the offer never arriving.
+        this.routeCtcpStatus(
+          event,
+          `Couldn't handle a DCC request from ${nick}: ${(e as Error)?.message || e}`,
+        );
       }
       return;
     }
+    if (answerer === null && !this.ctcpLimiter.allowIncoming(this.ctcpPeerKey(event))) return;
     if (answerer === 'clients') {
       this.routeCtcpStatus(event, formatCtcpForwardedLine(nick, type));
       return;
