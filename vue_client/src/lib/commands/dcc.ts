@@ -29,7 +29,7 @@ const LIST = new Set(['list', 'ls']);
 
 const USAGE =
   'usage: /dcc [list] · /dcc accept|reject|cancel <id> · /dcc chat [-passive] <nick> · ' +
-  '/dcc close <nick>';
+  '/dcc close chat <nick>';
 
 // A nick is any non-whitespace token; the server does the real validation. A
 // leading `=` is refused here because that is a DCC-chat BUFFER name, and
@@ -59,17 +59,21 @@ export function parseDccCommand(argLine: string): DccCommand {
 
   if (LIST.has(verb)) return { kind: 'list' };
 
-  // `/dcc chat [-passive] <nick>` opens a chat; `/dcc chat close <nick>` and
-  // `/dcc close <nick>` end one. `-passive` is spelled as irssi and repartee
-  // spell it, and is opt-in rather than a fallback: WeeChat and HexDroid
-  // mishandle a passive offer into a silent dial to port 0.
+  // The chat verbs follow irssi's syntax exactly, so a habit carried over from
+  // irssi does what it did there:
+  //
+  //   DCC CHAT [-passive] <nick>      dcc-chat.c:442
+  //   DCC CLOSE <type> <nick>         dcc.c:490
+  //
+  // ⚠ Type-first on close is the whole reason this is strict. An earlier
+  // `/dcc close <nick>` shorthand read the word after `close` as the nick, so
+  // irssi's `/dcc close chat bob` closed a chat with a peer literally named
+  // "chat", said "no live DCC chat", and left the real one open. Accepting only
+  // irssi's shape leaves nothing ambiguous to guess about.
+  //
+  // `-passive` is opt-in rather than a fallback: WeeChat and HexDroid mishandle
+  // a passive offer into a silent dial to port 0.
   if (verb === 'chat') {
-    if ((parts[1] || '').toLowerCase() === 'close') {
-      const nick = parseNick(parts[2]);
-      return nick
-        ? { kind: 'chatClose', nick }
-        : { kind: 'error', message: 'usage: /dcc chat close <nick>' };
-    }
     const flags = parts.slice(1).filter((p) => p.startsWith('-'));
     const rest = parts.slice(1).filter((p) => !p.startsWith('-'));
     const unknown = flags.find((f) => f.toLowerCase() !== '-passive');
@@ -79,15 +83,38 @@ export function parseDccCommand(argLine: string): DccCommand {
         message: `unknown option "${unknown}". usage: /dcc chat [-passive] <nick>`,
       };
     }
+    // ⚠ `/dcc chat close bob` isn't a command, and read literally it would OFFER
+    // a chat to a peer named "close". Catch the intent instead.
+    if (rest.length > 1) {
+      return {
+        kind: 'error',
+        message:
+          rest[0].toLowerCase() === 'close'
+            ? 'to end a chat: /dcc close chat <nick>'
+            : 'usage: /dcc chat [-passive] <nick>',
+      };
+    }
     const nick = parseNick(rest[0]);
     if (!nick) return { kind: 'error', message: 'usage: /dcc chat [-passive] <nick>' };
     return { kind: 'chat', nick, passive: flags.length > 0 };
   }
   if (verb === 'close') {
-    const nick = parseNick(parts[1]);
-    return nick
-      ? { kind: 'chatClose', nick }
-      : { kind: 'error', message: 'usage: /dcc close <nick>' };
+    const type = (parts[1] || '').toLowerCase();
+    if (type === 'chat') {
+      const nick = parseNick(parts[2]);
+      return nick && !parts[3]
+        ? { kind: 'chatClose', nick }
+        : { kind: 'error', message: 'usage: /dcc close chat <nick>' };
+    }
+    // irssi's file-transfer types. Transfers close by id here, so point there
+    // rather than reading "send" as a peer's nick.
+    if (type === 'send' || type === 'get') {
+      return {
+        kind: 'error',
+        message: 'file transfers close by id: /dcc list, then /dcc cancel <id>',
+      };
+    }
+    return { kind: 'error', message: 'usage: /dcc close chat <nick>' };
   }
 
   const isAccept = ACCEPT.has(verb);

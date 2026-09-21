@@ -82,10 +82,53 @@ describe('parseDccCommand', () => {
     expect((r as { message: string }).message).toMatch(/-active/);
   });
 
-  it('parses /dcc chat close <nick> and /dcc close <nick>', () => {
-    expect(parseDccCommand('chat close alice')).toEqual({ kind: 'chatClose', nick: 'alice' });
-    expect(parseDccCommand('close bob')).toEqual({ kind: 'chatClose', nick: 'bob' });
+  // The chat verbs follow irssi exactly. The two non-irssi spellings that
+  // existed briefly are gone, and must not quietly do something else instead.
+  it('no longer accepts the non-irssi /dcc close <nick> shorthand', () => {
+    expect(parseDccCommand('close bob')).toMatchObject({ kind: 'error' });
     expect(parseDccCommand('close')).toMatchObject({ kind: 'error' });
+  });
+
+  // ⚠ Read literally, `/dcc chat close bob` would OFFER a chat to a peer named
+  // "close" — worse than an error. Point at the real spelling instead.
+  it('catches /dcc chat close <nick> rather than offering a chat to "close"', () => {
+    const r = parseDccCommand('chat close alice');
+    expect(r).toMatchObject({ kind: 'error' });
+    expect((r as { message: string }).message).toMatch(/\/dcc close chat <nick>/);
+  });
+
+  it('still offers a chat to a peer who is genuinely nicked "close"', () => {
+    expect(parseDccCommand('chat close')).toEqual({ kind: 'chat', nick: 'close', passive: false });
+  });
+
+  // ⚠⚠ QA: `/dcc close chat ami|shellter` answered "no live DCC chat" and left
+  // the chat open, because the word after `close` was read as the nick — it
+  // tried to close a chat with a peer called "chat". Type-first is irssi's
+  // syntax (DCC CLOSE <type> <nick>, dcc.c:490), so it's the form people type.
+  it("parses irssi's /dcc close <type> <nick>", () => {
+    expect(parseDccCommand('close chat ami|shellter')).toEqual({
+      kind: 'chatClose',
+      nick: 'ami|shellter',
+    });
+    expect(parseDccCommand('close CHAT bob')).toEqual({ kind: 'chatClose', nick: 'bob' });
+  });
+
+  it('asks for a nick rather than closing a peer literally named "chat"', () => {
+    expect(parseDccCommand('close chat')).toMatchObject({ kind: 'error' });
+    // Someone genuinely nicked "chat" is still reachable, as in irssi.
+    expect(parseDccCommand('close chat chat')).toEqual({ kind: 'chatClose', nick: 'chat' });
+  });
+
+  it("points irssi's file-transfer types at the id-based commands", () => {
+    expect(parseDccCommand('close get bob')).toMatchObject({ kind: 'error' });
+    const r = parseDccCommand('close send bob');
+    expect(r).toMatchObject({ kind: 'error' });
+    expect((r as { message: string }).message).toMatch(/\/dcc cancel <id>/);
+  });
+
+  it('rejects trailing junk instead of guessing', () => {
+    expect(parseDccCommand('close chat bob extra')).toMatchObject({ kind: 'error' });
+    expect(parseDccCommand('chat bob extra')).toMatchObject({ kind: 'error' });
   });
 
   // `=bob` is the BUFFER; the peer is `bob`. Opening a chat with a peer

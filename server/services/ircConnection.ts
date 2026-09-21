@@ -6804,7 +6804,7 @@ export class IrcConnection {
     return true;
   }
 
-  /** Close a live DCC chat (`/dcc close <nick>`). */
+  /** Close a live DCC chat (`/dcc close chat <nick>`, irssi's syntax). */
   closeDccChat(nick: string): boolean {
     const key = nick.toLowerCase();
     const entry = this.dccChats.get(key);
