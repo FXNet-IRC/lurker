@@ -7,7 +7,7 @@
 // alphabetically). Used by keyboard navigation so prev/next-channel and the
 // quick switcher walk the same order the user sees in the sidebar.
 
-import { isChannelTarget, stripChannelPrefix } from '../../../shared/channels.js';
+import { isChannelTarget, stripChannelPrefix, dccChatPeer } from '../../../shared/channels.js';
 
 interface BufferEntry {
   target: string;
@@ -74,7 +74,9 @@ function isServerTarget(target: string): boolean {
 // ⚠ All four sigils, not just `#` (#724) — the comment always said "channel sigils", but the
 // pattern stripped only one of them, so `&local` sorted under `&` instead of alongside `#local`.
 export function bufferSortKey(target: string): string {
-  return stripChannelPrefix(target).toLowerCase();
+  // ⚠ A `=nick` DCC chat sorts under its PEER, beside a DM with the same person
+  // — otherwise every chat piles up at the top of the DM block under '='.
+  return stripChannelPrefix(dccChatPeer(target)).toLowerCase();
 }
 
 function bufferOrder(target: string): number {

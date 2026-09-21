@@ -54,4 +54,44 @@ describe('parseDccCommand', () => {
   it('errors on an unknown subcommand', () => {
     expect(parseDccCommand('frobnicate 1').kind).toBe('error');
   });
+
+  it('parses /dcc chat <nick>', () => {
+    expect(parseDccCommand('chat alice')).toEqual({ kind: 'chat', nick: 'alice', passive: false });
+    expect(parseDccCommand('CHAT Bob')).toEqual({ kind: 'chat', nick: 'Bob', passive: false });
+    expect(parseDccCommand('chat')).toMatchObject({ kind: 'error' });
+  });
+
+  // Opt-in, never a fallback: WeeChat and HexDroid mishandle a passive offer
+  // into a silent dial to port 0, so the user has to ask for it by name.
+  it('parses the -passive flag, in either position', () => {
+    expect(parseDccCommand('chat -passive alice')).toEqual({
+      kind: 'chat',
+      nick: 'alice',
+      passive: true,
+    });
+    expect(parseDccCommand('chat alice -passive')).toEqual({
+      kind: 'chat',
+      nick: 'alice',
+      passive: true,
+    });
+  });
+
+  it('rejects an unknown option rather than reading it as a nick', () => {
+    const r = parseDccCommand('chat -active alice');
+    expect(r).toMatchObject({ kind: 'error' });
+    expect((r as { message: string }).message).toMatch(/-active/);
+  });
+
+  it('parses /dcc chat close <nick> and /dcc close <nick>', () => {
+    expect(parseDccCommand('chat close alice')).toEqual({ kind: 'chatClose', nick: 'alice' });
+    expect(parseDccCommand('close bob')).toEqual({ kind: 'chatClose', nick: 'bob' });
+    expect(parseDccCommand('close')).toMatchObject({ kind: 'error' });
+  });
+
+  // `=bob` is the BUFFER; the peer is `bob`. Opening a chat with a peer
+  // literally named "=bob" is never what was meant.
+  it('refuses a =-prefixed nick', () => {
+    expect(parseDccCommand('chat =bob')).toMatchObject({ kind: 'error' });
+    expect(parseDccCommand('close =bob')).toMatchObject({ kind: 'error' });
+  });
 });

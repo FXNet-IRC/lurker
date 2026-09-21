@@ -1318,6 +1318,25 @@ check before uploading.
 `GET /?limit` list · `POST /:id/accept|reject|cancel`. Live updates via
 `dcc-transfer` frames; file bytes move over IRC, not HTTP.
 
+`POST /chat` (`{networkId, nick, passive?}`) opens a DCC CHAT; `POST /chat/close`
+(`{networkId, nick}`) ends one. Both return as soon as the offer is away — a DCC
+handshake takes as long as the peer takes to answer, so the outcome arrives as
+notices in the chat's own buffer rather than in the response.
+
+A DCC chat is surfaced as a buffer named `=nick` (the irssi convention), with
+`kind: "dcc"`. **A `=` target is a buffer name, not an IRC target**: the server
+routes anything sent to one over the direct socket instead of the wire, and such
+buffers are deliberately absent from the bouncer's playback, CHATHISTORY TARGETS
+and read markers, and from the MCP `list_buffers` surface. A client should treat
+`kind: "dcc"` as its own thing rather than folding it into `dm` — a DCC peer has
+no presence, so probing one is both meaningless and a way to put a non-nick on
+the wire.
+
+Sessions are process-bound: a chat survives a reconnect (the socket is
+independent of IRC) but not a server restart, while the buffer and its history
+persist. Sending into a chat the server no longer holds fails and says so in the
+buffer.
+
 ### Export / import
 
 `GET /api/exports/preview` · `POST /api/exports` (`{include_messages}`, allowed
