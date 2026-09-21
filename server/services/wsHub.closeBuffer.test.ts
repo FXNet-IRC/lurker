@@ -340,6 +340,37 @@ describe('closeBuffer parts only a channel we are on', () => {
     ircManager.connectionsForUser(userId).delete(network.id);
   });
 
+  it('keeps the mark when an error about the channel answers something else', async () => {
+    // event.channel is set on errors that have nothing to do with a JOIN — a
+    // 404 refusing a message to the channel is the common one. Clearing on
+    // those drops the mark for a JOIN still in flight, and the close that
+    // follows sends no PART, so its echo reopens the buffer just closed.
+    const { network, conn } = await connected('closesendfail');
+    ircd.hold = (cmd) => cmd === 'JOIN';
+    ircManager.joinChannel(userId, network.id, '#sendfail');
+    await until(
+      () => sentTo('closesendfail').some((l) => l.startsWith('JOIN ')),
+      5000,
+      'JOIN sent',
+    );
+
+    // ERR_CANNOTSENDTOCHAN for the same channel, while that JOIN is pending.
+    conn.client.emit('irc error', {
+      error: 'cannot_send_to_channel',
+      channel: '#sendfail',
+      reason: 'Cannot send to channel',
+    });
+    expect(conn.mayBeJoined('#sendfail')).toBe(true);
+
+    closeBuffer(userId, network.id, '#sendfail');
+    await until(() => partsSent('closesendfail').length > 0, 5000, 'PART sent');
+
+    expect(partsSent('closesendfail')).toEqual(['PART #sendfail']);
+    ircd.hold = null;
+    conn.dispose();
+    ircManager.connectionsForUser(userId).delete(network.id);
+  });
+
   it('stops parting after a rejection irc-framework does not model', async () => {
     // 403, 476 and 477 never reach the 'irc error' handler — irc-framework has
     // no entry for them, so they arrive as unknown commands. A rejection that

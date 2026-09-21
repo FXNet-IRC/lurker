@@ -1487,13 +1487,16 @@ export class IrcConnection {
       // but see the nick case below.
       const channel = typeof params[1] === 'string' ? params[1] : '';
       const reason = params[params.length - 1] || null;
-      // A 4xx/5xx naming a channel ends whatever we sent about it, so a JOIN
-      // for it is no longer outstanding (pendingJoins). The rejections
-      // irc-framework doesn't model arrive here rather than on 'irc error' —
-      // 403, 476 and 477 among them — and a join that SUCCEEDS is answered in
-      // the 3xx range (topic, NAMES), all of it modelled. So the error class is
-      // the test: a list of numerics would miss whatever an ircd adds next.
-      if (channel && isChannelTarget(channel) && /^[45]\d\d$/.test(command)) {
+      // The join rejections irc-framework doesn't model arrive here rather than
+      // on 'irc error' — 476 and 477 have no entry in its generics, and neither
+      // does 403, which answers a JOIN without having a toast of its own. Same
+      // rule as there: a rejection ends the JOIN, so the mark goes, and only a
+      // numeric that can answer a JOIN clears it.
+      if (
+        channel &&
+        isChannelTarget(channel) &&
+        (joinRejectionMessage(command) || command === '403')
+      ) {
         this.pendingJoins.delete(foldTargetFor(this.network.id, channel));
       }
       // ERR_NEEDREGGEDNICK (477) to a channel we're already in is a speak
@@ -3499,12 +3502,20 @@ export class IrcConnection {
       // client waits for channel-joined before opening the buffer, so on
       // failure there is no buffer to render into.
       const rejectChannel = event?.channel as string | undefined;
-      // An error naming a channel answers whatever we sent about it, so a JOIN
-      // for it is no longer outstanding (see pendingJoins). Every rejection,
-      // not just the durable ones below: a 471 we will retry still ended THIS
-      // join, and leaving it pending would have a close send a PART for a
-      // channel we never got into — the 442 this all exists to stop.
-      if (rejectChannel) this.pendingJoins.delete(foldTargetFor(this.network.id, rejectChannel));
+      // A rejection of a JOIN ends it, so the mark goes (see pendingJoins) —
+      // every join rejection, not just the durable ones below, since a 471 we
+      // will retry still ended THIS join.
+      //
+      // ⚠ Only the ones that can answer a JOIN. `event.channel` is set on
+      // plenty of errors that answer something else — a 404 refusing a message
+      // to the channel, a 482 refusing a mode — and clearing on those drops a
+      // mark for a JOIN still in flight. The close that followed would then
+      // send no PART, and the echo would reopen the buffer it had just closed.
+      // Being too narrow here is the safer miss: an exotic rejection nobody
+      // listed leaves the mark, and the close sends the PART it always used to.
+      if (rejectChannel && joinRejectionMessageByTag(tag)) {
+        this.pendingJoins.delete(foldTargetFor(this.network.id, rejectChannel));
+      }
       // ERR_NOTONCHANNEL (442) is authoritative: the server says we are not on
       // that channel, so the PART echo that normally evicts it from
       // this.channels is never coming. Evict here instead. Without this, any
