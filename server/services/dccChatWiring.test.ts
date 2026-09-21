@@ -22,6 +22,7 @@ import { encodeDccAddress } from './dcc.js';
 import { IrcConnection } from './ircConnection.js';
 import ircManager from './ircManager.js';
 import { activeDccListenerCount, resetDccListeners } from './dccListener.js';
+import { resetDccChatHosts } from './dccChatSessions.js';
 
 beforeAll(() => {
   createUser('dcc-chat-alice'); // id 1
@@ -43,6 +44,7 @@ afterEach(() => {
   setUserCapability(1, CAPABILITY_DCC, false);
   db.prepare('DELETE FROM messages').run();
   resetDccListeners();
+  resetDccChatHosts();
   for (const p of peers.splice(0)) p.close();
   ircManager.byUser.delete(1);
 });
@@ -535,6 +537,10 @@ describe('a = target never reaches the IRC wire', () => {
 
   // The guard sits ahead of the writable-connection gate on purpose: a DCC chat
   // is an independent socket and has to keep working while IRC is down.
+  //
+  // ⚠ This one only proves the WRITABLE gate is bypassed — the connection is
+  // still in ircManager's map. The test below covers the case that actually
+  // broke in QA, where it isn't.
   it('still delivers while the IRC connection is not writable', async () => {
     enableDcc();
     allowLoopback();
@@ -729,5 +735,54 @@ describe('a DCC offer does not spend the CTCP reply budget', () => {
     offer();
     offer();
     expect(h.ctcpLines().slice(mark)).toEqual([]);
+  });
+});
+
+// ⚠⚠ QA: "I can't send messages via DCC chat when the network is offline."
+// ircManager.stopNetwork — the user pressing Disconnect, /disconnect, the REST
+// endpoint, the disconnect_network verb — calls conn.disconnect() and then
+// DROPS the connection from its map. disconnect() deliberately does no DCC
+// teardown, so the socket stayed up while getConnection returned null: the chat
+// became unsendable, uncloseable and invisible until the process exited.
+//
+// irssi is explicit that this is wrong — on "server disconnected" it sets
+// `dcc->server = NULL` and leaves the session running (dcc.c:300-312).
+describe('a chat survives the network being stopped', () => {
+  it('still sends and can still be closed after the connection leaves the map', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    inject(h.conn);
+    const peer = await startPeer();
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    const sock = await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+
+    // Exactly what stopNetwork does to the map.
+    ircManager.connectionsForUser(1).delete(1);
+    expect(ircManager.getConnection(1, 1)).toBeNull();
+
+    const got = new Promise<string>((r) => sock.once('data', (d) => r(d.toString())));
+    expect(ircManager.send(1, 1, '=bob', 'network is down, chat is not')).toBe(true);
+    expect(await got).toBe('network is down, chat is not\r\n');
+
+    // And it is still closeable — otherwise the socket could never be reclaimed.
+    expect(ircManager.dccChatClose(1, 1, 'bob')).toBe(true);
+    expect(h.conn.hasDccChat('bob')).toBe(false);
+  });
+
+  it('stops holding the connection once its last chat ends', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    const peer = await startPeer();
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+
+    ircManager.connectionsForUser(1).delete(1);
+    h.conn.closeDccChat('bob');
+    // Registry released, so a stale connection isn't kept alive by it.
+    expect(ircManager.send(1, 1, '=bob', 'nobody home')).toBe(false);
   });
 });

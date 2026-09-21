@@ -53,6 +53,7 @@ import { contextKey, isChannelContext } from './e2e/context.js';
 import { e2eDbg } from './e2e/debug.js';
 import db from '../db/index.js';
 import { isDccChatTarget, dccChatPeer } from '../../shared/channels.js';
+import { dccChatHost, dccChatKey, type DccChatHost } from './dccChatSessions.js';
 
 // A buffer's read pointer moved forward: what markRead emits as 'read-marker'.
 export interface ReadMarkerMove {
@@ -713,6 +714,13 @@ class IrcManager extends EventEmitter {
     return true;
   }
 
+  // The thing that can reach a live DCC chat on this network: normally the
+  // connection, but a user-initiated disconnect drops that from the map while
+  // the chat's socket stays up, so fall back to the session registry.
+  private dccChatOwner(userId: number, networkId: number): DccChatHost | null {
+    return this.getConnection(userId, networkId) ?? dccChatHost(dccChatKey(userId, networkId));
+  }
+
   /** Offer a DCC chat to a peer. False when the network has no connection object
    *  at all; a connection that merely isn't registered still reports its own
    *  failure into the `=nick` buffer, which is more useful than a bare false. */
@@ -730,9 +738,11 @@ class IrcManager extends EventEmitter {
 
   /** Close a live DCC chat. False when there was no session to close. */
   dccChatClose(userId: number, networkId: number, nick: string): boolean {
-    const conn = this.getConnection(userId, networkId);
-    if (!conn) return false;
-    return conn.closeDccChat(nick);
+    // Closeable without a connection too — otherwise a chat still running past
+    // a disconnect could never be ended.
+    const owner = this.dccChatOwner(userId, networkId);
+    if (!owner) return false;
+    return owner.closeDccChat(nick);
   }
 
   // Long messages need to be split: irc-framework breaks anything past ~350
@@ -753,7 +763,7 @@ class IrcManager extends EventEmitter {
     // in reconnect backoff. Only getConnection (which returns a connection in any
     // state) is needed to reach the session map.
     if (isDccChatTarget(target)) {
-      const dcc = this.getConnection(userId, networkId);
+      const dcc = this.dccChatOwner(userId, networkId);
       return dcc ? dcc.dccChatSend(dccChatPeer(target), text) : false;
     }
 
@@ -904,7 +914,7 @@ class IrcManager extends EventEmitter {
     // in reconnect backoff. Only getConnection (which returns a connection in any
     // state) is needed to reach the session map.
     if (isDccChatTarget(target)) {
-      const dcc = this.getConnection(userId, networkId);
+      const dcc = this.dccChatOwner(userId, networkId);
       return dcc ? dcc.dccChatSend(dccChatPeer(target), text, { action: true }) : false;
     }
 
@@ -949,7 +959,7 @@ class IrcManager extends EventEmitter {
     // in reconnect backoff. Only getConnection (which returns a connection in any
     // state) is needed to reach the session map.
     if (isDccChatTarget(target)) {
-      const dcc = this.getConnection(userId, networkId);
+      const dcc = this.dccChatOwner(userId, networkId);
       return dcc ? dcc.dccChatSend(dccChatPeer(target), text) : false;
     }
 

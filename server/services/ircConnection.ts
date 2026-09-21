@@ -120,6 +120,7 @@ import {
 import { hasFreeSpaceFor, resolveDccDestination } from './dccPaths.js';
 import { DccChat } from './dccChat.js';
 import { openDccListener, type DccListenHandle } from './dccListener.js';
+import { dccChatKey, registerDccChatHost, unregisterDccChatHost } from './dccChatSessions.js';
 import { DccReceiver } from './dccReceiver.js';
 import {
   type DccTransferRow,
@@ -6692,6 +6693,10 @@ export class IrcConnection {
     });
     this.dccChats.set(key, { nick, chat });
     this.dccChatDeadWarned.delete(key);
+    // Reachable even after ircManager drops this connection from its map on a
+    // user-initiated disconnect — the socket outlives the IRC link, as irssi's
+    // does (dcc.c:300-312).
+    registerDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
     chat.start();
     this.dccChatNotice(nick, `DCC chat with ${nick} connected.`);
   }
@@ -6702,7 +6707,14 @@ export class IrcConnection {
   private forgetDccChat(key: string, chat: DccChat): boolean {
     if (this.dccChats.get(key)?.chat !== chat) return false;
     this.dccChats.delete(key);
+    this.releaseDccChatHost();
     return true;
+  }
+
+  // Stop holding this connection open for DCC once its last chat is gone.
+  private releaseDccChatHost(): void {
+    if (this.dccChats.size > 0) return;
+    unregisterDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
   }
 
   /**
@@ -6774,6 +6786,7 @@ export class IrcConnection {
     }
     if (!entry) return false;
     this.dccChats.delete(key);
+    this.releaseDccChatHost();
     entry.chat.close();
     this.dccChatNotice(entry.nick, `DCC chat with ${entry.nick} closed.`);
     return true;
@@ -6791,6 +6804,7 @@ export class IrcConnection {
     }
     for (const pending of this.pendingInboundChats.values()) clearTimeout(pending.timer);
     this.pendingInboundChats.clear();
+    unregisterDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
     for (const handle of this.dccChatListeners.keys()) handle.close();
     this.dccChatListeners.clear();
     for (const pending of this.pendingPassiveChats.values()) clearTimeout(pending.timer);
