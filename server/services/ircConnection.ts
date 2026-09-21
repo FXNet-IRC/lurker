@@ -606,6 +606,21 @@ export class IrcConnection {
   // the socket dying (forgetJoinedChannels). Lost on a process restart
   // mid-join — the user just re-/joins with the key.
   private pendingJoinKeys = new Map<string, string>();
+  // Channels whose JOIN is on the wire with no answer yet, folded. Membership
+  // is echo-written, so between the request and its echo isChannelJoined says
+  // "no" for a channel we are about to be in — indistinguishable, to a caller,
+  // from one we left. mayBeJoined() is what tells those apart. Emptied by the
+  // same four things that answer a JOIN: the echo, a forward (470), a
+  // rejection naming the channel, and the socket dying.
+  private pendingJoins = new Set<string>();
+  // The mirror: channels whose PART is on the wire with no answer yet, folded.
+  // Membership is echo-written in BOTH directions, so between a PART and its
+  // echo the map still says we are in a channel we have already left — and a
+  // caller that acts on that sends a second PART, which the server answers 442
+  // (#967). Emptied wherever membership leaves the map (deleteChannel: the
+  // echo, a kick, a 442's eviction, the engine's prune) and by a JOIN for the
+  // same channel, which supersedes it.
+  private pendingParts = new Set<string>();
   userModes: Set<string>;
   awayState: AwayState;
   // Caps this socket's server has answered a REQ for with a NAK. A refusal is
@@ -1480,6 +1495,18 @@ export class IrcConnection {
       // but see the nick case below.
       const channel = typeof params[1] === 'string' ? params[1] : '';
       const reason = params[params.length - 1] || null;
+      // The join rejections irc-framework doesn't model arrive here rather than
+      // on 'irc error' — 476 and 477 have no entry in its generics, and neither
+      // does 403, which answers a JOIN without having a toast of its own. Same
+      // rule as there: a rejection ends the JOIN, so the mark goes, and only a
+      // numeric that can answer a JOIN clears it.
+      if (
+        channel &&
+        isChannelTarget(channel) &&
+        (joinRejectionMessage(command) || command === '403')
+      ) {
+        this.pendingJoins.delete(foldTargetFor(this.network.id, channel));
+      }
       // ERR_NEEDREGGEDNICK (477) to a channel we're already in is a speak
       // rejection, not a join failure — surface it inline in that channel so
       // the user sees why their message didn't land, instead of a misleading
@@ -2557,6 +2584,12 @@ export class IrcConnection {
         // The away-notify 'back' event is the authoritative back signal.
         this.markPeerEvent(eventNick, 'online');
       }
+      // Before the restoring arm below returns: any self-JOIN answers the JOIN
+      // we sent, replayed or live, so the mark goes either way. Left behind in
+      // the replay case it would never be cleared again (only a dial forgets
+      // the set, and a re-attach doesn't dial), and a close of that channel
+      // would PART it forever after — the 442 this all exists to stop.
+      if (isSelf) this.pendingJoins.delete(foldTargetFor(this.network.id, eventChannel));
       if (isSelf && this.restoring) {
         // A synthesised JOIN from the engine's replay. autojoin is lowered only
         // by a part, a kick or a close (db/buffers.ts) — so a channel the socket
@@ -2659,6 +2692,7 @@ export class IrcConnection {
       const from = event?.from as string | undefined;
       if (!from) return;
       this.takeStashedJoinKey(from);
+      this.pendingJoins.delete(foldTargetFor(this.network.id, from));
       // forget: a channel we were never in must not keep an autojoin or a row
       // with nothing to show.
       this.evictChannel(from, { forget: true });
@@ -3476,6 +3510,20 @@ export class IrcConnection {
       // client waits for channel-joined before opening the buffer, so on
       // failure there is no buffer to render into.
       const rejectChannel = event?.channel as string | undefined;
+      // A rejection of a JOIN ends it, so the mark goes (see pendingJoins) —
+      // every join rejection, not just the durable ones below, since a 471 we
+      // will retry still ended THIS join.
+      //
+      // ⚠ Only the ones that can answer a JOIN. `event.channel` is set on
+      // plenty of errors that answer something else — a 404 refusing a message
+      // to the channel, a 482 refusing a mode — and clearing on those drops a
+      // mark for a JOIN still in flight. The close that followed would then
+      // send no PART, and the echo would reopen the buffer it had just closed.
+      // Being too narrow here is the safer miss: an exotic rejection nobody
+      // listed leaves the mark, and the close sends the PART it always used to.
+      if (rejectChannel && joinRejectionMessageByTag(tag)) {
+        this.pendingJoins.delete(foldTargetFor(this.network.id, rejectChannel));
+      }
       // ERR_NOTONCHANNEL (442) is authoritative: the server says we are not on
       // that channel, so the PART echo that normally evicts it from
       // this.channels is never coming. Evict here instead. Without this, any
@@ -4314,6 +4362,36 @@ export class IrcConnection {
     return this.joinedFoldedCache.has(foldTargetFor(this.network.id, name));
   }
 
+  /** Whether we are in `name`, or about to be: membership plus the one state
+   *  the channels map can't see, a JOIN we sent whose echo hasn't landed.
+   *  Membership is echo-written, so between the request and its echo the map
+   *  says "no" for a channel we are about to be in, and a command sent now
+   *  reaches the server behind that JOIN.
+   *
+   *  This is the probe for a caller deciding whether to ACT on the network —
+   *  whether a close owes a PART. Being wrong one way leaks a 442 to every
+   *  attached client (#967); being wrong the other leaves the user in a
+   *  channel they closed. isChannelJoined stays the probe for rendering what
+   *  we know now.
+   *
+   *  ⚠ And a PART on the wire takes it back off. Membership is echo-written in
+   *  both directions, so the map still says yes for a channel we have already
+   *  parted — from an attached client, from another tab, or from this very
+   *  close a moment ago. Acting on that is the second PART and the 442 all over
+   *  again, which also makes a close of an already-closed buffer idempotent on
+   *  the wire.
+   *
+   *  ⚠ `restoring` is deliberately NOT part of this. A restore's replayed
+   *  self-JOIN already reconciles a channel whose row says autojoin=0 or
+   *  closed by PARTing it ("this is that PART, late", in the join handler), so
+   *  a caller that also parted would send it twice and the loser would draw
+   *  the 442. The replay owns that window; nobody else writes into it. */
+  mayBeJoined(name: string): boolean {
+    const folded = foldTargetFor(this.network.id, name);
+    if (this.pendingParts.has(folded)) return false;
+    return this.isChannelJoined(name) || this.pendingJoins.has(folded);
+  }
+
   /** The live ChannelState for `name`, resolved the same fold-aware way
    *  isChannelJoined resolves membership (#707). Callers that need the
    *  channel's CONTENTS (topic, members) rather than a yes/no must come
@@ -4345,7 +4423,33 @@ export class IrcConnection {
   }
 
   private deleteChannel(key: string): boolean {
-    const deleted = this.channels.delete(key);
+    const folded = foldTargetFor(this.network.id, key);
+    // The one place membership leaves the map, so the one place a part awaiting
+    // its answer has been answered: the PART echo, a kick, a 442's eviction, the
+    // engine's prune on re-attach. Unconditional — the mark must go even when
+    // there was no entry to delete, or a PART for a channel we had already left
+    // would leave one behind forever.
+    this.pendingParts.delete(folded);
+    // ⚠ Fold-aware, like isChannelJoined and channelState (#707). Every caller
+    // hands this a raw `.toLowerCase()` of whatever the SERVER said, while the
+    // map is keyed by the name we joined under — and those differ whenever an
+    // ircd echoes a fold variant, `#foo{bar}` for a `#foo[bar]` we are in on an
+    // rfc1459 network. An exact-key delete misses that entry, so membership
+    // goes on claiming we are in a channel we have left for the life of the
+    // connection: the next close sends a second PART, the server answers 442,
+    // and that is #967 by another road. Exact hit first, so the ordinary case
+    // stays one probe; the fallback scans the joined channels, a handful, for
+    // the same reason channelState is deliberately a scan.
+    let actual = key;
+    if (!this.channels.has(key)) {
+      for (const k of this.channels.keys()) {
+        if (foldTargetFor(this.network.id, k) === folded) {
+          actual = k;
+          break;
+        }
+      }
+    }
+    const deleted = this.channels.delete(actual);
     if (deleted) this.joinedFoldedCache = null;
     return deleted;
   }
@@ -4366,6 +4470,8 @@ export class IrcConnection {
     // key. Cleared even with no channels joined: the join that never landed is
     // exactly the case with none.
     this.pendingJoinKeys.clear();
+    this.pendingJoins.clear();
+    this.pendingParts.clear();
     if (this.channels.size === 0) return;
     const names = Array.from(this.channels.values(), (ch) => ch.name);
     this.channels.clear();
@@ -4382,6 +4488,78 @@ export class IrcConnection {
     }
     if (!ch.modes) ch.modes = new Set();
     return ch;
+  }
+
+  /** Mark a JOIN put on the wire, for every channel in a comma list.
+   *
+   *  A JOIN supersedes a PART still in flight for the same channel: rejoining is
+   *  the whole point, and a stale part mark would have the next close send
+   *  nothing and leave us in it.
+   *
+   *  ⚠ And superseding one is itself the reason to track this JOIN. While that
+   *  PART is unanswered the map still says joined, so the membership test reads
+   *  "already in it" and marks nothing — then the PART echo lands, membership
+   *  goes false, and NOTHING says a JOIN is outstanding. A close in that gap
+   *  sends no PART and the JOIN echo reopens the buffer it closed. A cycle has
+   *  to be tracked even though we look like a member: we are about to stop
+   *  being one, briefly.
+   *
+   *  ⚠ Only a channel whose outcome is UNKNOWN otherwise. A JOIN for one we are
+   *  already in is answered by nothing — no echo, as ircManager.joinChannel says
+   *  in the branch that sends it — so a mark would never be cleared, and after
+   *  the user later parted, mayBeJoined would still say yes and the close would
+   *  PART a channel we had left. That is #967 again, from the guard meant to
+   *  prevent it. */
+  private noteJoinSent(channelList: string): void {
+    for (const one of channelList.split(',')) {
+      if (!one) continue;
+      const folded = foldTargetFor(this.network.id, one);
+      const supersededPart = this.pendingParts.delete(folded);
+      if (supersededPart || !this.isChannelJoined(one)) this.pendingJoins.add(folded);
+    }
+  }
+
+  /** Mark a PART put on the wire, for every channel in a comma list. Leaving
+   *  also ends any join we were still waiting on: a JOIN the server never
+   *  answered leaves its mark behind (nothing else clears one), and the next
+   *  close would read it as "maybe in there" and PART again. */
+  private notePartSent(channelList: string): void {
+    for (const one of channelList.split(',')) {
+      if (!one) continue;
+      const folded = foldTargetFor(this.network.id, one);
+      this.pendingJoins.delete(folded);
+      this.pendingParts.add(folded);
+    }
+  }
+
+  /** The same marks for a JOIN or PART that reaches the socket as a raw line.
+   *
+   *  ⚠ `/quote PART #x` and `/raw JOIN #x` do not go through part() or join() —
+   *  they are handed to raw() verbatim (wsHub's 'raw' verb) — so without this
+   *  the marks are simply missing, and a close right after a raw PART sends the
+   *  duplicate this all exists to stop. Read on the way out, like
+   *  takeRawMonitor and noteOutgoingCommand beside it: raw() is the one path
+   *  every slash command and member-menu action takes. */
+  private noteRawMembership(line: string): void {
+    // The verb, past an IRCv3 tag block the caller may have put in front of it.
+    const parsed = /^\s*(?:@\S+\s+)?(JOIN|PART)\s+(\S+)/i.exec(line);
+    if (!parsed) return;
+    const targets = parsed[2];
+    if (parsed[1].toUpperCase() === 'PART') return this.notePartSent(targets);
+    // `JOIN 0` leaves every channel at once (RFC 2812 3.2.1) — it is a PART of
+    // all of them, and it is what a bouncer client's `JOIN 0` relays to.
+    if (targets === '0') {
+      for (const ch of this.channels.values()) this.notePartSent(ch.name);
+      // Including channels whose own JOIN is still in flight: those are not in
+      // the map yet, so the loop above misses them, and the mark left behind
+      // would have a close PART the very channel this command is abandoning.
+      // Moved rather than dropped, so the answer still holds once their JOIN
+      // echo lands and briefly makes them members.
+      for (const folded of this.pendingJoins) this.pendingParts.add(folded);
+      this.pendingJoins.clear();
+      return;
+    }
+    this.noteJoinSent(targets);
   }
 
   /** Hold a join key until its echo (see pendingJoinKeys). */
@@ -5194,9 +5372,23 @@ export class IrcConnection {
     // calls .match() on the last arg, so a numeric key throws a TypeError that,
     // with no global uncaught handler (see wsHub sendSnapshot backstop), would
     // drop the whole (shared, on hosted) process.
+    // One JOIN can carry many channels: the reconnect rejoin batches them
+    // (planChannelRejoins packs `#a,#b,#c` up to the line limit), and an echo
+    // names one. Marking the blob would leave an entry no echo ever clears and
+    // no lookup ever matches — the guard inert on exactly the path where a
+    // close races a join most often.
+    //
+    // ⚠ Only a channel whose outcome is UNKNOWN is marked. A JOIN for one we
+    // are already in is answered by nothing — no echo, as ircManager.joinChannel
+    // says in the branch that sends it — so a mark would never be cleared, and
+    // after the user later parted, mayBeJoined would still say yes and the
+    // close would PART a channel we had left. That is #967 again, from the
+    // guard meant to prevent it. We are in it, so membership already answers.
+    this.noteJoinSent(channel);
     this.client.join(channel, typeof key === 'string' ? key : undefined);
   }
   part(channel: string, reason?: string): void {
+    this.notePartSent(channel);
     this.client.part(channel, reason);
   }
   say(target: string, text: string): void {
@@ -6864,6 +7056,9 @@ export class IrcConnection {
     // in the channel it was aimed at (#434). Cheap and total: this is the one
     // path every slash command and member-menu action takes.
     this.noteOutgoingCommand(clean);
+    // A raw JOIN/PART changes membership just as join()/part() do, and nothing
+    // else would record it.
+    this.noteRawMembership(clean);
     // A query waits its turn, and its reply goes to `asker` (replyRouter.ts).
     this.replies.send(asker, clean);
   }
