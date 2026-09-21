@@ -58,8 +58,14 @@ export function isChannelTarget(target: string | null | undefined): boolean {
 export const DCC_CHAT_PREFIX = '=';
 
 // ⚠ A plain boolean for the same reason `isChannelTarget` is one — see its note.
+//
+// ⚠ Any `=`-prefixed string, bare `=` included. Requiring a peer after the sigil
+// let a bare `=` through as an ordinary DM target, so it reached the wire as
+// `PRIVMSG =`. No valid nick or channel starts with `=`, so treating every such
+// string as a pseudo-target is exact, not over-broad; callers that need a peer
+// get an empty one from dccChatPeer and refuse.
 export function isDccChatTarget(target: string | null | undefined): boolean {
-  return typeof target === 'string' && target.startsWith(DCC_CHAT_PREFIX) && target.length > 1;
+  return typeof target === 'string' && target.startsWith(DCC_CHAT_PREFIX);
 }
 
 /** The peer nick a `=nick` buffer is chatting with. Returns the target unchanged if it isn't

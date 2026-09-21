@@ -6899,6 +6899,9 @@ export class IrcConnection {
    * form the moment it sees a bare \x01 from us (dcc-chat.c:685-687).
    */
   dccChatSend(nick: string, text: string, opts: { action?: boolean } = {}): boolean {
+    // A bare `=` target yields no peer. It must still be refused — it's a
+    // pseudo-target, never a wire target — just not announced as a dead chat.
+    if (!nick) return false;
     const key = nick.toLowerCase();
     const entry = this.dccChats.get(key);
     if (!entry) {

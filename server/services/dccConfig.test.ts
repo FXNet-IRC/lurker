@@ -12,6 +12,7 @@ import {
   dccActiveListenAvailable,
   dccAllowPrivateHosts,
   dccEnabledForUser,
+  dccListenBindHost,
   dccMasterEnabled,
   dccMaxFileBytes,
   parseDccEnabled,
@@ -122,4 +123,33 @@ describe('dccActiveListenAvailable', () => {
       expect(dccActiveListenAvailable()).toBe(false);
     },
   );
+});
+
+// ⚠ The default listen address used to be 0.0.0.0 — IPv4 only — no matter what
+// we advertised, so with an IPv6 external host we sent peers to an address we
+// weren't listening on.
+describe('dccListenBindHost', () => {
+  afterEach(() => {
+    delete process.env.LURKER_DCC_EXTERNAL_HOST;
+    delete process.env.LURKER_DCC_LISTEN_BIND;
+  });
+
+  it('listens on IPv6 when it advertises an IPv6 address', () => {
+    process.env.LURKER_DCC_EXTERNAL_HOST = '2001:db8::1';
+    expect(dccListenBindHost()).toBe('::');
+  });
+
+  // Not `::` for everyone: a host with IPv6 disabled can't bind it at all.
+  it('stays IPv4 when it advertises an IPv4 address, or none', () => {
+    process.env.LURKER_DCC_EXTERNAL_HOST = '203.0.113.5';
+    expect(dccListenBindHost()).toBe('0.0.0.0');
+    delete process.env.LURKER_DCC_EXTERNAL_HOST;
+    expect(dccListenBindHost()).toBe('0.0.0.0');
+  });
+
+  it('always honours an explicit LURKER_DCC_LISTEN_BIND', () => {
+    process.env.LURKER_DCC_EXTERNAL_HOST = '2001:db8::1';
+    process.env.LURKER_DCC_LISTEN_BIND = '10.0.0.5';
+    expect(dccListenBindHost()).toBe('10.0.0.5');
+  });
 });

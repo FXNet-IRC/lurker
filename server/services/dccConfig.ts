@@ -12,6 +12,8 @@
 // BOTH must be true for a user to use DCC. The master-switch parser is pure (and
 // unit-tested); the per-user gate reads the DB.
 
+import net from 'net';
+
 import { CAPABILITY_DCC, userHasCapability } from '../db/userCapabilities.js';
 import { parseTruthyEnv } from '../utils/truthyEnv.js';
 import { encodeDccAddress } from './dcc.js';
@@ -76,7 +78,13 @@ export function dccExternalHost(): string | null {
  *  it; pin it to one interface if you run multi-homed. */
 export function dccListenBindHost(): string {
   const h = (process.env.LURKER_DCC_LISTEN_BIND ?? '').trim();
-  return h || '0.0.0.0';
+  if (h) return h;
+  // ⚠ Follow the ADVERTISED address's family. The default used to be 0.0.0.0
+  // unconditionally — IPv4 only — so with an IPv6 LURKER_DCC_EXTERNAL_HOST we
+  // told peers to dial a v6 address we weren't listening on, and every one of
+  // them was refused. Not `::` for everyone: a host with IPv6 disabled (common
+  // in containers) can't bind it at all, which would break v4-only installs.
+  return net.isIPv6(dccExternalHost() ?? '') ? '::' : '0.0.0.0';
 }
 
 /** The inclusive TCP port range DCC listeners are allocated from

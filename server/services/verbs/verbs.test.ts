@@ -149,6 +149,42 @@ describe('list_networks', () => {
   });
 });
 
+// ⚠⚠ #528 was public and minted `=nick` DCC buffers as kind 'dm' — it predates
+// the 'dcc' kind. An install that ever ran it has such rows, and filtering on
+// kind alone handed them to MCP (list_buffers) and to bouncer clients (playback
+// and CHATHISTORY TARGETS, both fed by these queries).
+describe('legacy =nick rows kinded as dm', () => {
+  it('are hidden from list_buffers and CHATHISTORY TARGETS by shape, not just kind', async () => {
+    const { ensureExists } = await import('../../db/buffers.js');
+    const { listActiveTargetsInWindow } = await import('../../db/messages.js');
+    const { default: db } = await import('../../db/index.js');
+    ensureExists(owner.id, net.id, '=legacy', { kind: 'dm' }); // what #528 left behind
+    insertMessage({
+      networkId: net.id,
+      target: '=legacy',
+      nick: 'legacy',
+      text: 'from an old build',
+      type: 'message',
+      time: new Date().toISOString(),
+    } as never);
+    try {
+      const listed = callVerb('list_buffers', rCtx(owner.id), {}) as Array<{ target: string }>;
+      expect(listed.map((b) => b.target)).not.toContain('=legacy');
+      const targets = listActiveTargetsInWindow(
+        net.id,
+        '2000-01-01T00:00:00Z',
+        '2100-01-01T00:00:00Z',
+        50,
+      );
+      expect(targets.map((t) => t.target)).not.toContain('=legacy');
+      // …while an ordinary DM still shows, so the filter isn't hiding everything.
+      expect(listed.map((b) => b.target)).toContain('bob');
+    } finally {
+      db.prepare("DELETE FROM buffers WHERE target = '=legacy'").run();
+    }
+  });
+});
+
 describe('list_buffers', () => {
   it("returns the caller's buffers and excludes :server:* pseudo-buffers", () => {
     const result = callVerb('list_buffers', rCtx(owner.id), {}) as Array<{
@@ -718,6 +754,24 @@ describe('agent control verbs', () => {
         serverBuffer: `:server:${net.id}`,
       });
       expect(conn.sent).toEqual(['WHOIS bob']);
+    });
+
+    // ⚠ The lookup is a RAW line, which bypasses every `=` guard in ircManager,
+    // so a `=bob` DCC buffer target handed to this verb put `WHOIS =bob` on the
+    // wire. It means bob — the web client's whois store normalizes the same way.
+    it('looks up the peer behind a =nick DCC target, never the buffer name', () => {
+      const conn = live();
+      callVerb('whois', rwCtx(owner.id), { networkId: net.id, nick: '=bob' });
+      expect(conn.sent).toEqual(['WHOIS bob']);
+    });
+
+    it('refuses a bare = rather than sending WHOIS =', () => {
+      const conn = live();
+      expect(callVerb('whois', rwCtx(owner.id), { networkId: net.id, nick: '=' })).toEqual({
+        ok: false,
+        error: 'empty-nick',
+      });
+      expect(conn.sent).toEqual([]);
     });
 
     it('validates the nick, and reports not-connected otherwise', () => {

@@ -727,6 +727,10 @@ export function listActiveTargetsInWindow(
   // rows happened to arrive under. Sentinels are excluded by kind — the
   // registry's classification, not a name-shape LIKE.
   //
+  // ⚠ And by SHAPE, not just kind: #528 was public and minted `=nick` rows as
+  // kind 'dm' (it predates the 'dcc' kind), so an install that ever ran it has
+  // rows the kind filter alone would hand straight to bouncer clients and MCP.
+  //
   // ⚠ 'dcc' is excluded for a different reason than the sentinels: this feeds
   // the bouncer's CHATHISTORY TARGETS, and a `=nick` target advertised there is
   // one an attached client will happily open a query on and then PRIVMSG — a
@@ -739,6 +743,7 @@ export function listActiveTargetsInWindow(
          JOIN buffers b ON b.id = m.buffer_id
         WHERE b.network_id = ?
           AND b.kind NOT IN ('server', 'system', 'dcc')
+          AND substr(b.target, 1, 1) <> '='
           AND ${filter.sql}
           AND m.time > ? AND m.time < ?
         GROUP BY b.id
@@ -790,6 +795,7 @@ export function listBuffersForNetwork(networkId: number): BufferSummary[] {
          JOIN messages m ON m.buffer_id = b.id
         WHERE b.network_id = ?
           AND b.kind NOT IN ('server', 'system', 'dcc')
+          AND substr(b.target, 1, 1) <> '='
         GROUP BY b.id
         ORDER BY lastMessageAt DESC`,
     )

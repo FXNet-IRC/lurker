@@ -556,6 +556,21 @@ describe('a = target never reaches the IRC wire', () => {
     h.conn.closeDccChat('bob');
   });
 
+  // No valid nick or channel starts with `=`, so a bare `=` is a pseudo-target
+  // too — it used to fall through as a DM and go out as `PRIVMSG =`.
+  it('refuses a bare = on every send path, silently', () => {
+    enableDcc();
+    const h = harness();
+    inject(h.conn);
+    expect(ircManager.send(1, 1, '=', 'hi')).toBe(false);
+    expect(ircManager.action(1, 1, '=', 'waves')).toBe(false);
+    expect(ircManager.notice(1, 1, '=', 'psst')).toBe(false);
+    expect(h.say).not.toHaveBeenCalled();
+    expect(h.raw).not.toHaveBeenCalled();
+    // A pseudo-target, not a dead chat — no "No live DCC chat with …" line.
+    expect(h.notices()).toEqual([]);
+  });
+
   it('refuses a typing notification rather than emitting TAGMSG =bob', () => {
     enableDcc();
     const h = harness();
