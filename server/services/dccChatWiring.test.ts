@@ -29,9 +29,16 @@ beforeAll(() => {
   createNetwork(1, { name: 'n', host: 'h', port: 6697, tls: true, nick: 'alice' }); // network id 1
 });
 
-// A high, uncommon range so a listening test can't collide with anything real.
-const LISTEN_MIN = 45840;
-const LISTEN_MAX = 45849;
+// ⚠⚠ Below 32768, deliberately. A fixed test port must sit OUTSIDE the OS
+// ephemeral range, which the kernel hands out as the LOCAL port of every
+// outgoing connection — any concurrent test's client socket can land on it,
+// and this listen then fails with EADDRINUSE. Linux's range is 32768-60999
+// and macOS's 49152-65535, so the old 458xx ports were safe on a Mac and
+// collided under CI's parallel suite on Linux (reproduced in Docker, Node 24:
+// EADDRINUSE 127.0.0.1:45822). Keep any replacement below 32768. Distinct from dccListener.test.ts's
+// 24820-24829, since the two files can run in parallel.
+const LISTEN_MIN = 24840;
+const LISTEN_MAX = 24849;
 
 const peers: net.Server[] = [];
 afterEach(() => {

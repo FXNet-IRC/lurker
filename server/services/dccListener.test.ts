@@ -8,9 +8,15 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import net from 'net';
 import { openDccListener, activeDccListenerCount, resetDccListeners } from './dccListener.js';
 
-// A high, uncommon range so the test doesn't collide with anything real.
-const MIN = 45820;
-const MAX = 45829;
+// ⚠⚠ Below 32768, deliberately. A fixed test port must sit OUTSIDE the OS
+// ephemeral range, which the kernel hands out as the LOCAL port of every
+// outgoing connection — any concurrent test's client socket can land on it,
+// and this listen then fails with EADDRINUSE. Linux's range is 32768-60999
+// and macOS's 49152-65535, so the old 458xx ports were safe on a Mac and
+// collided under CI's parallel suite on Linux (reproduced in Docker, Node 24:
+// EADDRINUSE 127.0.0.1:45822). Keep any replacement below 32768.
+const MIN = 24820;
+const MAX = 24829;
 
 beforeEach(() => {
   process.env.LURKER_DCC_LISTEN_BIND = '127.0.0.1';
