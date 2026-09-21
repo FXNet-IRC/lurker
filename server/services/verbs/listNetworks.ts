@@ -28,7 +28,12 @@ registerVerb({
         id: net.id,
         name: net.name,
         connected: conn?.state === 'connected',
-        nick: conn?.client?.user?.nick || net.nick,
+        // ⚠ currentNick, not the framework's copy. irc-framework won't store a
+        // digit-leading nick (client.js:266), so after a netsplit collision
+        // SAVEs us to our UID its user.nick still names our OLD nick — which is
+        // now free, and if a stranger takes it and renames, the framework
+        // writes THEIR new nick into our copy. currentNick follows us through.
+        nick: conn?.currentNick || net.nick,
       };
     });
   },

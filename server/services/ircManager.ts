@@ -776,7 +776,7 @@ class IrcManager extends EventEmitter {
         conn.publish({
           type: 'message',
           target,
-          nick: conn.client.user?.nick,
+          nick: conn.currentNick,
           text,
           kind: 'privmsg',
           self: true,
@@ -804,7 +804,7 @@ class IrcManager extends EventEmitter {
     // row can only come from here.
     const adoptEcho = conn.echoActive();
     if (hasInteriorNewline(text) && conn.supportsMultiline()) {
-      const nick = conn.client.user?.nick;
+      const nick = conn.currentNick;
       const echoes = conn.sendMultiline(target, text);
       if (!adoptEcho) {
         for (const echo of echoes) {
@@ -820,7 +820,7 @@ class IrcManager extends EventEmitter {
       conn.publish({
         type: 'message',
         target,
-        nick: conn.client.user?.nick,
+        nick: conn.currentNick,
         text: chunk,
         kind: 'privmsg',
         self: true,
@@ -866,7 +866,7 @@ class IrcManager extends EventEmitter {
       conn.publish({
         type: 'action',
         target,
-        nick: conn.client.user?.nick,
+        nick: conn.currentNick,
         text: chunk,
         // Shape parity with the adopted echo, which stamps kind:'action'.
         kind: 'action',
@@ -894,7 +894,7 @@ class IrcManager extends EventEmitter {
       conn.publish({
         type: 'notice',
         target,
-        nick: conn.client.user?.nick,
+        nick: conn.currentNick,
         text: chunk,
         kind: 'notice',
         self: true,
