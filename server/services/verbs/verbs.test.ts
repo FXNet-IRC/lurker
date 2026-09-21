@@ -127,6 +127,26 @@ describe('list_networks', () => {
     const result = callVerb('list_networks', rCtx(intruder.id), {}) as Array<{ id: number }>;
     expect(result.map((n) => n.id)).toEqual([otherNet.id]);
   });
+
+  // A netsplit collision SAVEs us to our UID. irc-framework refuses to store a
+  // digit-leading nick, so its copy keeps our OLD nick — which is now free. If a
+  // stranger takes it and renames, the framework matches `user.nick === event
+  // .nick` and writes THEIR new nick into our copy. So during the window it is
+  // not merely stale, it names someone else; only currentNick is us.
+  it('reports our own nick during a collision, not the framework copy', () => {
+    const conn = {
+      state: 'connected',
+      currentNick: '042AAEL37',
+      client: { user: { nick: 'mallory' } }, // hijacked by a stranger's rename
+    };
+    ircManager.connectionsForUser(owner.id).set(net.id, conn as never);
+    try {
+      const result = callVerb('list_networks', rCtx(owner.id), {}) as Array<{ nick: string }>;
+      expect(result[0].nick).toBe('042AAEL37');
+    } finally {
+      ircManager.connectionsForUser(owner.id).delete(net.id);
+    }
+  });
 });
 
 describe('list_buffers', () => {
