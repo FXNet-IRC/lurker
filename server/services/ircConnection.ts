@@ -2122,8 +2122,7 @@ export class IrcConnection {
     // login or in response to /MODE <self>). irc-framework normalises it to
     // 'user info' with the raw mode string ('+iwx').
     on('user info', (event: Record<string, unknown>) => {
-      if (!c.user.nick || (event.nick as string).toLowerCase() !== c.user.nick.toLowerCase())
-        return;
+      if (!this.isSelfNick(event.nick as string)) return;
       this.userModes = new Set(((event.raw_modes as string) || '').replace(/^[+-]/, '').split(''));
       this.publishUserModes();
     });
@@ -2148,7 +2147,7 @@ export class IrcConnection {
       if (!event.new_hostname && !event.new_ident) return; // SETNAME — not ours
       const eventNick = event.nick as string;
       const lower = eventNick.toLowerCase();
-      const isSelf = !!c.user.nick && c.user.nick.toLowerCase() === lower;
+      const isSelf = this.isSelfNick(lower);
       // CHGHOST only carries the half that changed on some ircds; fall back to
       // the previous value so the mask we store and show is always complete.
       const newIdent = (event.new_ident as string) || (event.ident as string) || '';
@@ -2243,7 +2242,7 @@ export class IrcConnection {
         this.accumulateMultiline(event);
         return;
       }
-      const me = c.user?.nick;
+      const me = this.currentNick;
       const eventNick = event.nick as string | undefined;
       const eventTarget = event.target as string | undefined;
       const eventHostname = event.hostname as string | undefined;
@@ -2548,7 +2547,7 @@ export class IrcConnection {
       const eventNick = event.nick as string;
       // Case-insensitive, like the part and kick handlers: a server that echoes
       // our nick in a different case is still telling us about our own join.
-      const isSelf = !!c.user.nick && eventNick.toLowerCase() === c.user.nick.toLowerCase();
+      const isSelf = this.isSelfNick(eventNick);
       // Only our own JOIN makes a channel ours (#908). Someone else's updates a
       // channel we are in and creates nothing for one we are not — a backlog
       // line replayed for a channel we have since left, say. Fold-aware, like
@@ -2719,7 +2718,7 @@ export class IrcConnection {
       // Case-insensitive self-match, like the self-kick branch below: this
       // branch now lowers autojoin, so a server that echoes our nick in the
       // PART prefix with different casing must not skip the correction.
-      if (c.user.nick && eventNick.toLowerCase() === c.user.nick.toLowerCase()) {
+      if (this.isSelfNick(eventNick)) {
         this.deleteChannel(eventChannel.toLowerCase());
         // The echo lowers autojoin, not just ircManager.partChannel. That path
         // is the app's own /part and buffer-close, so a PART Lurker did not
@@ -2803,7 +2802,7 @@ export class IrcConnection {
       const invited = event.invited as string | undefined;
       const rawChannel = event.channel as string | undefined;
       if (!inviter || !rawChannel || !invited) return;
-      const me = c.user?.nick;
+      const me = this.currentNick;
       const meLower = me?.toLowerCase();
       const channel = canonicalChannelTarget(rawChannel, this.channels) ?? rawChannel;
 
@@ -2842,7 +2841,7 @@ export class IrcConnection {
       // and the invite-notify self-echo above is deduped against it (#261).
       const invited = event.nick as string | undefined;
       const rawChannel = event.channel as string | undefined;
-      const me = c.user?.nick;
+      const me = this.currentNick;
       if (!invited || !rawChannel || !me) return;
       const channel = canonicalChannelTarget(rawChannel, this.channels) ?? rawChannel;
       this.publish({ type: 'invite', target: channel, nick: me, invited, time: event.time });
@@ -2881,7 +2880,27 @@ export class IrcConnection {
       // Detect self by matching the event's old nick against the current
       // tracked nick, mirroring what the framework's own listener does at
       // client.js:265 before it updates user.nick.
-      const isSelfNick = !!c.user.nick && c.user.nick.toLowerCase() === oldLower;
+      //
+      // ⚠⚠ …and against OUR nick too, because the framework's copy goes stale
+      // and stays stale. client.js:266 refuses to store a nick beginning with a
+      // digit ("reserved for uuids... they cannot be used"), which is exactly
+      // what a server hands you when it resolves a netsplit nick collision —
+      // Libera SAVEs you to your UID ("042AAEL37 Nick collision, forcing nick
+      // change to your unique ID"). So `user.nick` keeps the pre-collision nick
+      // forever, and the NEXT change — the one taking you back to a real nick —
+      // has an old nick that matches neither. Keying on that alone lost the
+      // user's identity for the rest of the session: own-nick never updated,
+      // the auto-highlight rule kept the old name, and self-echo filtering
+      // started treating our own lines as a stranger's.
+      //
+      // ⚠⚠ And OUR record is the authority, not the framework's. Preferring
+      // theirs is not merely less accurate, it is wrong in a way that hands our
+      // identity to someone else: while we sit on a UID, their `user.nick` still
+      // names our old nick — which is now FREE. A stranger takes it, renames,
+      // and we would follow them, because their rename's old nick matches the
+      // stale copy. currentNick is seeded in the constructor and never unset, so
+      // the framework check is a fallback that should never be needed.
+      const isSelfNick = this.isSelfNick(eventNick);
       if (isSelfNick) {
         try {
           highlightRulesService.upsertAutoNickRule(
@@ -2915,6 +2934,13 @@ export class IrcConnection {
           this.syncMonitor();
         }
         this.currentNick = eventNewNick;
+        // Repair the framework's copy when it would otherwise stay behind. Its
+        // own rule is kept — a digit-leading UID still isn't stored, because
+        // other parts of it treat user.nick as something you could send as —
+        // but the moment we're back on a usable nick the two agree again.
+        // Without this, ircManager publishes self-messages under `client.user
+        // .nick`, so a stale one puts the WRONG name on the user's own lines.
+        if (!/^\d/.test(eventNewNick)) c.user.nick = eventNewNick;
         this.publish({ type: 'own-nick', nick: eventNewNick });
       }
       const userhost = buildUserhost(event);
@@ -2990,7 +3016,7 @@ export class IrcConnection {
       const eventNick = event.nick as string | undefined;
 
       // Self user-mode change (e.g. server sets +i on connect, /OPER yields +o, etc.)
-      if (target && c.user.nick && target.toLowerCase() === c.user.nick.toLowerCase()) {
+      if (target && this.isSelfNick(target)) {
         let changed = false;
         for (const m of eventModes) {
           if (!m || !m.mode) continue;
@@ -3616,7 +3642,7 @@ export class IrcConnection {
     });
 
     on('tagmsg', (event: Record<string, unknown>) => {
-      const me = c.user?.nick;
+      const me = this.currentNick;
       const eventNick = event.nick as string | undefined;
       // Case-folded, matching the message handler's self check — under
       // echo-message our own TAGMSGs reflect back, and a server relaying a
@@ -3648,7 +3674,7 @@ export class IrcConnection {
   // or null when the caller should no-op.
   eligiblePeer(nick: string | undefined | null): string | null {
     if (!nick) return null;
-    const me = this.client.user?.nick;
+    const me = this.currentNick;
     if (me && nick.toLowerCase() === me.toLowerCase()) return null;
     const lower = nick.toLowerCase();
     if (!this.trackedPeers.has(lower)) return null;
@@ -4074,7 +4100,7 @@ export class IrcConnection {
   // handlers recognize the nick — they just get no live presence.
   private addPeerWatch(nick: string | undefined | null, reason: TrackReason): boolean {
     if (!nick) return false;
-    const me = this.client.user?.nick;
+    const me = this.currentNick;
     if (me && nick.toLowerCase() === me.toLowerCase()) return false;
     const lower = nick.toLowerCase();
     const existing = this.trackedPeers.get(lower);

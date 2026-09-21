@@ -714,7 +714,12 @@ describe('nick-regain MONITOR teardown gating (#384)', () => {
     conn.state = 'connected';
     conn.regainNick = 'nick'; // the primary we still want back
     conn.pendingRegainSetup = true;
+    // ⚠ Both copies. Registering under a fallback sets currentNick to the
+    // nick the server gave us (ircConnection sets it from the registered
+    // nick), so a test that moved only the framework's copy was modelling a
+    // state a real connection never reaches — and self-detection reads ours.
     conn.client.user.nick = 'nick1'; // currently on the fallback
+    conn.currentNick = 'nick1';
     conn.publish = vi.fn<(event: unknown) => void>(); // we assert on the wire, not the buffer
     const raw = vi.fn<(...args: unknown[]) => void>();
     conn.client.raw = raw;
@@ -736,6 +741,7 @@ describe('nick-regain MONITOR teardown gating (#384)', () => {
     conn.regainNick = 'nick';
     conn.pendingRegainSetup = false;
     conn.client.user.nick = 'nick1';
+    conn.currentNick = 'nick1'; // as registration under a fallback would leave it
     conn.publish = vi.fn<(event: unknown) => void>();
     const raw = vi.fn<(...args: unknown[]) => void>();
     conn.client.raw = raw;
@@ -1795,6 +1801,7 @@ describe('refused-message handler routing (#283)', () => {
     conn.publish = vi.fn<(event: unknown) => void>();
     conn.client.raw = vi.fn<(...args: string[]) => void>(); // swallow the on-join MODE request
     conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
     (conn.client as unknown as { network: { cap: { enabled: string[] } } }).network = {
       cap: { enabled: ['message-tags'] },
     };
@@ -2512,6 +2519,7 @@ describe('disconnect-offline sweep + WHO re-light (no-MONITOR presence)', () => 
     const conn = makeConn('relight');
     conn.publish = vi.fn<typeof conn.publish>(); // assert on presence, not history
     conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
     conn.trackDmPeer('chanpal');
     // Peer shares a channel with us…
     conn.client.emit('join', { channel: '#room', nick: 'me' });
@@ -2531,6 +2539,7 @@ describe('disconnect-offline sweep + WHO re-light (no-MONITOR presence)', () => 
     const conn = makeConn('relight-away');
     conn.publish = vi.fn<typeof conn.publish>();
     conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
     conn.trackDmPeer('awaychan');
     conn.client.emit('join', { channel: '#room', nick: 'me' });
     conn.client.emit('join', { channel: '#room', nick: 'awaychan' });
@@ -4250,6 +4259,7 @@ describe('join echo, forwarded joins (470), and un-partable channels (442)', () 
   it('self-join echo mints the registry row with autojoin and the stashed key', () => {
     const conn = makeConn('echo-mints');
     conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
     conn.stashJoinKey('#Secret', 'hunter2');
 
     conn.client.emit('join', { channel: '#Secret', nick: 'me' });
@@ -4287,6 +4297,7 @@ describe('join echo, forwarded joins (470), and un-partable channels (442)', () 
   it('self-part echo lowers autojoin, so a raw PART is not undone on reconnect', () => {
     const conn = makeConn('part-echo-autojoin');
     conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
     conn.upsertChannel('#apple');
     ensureBufferOpen(conn.network.user_id, conn.network.id, '#apple', {
       kind: 'channel',
@@ -4308,6 +4319,7 @@ describe('join echo, forwarded joins (470), and un-partable channels (442)', () 
   it('self-part echo matches our nick case-insensitively', () => {
     const conn = makeConn('part-echo-nick-case');
     conn.client.user.nick = 'Me';
+    conn.currentNick = 'Me'; // as registration leaves it
     conn.upsertChannel('#apple');
     ensureBufferOpen(conn.network.user_id, conn.network.id, '#apple', {
       kind: 'channel',
@@ -4868,6 +4880,7 @@ describe('engine-restore late PART keeps isChannelJoined in sync (#stale-cache)'
   it('reports not-joined immediately for an un-autojoined channel, even with a warm cache', () => {
     const conn = makeConn('restore-late-part-autojoin');
     conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
     // Survived the engine's attach-time live-channel diff (still really
     // joined on the ircd), but the row says we left it while disconnected.
     conn.upsertChannel('#leaving');
@@ -4894,6 +4907,7 @@ describe('engine-restore late PART keeps isChannelJoined in sync (#stale-cache)'
   it('reports not-joined immediately for a closed-but-still-autojoined channel, even with a warm cache', () => {
     const conn = makeConn('restore-late-part-closed');
     conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
     conn.upsertChannel('#leaving');
     ensureBufferOpen(conn.network.user_id, conn.network.id, '#leaving', {
       kind: 'channel',
