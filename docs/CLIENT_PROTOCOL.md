@@ -1325,9 +1325,9 @@ notices in the chat's own buffer rather than in the response.
 
 **An inbound offer is never auto-accepted.** It is recorded and surfaced as a
 notice, and `POST /chat` for that peer accepts it instead of making a
-counter-offer (the same doubling irssi's `/dcc chat <nick>` has); `POST
-/chat/close` declines it. Accepting is what makes the server dial an address the
-peer chose, so it stays a deliberate act — as it is in WeeChat
+counter-offer (the same doubling irssi's `/dcc chat <nick>` has), while
+`POST /chat/close` declines it. Accepting is what makes the server dial an
+address the peer chose, so it stays a deliberate act — as it is in WeeChat
 (`xfer.file.auto_accept_chats`, off) and irssi (`dcc_autochat_masks`, empty).
 Offers expire after ten minutes.
 
