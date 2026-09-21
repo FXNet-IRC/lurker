@@ -254,6 +254,11 @@ const PASSIVE_DCC_TIMEOUT_MS = 120_000;
 // promptly instead of hanging until the OS SYN timeout (~1-2 minutes).
 const DCC_CHAT_CONNECT_TIMEOUT_MS = 15_000;
 
+// How long an unsolicited inbound chat offer stays acceptable. Generous, because
+// the cost of a stale one is only a dial that fails — but not unbounded, so a
+// drive-by offer doesn't sit accepted-able forever.
+const INBOUND_DCC_CHAT_OFFER_TTL_MS = 10 * 60_000;
+
 const NON_PERSISTED_TYPES = new Set([
   'state',
   'names',
@@ -684,13 +689,24 @@ export class IrcConnection {
   // is independent of the IRC connection (so it survives a reconnect, exactly as
   // irssi's does) but cannot outlive the process, while the buffer and its
   // history persist — hence the restore notice in hydrateDccChats().
-  private readonly dccChats = new Map<string, DccChat>();
+  private readonly dccChats = new Map<string, { nick: string; chat: DccChat }>();
   // Peers we've already told "that chat is gone" since their last live session,
   // so typing repeatedly into a dead `=nick` buffer doesn't repeat the notice.
   private readonly dccChatDeadWarned = new Set<string>();
   // Listeners for offers we've made that nobody has answered yet; closed on
   // dispose so their bound ports are released rather than leaked.
   private readonly dccChatListeners = new Set<DccListenHandle>();
+  // Inbound chat offers awaiting the user's acceptance, keyed by lowercased
+  // nick. ⚠ An offer is NOT auto-accepted: dialling would have this server open
+  // a TCP connection to an address a stranger chose, and hand them its IP, on
+  // nothing but a PRIVMSG. Both mature references refuse by default too —
+  // WeeChat's xfer.file.auto_accept_chats is "off" ("use carefully!",
+  // xfer-config.c:333-338) and irssi's dcc_autochat_masks is empty
+  // (dcc-chat.c:835) — and Lurker's own file path already requires approval.
+  private readonly pendingInboundChats = new Map<
+    string,
+    { nick: string; offer: DccChatOffer; timer: ReturnType<typeof setTimeout> }
+  >();
   // Passive chat offers awaiting the peer's reverse reply, keyed by our token.
   private readonly pendingPassiveChats = new Map<
     number,
@@ -6330,8 +6346,19 @@ export class IrcConnection {
    */
   offerDccChat(nick: string, opts: { passive?: boolean } = {}): void {
     if (!this.dccChatAllowed(nick, 'offer a DCC chat')) return;
-    if (this.dccChats.has(nick.toLowerCase())) {
+    const key = nick.toLowerCase();
+    if (this.dccChats.has(key)) {
       this.dccChatNotice(nick, `Already in a DCC chat with ${nick}.`);
+      return;
+    }
+    // `/dcc chat <nick>` doubles as "accept the offer they already made", which
+    // is how irssi spells it too — making a fresh offer at someone who is
+    // already waiting for us would just deadlock the two halves.
+    const inbound = this.pendingInboundChats.get(key);
+    if (inbound) {
+      clearTimeout(inbound.timer);
+      this.pendingInboundChats.delete(key);
+      this.acceptInboundDccChat(inbound.nick, inbound.offer);
       return;
     }
     if (opts.passive) {
@@ -6427,7 +6454,8 @@ export class IrcConnection {
    */
   private handleInboundDccChat(nick: string, offer: DccChatOffer): void {
     if (!this.dccChatAllowed(nick, 'accept a DCC chat')) return;
-    // Our own passive offer being answered?
+    // Our own passive offer being answered? That we DO proceed with — we
+    // initiated it, and the token proves this is the reply to ours.
     if (!offer.passive && offer.token !== null) {
       const pending = this.pendingPassiveChats.get(offer.token);
       if (pending && pending.nick.toLowerCase() === nick.toLowerCase()) {
@@ -6441,6 +6469,29 @@ export class IrcConnection {
       this.dccChatNotice(nick, `${nick} offered a DCC chat, but one is already open.`);
       return;
     }
+    // Anything else is an unsolicited offer: record it and ask. `/dcc chat
+    // <nick>` accepts, exactly as it does in irssi.
+    const key = nick.toLowerCase();
+    const prior = this.pendingInboundChats.get(key);
+    if (prior) clearTimeout(prior.timer);
+    const timer = setTimeout(() => {
+      if (this.pendingInboundChats.delete(key)) {
+        this.dccChatNotice(nick, `The DCC chat offer from ${nick} expired.`);
+      }
+    }, INBOUND_DCC_CHAT_OFFER_TTL_MS);
+    timer.unref?.();
+    this.pendingInboundChats.set(key, { nick, offer, timer });
+    this.dccChatNotice(
+      nick,
+      `${nick} wants to start a DCC chat — \`/dcc chat ${nick}\` to accept, or ignore this.` +
+        (offer.passive ? ' (They are firewalled, so this server would do the listening.)' : ''),
+    );
+  }
+
+  // Accept an offer already recorded by handleInboundDccChat. Active: dial them.
+  // Passive: they are firewalled, so we listen and reverse-reply with our port
+  // and their token.
+  private acceptInboundDccChat(nick: string, offer: DccChatOffer): void {
     if (offer.passive) {
       // The peer is firewalled and wants US to listen.
       if (!dccActiveListenAvailable() || offer.token === null) {
@@ -6545,7 +6596,7 @@ export class IrcConnection {
         }
       },
     });
-    this.dccChats.set(key, chat);
+    this.dccChats.set(key, { nick, chat });
     this.dccChatDeadWarned.delete(key);
     chat.start();
     this.dccChatNotice(nick, `DCC chat with ${nick} connected.`);
@@ -6563,8 +6614,8 @@ export class IrcConnection {
    */
   dccChatSend(nick: string, text: string, opts: { action?: boolean } = {}): boolean {
     const key = nick.toLowerCase();
-    const chat = this.dccChats.get(key);
-    if (!chat) {
+    const entry = this.dccChats.get(key);
+    if (!entry) {
       // ⚠ A chat dies with the process but its buffer and history persist, so
       // this is the ordinary state of every `=nick` buffer after a restart.
       // Saying nothing leaves the user typing into a buffer that silently eats
@@ -6580,18 +6631,28 @@ export class IrcConnection {
       return false;
     }
     const wire = opts.action ? `\u0001ACTION ${text}\u0001` : text;
-    if (!chat.send(wire)) return false;
+    if (!entry.chat.send(wire)) return false;
     this.publishDccChatLine(nick, text, true, !!opts.action);
     return true;
   }
 
   /** Close a live DCC chat (`/dcc close <nick>`). */
   closeDccChat(nick: string): boolean {
-    const chat = this.dccChats.get(nick.toLowerCase());
-    if (!chat) return false;
-    this.dccChats.delete(nick.toLowerCase());
-    chat.close();
-    this.dccChatNotice(nick, `DCC chat with ${nick} closed.`);
+    const key = nick.toLowerCase();
+    const entry = this.dccChats.get(key);
+    // Also cancels a still-unaccepted inbound offer, which is the other thing
+    // "close this chat" can reasonably mean.
+    const pending = this.pendingInboundChats.get(key);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pendingInboundChats.delete(key);
+      this.dccChatNotice(pending.nick, `Declined the DCC chat offer from ${pending.nick}.`);
+      if (!entry) return true;
+    }
+    if (!entry) return false;
+    this.dccChats.delete(key);
+    entry.chat.close();
+    this.dccChatNotice(entry.nick, `DCC chat with ${entry.nick} closed.`);
     return true;
   }
 
@@ -6600,11 +6661,13 @@ export class IrcConnection {
   // and publishEphemeral() both return silently once it is, which would swallow
   // the very notice that tells the user their chats went away.
   private teardownDccChats(reason: string): void {
-    for (const [key, chat] of this.dccChats) {
+    for (const [key, entry] of this.dccChats) {
       this.dccChats.delete(key);
-      chat.close();
-      this.dccChatNotice(key, `DCC chat ended — ${reason}.`);
+      entry.chat.close();
+      this.dccChatNotice(entry.nick, `DCC chat ended — ${reason}.`);
     }
+    for (const pending of this.pendingInboundChats.values()) clearTimeout(pending.timer);
+    this.pendingInboundChats.clear();
     for (const handle of this.dccChatListeners) handle.close();
     this.dccChatListeners.clear();
     for (const pending of this.pendingPassiveChats.values()) clearTimeout(pending.timer);

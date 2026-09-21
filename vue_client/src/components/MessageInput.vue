@@ -2486,6 +2486,7 @@ const COMMANDS_LINES = [
   '  /dcc [list]            — DCC downloads: list, or accept/reject/cancel <id>',
   '      e.g. /dcc   ·   /dcc accept 3   ·   /dcc reject 3   ·   /dcc cancel 3',
   '  /dcc chat <nick>       — open a direct peer-to-peer chat, in a =nick buffer',
+  '      also accepts an offer someone made you; /dcc close <nick> ends or declines',
   '      e.g. /dcc chat bob   ·   /dcc chat -passive bob   ·   /dcc close bob',
   '  /set <key> <value…>    — change a setting; /set (or /set ?) lists all keys',
   '  /get <key>             — read a setting back (output in the system buffer)',

@@ -158,6 +158,13 @@ function offerFrom(conn: IrcConnection, nick: string, body: string): void {
   conn.client.emit('ctcp request', { nick, type: 'DCC', message: `DCC ${body}` });
 }
 
+// An inbound offer is never auto-accepted, so the flows below take it and then
+// accept it the way the user would: `/dcc chat <nick>`.
+function offerAndAccept(conn: IrcConnection, nick: string, body: string): void {
+  offerFrom(conn, nick, body);
+  conn.offerDccChat(nick);
+}
+
 function waitFor(pred: () => boolean, timeoutMs = 3000): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
@@ -177,7 +184,7 @@ describe('inbound DCC CHAT offer', () => {
     const h = harness();
     const peer = await startPeer();
 
-    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
     const sock = await peer.socket;
     await waitFor(() => h.conn.hasDccChat('bob'));
 
@@ -201,7 +208,7 @@ describe('inbound DCC CHAT offer', () => {
     allowLoopback();
     const h = harness();
     const peer = await startPeer();
-    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
     const sock = await peer.socket;
     await waitFor(() => h.conn.hasDccChat('bob'));
     sock.write('bare lf line\n');
@@ -214,7 +221,7 @@ describe('inbound DCC CHAT offer', () => {
     enableDcc(); // note: no allowLoopback()
     const h = harness();
     const peer = await startPeer();
-    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
     expect(h.conn.hasDccChat('bob')).toBe(false);
     expect(h.notices().at(-1)).toMatch(/private or reserved/);
   });
@@ -238,7 +245,7 @@ describe('inbound DCC CHAT offer', () => {
     enableListening();
     const h = harness();
 
-    offerFrom(h.conn, 'bob', 'CHAT chat 16843009 0 42');
+    offerAndAccept(h.conn, 'bob', 'CHAT chat 16843009 0 42');
     await waitFor(() => h.lastOffer() !== null);
 
     const body = h.lastOffer()!;
@@ -261,7 +268,7 @@ describe('inbound DCC CHAT offer', () => {
   it('explains rather than hangs when a peer passive offer arrives with no listen range', () => {
     enableDcc();
     const h = harness();
-    offerFrom(h.conn, 'bob', 'CHAT chat 16843009 0 42');
+    offerAndAccept(h.conn, 'bob', 'CHAT chat 16843009 0 42');
     expect(h.conn.hasDccChat('bob')).toBe(false);
     expect(h.notices().at(-1)).toMatch(/no listening port range/);
   });
@@ -272,6 +279,94 @@ describe('inbound DCC CHAT offer', () => {
     offerFrom(h.conn, 'bob', 'CHAT chat 16843009 5000');
     expect(h.conn.hasDccChat('bob')).toBe(false);
     expect(h.notices()).toHaveLength(0);
+  });
+});
+
+// ⚠⚠ An unsolicited offer must not make this server dial an address a stranger
+// chose, nor hand them its IP, on nothing but a PRIVMSG. Both mature references
+// agree: WeeChat's xfer.file.auto_accept_chats defaults to "off" ("use
+// carefully!", xfer-config.c:333-338) and irssi's dcc_autochat_masks defaults to
+// empty (dcc-chat.c:835), so neither accepts without the user saying so. Lurker's
+// own file path already requires approval; chat must not be weaker.
+describe('an inbound offer is not auto-accepted', () => {
+  // `dialDccChat` publishes "Connecting to …" synchronously, before net.connect,
+  // so its ABSENCE is a deterministic assertion that no dial was attempted —
+  // no sleeping on "did a connection show up".
+  const dialled = (h: ReturnType<typeof harness>) =>
+    h.notices().some((t) => t.startsWith('Connecting to '));
+
+  it('records the offer and asks, without dialling', () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    offerFrom(h.conn, 'bob', 'CHAT chat 16843009 5000');
+    expect(h.conn.hasDccChat('bob')).toBe(false);
+    expect(dialled(h)).toBe(false);
+    expect(h.notices().at(-1)).toMatch(/wants to start a DCC chat/);
+    expect(h.notices().at(-1)).toContain('/dcc chat bob');
+  });
+
+  it('says who would be doing the listening when the offer is passive', () => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+    offerFrom(h.conn, 'bob', 'CHAT chat 16843009 0 42');
+    expect(h.ctcpRequest).not.toHaveBeenCalled(); // no reverse reply until accepted
+    expect(h.notices().at(-1)).toMatch(/firewalled, so this server would do the listening/);
+  });
+
+  // `/dcc chat <nick>` doubles as accept, as it does in irssi — offering back at
+  // someone already waiting on us would just deadlock the two halves.
+  it('accepts via /dcc chat <nick> rather than making a counter-offer', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    const peer = await startPeer();
+    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    expect(dialled(h)).toBe(false);
+
+    h.conn.offerDccChat('bob');
+    await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+    // It dialled them; it did not send an offer of its own.
+    expect(h.ctcpRequest).not.toHaveBeenCalled();
+    h.conn.closeDccChat('bob');
+  });
+
+  it('declines a pending offer via /dcc close <nick>', () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    offerFrom(h.conn, 'bob', 'CHAT chat 16843009 5000');
+    expect(h.conn.closeDccChat('bob')).toBe(true);
+    expect(h.notices().at(-1)).toMatch(/Declined the DCC chat offer/);
+    // Declined means gone: a later accept must not resurrect it.
+    h.conn.offerDccChat('bob');
+    expect(dialled(h)).toBe(false);
+  });
+
+  it('expires a pending offer instead of leaving it acceptable forever', () => {
+    vi.useFakeTimers();
+    try {
+      enableDcc();
+      allowLoopback();
+      const h = harness();
+      offerFrom(h.conn, 'bob', 'CHAT chat 16843009 5000');
+      vi.advanceTimersByTime(10 * 60_000 + 1000);
+      expect(h.notices().at(-1)).toMatch(/expired/);
+      h.conn.offerDccChat('bob');
+      expect(dialled(h)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the peer's casing in its notices", () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    offerFrom(h.conn, 'BoB', 'CHAT chat 16843009 5000');
+    expect(h.notices().at(-1)).toContain('BoB');
   });
 });
 
@@ -359,7 +454,7 @@ describe('DCC CHAT actions', () => {
     allowLoopback();
     const h = harness();
     const peer = await startPeer();
-    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
     const sock = await peer.socket;
     await waitFor(() => h.conn.hasDccChat('bob'));
 
@@ -374,7 +469,7 @@ describe('DCC CHAT actions', () => {
     allowLoopback();
     const h = harness();
     const peer = await startPeer();
-    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
     const sock = await peer.socket;
     await waitFor(() => h.conn.hasDccChat('bob'));
 
@@ -399,7 +494,7 @@ describe('a = target never reaches the IRC wire', () => {
     const h = harness();
     inject(h.conn);
     const peer = await startPeer();
-    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
     const sock = await peer.socket;
     await waitFor(() => h.conn.hasDccChat('bob'));
 
@@ -435,7 +530,7 @@ describe('a = target never reaches the IRC wire', () => {
     const h = harness();
     inject(h.conn);
     const peer = await startPeer();
-    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
     const sock = await peer.socket;
     await waitFor(() => h.conn.hasDccChat('bob'));
 

@@ -1323,6 +1323,14 @@ check before uploading.
 handshake takes as long as the peer takes to answer, so the outcome arrives as
 notices in the chat's own buffer rather than in the response.
 
+**An inbound offer is never auto-accepted.** It is recorded and surfaced as a
+notice, and `POST /chat` for that peer accepts it instead of making a
+counter-offer (the same doubling irssi's `/dcc chat <nick>` has); `POST
+/chat/close` declines it. Accepting is what makes the server dial an address the
+peer chose, so it stays a deliberate act — as it is in WeeChat
+(`xfer.file.auto_accept_chats`, off) and irssi (`dcc_autochat_masks`, empty).
+Offers expire after ten minutes.
+
 A DCC chat is surfaced as a buffer named `=nick` (the irssi convention), with
 `kind: "dcc"`. **A `=` target is a buffer name, not an IRC target**: the server
 routes anything sent to one over the direct socket instead of the wire, and such
