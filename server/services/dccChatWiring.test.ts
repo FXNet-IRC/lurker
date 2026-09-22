@@ -23,6 +23,8 @@ import { IrcConnection } from './ircConnection.js';
 import ircManager from './ircManager.js';
 import { activeDccListenerCount, resetDccListeners } from './dccListener.js';
 import { resetDccChatHosts } from './dccChatSessions.js';
+import { ensureOpen, isClosed } from '../db/buffers.js';
+import { closeBuffer } from './wsHub.js';
 
 beforeAll(() => {
   createUser('dcc-chat-alice'); // id 1
@@ -1354,5 +1356,66 @@ describe('review #973: ending an offer while its port is still binding', () => {
     await settle();
     expect(h.ctcpRequest).not.toHaveBeenCalled();
     expect(activeDccListenerCount()).toBe(0);
+  });
+});
+
+// irssi ends a DCC chat when its `=nick` window closes (fe-dcc-chat.c:198-210),
+// and so does WeeChat (xfer_chat_buffer_close_cb). Closing the buffer used to
+// only hide it: the chat ran on out of sight and came back when the peer spoke.
+describe('closing a =nick buffer ends the chat', () => {
+  it('ends a live session — after the row closes, so its notice reaches no client', async () => {
+    enableDcc();
+    allowLoopback();
+    const h = harness();
+    inject(h.conn);
+    const peer = await startPeer();
+    offerAndAccept(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} ${peer.port}`);
+    const sock = await peer.socket;
+    await waitFor(() => h.conn.hasDccChat('bob'));
+    ensureOpen(1, 1, '=bob', { kind: 'dcc' });
+
+    // Whether the row was already closed when the chat's closing notice went
+    // out. It must be: the live filter then drops the line, where an open row
+    // let it reach a client that had removed the row on Close, which minted it
+    // again from the line until buffer-closed arrived.
+    let closedAtNotice: boolean | null = null;
+    const publish = h.conn.publish;
+    h.conn.publish = (event: Parameters<typeof publish>[0]) => {
+      if (event.type === 'notice' && /closed/.test(String(event.text))) {
+        closedAtNotice = isClosed(1, 1, '=bob');
+      }
+      return publish(event);
+    };
+
+    const hungUp = new Promise<void>((r) => sock.once('close', () => r()));
+    closeBuffer(1, 1, '=bob');
+    await hungUp;
+    expect(h.conn.hasDccChat('bob')).toBe(false);
+    expect(closedAtNotice).toBe(true);
+  });
+
+  it('cancels our pending offer, releasing its port', async () => {
+    enableDcc();
+    enableListening();
+    const h = harness();
+    inject(h.conn);
+    h.conn.offerDccChat('bob');
+    await waitFor(() => h.lastOffer() !== null);
+    expect(activeDccListenerCount()).toBe(1);
+    ensureOpen(1, 1, '=bob', { kind: 'dcc' });
+    closeBuffer(1, 1, '=bob');
+    expect(activeDccListenerCount()).toBe(0);
+    expect(h.notices()).toContain('Cancelled the pending DCC chat offer to bob.');
+  });
+
+  it('declines their offer', () => {
+    enableDcc();
+    const h = harness();
+    inject(h.conn);
+    offerFrom(h.conn, 'bob', `CHAT chat ${encodeDccAddress('127.0.0.1')} 4000`);
+    expect(h.conn.pendingDccChatOffers()).toEqual(['bob']);
+    closeBuffer(1, 1, '=bob');
+    expect(h.conn.pendingDccChatOffers()).toEqual([]);
+    expect(h.ctcpLines()).toContain('Declined the DCC chat offer from bob.');
   });
 });

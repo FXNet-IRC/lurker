@@ -9,7 +9,7 @@ import type { LogLine } from './systemLog.js';
 import type { MessageEvent } from '../db/messages.js';
 import type { PageUnit } from '../../shared/eventFilter.js';
 import { asPageUnit } from '../../shared/eventFilter.js';
-import { isChannelTarget, isDccChatTarget } from '../../shared/channels.js';
+import { dccChatPeer, isChannelTarget, isDccChatTarget } from '../../shared/channels.js';
 import { WS_CLOSE_SESSION_REVOKED } from '../../shared/wsCloseCodes.js';
 import { WebSocketServer } from 'ws';
 import cookie from 'cookie';
@@ -1649,6 +1649,21 @@ export function closeBuffer(
   // though the row's state just flipped.
   const closedBufferId = opts.bufferId ?? resolveBuffer(userId, networkId, target)?.id ?? null;
   closeBufferRow(userId, networkId, target);
+  // A `=nick` DCC chat's buffer IS the chat, so closing it ends the session —
+  // or cancels our pending offer, or declines theirs, whichever is there. irssi
+  // does the same when a `=nick` window closes (fe-dcc-chat.c:198-210), and so
+  // does WeeChat (xfer_chat_buffer_close_cb). Before this, Close only hid the
+  // buffer: the chat ran on out of sight, and came back the next time the peer
+  // spoke.
+  //
+  // ⚠ AFTER the row closes. Ending writes "DCC chat with bob closed." into the
+  // buffer, and the live filter drops a non-reopening event for a closed buffer
+  // (reopensClosedBuffer), so no client sees it. Ended first, the line went out
+  // while the row was still open — and a client that had already removed the row
+  // on Close (iOS does, optimistically) minted it again from that line until
+  // buffer-closed arrived.
+  const dccPeer = dccChatPeer(target);
+  if (isDccChatTarget(target) && dccPeer) ircManager.dccChatClose(userId, networkId, dccPeer);
   // The client renders the pinned section by intersecting pins with open
   // buffers, so a pin on a now-closed buffer is invisible — and leaving the
   // row would diverge the client's pin set from ours (issue #112). Close
