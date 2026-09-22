@@ -9,7 +9,7 @@ import type { LogLine } from './systemLog.js';
 import type { MessageEvent } from '../db/messages.js';
 import type { PageUnit } from '../../shared/eventFilter.js';
 import { asPageUnit } from '../../shared/eventFilter.js';
-import { isChannelTarget, isDccChatTarget } from '../../shared/channels.js';
+import { dccChatPeer, isChannelTarget, isDccChatTarget } from '../../shared/channels.js';
 import { WS_CLOSE_SESSION_REVOKED } from '../../shared/wsCloseCodes.js';
 import { WebSocketServer } from 'ws';
 import cookie from 'cookie';
@@ -2974,6 +2974,40 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         const ctcpArgs = typeof msg.args === 'string' ? msg.args : '';
         const issuingTarget = typeof msg.issuingTarget === 'string' ? msg.issuingTarget : '';
         if (!Number.isFinite(networkId) || networkId <= 0 || !ctcpTarget || !ctcpType) break;
+        // A `=nick` DCC chat is a buffer, not a nick, and CTCP rides IRC — so
+        // ircManager refuses it. Say why here, where it can be said: its false
+        // alone would read as "this network isn't connected".
+        //
+        // ⚠ No command name on the line. `/ping bob` and `/ctcp bob PING` send
+        // the same frame, so this can't tell which was typed; the suggestion
+        // follows the frame instead, and is right for either.
+        //
+        // ⚠ It carries the arguments over, and offers `/ping` only for a PING
+        // that had none: `/ping` sends a fresh timestamp, so for
+        // `/ctcp =bob PING 12345` it would be a different request.
+        if (isDccChatTarget(ctcpTarget)) {
+          const peer = dccChatPeer(ctcpTarget);
+          const args = ctcpArgs.trim();
+          const suggestion =
+            ctcpType.toUpperCase() === 'PING' && !args
+              ? `/ping ${peer}`
+              : `/ctcp ${peer} ${ctcpType}${args ? ` ${args}` : ''}`;
+          // Only a peer that is a nick gets a suggestion. `==bob` peels to `=bob`,
+          // which this same check would refuse; a bare `=` peels to nothing.
+          const instead =
+            peer && !isDccChatTarget(peer) ? ` CTCP goes over IRC, so use ${suggestion}.` : '';
+          const evt = {
+            type: 'ctcp',
+            level: 'warn',
+            networkId,
+            target: issuingTarget,
+            text: `${ctcpTarget} is a DCC chat, not a nick.${instead}`,
+            time: new Date().toISOString(),
+            self: false,
+          } as unknown as MessageEvent;
+          fanOut(userId, { ...decorateMessage(userId, evt), kind: 'irc' });
+          break;
+        }
         const ok = ircManager.ctcpRequest(
           userId,
           networkId,

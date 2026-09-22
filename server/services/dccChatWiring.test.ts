@@ -571,6 +571,21 @@ describe('a = target never reaches the IRC wire', () => {
     expect(h.notices()).toEqual([]);
   });
 
+  // A bare `/ping` in `=bob` defaulted to the buffer name on both clients, and a
+  // CTCP request is its own path — none of the guards around it covered this one.
+  it('refuses a CTCP request rather than emitting PRIVMSG =bob', () => {
+    enableDcc();
+    const h = harness();
+    inject(h.conn);
+    expect(ircManager.ctcpRequest(1, 1, '=bob', '=bob', 'PING', '')).toBe(false);
+    expect(ircManager.ctcpRequest(1, 1, '=bob', '=', 'VERSION', '')).toBe(false);
+    expect(h.ctcpRequest).not.toHaveBeenCalled();
+    expect(h.ctcpLines()).toEqual([]);
+    // The person behind the chat is still reachable by nick.
+    expect(ircManager.ctcpRequest(1, 1, '=bob', 'bob', 'VERSION', '')).toBe(true);
+    expect(h.ctcpRequest).toHaveBeenCalledWith('bob', 'VERSION');
+  });
+
   it('refuses a typing notification rather than emitting TAGMSG =bob', () => {
     enableDcc();
     const h = harness();

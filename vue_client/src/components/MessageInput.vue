@@ -168,6 +168,7 @@ import { parseNetworkCommand } from '../lib/commands/network.js';
 import { splitSetArgs, coerceSettingValue, formatSettingValue } from '../lib/commands/settings.js';
 import { parseRelayCommand } from '../lib/commands/relay.js';
 import { parseDccCommand } from '../lib/commands/dcc.js';
+import { bufferPeer } from '../lib/commands/ping.js';
 import { parseThemeCommand } from '../lib/commands/theme.js';
 import { useThemesStore } from '../stores/themes.js';
 import { foldThemeName, themeNameError } from '../../../shared/themePresets.js';
@@ -3415,11 +3416,10 @@ function handleCommand(line: string, networkId: number | null, target: string): 
     }
     case 'ping': {
       // /ping [nick] — CTCP PING for round-trip latency (#263). Defaults to the
-      // current DM peer when no nick is given — i.e. the active buffer is not a
-      // channel (any prefix #&!+, matching the server's isChannelContext) and not
-      // a pseudo-buffer (`:server:`/system), so /ping in an `&local` channel
-      // doesn't ping the whole channel.
-      const who = rest[0] || (target && !/^[#&!+:]/.test(target) ? target : '');
+      // current DM's peer when no nick is given — never a channel, so /ping in an
+      // `&local` channel doesn't ping the whole channel, and never a `=nick` DCC
+      // chat's buffer name, which isn't a nick (see bufferPeer).
+      const who = rest[0] || bufferPeer(target);
       if (!who) {
         localInfo(networkId, target, 'usage: /ping <nick> (a nick is only optional inside a DM)');
         return true;

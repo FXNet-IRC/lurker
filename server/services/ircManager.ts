@@ -1063,6 +1063,12 @@ class IrcManager extends EventEmitter {
   // could see go out wait forever for a reply that could never arrive. wsHub has
   // a "this network isn't connected" warning on the false branch that had no way
   // to fire.
+  //
+  // ⚠⚠ Never to a `=nick` DCC chat. A CTCP rides the IRC wire, so `/ping` typed
+  // bare in `=bob` (both clients default it to the buffer's target) went out as
+  // `PRIVMSG =bob :\x01PING …\x01`. The send/action/notice/typing guards above
+  // never covered it because this path is its own. wsHub explains the refusal to
+  // the user; this is the chokepoint for any other caller.
   ctcpRequest(
     userId: number,
     networkId: number,
@@ -1071,6 +1077,7 @@ class IrcManager extends EventEmitter {
     type: string,
     args: string,
   ): boolean {
+    if (isDccChatTarget(target)) return false;
     const conn = this.writableConnection(userId, networkId);
     if (!conn) return false;
     conn.sendCtcpRequest(issuingTarget, target, type, args);
