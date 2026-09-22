@@ -78,13 +78,13 @@ async function ctcpReply(frame: Frame): Promise<Frame> {
   }
 }
 
-const ctcp = (target: string, ctcpType: string) => ({
+const ctcp = (target: string, ctcpType: string, args = '') => ({
   type: 'ctcp',
   networkId,
   target,
   issuingTarget: '=bob',
   ctcpType,
-  args: '',
+  args,
 });
 
 describe('a ctcp frame aimed at a DCC chat', () => {
@@ -104,6 +104,17 @@ describe('a ctcp frame aimed at a DCC chat', () => {
     const reply = await ctcpReply(ctcp('=bob', 'VERSION'));
     expect(reply.text).toBe(
       '=bob is a DCC chat, not a nick. CTCP goes over IRC, so use /ctcp bob VERSION.',
+    );
+  });
+
+  // ⚠ The suggestion is the same request aimed at the nick. `/ping` sends a
+  // fresh timestamp, so it isn't that for a PING carrying its own argument.
+  it('carries arguments over, and offers /ping only for a bare PING', async () => {
+    expect((await ctcpReply(ctcp('=bob', 'PING', '12345'))).text).toBe(
+      '=bob is a DCC chat, not a nick. CTCP goes over IRC, so use /ctcp bob PING 12345.',
+    );
+    expect((await ctcpReply(ctcp('=bob', 'VERSION', 'extra words'))).text).toBe(
+      '=bob is a DCC chat, not a nick. CTCP goes over IRC, so use /ctcp bob VERSION extra words.',
     );
   });
 

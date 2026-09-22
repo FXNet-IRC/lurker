@@ -2980,11 +2980,18 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         //
         // ⚠ No command name on the line. `/ping bob` and `/ctcp bob PING` send
         // the same frame, so this can't tell which was typed; the suggestion
-        // follows the CTCP type instead, and is right for either.
+        // follows the frame instead, and is right for either.
+        //
+        // ⚠ It carries the arguments over, and offers `/ping` only for a PING
+        // that had none: `/ping` sends a fresh timestamp, so for
+        // `/ctcp =bob PING 12345` it would be a different request.
         if (isDccChatTarget(ctcpTarget)) {
           const peer = dccChatPeer(ctcpTarget);
+          const args = ctcpArgs.trim();
           const suggestion =
-            ctcpType.toUpperCase() === 'PING' ? `/ping ${peer}` : `/ctcp ${peer} ${ctcpType}`;
+            ctcpType.toUpperCase() === 'PING' && !args
+              ? `/ping ${peer}`
+              : `/ctcp ${peer} ${ctcpType}${args ? ` ${args}` : ''}`;
           const instead = peer ? ` CTCP goes over IRC, so use ${suggestion}.` : '';
           const evt = {
             type: 'ctcp',
