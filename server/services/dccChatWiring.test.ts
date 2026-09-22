@@ -1379,12 +1379,15 @@ describe('closing a =nick buffer ends the chat', () => {
     // let it reach a client that had removed the row on Close, which minted it
     // again from the line until buffer-closed arrived.
     let closedAtNotice: boolean | null = null;
+    // Called with the connection as `this`, so the wrapper stays a faithful
+    // stand-in whatever `publish` is underneath — the harness's arrow function
+    // today, the real method (which reads instance state) if that ever changes.
     const publish = h.conn.publish;
     h.conn.publish = (event: Parameters<typeof publish>[0]) => {
       if (event.type === 'notice' && /closed/.test(String(event.text))) {
         closedAtNotice = isClosed(1, 1, '=bob');
       }
-      return publish(event);
+      return publish.call(h.conn, event);
     };
 
     const hungUp = new Promise<void>((r) => sock.once('close', () => r()));
