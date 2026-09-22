@@ -605,7 +605,7 @@ is emitted immediately from the server's optimistic local copy.
 | `join`         | `networkId, channel, key?`    | Request only — the buffer appears on `channel-joined` (§9.1). Without `key`, the channel's stored key is sent if the server has one                                                                 |
 | `part`         | `networkId, channel, reason?` | Buffer survives, parted                                                                                                                                                                             |
 | `open-buffer`  | `networkId, target, countBy?` | **Write.** Reopen/create: replies `backlog` + `buffer-opened`, announces a shell + `buffer-opened` to the user's other devices; JOINs if an unjoined channel; mints an empty DM row for a bare nick |
-| `close-buffer` | `networkId, target, reason?`  | Closes (PARTs a joined channel, untracks a DM peer). `:server:` refuses                                                                                                                             |
+| `close-buffer` | `networkId, target, reason?`  | Closes (PARTs a joined channel, untracks a DM peer, ends a `=nick` DCC chat). `:server:` refuses                                                                                                    |
 
 Every verb in this section is rejected while an account is paused — they are all
 writes. **Hydration is not in this section for that reason:** it's
@@ -1321,7 +1321,9 @@ check before uploading.
 `POST /chat` (`{networkId, nick, passive?}`) opens a DCC CHAT; `POST /chat/close`
 (`{networkId, nick}`) ends one. Both return as soon as the offer is away — a DCC
 handshake takes as long as the peer takes to answer, so the outcome arrives as
-notices in the chat's own buffer rather than in the response.
+notices in the chat's own buffer rather than in the response. Closing the `=nick`
+buffer (`close-buffer`) also does what `POST /chat/close` does, as irssi and
+WeeChat do when a DCC chat's window closes.
 
 **An inbound offer is never auto-accepted.** It is recorded and surfaced as a
 notice, and `POST /chat` for that peer accepts it instead of making a
