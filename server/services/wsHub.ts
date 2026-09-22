@@ -9,7 +9,7 @@ import type { LogLine } from './systemLog.js';
 import type { MessageEvent } from '../db/messages.js';
 import type { PageUnit } from '../../shared/eventFilter.js';
 import { asPageUnit } from '../../shared/eventFilter.js';
-import { isChannelTarget, isDccChatTarget } from '../../shared/channels.js';
+import { dccChatPeer, isChannelTarget, isDccChatTarget } from '../../shared/channels.js';
 import { WS_CLOSE_SESSION_REVOKED } from '../../shared/wsCloseCodes.js';
 import { WebSocketServer } from 'ws';
 import cookie from 'cookie';
@@ -2974,6 +2974,28 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         const ctcpArgs = typeof msg.args === 'string' ? msg.args : '';
         const issuingTarget = typeof msg.issuingTarget === 'string' ? msg.issuingTarget : '';
         if (!Number.isFinite(networkId) || networkId <= 0 || !ctcpTarget || !ctcpType) break;
+        // Name the command the user actually typed (/ping rides this same path).
+        const cmdName = ctcpType.toUpperCase() === 'PING' ? '/ping' : '/ctcp';
+        // A `=nick` DCC chat is a buffer, not a nick, and CTCP rides IRC — so
+        // ircManager refuses it. Say why here, where it can be said: its false
+        // alone would read as "this network isn't connected".
+        if (isDccChatTarget(ctcpTarget)) {
+          const peer = dccChatPeer(ctcpTarget);
+          const instead = peer
+            ? ` CTCP goes over IRC, so use ${cmdName === '/ping' ? `/ping ${peer}` : `/ctcp ${peer} ${ctcpType}`}.`
+            : '';
+          const evt = {
+            type: 'ctcp',
+            level: 'warn',
+            networkId,
+            target: issuingTarget,
+            text: `${cmdName}: ${ctcpTarget} is a DCC chat, not a nick.${instead}`,
+            time: new Date().toISOString(),
+            self: false,
+          } as unknown as MessageEvent;
+          fanOut(userId, { ...decorateMessage(userId, evt), kind: 'irc' });
+          break;
+        }
         const ok = ircManager.ctcpRequest(
           userId,
           networkId,
@@ -2983,8 +3005,6 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
           ctcpArgs,
         );
         if (!ok) {
-          // Name the command the user actually typed (/ping rides this same path).
-          const cmdName = ctcpType.toUpperCase() === 'PING' ? '/ping' : '/ctcp';
           const evt = {
             type: 'ctcp',
             level: 'warn',

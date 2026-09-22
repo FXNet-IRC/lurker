@@ -1338,7 +1338,10 @@ buffers are deliberately absent from the bouncer's playback, CHATHISTORY TARGETS
 and read markers, and from the MCP `list_buffers` surface. A client should treat
 `kind: "dcc"` as its own thing rather than folding it into `dm` — a DCC peer has
 no presence, so probing one is both meaningless and a way to put a non-nick on
-the wire.
+the wire. For the same reason a `ctcp` frame naming a `=` target is refused (a
+CTCP rides IRC), with a `ctcp` warning in the issuing buffer that names the nick
+to use instead. A client defaulting a bare `/ping` to the current buffer should
+default to the chat's peer.
 
 Sessions are process-bound: a chat survives a reconnect (the socket is
 independent of IRC) but not a server restart, while the buffer and its history
