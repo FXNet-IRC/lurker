@@ -88,25 +88,28 @@ const ctcp = (target: string, ctcpType: string) => ({
 });
 
 describe('a ctcp frame aimed at a DCC chat', () => {
-  it('says the buffer is a DCC chat and names the nick to use, for /ping', async () => {
+  // ⚠ The line names no command: `/ping =bob` and `/ctcp =bob PING` send this
+  // same frame, so a `/ping:` prefix would misname the second. The suggestion
+  // follows the CTCP type, which is right for either.
+  it('says the buffer is a DCC chat and names the nick to use, for a PING', async () => {
     const reply = await ctcpReply(ctcp('=bob', 'PING'));
     expect(reply.text).toBe(
-      '/ping: =bob is a DCC chat, not a nick. CTCP goes over IRC, so use /ping bob.',
+      '=bob is a DCC chat, not a nick. CTCP goes over IRC, so use /ping bob.',
     );
     expect(reply.target).toBe('=bob');
     expect(reply.level).toBe('warn');
   });
 
-  it('and for /ctcp, keeping the type', async () => {
+  it('and for any other type, keeping it', async () => {
     const reply = await ctcpReply(ctcp('=bob', 'VERSION'));
     expect(reply.text).toBe(
-      '/ctcp: =bob is a DCC chat, not a nick. CTCP goes over IRC, so use /ctcp bob VERSION.',
+      '=bob is a DCC chat, not a nick. CTCP goes over IRC, so use /ctcp bob VERSION.',
     );
   });
 
   it('suggests nothing for a bare =, which has no peer', async () => {
     const reply = await ctcpReply(ctcp('=', 'PING'));
-    expect(reply.text).toBe('/ping: = is a DCC chat, not a nick.');
+    expect(reply.text).toBe('= is a DCC chat, not a nick.');
   });
 
   // The check sits ahead of the old one without taking its place.

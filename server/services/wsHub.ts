@@ -2974,22 +2974,24 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         const ctcpArgs = typeof msg.args === 'string' ? msg.args : '';
         const issuingTarget = typeof msg.issuingTarget === 'string' ? msg.issuingTarget : '';
         if (!Number.isFinite(networkId) || networkId <= 0 || !ctcpTarget || !ctcpType) break;
-        // Name the command the user actually typed (/ping rides this same path).
-        const cmdName = ctcpType.toUpperCase() === 'PING' ? '/ping' : '/ctcp';
         // A `=nick` DCC chat is a buffer, not a nick, and CTCP rides IRC — so
         // ircManager refuses it. Say why here, where it can be said: its false
         // alone would read as "this network isn't connected".
+        //
+        // ⚠ No command name on the line. `/ping bob` and `/ctcp bob PING` send
+        // the same frame, so this can't tell which was typed; the suggestion
+        // follows the CTCP type instead, and is right for either.
         if (isDccChatTarget(ctcpTarget)) {
           const peer = dccChatPeer(ctcpTarget);
-          const instead = peer
-            ? ` CTCP goes over IRC, so use ${cmdName === '/ping' ? `/ping ${peer}` : `/ctcp ${peer} ${ctcpType}`}.`
-            : '';
+          const suggestion =
+            ctcpType.toUpperCase() === 'PING' ? `/ping ${peer}` : `/ctcp ${peer} ${ctcpType}`;
+          const instead = peer ? ` CTCP goes over IRC, so use ${suggestion}.` : '';
           const evt = {
             type: 'ctcp',
             level: 'warn',
             networkId,
             target: issuingTarget,
-            text: `${cmdName}: ${ctcpTarget} is a DCC chat, not a nick.${instead}`,
+            text: `${ctcpTarget} is a DCC chat, not a nick.${instead}`,
             time: new Date().toISOString(),
             self: false,
           } as unknown as MessageEvent;
@@ -3005,6 +3007,8 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
           ctcpArgs,
         );
         if (!ok) {
+          // Name the command the user actually typed (/ping rides this same path).
+          const cmdName = ctcpType.toUpperCase() === 'PING' ? '/ping' : '/ctcp';
           const evt = {
             type: 'ctcp',
             level: 'warn',
