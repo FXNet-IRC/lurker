@@ -2992,7 +2992,10 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
             ctcpType.toUpperCase() === 'PING' && !args
               ? `/ping ${peer}`
               : `/ctcp ${peer} ${ctcpType}${args ? ` ${args}` : ''}`;
-          const instead = peer ? ` CTCP goes over IRC, so use ${suggestion}.` : '';
+          // Only a peer that is a nick gets a suggestion. `==bob` peels to `=bob`,
+          // which this same check would refuse; a bare `=` peels to nothing.
+          const instead =
+            peer && !isDccChatTarget(peer) ? ` CTCP goes over IRC, so use ${suggestion}.` : '';
           const evt = {
             type: 'ctcp',
             level: 'warn',

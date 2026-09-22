@@ -123,6 +123,13 @@ describe('a ctcp frame aimed at a DCC chat', () => {
     expect(reply.text).toBe('= is a DCC chat, not a nick.');
   });
 
+  // `==bob` peels to `=bob`, and suggesting `/ping =bob` would name a target
+  // this same check refuses.
+  it('suggests nothing when the peer is not a nick either', async () => {
+    const reply = await ctcpReply(ctcp('==bob', 'PING'));
+    expect(reply.text).toBe('==bob is a DCC chat, not a nick.');
+  });
+
   // The check sits ahead of the old one without taking its place.
   it('still reports a nick on a network with no connection as not connected', async () => {
     const reply = await ctcpReply(ctcp('bob', 'PING'));
