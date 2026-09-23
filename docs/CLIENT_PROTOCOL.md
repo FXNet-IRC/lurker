@@ -59,8 +59,11 @@ behind them, and the endpoints aren't mounted, so a toggle would do nothing.
 `linkPreviews` gates `chat.inline_media.enabled`, `chat.link_previews.enabled`,
 and the `/api/link-preview/*` endpoints.
 
-Node edition disables `/api/api-tokens`, `/mcp`, and `/uploads/*` static serving;
-standalone has no `/api/node/*`. The WS protocol itself is identical in both.
+Node edition disables `/api/api-tokens` and `/uploads/*` static serving;
+standalone has no `/api/node/*`. OAuth (§3.2) and `/mcp` work in both, but in
+node edition the control plane answers OAuth registration and discovery at
+`app.lurker.chat`, and a cell's codes and tokens begin with its name and a `~`.
+The WS protocol itself is identical in both.
 Health check: `GET /api/health` → `{"status":"ok","time":"<ISO 8601>"}` (no
 auth, no version).
 
@@ -90,13 +93,15 @@ no feature flags on the socket.
 
 ## 3. Authentication
 
-Two credentials open every door (REST and WS); both resolve to the same
-`sessions` row:
+Three credentials open every door (REST and WS) with the same access. The cookie
+and the minted token resolve to the same `sessions` row; an OAuth access token
+belongs to an app the member approved:
 
-| Credential                      | Who uses it          | How                                                                                    |
-| ------------------------------- | -------------------- | -------------------------------------------------------------------------------------- |
-| Signed cookie `lurker_session`  | Browsers             | Set by the login endpoints; `httpOnly`, `SameSite=Lax`, 30-day                         |
-| `Authorization: Bearer <token>` | Native / TUI clients | Token from the mint endpoints below; sent on every REST call **and on the WS upgrade** |
+| Credential                             | Who uses it          | How                                                                                    |
+| -------------------------------------- | -------------------- | -------------------------------------------------------------------------------------- |
+| Signed cookie `lurker_session`         | Browsers             | Set by the login endpoints; `httpOnly`, `SameSite=Lax`, 30-day                         |
+| `Authorization: Bearer <token>`        | Native / TUI clients | Token from the mint endpoints below; sent on every REST call **and on the WS upgrade** |
+| `Authorization: Bearer <access token>` | Third-party clients  | Access token from the OAuth flow (§3.2); sent exactly like the minted token            |
 
 Browsers can't set headers on a WS upgrade, hence the cookie path. Native clients
 should use Bearer exclusively.
@@ -107,7 +112,7 @@ should use Bearer exclusively.
 POST /api/auth/login/token          (no auth; failure-throttled)
 { "username": "...", "password": "..." }
 → 200 { "token": "...", "expiresAt": "<ISO8601>", "user": { "id", "username", "role" } }
-→ 401 invalid credentials · 429 throttled (see §3.4)
+→ 401 invalid credentials · 429 throttled (see §3.5)
 ```
 
 The token is an opaque 32-byte base64url session token (`routes/auth.ts:558`,
@@ -125,7 +130,19 @@ The token is an opaque 32-byte base64url session token (`routes/auth.ts:558`,
   until it sets a password (`PUT /api/auth/password`). Surface that case: the
   mint endpoint just returns 401.
 
-### 3.2 Hosted (`app.lurker.chat`): mint at the control plane
+### 3.2 OAuth for third-party clients
+
+Self-hosted and hosted servers are both OAuth 2 authorization servers: the app
+registers itself, the member approves it in the browser, and the app exchanges a
+one-time code (PKCE `S256`) for an access token. The token has the same access as
+the minted token above and is sent the same way, but it never expires. The app
+never handles the password, so this is the recommended path for third-party
+clients, and it works for passkey-only accounts — see
+[OAuth for third-party clients](OAUTH.md). On hosted, use `https://app.lurker.chat`
+as the server. The token reaches everything proxied to the member's cell and, like
+the §3.3 token, none of the control plane's account or billing routes.
+
+### 3.3 Hosted (`app.lurker.chat`): mint at the control plane
 
 ```
 POST https://app.lurker.chat/_cp/auth/app/login     (no auth)
@@ -141,7 +158,7 @@ reset invalidates every session, via the session epoch); there is no per-device
 revoke on hosted. After minting, use the token exactly as in §3.1 — same header,
 same endpoints — the control plane proxies you to the right cell transparently.
 
-### 3.3 Browser flows (for completeness)
+### 3.4 Browser flows (for completeness)
 
 WebAuthn/passkey and password login endpoints (`/api/auth/setup*`, `/invite/*`,
 `/login/options|verify|password`, `/passkeys*`) set the `lurker_session` cookie
@@ -150,12 +167,13 @@ them. `GET /api/auth/auth-methods` → `{passkey:boolean}` tells a login form wh
 to offer. `GET /api/auth/me` → `{user:{id,username,role,is_paused}}` validates a
 session.
 
-### 3.4 Cross-cutting auth behavior
+### 3.5 Cross-cutting auth behavior
 
 - **401 semantics:** any `401` from `/api/*` or a refused WS upgrade means _dead
   session_ — clear the stored token and return to login. The server deliberately
   never uses 401 for downstream failures (upload provider errors are 502/400),
-  so you can trust it.
+  so you can trust it. Exception: `401 invalid_client` from `/api/oauth/token`
+  or `/api/oauth/revoke` (§3.2) rejects the app's `client_id`, not the session.
 - **Rate limiting:** credential endpoints allow 10 failures / 15 min / IP →
   `429` + `Retry-After`; the whole `/api/auth` router is capped at 60 req/min/IP.
   Honor `Retry-After`.
@@ -384,6 +402,18 @@ sigils (`~ & @ % +`). Map to sigils yourself for display. That letter list is a
 display ordering, not a classification set — don't reuse it to decide what a
 mode letter _means_ on a given network (§7.4).
 
+`nickNotes` rows are `{nick, note, updatedAt}` — the account's own free-form
+notes about people, per network (the same nick on two networks is two rows,
+because it may be two people). Live changes arrive as `nick-note-updated` with
+that shape plus `networkId`, from any of the user's devices.
+
+⚠ **A blank `note` is a delete**, in both directions, and blank means
+**whitespace-only**, not just `''`: the server trims before deciding, so a
+`set-nick-note` carrying `"   "` removes the row and echoes back `note: ''`. A
+clear and a write are one verb and one frame shape. ⚠ The note is also **stored
+trimmed**, so the value echoed back is not always the string that was sent —
+render what the frame carries rather than what you submitted.
+
 ### 5.2 Buffers
 
 A buffer is one conversation: `kind ∈ channel | dm | server | system`. **The
@@ -572,10 +602,10 @@ is emitted immediately from the server's optimistic local copy.
 
 | `type`         | Fields                        | Notes                                                                                                                                                                                               |
 | -------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `join`         | `networkId, channel, key?`    | Request only — the buffer appears on `channel-joined` (§9.1)                                                                                                                                        |
+| `join`         | `networkId, channel, key?`    | Request only — the buffer appears on `channel-joined` (§9.1). Without `key`, the channel's stored key is sent if the server has one                                                                 |
 | `part`         | `networkId, channel, reason?` | Buffer survives, parted                                                                                                                                                                             |
 | `open-buffer`  | `networkId, target, countBy?` | **Write.** Reopen/create: replies `backlog` + `buffer-opened`, announces a shell + `buffer-opened` to the user's other devices; JOINs if an unjoined channel; mints an empty DM row for a bare nick |
-| `close-buffer` | `networkId, target, reason?`  | Closes (PARTs a joined channel, untracks a DM peer). `:server:` refuses                                                                                                                             |
+| `close-buffer` | `networkId, target, reason?`  | Closes (PARTs a joined channel, untracks a DM peer, ends a `=nick` DCC chat). `:server:` refuses                                                                                                    |
 
 Every verb in this section is rejected while an account is paused — they are all
 writes. **Hydration is not in this section for that reason:** it's
@@ -686,7 +716,7 @@ Also the `type` of rows inside `backlog`/`history` `events[]`. **P** = persisted
 | `channel-topic`               | E   | RPL_TOPIC on join — set state, render nothing                                 |
 | `channel-modes`               | E   | full channel mode string                                                      |
 | `channel-joined`              | E   | **you** are in the channel — the materialization signal (§9.1)                |
-| `channel-parted`              | E   | you left/were removed — mark parted, keep history                             |
+| `channel-parted`              | E   | you left, were removed, or lost the connection — mark parted, keep history    |
 | `join-error`                  | E   | join failed — `text`, `reason`; do **not** create a buffer                    |
 | `names`                       | E   | `members[…]` — full nicklist replace                                          |
 | `member-update`               | E   | `member{…}` — single-nick patch (away/account/host changes)                   |
@@ -699,6 +729,7 @@ Also the `type` of rows inside `backlog`/`history` `events[]`. **P** = persisted
 | `peer-presence`               | E   | `nick, state ∈ online\|offline\|away\|back, stateAt, awayMessage, cameOnline` |
 | `typing`                      | E   | `nick, state ∈ active\|paused\|done`                                          |
 | `lag`                         | E   | `lagMs`                                                                       |
+| `whois_result`                | E   | `whois{…}` — a WHOIS reply, **no `target`**. See §7.5                         |
 | `ctcp`                        | E   | CTCP request/reply status text                                                |
 | `chghost`                     | P   | `newIdent, newHost` — render only; the nicklist patch rides `member-update`   |
 | `e2e`                         | E   | RPE2E status, `level` + `text`                                                |
@@ -713,6 +744,9 @@ Route them to that network's `:server:` buffer. `motd` is deliberately the
 catch-all for all "server voice" text that has no better home — don't build a
 taxonomy on top of it. `system` events (with `networkId:null`) belong to
 `:system:`.
+
+⚠ `whois_result` also arrives with no `target` and is **not** one of these — it
+is not server text and does not belong in a buffer. See §7.5.
 
 ### 7.4 `mode` events: the `modes[]` entry shape
 
@@ -752,6 +786,66 @@ Clients use this to decide what counts as presence churn. Lurker's own rule, in
 `shared/modes.ts`: a mode row is churn only if **every** entry in it is `prefix`
 with a `param` — one ban or channel flag anywhere in the message and the whole
 row is shown, since a row renders as a single line and can't be half-hidden.
+
+### 7.5 `whois_result`: a WHOIS reply
+
+```
+{ kind: 'irc', type: 'whois_result', networkId, whois: { nick, ... } }
+```
+
+Ephemeral, and one of the few `irc` events with **no `target`** that is not
+server text (`own-nick` is the other): it is about a person on a network, not
+about a conversation, so it belongs to whatever screen asked rather than to a
+buffer. A client that recognises events only below a target guard will drop it
+silently — which iOS did, for its whole life, until lurker-ios#12.
+
+Ask with the ordinary `raw` verb — `WHOIS <nick>`. There is no dedicated verb.
+The network's raw numerics _also_ render into `:server:` through the default-show
+`raw` path (§7.3); both happen, and this event is not a substitute for that.
+
+**The `whois` object is passed through from irc-framework verbatim**, which
+aggregates RPL_WHOIS\* (311/312/317/319/330/…) and emits once at
+RPL_ENDOFWHOIS. The server does not reshape it, so the field names are
+irc-framework's:
+
+| field                                          | meaning                                                |
+| ---------------------------------------------- | ------------------------------------------------------ |
+| `nick`                                         | always present, on a miss too                          |
+| `ident`, `hostname`                            | the two halves of the hostmask                         |
+| `real_name`                                    | GECOS                                                  |
+| `actual_hostname`, `actual_ip`                 | RPL_WHOISACTUALLY — opers and self only                |
+| `server`, `server_info`                        | which server they're on                                |
+| `account`                                      | services account (RPL_WHOISACCOUNT)                    |
+| `channels`                                     | see below                                              |
+| `modes`                                        | user modes, when disclosed                             |
+| `operator`, `helpop`, `bot`, `registered_nick` | the numeric's trailing **text**, not a boolean         |
+| `secure`                                       | boolean `true` — the one genuinely boolean flag        |
+| `certfp`                                       | certificate fingerprint                                |
+| `away`                                         | away reason, only if they were away when the whois ran |
+| `idle`, `logon`                                | see below                                              |
+| `error`                                        | `'not_found'` — see below                              |
+
+⚠⚠ **`channels` is one space-separated string**, not an array:
+`"@#foo +#bar #baz"`, accumulated across repeated numerics. Peel the membership
+sigils to get a joinable name — but **not greedily**: `&` and `+` are membership
+glyphs _and_ channel sigils (RFC 2811 §2.1), so a greedy `[~&@%+]*` turns `@&chan`
+into `chan`, a channel that does not exist. Peel only as far as the remainder is
+still a channel name.
+
+⚠⚠ **`idle` and `logon` are numeric-valued strings**, not numbers — they are
+assigned straight off the IRC parameters, which are text. `logon` is Unix
+seconds. Accept either form; don't assume a JSON number.
+
+⚠⚠ **`error: 'not_found'` does not come from ERR_NOSUCHNICK**, even though a
+miss is usually accompanied by one. That numeric is mapped to a different event
+entirely (`irc error`, with `error: 'no_such_nick'`) and never touches the whois
+reply. The miss is _synthesized_ at **RPL_ENDOFWHOIS**, when the numerics that
+came before it filled nothing in — so it arrives with a nick and little else.
+
+The distinction is invisible in the common case, because a conforming server
+sends the 401 and then the 318. It matters for anything that waits: a server
+that sends the 401 and **no** 318 produces no signal at all, and a lookup
+waiting on one waits forever. Neither first-party client has a timeout today.
 
 ---
 
@@ -943,7 +1037,12 @@ these signals:
 - **`buffer-reopened` needs no handler** — the message that caused the reopen
   arrives as a normal `irc` event and materializes the buffer via the DM rule.
 - **`channel-parted` → resolve, never materialize**: mark parted, clear members,
-  keep the buffer and history. If you have no such buffer, ignore it.
+  keep the buffer and history. If you have no such buffer, ignore it. It also
+  arrives for every joined channel when the connection to the IRC server drops;
+  each rejoin that lands sends its own `channel-joined`, and one that the server
+  refuses leaves the buffer parted.
+- **`names` and `channel-topic` only ever name a channel you are in.** A `/names`
+  or `/topic` for any other comes back as `motd` text in the server buffer.
 - **`membersPending` (on a snapshot channel, or on a `names` event) → keep the
   members you already hold.** The server has not heard the channel's NAMES
   since it last connected or attached — after an engine re-attach that is every
@@ -1016,7 +1115,9 @@ loses the tab-close race). The unread divider is client policy: snapshot
 `lastReadId` when the buffer becomes active and pin it until switch-away.
 App badge = Σ `highlights` across buffers; recompute on every `read-state`
 (a push notification can only _revise_ the OS badge, your client must correct
-it when the user actually reads).
+it when the user actually reads). An IRC client attached through the bouncer
+moves the same pointer with `MARKREAD`, so `read-state` can arrive for a buffer
+no app has touched.
 
 ### 9.5 Presence is per-socket and explicit
 
@@ -1024,8 +1125,10 @@ Every new socket starts `visible:false`. Assert `{type:'presence',
 visible:true}` when your UI is actually in front of the user, `false` when it
 leaves — **and re-assert after every reconnect**. Presence is what gates push
 (no push while any client is visible) and auto-away (no visible client for
-`away.auto.delay_seconds` → server sets away). An open socket is deliberately
-_not_ presence: a backgrounded phone keeps its socket and must still get push.
+`away.auto.delay_seconds` → server sets away). An IRC client attached through the
+bouncer also holds auto-away off, unless it sent `AWAY *`, but never push. An
+open socket is deliberately _not_ presence: a backgrounded phone keeps its socket
+and must still get push.
 On mobile, flush `presence:false` before suspension if the platform allows; the
 server's heartbeat reaper (~60 s) is the fallback.
 
@@ -1105,17 +1208,37 @@ add `key`/`code`/`status`). Exact multipart field names matter.
 
 ### Networks — `/api/networks`
 
-| Method & path                                      | Body / notes                                                                                                                                                                                                                                                 |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GET /`                                            | → `{networks:[…]}`. Passwords never returned — `has_password` / `has_sasl_password` booleans instead                                                                                                                                                         |
-| `POST /`                                           | `{name*, host*, port, tls, nick*, username, realname, server_password, autoconnect, sasl_account, sasl_password, default_channel, connect_commands, trusted_certificates}` → `201 {network}`, connects immediately. `403` if host blocked by admin allowlist |
-| `PATCH /:id` · `DELETE /:id`                       | Partial update / delete                                                                                                                                                                                                                                      |
-| `POST /reorder`                                    | `{ids:[…]}` (409 on set mismatch, returns authoritative order)                                                                                                                                                                                               |
-| `POST /:id/connect` · `/disconnect` · `/reconnect` | `disconnect` takes `{reason?}`                                                                                                                                                                                                                               |
-| `POST /:id/join` · `/part`                         | `{channel*, key?}` / `{channel*, reason?}`; `409` if not connected                                                                                                                                                                                           |
+| Method & path                                      | Body / notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /`                                            | → `{networks:[…]}`. Passwords never returned — `has_password` / `has_sasl_password` booleans instead                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `POST /`                                           | `{name*, host*, port, tls, nick*, username, realname, server_password, autoconnect, sasl_account, sasl_password, default_channel, connect_commands, trusted_certificates, generate_client_cert, proxy_enabled, proxy_type, proxy_host, proxy_port, proxy_username, proxy_password}` → `201 {network}`, connects immediately. `403` if host blocked by admin allowlist. `generate_client_cert` mints a CertFP pair BEFORE the first dial (`400` if `tls` is false) — attaching one afterwards misses the connect the user registers it from |
+| `PATCH /:id` · `DELETE /:id`                       | Partial update / delete                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `POST /reorder`                                    | `{ids:[…]}` (409 on set mismatch, returns authoritative order)                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `POST /:id/connect` · `/disconnect` · `/reconnect` | `disconnect` takes `{reason?}`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `POST /:id/join` · `/part`                         | `{channel*, key?}` / `{channel*, reason?}`; `409` if not connected                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `POST /:id/certificate`                            | CertFP. `{mode:'generate'}` mints a self-signed pair; `{mode:'import', cert*, key*}` takes PEM you already use elsewhere. → `{network, certificate}`; `400` names what was wrong with the pair                                                                                                                                                                                                                                                                                                                                             |
+| `DELETE /:id/certificate`                          | Detach the pair → `{network}`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `GET /:id/certificate/export`                      | The pair as one PEM file (key then cert — the `client.pem` shape HexChat/WeeChat want), `Cache-Control: no-store`. `404` when no cert is attached. **The only route that returns the private key**                                                                                                                                                                                                                                                                                                                                         |
+
+CertFP: a network may carry a TLS client certificate, presented on the handshake
+so services identify the user by its fingerprint — passively (NickServ CertFP) or
+as SASL EXTERNAL. The network payload's `client_cert` is a **description, never a
+PEM**: `{sha256, sha1, sha512, subject, validFrom, validTo}`, or `null` when none
+is attached. All three digests are bare lowercase hex, the form
+`/msg NickServ CERT ADD <fingerprint>` takes — which one a network wants is the
+network's own business (Libera requires SHA-512 and rejects the others by
+length), so carry all three rather than picking one. `CERT ADD` with no argument
+takes it from the live connection instead, which sidesteps the question. `client_key` never appears in any
+payload. A change takes effect on the next connect — a certificate is presented
+during the TLS handshake, so there is nothing to renegotiate on a live socket.
 
 `GET /api/network-presets` → `{presets, allowUserDefined}` for the add-network
 form.
+
+`GET /api/about` → `{engine}` for an About screen: `null` when this instance
+dials IRC itself, otherwise `{connected, version}` for the IRC engine holding its
+sockets. `version` is the Lurker release that last changed the engine, so it can
+trail the server's own; it is `null` until the engine has answered once.
 
 ### Settings & personalization
 
@@ -1195,6 +1318,63 @@ check before uploading.
 `GET /?limit` list · `POST /:id/accept|reject|cancel`. Live updates via
 `dcc-transfer` frames; file bytes move over IRC, not HTTP.
 
+`POST /chat` (`{networkId, nick, passive?}`) opens a DCC CHAT; `POST /chat/close`
+(`{networkId, nick}`) ends one. Both return as soon as the offer is away — a DCC
+handshake takes as long as the peer takes to answer, so the outcome arrives as
+notices in the chat's own buffer rather than in the response. Closing the `=nick`
+buffer (`close-buffer`) also does what `POST /chat/close` does, as irssi and
+WeeChat do when a DCC chat's window closes.
+
+**An inbound offer is never auto-accepted.** It is recorded and surfaced as a
+notice, and `POST /chat` for that peer accepts it instead of making a
+counter-offer (the same doubling irssi's `/dcc chat <nick>` has), while
+`POST /chat/close` declines it. Accepting is what makes the server dial an
+address the peer chose, so it stays a deliberate act — as it is in WeeChat
+(`xfer.file.auto_accept_chats`, off) and irssi (`dcc_autochat_masks`, empty).
+Offers expire after ten minutes.
+
+A DCC chat is surfaced as a buffer named `=nick` (the irssi convention), with
+`kind: "dcc"`. **A `=` target is a buffer name, not an IRC target**: the server
+routes anything sent to one over the direct socket instead of the wire, and such
+buffers are deliberately absent from the bouncer's playback, CHATHISTORY TARGETS
+and read markers, and from the MCP `list_buffers` surface. A client should treat
+`kind: "dcc"` as its own thing rather than folding it into `dm` — a DCC peer has
+no presence, so probing one is both meaningless and a way to put a non-nick on
+the wire. For the same reason a `ctcp` frame naming a `=` target is refused (a
+CTCP rides IRC), with a `ctcp` warning in the issuing buffer that names the nick
+to use instead. A client defaulting a bare `/ping` to the current buffer should
+default to the chat's peer.
+
+Sessions are process-bound: a chat survives a reconnect (the socket is
+independent of IRC) but not a server restart, while the buffer and its history
+persist. Sending into a chat the server no longer holds fails and says so in the
+buffer.
+
+Three ephemeral events, each targeting the network's `:server:` buffer and naming
+the peer in `from` (not `target`), carry DCC chat state to a client:
+
+| Event                   | Fields            | Meaning                                                        |
+| ----------------------- | ----------------- | -------------------------------------------------------------- |
+| `dcc-chat-offer`        | `from`, `passive` | A peer offered a chat; nothing is dialled until accepted.      |
+| `dcc-chat-offer-closed` | `from`            | That offer is gone — accepted, declined, expired or torn down. |
+| `dcc-chat-state`        | `from`, `live`    | A session with `from` opened (`true`) or ended (`false`).      |
+
+An offer surface should be retired on `dcc-chat-offer-closed` rather than on a
+timer, so it never outlives the offer it names. That event can be missed — the
+client's socket drops, or the server restarts, while an offer is pending — so the
+offers still awaiting an answer also ride every snapshot, as `dccChatOffers` (peer
+display nicks) on each network's state. Reconcile against it on every snapshot and
+retire anything no longer listed; otherwise a stale offer's Accept action sends the
+peer a _new_ offer instead.
+
+The current set of live sessions also rides every snapshot, as `dccChats` (peer
+display nicks) on each network's state — **including a disconnected network's**,
+because a chat outlives its IRC link. A client should seed from the snapshot and
+apply `dcc-chat-state` on top; the events alone leave a freshly loaded client
+unable to tell a live chat from a dead one. Whether a chat is live is independent
+of the network's `state`, which is the reverse of a DM: a DM's peer reads as
+offline the moment our link drops, a DCC chat does not.
+
 ### Export / import
 
 `GET /api/exports/preview` · `POST /api/exports` (`{include_messages}`, allowed
@@ -1207,9 +1387,10 @@ account_not_empty`). A mobile/TUI client can skip all of this.
 
 - `/api/admin/*` — admin panel (users, invites, presence, instance uploaders/
   networks). Admin-gated; build against it only if you're making an admin tool.
-- `/api/api-tokens` + `/mcp` (standalone only) — a _separate_ Bearer namespace
-  for MCP/automation. **Those tokens cannot open the WS**; don't confuse them
-  with session tokens.
+- `/api/api-tokens` (standalone only) and `/mcp` — API tokens are a _separate_
+  Bearer namespace for MCP/automation. **They cannot open the WS**; don't
+  confuse them with session tokens or with OAuth access tokens (§3.2), which
+  `/mcp` also accepts.
 - `/api/node/*` (node edition) — control-plane internal, fleet-secret gated.
 
 ---

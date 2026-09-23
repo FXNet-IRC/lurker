@@ -7,7 +7,7 @@
   <div v-if="active" class="status-bar">
     <div class="bar" :class="{ compact }">
       <div class="bar-main">
-        <span v-if="!compact" class="seg clock">{{ clock }}</span>
+        <span v-if="!compact && clock" class="seg clock">{{ clock }}</span>
         <span class="seg buffer"
           ><template v-if="targetLabel"
             ><span v-if="networkLabel" class="net">{{ networkLabel }}/</span
@@ -183,7 +183,7 @@ import {
   type NickStripItem,
 } from '../composables/useComposerOverlay.js';
 import type { EmojiMatch } from '../utils/emojiData.js';
-import { isChannelTarget } from '../../../shared/channels.js';
+import { dccChatPeer, isChannelTarget, isDccChatTarget } from '../../../shared/channels.js';
 
 withDefaults(
   defineProps<{
@@ -311,7 +311,23 @@ const peerForActive = computed(() => {
   if (!a) return null;
   return networks.peerFor(a.networkId, a.target);
 });
+// A `=nick` DCC chat has no IRC presence (peerFor deliberately answers null
+// for it), but it has the thing presence is really standing in for: whether
+// anything you type will arrive. When no session is live, say so in the same
+// slot and style a DM uses for an offline peer — otherwise the buffer looks
+// exactly as usable as a connected one, and the first sign is a line that
+// doesn't send. The session is independent of the IRC link, so this reads the
+// DCC state, never the network's.
+const dccChatDown = computed(() => {
+  const a = active.value;
+  if (!a || !isDccChatTarget(a.target)) return false;
+  return !networks.isDccChatLive(a.networkId, a.target);
+});
 const peerStatusLabel = computed(() => {
+  if (dccChatDown.value) {
+    const peer = dccChatPeer(active.value!.target);
+    return `DCC chat with ${peer} is not connected — /dcc chat ${peer} to start a new one`;
+  }
   const peer = peerForActive.value;
   if (!peer) return '';
   const a = active.value;
@@ -323,6 +339,7 @@ const peerStatusLabel = computed(() => {
   return '';
 });
 const peerStatusClass = computed(() => {
+  if (dccChatDown.value) return 'offline';
   const peer = peerForActive.value;
   if (!peer) return '';
   return isPeerOffline(peer) ? 'offline' : 'away';
@@ -387,9 +404,7 @@ const lagClass = computed(() => {
 
 // Clock lives in the status bar now. Same 1s tick + same format setting as
 // the input bar used to have, so existing look.bar.time_format keeps working.
-const tsFormat = computed(
-  () => (settings.effective('look.bar.time_format') as string) || 'HH:mm:ss',
-);
+const tsFormat = computed(() => settings.effective('look.bar.time_format') as string);
 const now = ref(new Date());
 let clockTimer: ReturnType<typeof setInterval> | null = null;
 let clockAlignTimeout: ReturnType<typeof setTimeout> | null = null;

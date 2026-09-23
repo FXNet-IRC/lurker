@@ -3,9 +3,10 @@
 
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { getEdition } from '../utils/edition.js';
+import { getEdition, isNodeMode } from '../utils/edition.js';
 import { isNetworkLockEnabled } from '../utils/forcedNetwork.js';
 import { isPublicModeEnabled } from '../utils/publicMode.js';
+import { isBouncerEnabled } from '../utils/bouncerConfig.js';
 import { PROTOCOL_VERSION, MIN_PROTOCOL_VERSION } from '../protocol.js';
 import { previewsEnabled } from '../utils/previews.js';
 
@@ -37,6 +38,10 @@ router.get('/', (_req: Request, res: Response) => {
     // presenting toggles that can't do anything.
     features: {
       linkPreviews: previewsEnabled(),
+      // Whether this instance runs the IRC bouncer, so the client can hide the
+      // Settings pane that explains how to attach to it. The port it listens on
+      // is behind auth (routes/bouncer.ts).
+      bouncer: !isNodeMode() && isBouncerEnabled(),
     },
   });
 });

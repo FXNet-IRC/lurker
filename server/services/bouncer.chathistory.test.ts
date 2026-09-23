@@ -100,10 +100,65 @@ describe('CHATHISTORY advertisement', () => {
   });
 });
 
+describe('attach playback', () => {
+  // A joined channel and a DM, both with history.
+  async function attachWithHistory(nick: string, caps: string): Promise<Client> {
+    const acct = harnessMod.seedAccount({ nick });
+    acct.upstream.addChannel('#room', { members: [nick, 'bob'] });
+    seedMessages(acct.network.id, '#room', 2);
+    seedMessages(acct.network.id, 'bob', 1);
+    const c = await harness.connect();
+    await attachBound(c, acct, caps);
+    // Playback goes out in the same pass as the 422, so the PONG comes after it.
+    c.send('PING sync');
+    await c.waitForCommand('PONG');
+    return c;
+  }
+
+  it('sends none to a client that negotiated draft/chathistory', async () => {
+    // soju skips it too (downstream.go:1841): the client fetches its own
+    // history, so a replay shows every line twice.
+    const c = await attachWithHistory('ap1', HISTORY_CAPS);
+    expect(c.lines.some((l) => l.includes('JOIN #room'))).toBe(true);
+    expect(c.lines.filter((l) => l.includes(' PRIVMSG '))).toEqual([]);
+    c.close();
+  });
+
+  it('still replays channels and DMs to a client without it', async () => {
+    const c = await attachWithHistory('ap2', 'sasl batch server-time message-tags');
+    expect(c.lines.some((l) => l.includes('PRIVMSG #room :msg2'))).toBe(true);
+    expect(c.lines.some((l) => l.includes('PRIVMSG ap2 :msg1'))).toBe(true);
+    c.close();
+  });
+
+  it("carries the network's msgid to a client with message-tags", async () => {
+    const acct = harnessMod.seedAccount({ nick: 'ap3' });
+    acct.upstream.addChannel('#room', { members: ['ap3', 'bob'] });
+    insertMessage({
+      networkId: acct.network.id,
+      target: '#room',
+      time: '2023-05-23T06:00:01.000Z',
+      type: 'message',
+      nick: 'bob',
+      userhost: 'bob!u@h',
+      text: 'played back',
+      self: false,
+      msgid: 'upstream-pb-1',
+    });
+    const c = await harness.connect();
+    await attachBound(c, acct, 'sasl batch server-time message-tags');
+    c.send('PING sync');
+    await c.waitForCommand('PONG');
+    const line = c.lines.find((l) => l.includes('PRIVMSG #room :played back'));
+    expect(line).toContain(';msgid=upstream-pb-1 :bob!u@h');
+    c.close();
+  });
+});
+
 describe('CHATHISTORY LATEST', () => {
-  it('returns the newest messages oldest-first, in a chathistory batch with msgid+time', async () => {
+  it('returns the newest messages oldest-first, in a chathistory batch with time', async () => {
     const acct = harnessMod.seedAccount({ nick: 'ch2' });
-    const ids = seedMessages(acct.network.id, '#room', 3);
+    seedMessages(acct.network.id, '#room', 3);
     const c = await harness.connect();
     await attachBound(c, acct);
     c.send('CHATHISTORY LATEST #room * 100');
@@ -111,38 +166,95 @@ describe('CHATHISTORY LATEST', () => {
     const ref = open.split('BATCH +')[1].split(' ')[0];
     expect(open).toContain('chathistory #room');
     const m1 = await c.waitFor((l) => l.includes('PRIVMSG #room :msg1'));
-    expect(m1).toContain(`msgid=${ids[0]}`);
     expect(m1).toContain('time=2023-05-23T06:00:01.000Z');
     expect(m1).toContain(`batch=${ref}`);
-    await c.waitFor((l) => l.includes('msg3') && l.includes(`msgid=${ids[2]}`));
+    await c.waitFor((l) => l.includes('msg3'));
     await c.waitFor((l) => l.includes(`BATCH -${ref}`));
   });
+});
 
-  it('still emits the INTERNAL row id as msgid for a row that stored an upstream msgid', async () => {
-    // The stored IRCv3 msgid (#450) and the bouncer's playback msgid are
-    // different namespaces (MSGREFTYPES=timestamp, see SUPPORTED_CAPS notes) —
-    // storing the upstream tag must not leak it into chathistory playback.
-    const acct = harnessMod.seedAccount({ nick: 'ch2b' });
-    const rowId = Number(
-      insertMessage({
-        networkId: acct.network.id,
-        target: '#tagged',
-        time: '2023-05-23T06:00:01.000Z',
-        type: 'message',
-        nick: 'bob',
-        userhost: 'bob!u@h',
-        text: 'tagged msg',
-        self: false,
-        msgid: 'upstream-uuid-1',
-      }).id,
-    );
+describe('CHATHISTORY msgids', () => {
+  const BACKSLASH = String.fromCharCode(92);
+  const NEWLINE = String.fromCharCode(10);
+
+  // One stored message in #tagged, then the batch CHATHISTORY returns for it.
+  async function historyOf(
+    nick: string,
+    row: Partial<Parameters<typeof insertMessage>[0]>,
+    caps = HISTORY_CAPS,
+  ): Promise<string[]> {
+    const acct = harnessMod.seedAccount({ nick });
+    insertMessage({
+      networkId: acct.network.id,
+      target: '#tagged',
+      time: '2023-05-23T06:00:01.000Z',
+      type: 'message',
+      nick: 'bob',
+      userhost: 'bob!u@h',
+      text: 'tagged msg',
+      self: false,
+      ...row,
+    });
     const c = await harness.connect();
-    await attachBound(c, acct);
+    await attachBound(c, acct, caps);
     c.send('CHATHISTORY LATEST #tagged * 100');
-    const line = await c.waitFor((l) => l.includes('PRIVMSG #tagged :tagged msg'));
-    expect(line).toContain(`msgid=${rowId}`);
-    expect(line).not.toContain('upstream-uuid-1');
+    const open = await c.waitFor((l) => l.includes('BATCH +') && l.includes('chathistory'));
+    const ref = open.split('BATCH +')[1].split(' ')[0];
+    await c.waitFor((l) => l.includes(`BATCH -${ref}`));
     c.close();
+    return batchBodies(c.lines, ref);
+  }
+
+  it("carries the network's msgid, not Lurker's row id", async () => {
+    // The spec wants the msgid "as originally sent by the IRC server", the one a
+    // client saw on the line live. A row id was a second id for the same message.
+    const lines = await historyOf('mid1', { msgid: 'upstream-uuid-1' });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(';msgid=upstream-uuid-1 :bob!u@h PRIVMSG #tagged :tagged msg');
+  });
+
+  it('carries no msgid for a message the network gave none', async () => {
+    const lines = await historyOf('mid2', {});
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain('msgid=');
+  });
+
+  it('escapes the msgid as a tag value', async () => {
+    const lines = await historyOf('mid3', { msgid: `a;b c${BACKSLASH}d` });
+    const escaped = `a${BACKSLASH}:b${BACKSLASH}sc${BACKSLASH}${BACKSLASH}d`;
+    expect(lines[0]).toContain(`;msgid=${escaped} :bob!u@h PRIVMSG`);
+  });
+
+  it('puts the msgid on the first line of a multiline message, and sends no blank lines', async () => {
+    // As the live multiline fallback does: halloy drops a later line that
+    // repeats an id as a duplicate.
+    const text = ['one', 'two', '', 'three'].join(NEWLINE);
+    const lines = await historyOf('mid4', { msgid: 'ml-1', text });
+    expect(lines.map((l) => l.slice(l.indexOf(' :bob!u@h ')))).toEqual([
+      ' :bob!u@h PRIVMSG #tagged :one',
+      ' :bob!u@h PRIVMSG #tagged :two',
+      ' :bob!u@h PRIVMSG #tagged :three',
+    ]);
+    expect(lines[0]).toContain('msgid=ml-1');
+    expect(lines.slice(1).some((l) => l.includes('msgid='))).toBe(false);
+  });
+
+  it('carries no msgid for a decrypted E2E message', async () => {
+    // Its msgid names the ciphertext line, which the client got live under that
+    // id. halloy would take this readable copy as a duplicate of that one.
+    const lines = await historyOf('mid5', { msgid: 'cipher-1', extra: { e2e: true } });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain('msgid=');
+  });
+
+  it('carries no msgid to a client without message-tags', async () => {
+    const lines = await historyOf(
+      'mid6',
+      { msgid: 'upstream-uuid-6' },
+      'sasl batch server-time draft/chathistory',
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain('msgid=');
   });
 });
 
@@ -305,5 +417,273 @@ describe('CHATHISTORY errors', () => {
     const close = await c.waitFor((l) => l.includes(`BATCH -${ref}`));
     expect(close).toBeTruthy();
     expect(batchBodies(c.lines, ref)).toHaveLength(0);
+  });
+});
+
+describe('draft/event-playback', () => {
+  const EVENT_CAPS = `${HISTORY_CAPS} draft/event-playback`;
+  const at = (s: number) => `2023-05-23T06:00:${String(s).padStart(2, '0')}.000Z`;
+
+  // Rows in `target`, one second apart from :01, then the lines one CHATHISTORY
+  // command returns for them.
+  async function history(
+    nick: string,
+    target: string,
+    rows: Array<Partial<Parameters<typeof insertMessage>[0]>>,
+    command: string,
+    caps = EVENT_CAPS,
+  ): Promise<{ lines: string[]; ref: string }> {
+    const acct = harnessMod.seedAccount({ nick });
+    rows.forEach((row, i) =>
+      insertMessage({
+        networkId: acct.network.id,
+        target,
+        time: at(i + 1),
+        type: 'message',
+        nick: 'bob',
+        self: false,
+        ...row,
+      } as Parameters<typeof insertMessage>[0]),
+    );
+    const c = await harness.connect();
+    await attachBound(c, acct, caps);
+    c.send(command);
+    const open = await c.waitFor((l) => l.includes('BATCH +'));
+    const ref = open.split('BATCH +')[1].split(' ')[0];
+    await c.waitFor((l) => l.includes(`BATCH -${ref}`));
+    c.close();
+    return { lines: batchBodies(c.lines, ref), ref };
+  }
+
+  const EVENTS: Array<Partial<Parameters<typeof insertMessage>[0]>> = [
+    { type: 'message', nick: 'bob', userhost: 'bob!u@h', text: 'hi' },
+    { type: 'join', nick: 'alice', userhost: 'alice!a@h', extra: { account: 'alice' } },
+    { type: 'part', nick: 'alice', userhost: 'alice!a@h', text: 'bye now' },
+    { type: 'quit', nick: 'carol', userhost: 'carol!c@h', text: 'Quit: gone' },
+    { type: 'nick', nick: 'dave', userhost: 'dave!d@h', extra: { newNick: 'david' } },
+    { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'spam', extra: { kicked: 'eve' } },
+    { type: 'mode', nick: 'op', text: '+o bob', extra: { modes: [] } },
+    { type: 'topic', nick: 'op', text: 'new topic' },
+  ];
+
+  it('is offered', async () => {
+    const c = await harness.connect();
+    c.send('CAP LS 302');
+    const ls = await c.waitFor((l) => l.includes(' LS '));
+    expect(ls).toContain('draft/event-playback');
+    c.close();
+  });
+
+  it('replays joins, parts, quits, nick changes, kicks, and mode and topic changes', async () => {
+    // With extended-join, which a plain JOIN must still go out as.
+    const { lines, ref } = await history(
+      'ep1',
+      '#ev',
+      EVENTS,
+      'CHATHISTORY LATEST #ev * 100',
+      `${EVENT_CAPS} extended-join`,
+    );
+    const tag = (s: number) => `@batch=${ref};time=${at(s)} `;
+    expect(lines).toEqual([
+      `${tag(1)}:bob!u@h PRIVMSG #ev :hi`,
+      // Plain: the realname an extended JOIN carries isn't stored.
+      `${tag(2)}:alice!a@h JOIN #ev`,
+      `${tag(3)}:alice!a@h PART #ev :bye now`,
+      `${tag(4)}:carol!c@h QUIT :Quit: gone`,
+      `${tag(5)}:dave!d@h NICK david`,
+      `${tag(6)}:op!o@h KICK #ev eve :spam`,
+      // Mode and topic rows store no mask, so the setter goes out bare.
+      `${tag(7)}:op MODE #ev +o bob`,
+      `${tag(8)}:op TOPIC #ev :new topic`,
+    ]);
+  });
+
+  it('leaves off an empty reason, but keeps a cleared topic', async () => {
+    const { lines } = await history(
+      'ep10',
+      '#ev',
+      [
+        { type: 'part', nick: 'alice', userhost: 'alice!a@h', text: null },
+        { type: 'quit', nick: 'carol', userhost: 'carol!c@h', text: '' },
+        { type: 'kick', nick: 'op', userhost: 'op!o@h', text: null, extra: { kicked: 'eve' } },
+        { type: 'topic', nick: 'op', text: '' },
+      ],
+      'CHATHISTORY LATEST #ev * 100',
+    );
+    expect(lines.map((l) => l.slice(l.indexOf(' :') + 1))).toEqual([
+      ':alice!a@h PART #ev',
+      ':carol!c@h QUIT',
+      ':op!o@h KICK #ev eve',
+      ':op TOPIC #ev :',
+    ]);
+  });
+
+  it('replays only messages to a client that did not ask', async () => {
+    const { lines } = await history(
+      'ep2',
+      '#ev',
+      EVENTS,
+      'CHATHISTORY LATEST #ev * 100',
+      HISTORY_CAPS,
+    );
+    expect(lines.map((l) => l.slice(l.indexOf(' :') + 1))).toEqual([':bob!u@h PRIVMSG #ev :hi']);
+  });
+
+  it('leaves out host changes and invites, which soju replays neither of', async () => {
+    const { lines } = await history(
+      'ep3',
+      '#ev',
+      [
+        { type: 'join', nick: 'alice', userhost: 'alice!a@h' },
+        { type: 'chghost', nick: 'alice', userhost: 'alice!a@h', extra: { newHost: 'h2' } },
+        { type: 'invite', nick: 'op', extra: { invited: 'frank' } },
+      ],
+      // The newest rows are the ones left out, so they mustn't use up the limit.
+      'CHATHISTORY LATEST #ev * 1',
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(':alice!a@h JOIN #ev');
+  });
+
+  it('counts events toward the limit', async () => {
+    const { lines } = await history('ep4', '#ev', EVENTS, 'CHATHISTORY LATEST #ev * 3');
+    expect(lines.map((l) => l.split(' ')[2])).toEqual(['KICK', 'MODE', 'TOPIC']);
+  });
+
+  // goguma applies every replayed line to its live state: an old PART from its
+  // own nick marks the channel as left, an old NICK from it renames us.
+  it('leaves out events naming our current nick, before the limit is applied', async () => {
+    const { lines } = await history(
+      'ep5',
+      '#ev',
+      [
+        { type: 'join', nick: 'zed', userhost: 'zed!z@h' },
+        { type: 'kick', nick: 'EP5', userhost: 'EP5!e@h', text: 'bye', extra: { kicked: 'zed' } },
+        { type: 'join', nick: 'Ep5', userhost: 'Ep5!e@h' },
+        { type: 'part', nick: 'ep5', userhost: 'ep5!e@h', text: 'later' },
+        { type: 'nick', nick: 'EP5', userhost: 'EP5!e@h', extra: { newNick: 'ep5_' } },
+        { type: 'quit', nick: 'ep5', userhost: 'ep5!e@h', text: 'bye' },
+        { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'out', extra: { kicked: 'eP5' } },
+      ],
+      'CHATHISTORY LATEST #ev * 2',
+    );
+    // Our kick of someone else still goes, and nothing else fills the limit.
+    expect(lines.map((l) => l.slice(l.indexOf(' :') + 1))).toEqual([
+      ':zed!z@h JOIN #ev',
+      ':EP5!e@h KICK #ev zed :bye',
+    ]);
+  });
+
+  // goguma compares nicks under the network's CASEMAPPING, so the filter does.
+  it("compares our nick under the network's casemapping", async () => {
+    const { default: db } = await import('../db/index.js');
+    const { invalidateCasemappingCache } = await import('../db/buffers.js');
+    type Row = Partial<Parameters<typeof insertMessage>[0]>;
+    const replayed = async (nick: string, casemapping: string, rows: Row[]) => {
+      const acct = harnessMod.seedAccount({ nick });
+      db.prepare('UPDATE networks SET casemapping = ? WHERE id = ?').run(
+        casemapping,
+        acct.network.id,
+      );
+      invalidateCasemappingCache(acct.network.id);
+      rows.forEach((row, i) =>
+        insertMessage({
+          networkId: acct.network.id,
+          target: '#ev',
+          time: at(i + 1),
+          self: false,
+          ...row,
+        } as Parameters<typeof insertMessage>[0]),
+      );
+      const c = await harness.connect();
+      await attachBound(c, acct, EVENT_CAPS);
+      c.send('CHATHISTORY LATEST #ev * 100');
+      const open = await c.waitFor((l) => l.includes('BATCH +'));
+      const ref = open.split('BATCH +')[1].split(' ')[0];
+      await c.waitFor((l) => l.includes(`BATCH -${ref}`));
+      c.close();
+      return batchBodies(c.lines, ref).map((l) => l.split(' ')[2] + ' ' + l.split(' ')[1]);
+    };
+    const brackets: Row[] = [
+      { type: 'join', nick: 'Ep{11}^', userhost: 'Ep{11}^!e@h' },
+      { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'out', extra: { kicked: 'EP[11]~' } },
+      { type: 'join', nick: 'zed', userhost: 'zed!z@h' },
+    ];
+    // rfc1459: [ ] \ ^ are the capitals of { } | ~.
+    expect(await replayed('ep[11]~', 'rfc1459', brackets)).toEqual(['JOIN :zed!z@h']);
+    // ascii: they're different characters, so both lines are someone else's.
+    expect(await replayed('ep[11]^', 'ascii', brackets)).toEqual([
+      'JOIN :Ep{11}^!e@h',
+      'KICK :op!o@h',
+      'JOIN :zed!z@h',
+    ]);
+    const unicode: Row[] = [
+      { type: 'join', nick: 'ÄLICE', userhost: 'ÄLICE!a@h' },
+      { type: 'kick', nick: 'op', userhost: 'op!o@h', text: 'out', extra: { kicked: 'ÄLiCe' } },
+      { type: 'join', nick: 'zed', userhost: 'zed!z@h' },
+    ];
+    // rfc7613 folds Unicode: Ä is the capital of ä.
+    expect(await replayed('älice', 'rfc7613', unicode)).toEqual(['JOIN :zed!z@h']);
+    // ascii folds only A-Z.
+    expect(await replayed('älice', 'ascii', unicode)).toEqual([
+      'JOIN :ÄLICE!a@h',
+      'KICK :op!o@h',
+      'JOIN :zed!z@h',
+    ]);
+  });
+
+  it('names the server as the source of a mode it set, whatever its name', async () => {
+    const { lines } = await history(
+      'ep6',
+      '#ev',
+      [
+        { type: 'mode', nick: 'irc.example.net', text: '+nt', extra: { modes: [] } },
+        { type: 'mode', nick: 'localhost', text: '+s', extra: { modes: [] } },
+      ],
+      'CHATHISTORY LATEST #ev * 100',
+    );
+    expect(lines.map((l) => l.slice(l.indexOf(' :') + 1))).toEqual([
+      ':irc.example.net MODE #ev +nt',
+      ':localhost MODE #ev +s',
+    ]);
+  });
+
+  it('lists a buffer with only events among TARGETS, for a client that asked', async () => {
+    const window =
+      'CHATHISTORY TARGETS timestamp=2023-05-23T00:00:00.000Z timestamp=2023-05-24T00:00:00.000Z 100';
+    const rows = [{ type: 'join', nick: 'alice', userhost: 'alice!a@h' }];
+    const withEvents = await history('ep7', '#joinsonly', rows, window);
+    expect(withEvents.lines.some((l) => l.includes('TARGETS #joinsonly'))).toBe(true);
+    const without = await history('ep8', '#joinsonly', rows, window, HISTORY_CAPS);
+    expect(without.lines.some((l) => l.includes('TARGETS #joinsonly'))).toBe(false);
+  });
+
+  it("keeps a buffer's joins from using up its attach playback", async () => {
+    const acct = harnessMod.seedAccount({ nick: 'ep9' });
+    acct.upstream.addChannel('#busy', { members: ['ep9', 'bob'] });
+    seedMessages(acct.network.id, '#busy', 2);
+    for (let s = 3; s <= 6; s++) {
+      insertMessage({
+        networkId: acct.network.id,
+        target: '#busy',
+        time: at(s),
+        type: 'join',
+        nick: `joiner${s}`,
+        self: false,
+      });
+    }
+    process.env.LURKER_BOUNCER_PLAYBACK = '2';
+    try {
+      const c = await harness.connect();
+      await attachBound(c, acct, 'sasl batch server-time message-tags draft/event-playback');
+      c.send('PING sync');
+      await c.waitForCommand('PONG');
+      expect(c.lines.filter((l) => l.includes('PRIVMSG #busy'))).toHaveLength(2);
+      // Attach playback never replays events, even to a client that asked.
+      expect(c.lines.some((l) => l.includes('joiner'))).toBe(false);
+      c.close();
+    } finally {
+      delete process.env.LURKER_BOUNCER_PLAYBACK;
+    }
   });
 });

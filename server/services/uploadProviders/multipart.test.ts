@@ -129,6 +129,22 @@ describe('postMultipart', () => {
     expect(last.body.includes(bytes)).toBe(true);
   });
 
+  it('percent-encodes a CR or LF in a filename, so it cannot end the part header', async () => {
+    respondWith = { status: 200, text: 'ok' };
+    keepBody = true;
+    await postMultipart(base, [
+      {
+        name: 'file',
+        filename: 'shot\r\nX-Injected: 1.png',
+        contentType: 'image/png',
+        source: bufferSource(Buffer.from('x')),
+      },
+    ]);
+    const text = last.body.toString('binary');
+    expect(text).toContain('filename="shot%0D%0AX-Injected: 1.png"');
+    expect(text).not.toMatch(/^X-Injected/m);
+  });
+
   // #545: the byte count that drives the client's "Sending… NN%" for the slow half of
   // an upload. Asserted against a REAL socket (this suite's http server), because the
   // whole claim is that a yielded-and-resumed chunk is a chunk the socket took — that

@@ -13,6 +13,7 @@
 import '../test-utils/isolateDb.js';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { IrcConnection } from './ircConnection.js';
+import { setAttachedIrcClientCounter } from './attachedIrcClients.js';
 import { createUser } from '../db/users.js';
 import { createNetwork } from '../db/networks.js';
 import { APP_NAME, APP_VERSION } from '../utils/userAgent.js';
@@ -31,6 +32,14 @@ beforeAll(() => {
 function makeConn(): IrcConnection {
   return new IrcConnection({
     network: {
+      client_cert: null,
+      client_key: null,
+      proxy_enabled: 0,
+      proxy_type: null,
+      proxy_host: null,
+      proxy_port: null,
+      proxy_username: null,
+      proxy_password: null,
       id: 1,
       user_id: 1,
       name: 'n',
@@ -367,6 +376,150 @@ describe('inbound CTCP request — settings gating', () => {
       message: 'PING 1',
     });
     expect(ctcpResponse).not.toHaveBeenCalled();
+  });
+});
+
+// With IRC clients attached through the bouncer, one side answers (#932). The
+// integration tests are bouncer.ctcp.test.ts; these pin the handler.
+describe('inbound CTCP request — IRC clients attached through the bouncer', () => {
+  const A = String.fromCharCode(1);
+  const FORWARDED = 'requested CTCP VERSION (forwarded to your IRC client)';
+  // How many attached clients count on the connection, as the bouncer reports.
+  let attached = 1;
+
+  beforeEach(() => {
+    attached = 1;
+    setAttachedIrcClientCounter(() => attached);
+  });
+
+  afterEach(() => {
+    setAttachedIrcClientCounter(null);
+    for (const k of ['replies', 'version', 'time', 'source', 'clientinfo']) {
+      settingsService.reset(1, `ctcp.${k}`);
+    }
+  });
+
+  // A request from its own ident, so each has its own limit.
+  const request = (message: string, ident = 'b') => ({
+    nick: 'bob',
+    ident,
+    hostname: 'h',
+    type: message.split(' ')[0],
+    message,
+  });
+
+  it('leaves every type Lurker answers to the client, and says so', () => {
+    const { conn, ctcpResponse, ctcpLines } = harness();
+    const messages = ['VERSION', 'PING 1', 'TIME', 'SOURCE', 'CLIENTINFO'];
+    messages.forEach((m, i) => conn.client.emit('ctcp request', request(m, `b${i}`)));
+    expect(ctcpResponse).not.toHaveBeenCalled();
+    expect(ctcpLines().map((l) => l.text)).toEqual(
+      messages.map((m) => `bob requested CTCP ${m.split(' ')[0]} (forwarded to your IRC client)`),
+    );
+  });
+
+  it('answers while no client counts on this network', () => {
+    attached = 0;
+    const { conn, ctcpResponse } = harness();
+    conn.client.emit('ctcp request', request('VERSION'));
+    expect(ctcpResponse).toHaveBeenCalledWith('bob', 'VERSION', DEFAULT_VERSION_REPLY);
+  });
+
+  it('answers a type whose reply the user changed, and only that type', () => {
+    settingsService.update(1, { 'ctcp.version': 'mine' });
+    const { conn, ctcpResponse, ctcpLines } = harness();
+    conn.client.emit('ctcp request', request('VERSION'));
+    conn.client.emit('ctcp request', request('TIME', 'b2'));
+    expect(ctcpResponse.mock.calls).toEqual([['bob', 'VERSION', 'mine']]);
+    expect(ctcpLines()[1].text).toBe('bob requested CTCP TIME (forwarded to your IRC client)');
+  });
+
+  it('answers nothing, and says so, with replies turned off', () => {
+    settingsService.update(1, { 'ctcp.replies': false });
+    const { conn, ctcpResponse, ctcpLines } = harness();
+    conn.client.emit('ctcp request', request('VERSION'));
+    expect(ctcpResponse).not.toHaveBeenCalled();
+    expect(ctcpLines()[0].text).toBe('bob requested CTCP VERSION (no reply)');
+  });
+
+  it('leaves a type Lurker has no answer for as it was', () => {
+    const { conn, ctcpLines } = harness();
+    conn.client.emit('ctcp request', request('USERINFO'));
+    expect(ctcpLines()[0].text).toBe('bob requested CTCP USERINFO (no reply)');
+  });
+
+  it('answers the way the raw listener decided, as the relay did, and forgets it after the line', async () => {
+    const { conn, ctcpResponse, ctcpLines } = harness();
+    conn.client.emit('raw', { from_server: true, line: `:bob!b@h PRIVMSG alice :${A}VERSION${A}` });
+    expect(conn.ctcpAnswerer).toBe('clients');
+    // The client detaches between the relay and the handler.
+    attached = 0;
+    conn.client.emit('ctcp request', request('VERSION'));
+    expect(ctcpResponse).not.toHaveBeenCalled();
+    expect(ctcpLines()[0].text).toBe(`bob ${FORWARDED}`);
+    await Promise.resolve();
+    expect(conn.ctcpAnswerer).toBeNull();
+  });
+
+  it('keeps a batched request’s decision until irc-framework runs its line', async () => {
+    const { conn, ctcpResponse, ctcpLines } = harness();
+    const line = `@batch=b1 :bob!b@h PRIVMSG alice :${A}VERSION${A}`;
+    for (let i = 0; i < 3; i++) conn.client.emit('raw', { from_server: true, line });
+    // The batch ends in a later tick, after the client detached.
+    await Promise.resolve();
+    attached = 0;
+    for (let i = 0; i < 3; i++) {
+      conn.client.emit('ctcp request', { ...request('VERSION'), tags: { batch: 'b1' } });
+    }
+    expect(ctcpResponse).not.toHaveBeenCalled();
+    expect(ctcpLines().map((l) => l.text)).toEqual([
+      `bob ${FORWARDED}`,
+      `bob ${FORWARDED}`,
+      `bob ${FORWARDED}`,
+    ]);
+    expect(conn.batchedCtcpAnswerers.size).toBe(0);
+  });
+
+  it('drops only the oldest batch once 100 are waiting', () => {
+    const { conn } = harness();
+    for (let i = 0; i <= 100; i++) {
+      conn.client.emit('raw', {
+        from_server: true,
+        line: `@batch=b${i} :bob!b${i}@h PRIVMSG alice :${A}VERSION${A}`,
+      });
+    }
+    expect(conn.batchedCtcpAnswerers.size).toBe(100);
+    expect(conn.batchedCtcpAnswerers.has('b0')).toBe(false);
+    expect(conn.batchedCtcpAnswerers.get('b1')).toEqual(['clients']);
+    expect(conn.batchedCtcpAnswerers.get('b100')).toEqual(['clients']);
+  });
+
+  it('takes one of the peer’s allowance per request, however it was decided', () => {
+    const { conn, ctcpLines } = harness();
+    const line = `:bob!b@h PRIVMSG alice :${A}VERSION${A}`;
+    for (let i = 0; i < 4; i++) {
+      conn.client.emit('raw', { from_server: true, line });
+      conn.client.emit('ctcp request', request('VERSION'));
+    }
+    // Three a minute from one peer: the fourth is neither answered nor shown.
+    expect(ctcpLines().map((l) => l.text)).toEqual([
+      `bob ${FORWARDED}`,
+      `bob ${FORWARDED}`,
+      `bob ${FORWARDED}`,
+    ]);
+  });
+
+  it('decides nothing for our own line, and takes none of the allowance', () => {
+    const { conn, ctcpLines } = harness();
+    for (let i = 0; i < 4; i++) {
+      conn.client.emit('raw', {
+        from_server: true,
+        line: `:alice!a@h PRIVMSG bob :${A}VERSION${A}`,
+      });
+      expect(conn.ctcpAnswerer).toBeNull();
+    }
+    conn.client.emit('ctcp request', request('VERSION'));
+    expect(ctcpLines().map((l) => l.text)).toEqual([`bob ${FORWARDED}`]);
   });
 });
 
@@ -886,12 +1039,13 @@ describe('a /whois between requests is ordered by sequence, not by the clock', (
     conn.publish = publish;
 
     conn.raw('WHOIS bob');
-    conn.client.emit('irc error', { error: 'no_such_nick', nick: 'bob' });
+    conn.client.connection.addReadBuffer(':irc.example.test 401 nick bob :No such nick/channel');
 
     expect(ctcpLines().slice(before)).toHaveLength(0);
+    // Since #904 the raw handler's line is that report, and the only one.
     expect(publish).toHaveBeenCalledTimes(1);
     expect(publish).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'error', target: ':server:1' }),
+      expect.objectContaining({ type: 'motd', target: ':server:1' }),
     );
   });
 

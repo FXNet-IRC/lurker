@@ -47,10 +47,11 @@ import {
   deleteById as deleteCredentialById,
 } from '../db/webauthnCredentials.js';
 import { createSession, deleteSession, deleteSessionsForUser } from '../db/sessions.js';
-import { closeSocketsForUser } from '../services/wsHub.js';
+import { closeSocketsForUser, closeSocketsForOAuthTokens } from '../services/wsHub.js';
 import { isNodeMode } from '../utils/edition.js';
 import { dropSessionsForUser as dropBouncerSessionsForUser } from '../services/bouncer.js';
 import { revokeAllForUser as revokeApiTokensForUser } from '../db/apiTokens.js';
+import { deleteOAuthForUser, deleteTokenByRaw as deleteOAuthTokenByRaw } from '../db/oauth.js';
 import { deleteAllForUser as deletePushSubscriptionsForUser } from '../db/pushSubscriptions.js';
 import { SESSION_COOKIE, getCookieOptions, requireAuth, bearerToken } from '../middleware/auth.js';
 import { rpConfig, saveChallenge, consumeChallenge, userIdToHandle } from '../services/webauthn.js';
@@ -68,6 +69,12 @@ import {
 } from '../middleware/rateLimit.js';
 
 const CHALLENGE_COOKIE = 'lurker_webauthn_challenge';
+
+// The passkey algorithms we offer and accept: Ed25519, ES256 and RS256, which
+// were @simplewebauthn/server 13's defaults. v14 puts ML-DSA-44 (-48) first on
+// any runtime that has it. Node's ML-DSA support is still experimental, and a
+// passkey made with it can't be verified on a Node that lacks it.
+const PASSKEY_ALGORITHM_IDS = [-8, -7, -257];
 
 function challengeCookieOptions(): ReturnType<typeof getCookieOptions> & { maxAge: number } {
   // Short-lived, signed, scoped to the auth flow. Mirrors session cookie
@@ -153,6 +160,7 @@ router.post('/setup/options', async (req: Request, res: Response) => {
     userID: new Uint8Array(userIdToHandle(user.id)),
     userDisplayName: user.username,
     attestationType: 'none',
+    supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     authenticatorSelection: {
       residentKey: 'required',
       userVerification: 'preferred',
@@ -193,6 +201,7 @@ router.post('/setup/verify', async (req: Request, res: Response) => {
       expectedOrigin,
       expectedRPID: rpID,
       requireUserVerification: false,
+      supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     });
   } catch (err) {
     const e = err as { message?: string };
@@ -305,6 +314,7 @@ router.post('/invite/:token/options', async (req: Request<{ token: string }>, re
     userID: new Uint8Array(userIdToHandle(user.id)),
     userDisplayName: user.username,
     attestationType: 'none',
+    supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     authenticatorSelection: {
       residentKey: 'required',
       userVerification: 'preferred',
@@ -346,6 +356,7 @@ router.post('/invite/:token/verify', async (req: Request<{ token: string }>, res
       expectedOrigin,
       expectedRPID: rpID,
       requireUserVerification: false,
+      supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     });
   } catch (err) {
     deleteUser(entryUserId);
@@ -482,6 +493,10 @@ function finishRecovery(
   // Independent bearer credentials that outlive every session — an attacker who
   // minted one would otherwise keep read-write access straight through recovery.
   revokeApiTokensForUser(user.id);
+  // Apps authorized over OAuth (#891), and any approval not yet exchanged: a code
+  // approved before the recovery would otherwise mint a token minutes after it.
+  // Their sockets already went with closeSocketsForUser above.
+  deleteOAuthForUser(user.id);
   // Keyed on user_id with no session linkage, so an evicted device would keep
   // receiving the member's incoming messages as push content.
   deletePushSubscriptionsForUser(user.id);
@@ -575,6 +590,7 @@ router.post('/recovery/:token/options', async (req: Request<{ token: string }>, 
     userID: new Uint8Array(userIdToHandle(user.id)),
     userDisplayName: user.username,
     attestationType: 'none',
+    supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     authenticatorSelection: {
       residentKey: 'required',
       userVerification: 'preferred',
@@ -616,6 +632,7 @@ router.post('/recovery/:token/verify', async (req: Request<{ token: string }>, r
       expectedOrigin,
       expectedRPID: rpID,
       requireUserVerification: false,
+      supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     });
   } catch (err) {
     const e = err as { message?: string };
@@ -851,9 +868,20 @@ router.get('/auth-methods', (_req: Request, res: Response) => {
 router.post('/logout', (req: Request, res: Response) => {
   // Cookie for web, bearer for native — a native client has no cookie to clear,
   // so without the bearer branch its "log out" would leave a live session row
-  // behind and the token on the device would keep working.
-  const token = req.signedCookies?.[SESSION_COOKIE] ?? bearerToken(req.headers.authorization);
-  if (token) deleteSession(token);
+  // behind and the token on the device would keep working. A request carrying
+  // both signs out both: a bearer must not keep working because a cookie came
+  // along with it.
+  const cookieToken = req.signedCookies?.[SESSION_COOKIE];
+  const bearer = bearerToken(req.headers.authorization);
+  if (cookieToken) deleteSession(cookieToken);
+  if (bearer) {
+    deleteSession(bearer);
+    // A third-party app signing out with its OAuth token (#891) revokes that
+    // token and closes the sockets it opened, rather than answering ok while the
+    // token keeps working. At most one of the two deletes can match.
+    const revoked = deleteOAuthTokenByRaw(bearer);
+    if (revoked) closeSocketsForOAuthTokens(revoked.userId, [revoked.id], 'signed out');
+  }
   res.clearCookie(SESSION_COOKIE, { ...getCookieOptions(), maxAge: undefined });
   res.json({ ok: true });
 });
@@ -888,6 +916,7 @@ router.post('/passkeys/options', requireAuth, async (req: Request, res: Response
     userID: new Uint8Array(userIdToHandle(req.user!.id)),
     userDisplayName: req.user!.username,
     attestationType: 'none',
+    supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     authenticatorSelection: {
       residentKey: 'required',
       userVerification: 'preferred',
@@ -923,6 +952,7 @@ router.post('/passkeys/verify', requireAuth, async (req: Request, res: Response)
       expectedOrigin,
       expectedRPID: rpID,
       requireUserVerification: false,
+      supportedAlgorithmIDs: PASSKEY_ALGORITHM_IDS,
     });
   } catch (err) {
     const e = err as { message?: string };

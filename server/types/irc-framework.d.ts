@@ -21,6 +21,17 @@ declare module 'irc-framework' {
     gecos?: string;
     password?: string;
     account?: { account: string; password: string };
+    /** SASL mechanism. irc-framework defaults to PLAIN when an `account` is set;
+     *  'EXTERNAL' authenticates with the TLS client certificate instead and
+     *  carries no credential. Compared case-SENSITIVELY in two of the three
+     *  places the library reads it, so it must be spelled exactly. */
+    sasl_mechanism?: 'PLAIN' | 'EXTERNAL';
+    /** TLS client certificate presented on the handshake (CertFP, #459).
+     *  Forwarded to tls.connect as {key, cert} by the NET transport only — the
+     *  engine transport dials in another process and cannot carry it yet, which
+     *  is why ircConnection refuses to dial through an engine with a
+     *  certificate attached rather than presenting nothing. */
+    client_certificate?: { certificate: string; private_key: string };
     auto_reconnect?: boolean;
     auto_reconnect_max_retries?: number;
     enable_chghost?: boolean;
@@ -66,6 +77,14 @@ declare module 'irc-framework' {
       onTransport?(transport: unknown): void;
       onPhase?(phase: string, info: Record<string, unknown>): void;
     };
+    /**
+     * Proxy this connection's socket through a SOCKS5 / HTTP CONNECT proxy
+     * (#303). Read by services/proxyTransport.ts, which is Lurker's own
+     * subclass of the net transport — NOT by irc-framework, whose built-in
+     * `socks` option is deliberately unused (SOCKS5 only, no HTTP CONNECT, and
+     * it drops `outgoing_addr` on the proxied branch).
+     */
+    proxy?: import('../../shared/proxy.js').ProxyConfig;
   }
 
   /** Options passed to the Client constructor. */
@@ -97,6 +116,8 @@ declare module 'irc-framework' {
     ircd: string;
     options: Record<string, string | undefined>;
     cap: CapState;
+    /** Whether ISUPPORT offers a token (`whox`, `monitor`, …). */
+    supports(feature: string): boolean;
   }
 
   /** The connected user state. */
@@ -116,6 +137,12 @@ declare module 'irc-framework' {
 
   export class Client extends EventEmitter {
     constructor(options?: ClientOptions);
+
+    /**
+     * The WHOX token counter who() takes its tokens from (client.js). A 354 is
+     * parsed only if its token came from next() and hasn't been validated yet.
+     */
+    whox_token: { next(): number; validate(token: number): boolean };
 
     /** Network-level information (ISUPPORT, CAP negotiation). */
     network: NetworkInfo;
@@ -143,6 +170,11 @@ declare module 'irc-framework' {
 
     /** Request an IRCv3 capability during CAP negotiation. */
     requestCap(cap: string): void;
+
+    /** What requestCap() has been called with. irc-framework's OWN want list
+     *  (server-time, away-notify, …) lives inside its CAP handler and is not
+     *  exposed — this is only the caps the host asked for on top of it. */
+    readonly request_extra_caps: string[];
 
     /** Open a connection to the IRC server. */
     connect(options: ConnectOptions): void;
@@ -206,6 +238,10 @@ declare module 'irc-framework' {
     params: string[];
     tags?: Record<string, string>;
     prefix?: string;
+    /** The prefix's parts, which the parser splits out (irclineparser.js). */
+    nick?: string;
+    ident?: string;
+    hostname?: string;
   };
 
   // Default export in the package is an object with a `Client` property.
@@ -223,4 +259,41 @@ declare module 'irc-framework/src/linebreak.js' {
 
   /** Generator that yields chunks of `str` each fitting within `opts.bytes`. */
   export function lineBreak(str: string, opts: LineBreakOptions): IterableIterator<string>;
+}
+
+// irc-framework's built-in TCP/TLS transport, imported directly so
+// services/proxyTransport.ts can subclass it and override connect() alone —
+// everything else (writeLine, the line framing in onSocketData, disposeSocket,
+// close, setEncoding) is inherited unchanged.
+//
+// ⚠ This is an INTERNAL path with no published types, so the shape below is
+// hand-written from the source (irc-framework/src/transports/net.js) and is
+// only as true as the version in package.json. proxyTransport.test.ts pins the
+// members that matter, so an irc-framework bump that moves them fails a test
+// rather than failing at runtime on someone's connection.
+declare module 'irc-framework/src/transports/net.js' {
+  import type { EventEmitter } from 'node:events';
+  import type { Socket } from 'node:net';
+
+  export default class NetTransport extends EventEmitter {
+    constructor(options: Record<string, unknown>);
+    options: Record<string, unknown>;
+    socket: Socket | null;
+    /** 0 disconnected, 1 connecting, 2 connected. Module-private constants in
+     *  the source; the numbers are the contract. */
+    state: number;
+    requested_disconnect: boolean;
+    incoming_buffer: Buffer;
+    connect(): void;
+    close(force?: boolean): void;
+    disposeSocket(): void;
+    isConnected(): boolean;
+    setEncoding(encoding: string): boolean;
+    writeLine(line: string, cb?: () => void): void;
+    debugOut(out: string): void;
+    /** Binds every event the base class needs and handles a socket that is
+     *  already open — which is what a proxied dial hands back. */
+    _onSocketCreate(options: Record<string, unknown>, socket: Socket): void;
+    onSocketError(err: Error): void;
+  }
 }

@@ -50,7 +50,7 @@ afterAll(async () => {
   await ircd.close();
 });
 
-afterEach(() => {
+afterEach(async () => {
   for (const c of clients.splice(0)) {
     try {
       c.connection.end();
@@ -58,7 +58,7 @@ afterEach(() => {
       /* already gone */
     }
   }
-  for (const l of links.splice(0)) l.stop();
+  await Promise.all(links.splice(0).map((l) => l.stop()));
 });
 
 function newLink(secret = SECRET, port = enginePort): EngineLink {
@@ -195,10 +195,22 @@ describe('EngineTransport', () => {
     expect(a.t.events.at(-1)).toBe(`socket close:${ENGINE_CLOSE.LINK_LOST}`);
     linkA.stop();
 
+    // What happens while nobody is attached — and it has to have REACHED the
+    // engine before B attaches, or it is live traffic rather than backlog: a
+    // server's socket is free to hold small writes back behind an unacked one
+    // (Nagle), and a link that does not (setNoDelay) attaches well inside
+    // that window on Linux.
+    const buffered = () => engine.info(id)?.bufferedLines ?? 0;
+    const bufferedBefore = buffered();
     ircd.say('peer', '#two', 'while away 1');
     ircd.say('peer', 'moved', 'dm while away');
     ircd.setTopic('peer', '#two', 'set while away');
     ircd.say('peer', '#two', 'while away 2');
+    await until(
+      () => buffered() >= bufferedBefore + 4,
+      'the engine buffered the four lines',
+      () => [`buffered ${buffered()} (was ${bufferedBefore})`],
+    );
 
     // Process B: a fresh Client, configured with the STALE nick.
     const linkB = newLink();
@@ -406,5 +418,34 @@ describe('engine answers to a bad CONNECT', () => {
       () => t.events,
     );
     expect(String((t.closes[0] as Error)?.message)).toMatch(/invalid port/);
+  });
+
+  // CertFP (#459). ircConnection refuses earlier when it can, but on a cold
+  // start the first dial can outrun the engine's hello — and an engine below
+  // minor 2 would ignore the certificate field silently, leaving the app to
+  // authenticate with something it never presented. This is the check that
+  // cannot race: it runs where the link is known to be ready.
+  it('does not send a certificate to an engine that predates the field', async () => {
+    const l = newLink();
+    const id = `t:${++counter}`;
+    const { t } = makeClient(l, id, 'skewy');
+    // Wait out the hello: it is what sets engineMinor, so pinning the minor
+    // before the link is ready would just be overwritten by the real one.
+    await until(
+      () => l.state === 'ready',
+      'the link to be ready',
+      () => t.events,
+    );
+    const opts = (t.transport as unknown as { options: Record<string, unknown> }).options;
+    opts.client_certificate = { certificate: 'cert-pem', private_key: 'key-pem' };
+    l.engineMinor = 1;
+    // Re-dial now that the options say a certificate is required.
+    (t.transport as unknown as { connect(): void }).connect();
+    await until(
+      () => t.events.some((e) => e.startsWith('socket close:')),
+      'a refused dial',
+      () => t.events,
+    );
+    expect(String((t.closes[0] as Error)?.message)).toMatch(/cannot present a client certificate/);
   });
 });

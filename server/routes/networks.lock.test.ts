@@ -27,6 +27,9 @@ const fakeManager = {
   startNetwork() {
     this.calls.push(['startNetwork']);
   },
+  networkChanged() {
+    this.calls.push(['networkChanged']);
+  },
   listContacts() {
     return [];
   },

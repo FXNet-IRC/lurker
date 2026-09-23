@@ -126,6 +126,7 @@ beforeEach(() => {
     'notifications.dm.enabled',
     'notifications.highlight.enabled',
     'notifications.always_notify.enabled',
+    'notifications.kicked.enabled',
     'notifications.push.mute_when_away',
     'notifications.push.quiet_hours.enabled',
     'notifications.push.quiet_hours.start',
@@ -267,6 +268,93 @@ describe('maybePush gate chain', () => {
     try {
       emitChannel({ type: 'ctcp' });
       expect(await pushed()).toBe(false);
+    } finally {
+      setChannelNotifyAlways(userId, networkId, '#lurker', false);
+    }
+  });
+
+  // #965. Every event a connection publishes reaches maybePush — `names`,
+  // `typing`, `member-update`, `channel-modes`, ephemeral or not — and the
+  // notify-always bell used to notify on all of them. The nick-less ones
+  // composed as "someone in #channel" with an empty body, which is how this
+  // was found: a `names` republish (away-notify flipping a member's away flag
+  // calls publishNames) pushed every time someone in the channel went away.
+  it.each(['names', 'typing', 'member-update', 'channel-modes', 'error'])(
+    'does not push a %s event in a notify_always channel',
+    async (type) => {
+      buffers.ensureExists(userId, networkId, '#lurker');
+      setChannelNotifyAlways(userId, networkId, '#lurker', true);
+      try {
+        // nick: undefined is the shape that produced "someone" — these events
+        // carry no sender at all.
+        emitChannel({ type, nick: undefined, text: undefined });
+        expect(await pushed()).toBe(false);
+      } finally {
+        setChannelNotifyAlways(userId, networkId, '#lurker', false);
+      }
+    },
+  );
+
+  // The louder half of #965: a lifecycle row HAS a sender, so under the old gate
+  // every person entering or leaving a belled channel fired a real push.
+  it.each(['join', 'part', 'quit', 'mode'])(
+    'does not push a %s in a notify_always channel',
+    async (type) => {
+      buffers.ensureExists(userId, networkId, '#lurker');
+      setChannelNotifyAlways(userId, networkId, '#lurker', true);
+      try {
+        emitChannel({ type });
+        expect(await pushed()).toBe(false);
+      } finally {
+        setChannelNotifyAlways(userId, networkId, '#lurker', false);
+      }
+    },
+  );
+
+  // #968: a kick of us is its own signal — no bell required, because a channel
+  // disappearing from your sidebar with no word is the thing people asked not to
+  // happen.
+  it('pushes a kick of us with the bell OFF, gated by its own toggle', async () => {
+    emitChannel({ type: 'kick', nick: 'op', kicked: 'pushuser', selfKicked: true, text: 'bye' });
+    expect(await pushed()).toBe(true);
+    const p = await payload();
+    expect(p.kind).toBe('kicked');
+    // The KICKER and the reason — what composeNotification builds the alert
+    // from. If either stops riding, the notification renders wrong with
+    // nothing else failing.
+    expect(p).toMatchObject({ nick: 'op', target: '#lurker', text: 'bye' });
+
+    deliverMock = freshDeliver();
+    setUserSetting(userId, 'notifications.kicked.enabled', false);
+    emitChannel({ type: 'kick', nick: 'op', kicked: 'pushuser', selfKicked: true, text: 'bye' });
+    expect(await pushed()).toBe(false);
+  });
+
+  it('does not push a kick of someone else', async () => {
+    emitChannel({ type: 'kick', nick: 'op', kicked: 'bob', text: 'bye' });
+    expect(await pushed()).toBe(false);
+  });
+
+  it('pushes a kick even while a NOTICE-quiet always_notify bell is off', async () => {
+    // Belt and braces on the independence claim: the always_notify master
+    // toggle must not gate the kick, or "turn off busy channels" would also
+    // turn off being told you were removed from one.
+    setUserSetting(userId, 'notifications.always_notify.enabled', false);
+    emitChannel({ type: 'kick', nick: 'op', kicked: 'pushuser', selfKicked: true, text: 'bye' });
+    expect((await payload()).kind).toBe('kicked');
+  });
+
+  it('still pushes a NOTICE in a notify_always channel', async () => {
+    // The other half of #965: the gate is COUNTABLE_TYPES, not "message and
+    // action". A notice is conversation — it counts toward unread, and a bot
+    // answering in a channel you asked to hear everything from is exactly what
+    // the bell is for. If this flips, the fix was cut too deep.
+    buffers.ensureExists(userId, networkId, '#lurker');
+    setChannelNotifyAlways(userId, networkId, '#lurker', true);
+    try {
+      emitChannel({ type: 'notice' });
+      expect(await pushed()).toBe(true);
+      expect((await payload()).kind).toBe('always_notify');
     } finally {
       setChannelNotifyAlways(userId, networkId, '#lurker', false);
     }
@@ -477,5 +565,42 @@ describe('maybePush payload', () => {
     // A DM's every unread line counts as a highlight, so the badge is non-zero
     // and reflects a DB scan rather than anything on the event.
     expect((await payload()).badge).toBeGreaterThan(0);
+  });
+});
+
+// Auto-away counts attached IRC clients as well as visible sockets
+// (presence.ts). Push counts only the sockets.
+describe('presence', () => {
+  it('pushes while an IRC client is attached: it has no visibility to report', async () => {
+    const { setPresenceSource } = await import('./presence.js');
+    setPresenceSource('irc', () => 1);
+    try {
+      emitDm();
+      expect(await pushed()).toBe(true);
+    } finally {
+      setPresenceSource('irc', null);
+    }
+  });
+
+  it('clears auto-away for a visible socket, and starts it once that socket closes', async () => {
+    const { getUserAwayState } = await import('../db/userAwayState.js');
+    const { until } = await import('../test-utils/until.js');
+    const isAway = () => {
+      const row = getUserAwayState(userId);
+      return !!row?.away_datetime && !row.back_datetime;
+    };
+    setUserSetting(userId, 'away.auto.delay_seconds', 0.05);
+    try {
+      ircManager.setAwayAll(userId, 'afk', { autoSet: true });
+      // Waited for rather than read at once: setting away logs a system line,
+      // and that frame can land ahead of connectWithPresence's barrier reply.
+      const close = await connectWithPresence(true);
+      await until(() => !isAway(), 2000, 'auto-away cleared');
+      await close();
+      await until(isAway, 2000, 'auto-away');
+      expect(getUserAwayState(userId)?.auto_set).toBe(1);
+    } finally {
+      deleteUserSetting(userId, 'away.auto.delay_seconds');
+    }
   });
 });

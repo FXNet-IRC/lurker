@@ -14,8 +14,9 @@ let parseBouncerCredentials: typeof import('./bouncer.js').parseBouncerCredentia
 let unmarshalLogin: typeof import('./bouncer.js').unmarshalLogin;
 let rewriteNumericTarget: typeof import('./bouncer.js').rewriteNumericTarget;
 let filterRelayLine: typeof import('./bouncer.js').filterRelayLine;
-let memberPrefixSymbol: typeof import('./bouncer.js').memberPrefixSymbol;
+let memberPrefixSymbols: typeof import('./bouncer.js').memberPrefixSymbols;
 let buildNamesLines: typeof import('./bouncer.js').buildNamesLines;
+let withNetworkList: typeof import('./bouncer.js').withNetworkList;
 let isServicesNick: typeof import('./bouncer.js').isServicesNick;
 let escapeTagValue: typeof import('./bouncer.js').escapeTagValue;
 let buildNetworkAttrs: typeof import('./bouncer.js').buildNetworkAttrs;
@@ -33,8 +34,9 @@ beforeAll(async () => {
   unmarshalLogin = mod.unmarshalLogin;
   rewriteNumericTarget = mod.rewriteNumericTarget;
   filterRelayLine = mod.filterRelayLine;
-  memberPrefixSymbol = mod.memberPrefixSymbol;
+  memberPrefixSymbols = mod.memberPrefixSymbols;
   buildNamesLines = mod.buildNamesLines;
+  withNetworkList = mod.withNetworkList;
   isServicesNick = mod.isServicesNick;
   escapeTagValue = mod.escapeTagValue;
   buildNetworkAttrs = mod.buildNetworkAttrs;
@@ -262,64 +264,50 @@ describe('rewriteNumericTarget', () => {
       ':server 001 me :Welcome\r',
     );
   });
+
+  it('rewrites past a leading tag block, keeping the tags', () => {
+    expect(rewriteNumericTarget('@time=2026-09-06T05:04:37.800Z :server 001 old :Hi', 'me')).toBe(
+      '@time=2026-09-06T05:04:37.800Z :server 001 me :Hi',
+    );
+  });
+
+  it('leaves a tagged line with no prefix unchanged', () => {
+    expect(rewriteNumericTarget('@time=x PING :x', 'me')).toBe('@time=x PING :x');
+  });
 });
 
 describe('filterRelayLine', () => {
-  const noCaps = new Set<string>();
-
   it('passes ordinary conversation through untouched', () => {
     const line = ':nick!u@h PRIVMSG #chan :hello';
-    expect(filterRelayLine(line, noCaps)).toBe(line);
+    expect(filterRelayLine(line)).toBe(line);
   });
 
   it('strips the trailing CR irc-framework leaves on raw lines', () => {
-    expect(filterRelayLine(':nick!u@h PRIVMSG #chan :hello\r', noCaps)).toBe(
+    expect(filterRelayLine(':nick!u@h PRIVMSG #chan :hello\r')).toBe(
       ':nick!u@h PRIVMSG #chan :hello',
     );
   });
 
   it('drops connection plumbing', () => {
-    expect(filterRelayLine('PING :irc.libera.chat', noCaps)).toBeNull();
-    expect(filterRelayLine(':irc.libera.chat PONG server :token', noCaps)).toBeNull();
-    expect(filterRelayLine(':irc.libera.chat CAP * LS :sasl', noCaps)).toBeNull();
-    expect(filterRelayLine('AUTHENTICATE +', noCaps)).toBeNull();
-    expect(filterRelayLine('ERROR :Closing Link', noCaps)).toBeNull();
-    expect(filterRelayLine(':server 001 me :Welcome', noCaps)).toBeNull();
-    expect(filterRelayLine(':server 005 me CHANTYPES=# :are supported', noCaps)).toBeNull();
-    expect(filterRelayLine(':server 903 me :SASL successful', noCaps)).toBeNull();
+    expect(filterRelayLine('PING :irc.libera.chat')).toBeNull();
+    expect(filterRelayLine(':irc.libera.chat PONG server :token')).toBeNull();
+    expect(filterRelayLine(':irc.libera.chat CAP * LS :sasl')).toBeNull();
+    expect(filterRelayLine('AUTHENTICATE +')).toBeNull();
+    expect(filterRelayLine('ERROR :Closing Link')).toBeNull();
+    expect(filterRelayLine(':server 001 me :Welcome')).toBeNull();
+    expect(filterRelayLine(':server 005 me CHANTYPES=# :are supported')).toBeNull();
+    expect(filterRelayLine(':server 903 me :SASL successful')).toBeNull();
   });
 
   it('relays MOTD and other numerics', () => {
     const line = ':server 372 me :- welcome to the network';
-    expect(filterRelayLine(line, noCaps)).toBe(line);
+    expect(filterRelayLine(line)).toBe(line);
   });
 
-  it('strips all tags for a capless client', () => {
-    expect(filterRelayLine('@time=2026-01-01T00:00:00.000Z :n!u@h PRIVMSG #c :hi', noCaps)).toBe(
-      ':n!u@h PRIVMSG #c :hi',
-    );
-  });
-
-  it('keeps only the time tag for a server-time client', () => {
-    const caps = new Set(['server-time']);
-    expect(
-      filterRelayLine('@msgid=abc;time=2026-01-01T00:00:00.000Z :n!u@h PRIVMSG #c :hi', caps),
-    ).toBe('@time=2026-01-01T00:00:00.000Z :n!u@h PRIVMSG #c :hi');
-  });
-
-  it('keeps every tag for a message-tags client', () => {
-    const caps = new Set(['message-tags']);
-    const line = '@msgid=abc;time=x :n!u@h PRIVMSG #c :hi';
-    expect(filterRelayLine(line, caps)).toBe(line);
-  });
-
-  it('drops TAGMSG and BATCH unless the client negotiated message-tags', () => {
-    expect(filterRelayLine('@+typing=active :n!u@h TAGMSG #c', noCaps)).toBeNull();
-    expect(filterRelayLine(':server BATCH +ref draft/multiline #c', noCaps)).toBeNull();
-    const caps = new Set(['message-tags']);
-    expect(filterRelayLine('@+typing=active :n!u@h TAGMSG #c', caps)).toBe(
-      '@+typing=active :n!u@h TAGMSG #c',
-    );
+  it("leaves tags and cap-gated commands to each client's filter", () => {
+    // What one client may receive is bouncerClientFilter.ts's call, per client.
+    const line = '@time=2026-01-01T00:00:00.000Z :n!u@h AWAY :gone';
+    expect(filterRelayLine(line)).toBe(line);
   });
 });
 
@@ -391,6 +379,9 @@ describe('isValidServerTime', () => {
     expect(isValidServerTime('2023-05-23T06:00:00.000+00:00')).toBe(false); // offset
     expect(isValidServerTime('not-a-time')).toBe(false);
     expect(isValidServerTime('2023-13-45T99:99:99.000Z')).toBe(false); // impossible
+    // Date.parse reads these as March 2 and the next midnight.
+    expect(isValidServerTime('2023-02-30T06:00:00.000Z')).toBe(false);
+    expect(isValidServerTime('2023-05-23T24:00:00.000Z')).toBe(false);
   });
 });
 
@@ -404,11 +395,11 @@ describe('bouncerNetworkState', () => {
   });
 });
 
-describe('memberPrefixSymbol', () => {
-  it('maps the highest-ranked mode to its symbol', () => {
-    expect(memberPrefixSymbol(['v', 'o'])).toBe('@');
-    expect(memberPrefixSymbol(['v'])).toBe('+');
-    expect(memberPrefixSymbol([])).toBe('');
+describe('memberPrefixSymbols', () => {
+  it('maps every mode to its symbol, highest rank first', () => {
+    expect(memberPrefixSymbols(['v', 'o'])).toBe('@+');
+    expect(memberPrefixSymbols(['v'])).toBe('+');
+    expect(memberPrefixSymbols([])).toBe('');
   });
 
   it('honors a network-supplied prefix table', () => {
@@ -416,8 +407,8 @@ describe('memberPrefixSymbol', () => {
       { mode: 'y', symbol: '!' },
       { mode: 'o', symbol: '@' },
     ];
-    expect(memberPrefixSymbol(['y'], prefixes)).toBe('!');
-    expect(memberPrefixSymbol(['q'], prefixes)).toBe('');
+    expect(memberPrefixSymbols(['o', 'y'], prefixes)).toBe('!@');
+    expect(memberPrefixSymbols(['q'], prefixes)).toBe('');
   });
 });
 
@@ -451,6 +442,55 @@ describe('buildNamesLines', () => {
       .split(' ');
     expect(all).toHaveLength(200);
     expect(new Set(all).size).toBe(200);
+  });
+});
+
+describe('withNetworkList', () => {
+  const head = 'Available: ';
+
+  it('joins a short list verbatim', () => {
+    expect(withNetworkList(head, ['alpha', 'beta'], 400)).toBe('Available: alpha, beta');
+  });
+
+  it('handles an empty list', () => {
+    expect(withNetworkList(head, [], 400)).toBe(head);
+  });
+
+  it('drops the tail as "+N more" and stays inside the budget', () => {
+    const names = Array.from({ length: 60 }, (_, i) => `network-number-${i}`);
+    const out = withNetworkList(head, names, 200);
+    expect(Buffer.byteLength(out)).toBeLessThanOrEqual(200);
+    expect(out).toContain('network-number-0');
+    expect(out).toMatch(/\+\d+ more$/);
+    // The count must name every network actually dropped, not a rounded guess.
+    const hidden = Number(out.match(/\+(\d+) more$/)![1]);
+    const shown = out.slice(head.length).split(', ').length - 1;
+    expect(shown + hidden).toBe(names.length);
+  });
+
+  it('budgets in bytes, not code units, for multi-byte names', () => {
+    const names = Array.from({ length: 20 }, () => '日本語ネットワーク'); // 3 bytes/char
+    const out = withNetworkList(head, names, 120);
+    expect(Buffer.byteLength(out)).toBeLessThanOrEqual(120);
+    expect(out.length).toBeGreaterThan(0);
+  });
+
+  it('trims a single name that cannot fit at all', () => {
+    const out = withNetworkList(head, ['x'.repeat(500)], 200);
+    expect(Buffer.byteLength(out)).toBeLessThanOrEqual(200);
+    expect(out.startsWith(head)).toBe(true);
+  });
+
+  it('keeps a whole NOTICE under the 512-byte wire cap', () => {
+    const names = Array.from({ length: 40 }, (_, i) => `some-fairly-long-network-name-${i}`);
+    const budget = Math.max(64, 480 - Buffer.byteLength(':lurker.bouncer NOTICE someuser :'));
+    const text = withNetworkList(
+      'Not attached to a network — log in as someuser/<network> to attach. Available: ',
+      names,
+      budget,
+    );
+    const line = `:lurker.bouncer NOTICE someuser :${text}\r\n`;
+    expect(Buffer.byteLength(line)).toBeLessThanOrEqual(512);
   });
 });
 

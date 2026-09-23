@@ -28,10 +28,13 @@ import type { Network } from '../db/networks.js';
 import { IrcConnection } from './ircConnection.js';
 import ircManager from './ircManager.js';
 import type { EngineServer } from '../engine/server.js';
+import { DEFAULT_CAPS } from '../test-utils/fakeIrcd.js';
 import type { FakeIrcd } from '../test-utils/fakeIrcd.js';
 import { startEngineHarness } from '../test-utils/engineHarness.js';
 import type { EngineHarness } from '../test-utils/engineHarness.js';
 import { until as poll } from '../test-utils/until.js';
+import { TestLink } from '../test-utils/engineLink.js';
+import { instanceId } from '../db/instanceId.js';
 import { EngineLink, engineConnectionId, isOurConnectionId } from './engineLink.js';
 
 const SECRET = 'integration-secret';
@@ -67,7 +70,17 @@ const until = (pred: () => boolean, ms = 5000, what = 'condition') =>
   });
 
 beforeAll(async () => {
-  harness = await startEngineHarness({ secret: SECRET });
+  harness = await startEngineHarness({
+    secret: SECRET,
+    // Two caps nothing asks for at registration: irc-framework doesn't want
+    // them and neither does IrcConnection, so they are there for a LATER app
+    // version to discover on an already-registered socket. One the server
+    // grants, one it advertises and then refuses. (#888)
+    ircd: {
+      caps: [...DEFAULT_CAPS, 'draft/channel-rename', 'draft/refused', 'draft/granted'],
+      refuse: ['draft/refused'],
+    },
+  });
   ircd = harness.ircd;
   engine = harness.engine;
 
@@ -149,11 +162,17 @@ describe('IrcConnection through the engine', () => {
   }, 30000);
 
   it('a new IrcConnection re-attaches with no new history and no re-registration', async () => {
-    // Life while the app is away.
+    // Life while the app is away — and it has to have REACHED the engine
+    // before the app re-attaches, or it is live traffic rather than backlog.
+    // A server's socket is free to hold small writes back behind an unacked
+    // one (Nagle, ~40 ms on Linux), and a link with no such delay attaches
+    // well inside that window; a fixed sleep here was a coin toss.
+    const buffered = () => engine.info(engineId)?.bufferedLines ?? 0;
+    const bufferedBefore = buffered();
     ircd.kick('#gone', 'lurk');
     ircd.say('peer', '#stay', 'while away');
     ircd.say('peer', 'lurk', 'dm while away');
-    await new Promise((r) => setTimeout(r, 30));
+    await until(() => buffered() >= bufferedBefore + 3, 5000, 'the engine buffered the gap');
     managerEvents.length = 0;
 
     // Through ircManager this time, so the autojoin listener is on.
@@ -219,6 +238,15 @@ describe('IrcConnection through the engine', () => {
     managerEvents.length = 0;
     const rowsBefore = rows().length;
     const sentBefore = sentBy('lurk').length;
+    // The caps the connection had when it said 'connected' again, read at the
+    // moment the event fires, as the bouncer reads them.
+    let capsAtConnected: string[] = [];
+    const watchCaps = (e: Ev) => {
+      if (e.type === 'state' && e.state === 'connected') {
+        capsAtConnected = [...conn.client.network.cap.enabled].toSorted();
+      }
+    };
+    ircManager.on('event', watchCaps);
     EngineLink.shared().simulateLoss();
     // The whole cycle can finish inside one poll interval, so read the trail of
     // state events rather than sampling conn.state.
@@ -236,6 +264,21 @@ describe('IrcConnection through the engine', () => {
     expect(conn.state).toBe('connected');
     await new Promise((r) => setTimeout(r, 50));
     expect(stateEvents(managerEvents)).not.toContain('disconnected');
+    // Every state on the way back says it was the engine link that moved, not
+    // the network, so an attached IRC client is told nothing (bouncer.ts). The
+    // 'connected' at the end needs no flag: it re-asserts the state the client
+    // was already in.
+    const midway = managerEvents.filter((e) => e.type === 'state' && e.state !== 'connected');
+    expect(midway.length).toBeGreaterThan(0);
+    expect(midway.every((e) => e.engineLink === true)).toBe(true);
+    // And what the bouncer reads when that unflagged 'connected' arrives: the
+    // replayed CAP exchange runs ahead of the 001 that publishes it, so the
+    // network's caps are back. Were they not, every attached client's
+    // pass-through caps would be taken away and re-offered (bouncer.ts
+    // updateSupportedCaps) on every engine blip.
+    expect(capsAtConnected.length).toBeGreaterThan(0);
+    expect(capsAtConnected).toEqual([...conn.client.network.cap.enabled].toSorted());
+    ircManager.off('event', watchCaps);
     expect(
       rows()
         .slice(rowsBefore)
@@ -255,7 +298,7 @@ describe('IrcConnection through the engine', () => {
     );
   }, 20000);
 
-  it('skips a msgid it already has during catch-up, and only then', async () => {
+  it('skips a msgid it already has, in catch-up and after', async () => {
     const conn = ircManager.getConnection(userId, network.id)!;
     expect(conn.state).toBe('connected');
     const feed = (msgid: string, text: string) =>
@@ -268,11 +311,11 @@ describe('IrcConnection through the engine', () => {
     feed('dup-1', 'seen twice in catch-up');
     feed('dup-1', 'seen twice in catch-up');
     expect(count('seen twice in catch-up')).toBe(1);
-    // Steady state: no lookup, a server never repeats a msgid anyway.
+    // Steady state too: a server can send a line twice with the same msgid.
     conn.catchingUp = false;
     feed('dup-2', 'steady state');
     feed('dup-2', 'steady state');
-    expect(count('steady state')).toBe(2);
+    expect(count('steady state')).toBe(1);
     // And catch-up never drops a line it has NOT seen.
     conn.catchingUp = true;
     feed('fresh-1', 'new in catch-up');
@@ -340,6 +383,7 @@ describe('IrcConnection through the engine', () => {
     managerEvents.length = 0;
     const rowsBefore = rows().length;
     // autoconnect is 0 on this network, so initAll starts nothing itself…
+    expect(network.autoconnect).toBe(0);
     ircManager.initAll();
     // …and reconcile adopts what the engine kept.
     const adopted = ircManager.getConnection(userId, network.id);
@@ -371,6 +415,82 @@ describe('IrcConnection through the engine', () => {
       setUserPaused(userId, false);
     }
     // Leave a live connection behind for the last test.
+    const fresh = ircManager.startNetwork(userId, network.id)!;
+    await until(() => fresh.state === 'connected', 5000, 'fresh connection for the next test');
+  }, 30000);
+
+  // #894: the hello lists what no other link claims, and a link the engine has
+  // not yet seen die still claims what it held. Nothing re-listed those — a
+  // session left that way sat unadopted, or for a paused account un-closed,
+  // until the orphan reaper. The engine now offers it the moment the old link
+  // is gone. The corpse here is a bare link that attached and then died
+  // without a word, which is what a crashed process looks like to the engine.
+  it('a session released after hello is adopted, or closed, without a restart (#894)', async () => {
+    const conn = ircManager.getConnection(userId, network.id)!;
+    expect(conn.state).toBe('connected');
+    const corpse = async (): Promise<TestLink> => {
+      const c = await TestLink.connect(EngineLink.shared().opts.port, SECRET, {
+        instance: instanceId(),
+      });
+      c.send({
+        op: 'connect',
+        id: engineId,
+        host: '127.0.0.1',
+        port: ircd.port,
+        tls: false,
+        rejectUnauthorized: false,
+      });
+      await c.waitFor((f) => f.op === 'attached' && f.id === engineId);
+      return c;
+    };
+    ircManager.shutdown();
+    await until(() => engine.held().includes(engineId), 5000, 'engine holds the detached socket');
+    let c = await corpse();
+    EngineLink.resetForTests();
+    EngineLink.shared().start();
+    await until(() => EngineLink.shared().state === 'ready', 5000, 'new link ready');
+    // Strict at hello, as before.
+    expect(EngineLink.shared().held).not.toContain(engineId);
+    const rowsBefore = rows().length;
+    const registrations = ircd.registrations.filter((r) => r.nick === 'lurk').length;
+    ircManager.initAll();
+    expect(ircManager.getConnection(userId, network.id)).toBeNull();
+    c.kill();
+    await until(
+      () => ircManager.getConnection(userId, network.id)?.state === 'connected',
+      5000,
+      'adopted once the corpse was gone',
+    );
+    // An attach, not a dial: no "Connecting…", no second registration.
+    expect(
+      rows()
+        .slice(rowsBefore)
+        .some((r) => (r.text ?? '').startsWith('Connecting to ')),
+    ).toBe(false);
+    expect(ircd.registrations.filter((r) => r.nick === 'lurk')).toHaveLength(registrations);
+
+    // Same again, paused: the offer ends in a close.
+    ircManager.shutdown();
+    await until(() => engine.held().includes(engineId), 5000, 'engine holds it again');
+    c = await corpse();
+    setUserPaused(userId, true);
+    try {
+      EngineLink.resetForTests();
+      EngineLink.shared().start();
+      await until(() => EngineLink.shared().state === 'ready', 5000, 'link ready again');
+      ircManager.initAll();
+      expect(ircManager.getConnection(userId, network.id)).toBeNull();
+      c.kill();
+      await until(
+        () => !engine.held().includes(engineId),
+        5000,
+        "engine closed the paused account's socket",
+      );
+      await until(() => ircd.client('lurk') === undefined, 5000, 'ircd saw it go');
+    } finally {
+      setUserPaused(userId, false);
+    }
+    // Leave a live connection behind for the next test.
     const fresh = ircManager.startNetwork(userId, network.id)!;
     await until(() => fresh.state === 'connected', 5000, 'fresh connection for the next test');
   }, 30000);
@@ -467,6 +587,96 @@ describe('IrcConnection through the engine', () => {
       heldSet.delete(foreign);
     }
   });
+
+  // #888: the engine holds sockets across deploys, so a cap a new app version
+  // starts asking for would otherwise wait for the user's next real reconnect.
+  it('a newer app negotiates a cap on the held socket, and the engine keeps it', async () => {
+    const CAP = 'draft/channel-rename';
+    const conn = ircManager.getConnection(userId, network.id)!;
+    expect(conn.state).toBe('connected');
+    // Advertised all along, wanted by nobody: this socket registered without it.
+    expect(conn.client.network.cap.enabled).not.toContain(CAP);
+    const registrations = ircd.registrations.filter((r) => r.nick === 'lurk').length;
+
+    // "Deploy": the app goes away and the one that replaces it wants one more
+    // cap than the socket ever negotiated.
+    ircManager.shutdown();
+    await until(() => engine.held().includes(engineId), 5000, 'engine holds it');
+    const next = new IrcConnection({ network, onEvent: () => {} });
+    next.client.requestCap(CAP);
+    next.connect();
+    await until(() => next.state === 'connected', 8000, 'reattached');
+    await until(
+      () => next.client.network.cap.enabled.includes(CAP),
+      8000,
+      'the cap was REQd and ACKed on the held socket',
+    );
+    expect(ircd.client('lurk')!.caps.has(CAP)).toBe(true);
+    // Negotiated on the socket it already had — not by reconnecting.
+    expect(ircd.registrations.filter((r) => r.nick === 'lurk')).toHaveLength(registrations);
+
+    // And it sticks: a third app that never asks for it still finds it on,
+    // because the engine recorded the live ACK and the replay carries it.
+    next.detach();
+    await until(() => next.state === 'disconnected', 5000, 'detached');
+    const third = new IrcConnection({ network, onEvent: () => {} });
+    third.connect();
+    await until(() => third.state === 'connected', 8000, 'reattached again');
+    expect(third.client.request_extra_caps).not.toContain(CAP);
+    expect(third.client.network.cap.enabled).toContain(CAP);
+    third.detach();
+    await until(() => third.state === 'disconnected', 5000, 'detached again');
+
+    // Leave a live connection behind for the last test.
+    const fresh = ircManager.startNetwork(userId, network.id)!;
+    await until(() => fresh.state === 'connected', 8000, 'fresh connection for the next test');
+  }, 30000);
+
+  it('takes a NAK for an answer instead of re-asking on every re-attach (#888)', async () => {
+    ircManager.shutdown();
+    await until(() => engine.held().includes(engineId), 5000, 'engine holds it');
+    const conn = new IrcConnection({ network, onEvent: () => {} });
+    conn.client.requestCap('draft/refused');
+    // Asked for in the same restore. A REQ is all-or-nothing, so batching the
+    // two would have the server NAK both and put this one in the refusal set
+    // for good, though it would grant it on its own.
+    conn.client.requestCap('draft/granted');
+    conn.connect();
+    await until(() => conn.state === 'connected', 8000, 'reattached');
+    await until(
+      () => sentBy('lurk').includes('CAP REQ :draft/refused'),
+      5000,
+      'asked for the cap once',
+    );
+    await until(
+      () => conn.client.network.cap.enabled.includes('draft/granted'),
+      5000,
+      'the grantable one was granted',
+    );
+    // Advertised, so it stays in `available` and out of `enabled` for the life
+    // of the socket — the shape that would otherwise ask again forever.
+    expect(conn.client.network.cap.available.has('draft/refused')).toBe(true);
+    expect(conn.client.network.cap.enabled).not.toContain('draft/refused');
+    const asked = () => sentBy('lurk').filter((l) => l.startsWith('CAP REQ')).length;
+    const before = asked();
+
+    // A link blip is a re-attach of this same connection object — the case that
+    // repeats most often, and the one the refusal set has to survive.
+    EngineLink.shared().simulateLoss();
+    await until(() => conn.state !== 'connected', 5000, 'noticed the loss');
+    await until(() => conn.state === 'connected', 8000, 'reattached again');
+    // Bound the negative on the wire: anything the restore sent is ahead of
+    // this on the same ordered socket.
+    conn.raw('PING capbound');
+    await until(() => sentBy('lurk').includes('PING capbound'), 5000, 'the bound landed');
+    expect(asked()).toBe(before);
+
+    conn.detach();
+    await until(() => conn.state === 'disconnected', 5000, 'detached');
+    // Leave a live connection behind for the last test.
+    const fresh = ircManager.startNetwork(userId, network.id)!;
+    await until(() => fresh.state === 'connected', 8000, 'fresh connection for the next test');
+  }, 30000);
 
   it('ircManager.shutdown() detaches; dispose still QUITs', async () => {
     ircManager.shutdown();

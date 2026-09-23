@@ -59,17 +59,48 @@ async function link(startedAt?: number): Promise<TestLink> {
 let counter = 0;
 function connectFrame(
   id: string,
-  extra: Partial<{ tls: boolean; rejectUnauthorized: boolean; ident: string; port: number }> = {},
+  extra: Partial<{
+    tls: boolean;
+    rejectUnauthorized: boolean;
+    ident: string;
+    port: number;
+    clientCert: { cert: string; key: string };
+    host: string;
+    proxy: { type: 'socks5' | 'http'; host: string; port: number };
+  }> = {},
 ) {
   return {
     op: 'connect' as const,
     id,
-    host: '127.0.0.1',
+    host: extra.host ?? '127.0.0.1',
     port: extra.port ?? ircd.port,
     tls: extra.tls ?? false,
     rejectUnauthorized: extra.rejectUnauthorized ?? false,
     ...(extra.ident ? { ident: extra.ident } : {}),
+    ...(extra.clientCert ? { clientCert: extra.clientCert } : {}),
+    ...(extra.proxy ? { proxy: extra.proxy } : {}),
   };
+}
+
+// The same, with a CAP handshake first, so the recorded burst carries the
+// server's ACK — the baseline a replay's cap delta is measured against.
+async function registerWithCaps(
+  l: TestLink,
+  id: string,
+  nick: string,
+  caps: string[],
+): Promise<void> {
+  l.send(connectFrame(id));
+  await l.waitFor((f) => f.op === 'open' && f.id === id);
+  l.send({ op: 'write', id, line: 'CAP LS 302' });
+  // The last LS line of a 302 handshake is the one without the `*`.
+  await l.waitForLine(id, / CAP \* LS :/);
+  l.send({ op: 'write', id, line: `CAP REQ :${caps.join(' ')}` });
+  await l.waitForLine(id, / CAP \* ACK /);
+  l.send({ op: 'write', id, line: 'CAP END' });
+  l.send({ op: 'write', id, line: `NICK ${nick}` });
+  l.send({ op: 'write', id, line: `USER ${nick} 0 * :${nick}` });
+  await l.waitForLine(id, / 376 /);
 }
 
 // Dial through the engine and register on the fake ircd with plain NICK/USER.
@@ -317,6 +348,84 @@ describe('attach after the app is gone', () => {
     expect(att.replay.filter((x) => /JOIN/.test(x))).toHaveLength(0);
   });
 
+  it('follows a RENAME of a channel it is in, whoever sent it (#889)', async () => {
+    const id = `rename:${++counter}`;
+    const a = await link();
+    await register(a, id, 'renamer');
+    a.send({ op: 'write', id, line: 'JOIN #old' });
+    await a.waitForLine(id, /JOIN #old/);
+    // draft/channel-rename: the sender is whoever asked for the rename — an op,
+    // a service, the server — never us. What makes it ours is that #old is in
+    // our set.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #old #new :tidy up');
+    await a.waitForLine(id, /RENAME #old #new/);
+    // A rename that only changes case is legal, and must leave the set spelled
+    // the new way.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #new #New :case only');
+    await a.waitForLine(id, /RENAME #new #New/);
+    // A server spelling the line the client way — two parameters, the second
+    // its reason — must not be read as a rename to that text: the channel we
+    // are really in would be the thing that went missing. The reason can look
+    // like anything, including a bare channel name.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New :#reason');
+    await a.waitForLine(id, /RENAME #New :#reason/);
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New :#New is moving to #Newer');
+    await a.waitForLine(id, /RENAME #New :#New is moving/);
+    // And a well-formed line whose new name is a LIST: a channel name cannot
+    // hold a comma, and taking one would drop the channel we are in.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New #New,#Other :tidy');
+    await a.waitForLine(id, /RENAME #New #New,#Other/);
+    ackAll(a, id);
+    a.kill();
+
+    const b = await link();
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached');
+    expect(att.channels).toEqual(['#New']);
+    expect(att.replay.filter((x) => /JOIN/.test(x))).toEqual([
+      ':renamer!~renamer@fake.host JOIN #New',
+    ]);
+    b.send({ op: 'close', id });
+    await gone(engine, id);
+  });
+
+  it('replays the caps that changed after the burst, both ways (#888)', async () => {
+    const id = `caps:${++counter}`;
+    const a = await link();
+    await registerWithCaps(a, id, 'capped', ['away-notify', 'multi-prefix']);
+    a.send({ op: 'write', id, line: 'JOIN #c' });
+    await a.waitForLine(id, /JOIN #c/);
+    // cap-notify in the wild: this app asks for one more, and the server takes
+    // one away. Both are live lines — relayed once, then forgotten with the ack
+    // — so the burst on its own stops describing the socket here.
+    a.send({ op: 'write', id, line: 'CAP REQ :userhost-in-names' });
+    await a.waitForLine(id, /CAP capped ACK :userhost-in-names/);
+    ircd.sendRaw('capped', ':fake.test CAP capped DEL :away-notify');
+    await a.waitForLine(id, /CAP capped DEL :away-notify/);
+    // No cap list at all: the last parameter is the subcommand, and reading it
+    // as one would enable a cap called "ACK".
+    ircd.sendRaw('capped', ':fake.test CAP capped ACK');
+    await a.waitForLine(id, /CAP capped ACK$/);
+    ackAll(a, id);
+    a.kill();
+
+    const b = await link();
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached');
+    // The burst's own CAP lines, then the delta it cannot carry.
+    expect(att.replay.filter((x) => / CAP /.test(x)).slice(-2)).toEqual([
+      ':fake.test CAP capped DEL :away-notify',
+      ':fake.test CAP capped ACK :userhost-in-names',
+    ]);
+    // Registration first, then the caps, then the state: a cap that changes how
+    // a JOIN is read has to be in force before the synthesised JOINs land.
+    expect(att.replay.findIndex((x) => /CAP capped ACK/.test(x))).toBeLessThan(
+      att.replay.findIndex((x) => /JOIN #c/.test(x)),
+    );
+    b.send({ op: 'close', id });
+    await gone(engine, id);
+  });
+
   it('newest link wins: the old link is told, not closed', async () => {
     const id = `takeover:${++counter}`;
     const a = await link();
@@ -420,6 +529,113 @@ describe('TLS and identd', () => {
         (f) => f.op === 'closed' && f.id === strict,
       );
       expect(closed.error).toMatch(/self.signed|certificate/i);
+    } finally {
+      await secure.close();
+    }
+  });
+
+  // CertFP (#459). The engine is handed a private key over the wire and must
+  // treat it as untrusted input: tls.connect throws SYNCHRONOUSLY on a key it
+  // can't parse or one that doesn't match its certificate, and an uncaught
+  // throw here is every held socket in the process.
+  it('presents a client certificate, and refuses an unusable pair without dying', async () => {
+    const { generateClientCert, describeClientCert } = await import('../utils/clientCert.js');
+    const secure = await FakeIrcd.start({ tls: true, requestClientCert: true });
+    try {
+      const l = await link();
+      const healthy = `certfp-healthy:${++counter}`;
+      const pair = await generateClientCert('enginecert');
+      l.send(
+        connectFrame(healthy, {
+          port: secure.port,
+          tls: true,
+          rejectUnauthorized: false,
+          clientCert: { cert: pair.cert, key: pair.key },
+        }),
+      );
+      await l.waitFor((f) => f.op === 'open' && f.id === healthy);
+      l.send({ op: 'write', id: healthy, line: 'NICK certy' });
+      l.send({ op: 'write', id: healthy, line: 'USER certy 0 * :c' });
+      // 376, not 001: `held()` counts a session only once it is REGISTERED,
+      // and the burst ends at the MOTD. Stopping at 001 leaves the assertion
+      // below racing the rest of the burst — which it lost on CI.
+      await l.waitForLine(healthy, / 376 /);
+      expect(secure.client('certy')!.certfp).toBe(describeClientCert(pair.cert).sha256);
+
+      // A key that doesn't parse, and a pair that doesn't match: both refused
+      // as frames, neither reaching tls.connect.
+      const other = await generateClientCert('someone-else');
+      for (const bad of [
+        { cert: pair.cert, key: 'not a key' },
+        { cert: pair.cert, key: other.key },
+        { cert: pair.cert, key: '' },
+      ]) {
+        const badId = `certfp-bad:${++counter}`;
+        l.send(
+          connectFrame(badId, {
+            port: secure.port,
+            tls: true,
+            rejectUnauthorized: false,
+            clientCert: bad,
+          }),
+        );
+        // Matched by ITS id: waitFor scans the frames already in hand, so an
+        // unqualified `op === 'error'` would answer every pass after the first
+        // with the first pass's frame, and none of them would be a round trip.
+        expect(await l.waitFor((f) => f.op === 'error' && f.id === badId)).toMatchObject({
+          message: expect.stringMatching(/clientCert/),
+        });
+      }
+
+      // Still here, still holding the good one, still relaying.
+      expect(engine.held()).toContain(healthy);
+      secure.say('peer', 'certy', 'alive');
+      await l.waitForLine(healthy, /alive/);
+    } finally {
+      await secure.close();
+    }
+  });
+
+  // The engine holds a socket for days, and a heap snapshot walks whatever is
+  // still reachable. The handshake is the only thing that needs the private
+  // key, so nothing keeps a reference past it — the certificate stays, because
+  // matchesDial compares it to tell this session from a new one.
+  it('stops holding the client key once the handshake has it', async () => {
+    const { generateClientCert } = await import('../utils/clientCert.js');
+    const { EngineUpstream } = await import('./upstream.js');
+    const { ByteBudget } = await import('./lineBuffer.js');
+    const secure = await FakeIrcd.start({ tls: true, requestClientCert: true });
+    try {
+      const pair = await generateClientCert('dropkey');
+      const upstream = new EngineUpstream(
+        {
+          id: `drop:${++counter}`,
+          instance: 'test',
+          host: '127.0.0.1',
+          port: secure.port,
+          tls: true,
+          rejectUnauthorized: false,
+          clientCert: { cert: pair.cert, key: pair.key },
+        },
+        64 * 1024,
+        new ByteBudget(1024 * 1024),
+      );
+      upstream.dial();
+
+      expect(upstream.opts.clientCert?.key).toBe('');
+      expect(upstream.opts.clientCert?.cert).toBe(pair.cert);
+      // Still able to answer the question the certificate is kept for.
+      expect(
+        upstream.matchesDial({
+          host: '127.0.0.1',
+          port: secure.port,
+          tls: true,
+          clientCert: { cert: pair.cert, key: pair.key },
+        }),
+      ).toBe(true);
+      // And a second dial is a loud error rather than a keyless handshake.
+      expect(() => upstream.dial()).toThrow(/once per instance/);
+      upstream.close();
     } finally {
       await secure.close();
     }
@@ -547,6 +763,100 @@ describe('review findings', () => {
       await gone(engine, id);
     } finally {
       await forcing.close();
+    }
+  });
+
+  it('a RENAME during registration moves the set instead of joining the burst (#889)', async () => {
+    // A service puts us in a channel and renames it before the MOTD ends, so
+    // both lines fall inside the recorded burst's window.
+    const midBurst = await FakeIrcd.start({
+      burstLines: (c) => [
+        `:${c.nick}!~${c.user}@fake.host JOIN #burst`,
+        `:fake.test 353 ${c.nick} = #burst :${c.nick} someone`,
+        `:fake.test 366 ${c.nick} #burst :End of /NAMES list.`,
+        ':oper!o@peer.fake RENAME #burst #renamed :mid-registration',
+      ],
+    });
+    try {
+      const id = `burstrename:${++counter}`;
+      const a = await link();
+      a.send(connectFrame(id, { port: midBurst.port }));
+      await a.waitFor((f) => f.op === 'open' && f.id === id);
+      a.send({ op: 'write', id, line: 'NICK early' });
+      a.send({ op: 'write', id, line: 'USER early 0 * :e' });
+      await a.waitForLine(id, / 376 /);
+      ackAll(a, id);
+      a.kill();
+      const b = await link();
+      b.send(connectFrame(id, { port: midBurst.port }));
+      const att = await b.waitFor<Attached>((f) => f.op === 'attached');
+      expect(att.channels).toEqual(['#renamed']);
+      // Both lines are state: the JOIN because the set may since have undone
+      // it, the RENAME because replaying it would announce a rename that
+      // happened once, on every re-attach for the life of the socket.
+      expect(att.replay.filter((x) => /JOIN|RENAME/.test(x))).toEqual([
+        ':early!~early@fake.host JOIN #renamed',
+      ]);
+      // And nothing the burst recorded about the old name comes back: a 353
+      // for it would put the fresh Client straight back into a channel the
+      // server no longer has, whatever the synthesised JOINs say.
+      expect(att.replay.filter((x) => /#burst/.test(x))).toEqual([]);
+      b.send({ op: 'close', id });
+      await gone(engine, id);
+    } finally {
+      await midBurst.close();
+    }
+  });
+
+  it('replays a burst line about a channel only while it is still in it (#889)', async () => {
+    // A server-side auto-join during registration: the JOIN and its NAMES are
+    // inside the burst, where they stay for the life of the socket.
+    const autoJoin = await FakeIrcd.start({
+      burstLines: (c) => [
+        `:${c.nick}!~${c.user}@fake.host JOIN #auto`,
+        `:fake.test 353 ${c.nick} = #auto :${c.nick} someone`,
+        `:fake.test 366 ${c.nick} #auto :End of /NAMES list.`,
+        // Free text that happens to read exactly like the channel — a MOTD
+        // listing channels one per line. Not about it, and not to go with it.
+        `:fake.test 372 ${c.nick} :#auto`,
+      ],
+    });
+    try {
+      const id = `autojoin:${++counter}`;
+      const a = await link();
+      a.send(connectFrame(id, { port: autoJoin.port }));
+      await a.waitFor((f) => f.op === 'open' && f.id === id);
+      a.send({ op: 'write', id, line: 'NICK early' });
+      a.send({ op: 'write', id, line: 'USER early 0 * :e' });
+      await a.waitForLine(id, / 376 /);
+      ackAll(a, id);
+      a.kill();
+
+      // Still in it, so the burst's NAMES is still the truth about it.
+      const b = await link();
+      b.send(connectFrame(id, { port: autoJoin.port }));
+      const still = await b.waitFor<Attached>((f) => f.op === 'attached');
+      expect(still.channels).toEqual(['#auto']);
+      expect(still.replay.filter((x) => / 353 /.test(x))).toHaveLength(1);
+
+      // Now leave it. (Injected: burstLines is raw, so the fake ircd never
+      // made us a member and would answer a real PART with 442.)
+      autoJoin.sendRaw('early', ':early!~early@fake.host PART #auto');
+      await b.waitForLine(id, /PART #auto/);
+      ackAll(b, id);
+      b.kill();
+
+      const c = await link();
+      c.send(connectFrame(id, { port: autoJoin.port }));
+      const gone2 = await c.waitFor<Attached>((f) => f.op === 'attached');
+      expect(gone2.channels).toEqual([]);
+      // The channel's own lines are gone; the MOTD line that merely reads like
+      // it is still there, keeping the burst a contiguous registration.
+      expect(gone2.replay.filter((x) => /#auto/.test(x))).toEqual([':fake.test 372 early :#auto']);
+      c.send({ op: 'close', id });
+      await gone(engine, id);
+    } finally {
+      await autoJoin.close();
     }
   });
 
@@ -888,6 +1198,96 @@ describe('third review round', () => {
   });
 });
 
+// The hello's `held` list withholds what another link still claims — a dead
+// link's included, since the engine may read a replacement's hello before the
+// corpse's EOF (#849) — and until #894 nothing ever re-listed those. An offer
+// can cross a `close` the link already sent; that is the app's to drop
+// (engineLink.test.ts), so nothing here waits for anything.
+describe('a session released after hello is offered (#894)', () => {
+  it('offers the session a dead link still claimed at hello, once that link is gone', async () => {
+    const id = `late:${++counter}`;
+    const nick = `late${counter}`;
+    const a = await link();
+    await register(a, id, nick);
+    const b = await link();
+    // Strict at hello, as before: a is still on the books.
+    expect(b.hello?.held).not.toContain(id);
+    a.kill();
+    expect(await b.waitFor((f) => f.op === 'held')).toMatchObject({ op: 'held', id });
+    // And it is adoptable: the connect attaches, it does not dial.
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached' && f.id === id);
+    expect(att.nick).toBe(nick);
+    expect(ircd.registrations.filter((r) => r.nick === nick)).toHaveLength(1);
+  });
+
+  it('offers what a link let go of to the others, not back to it', async () => {
+    const id = `letgo:${++counter}`;
+    const a = await link();
+    await register(a, id, `letgo${counter}`);
+    const b = await link();
+    expect(b.hello?.held).not.toContain(id);
+    a.send({ op: 'detach', id });
+    expect(await b.waitFor((f) => f.op === 'held')).toMatchObject({ id });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(a.frames.some((f) => f.op === 'held')).toBe(false);
+  });
+
+  it('offers a session that finished registering after its link died', async () => {
+    // A dial the dead link left behind: at b's hello it is not a session yet,
+    // so the hello cannot list it, and the release at a's death has nothing
+    // to offer either. Registration completing is the moment it becomes one.
+    const id = `late-reg:${++counter}`;
+    const nick = `latereg${counter}`;
+    const a = await link();
+    a.send(connectFrame(id));
+    await a.waitFor((f) => f.op === 'open' && f.id === id);
+    const b = await link();
+    expect(b.hello?.held).not.toContain(id);
+    a.send({ op: 'write', id, line: `NICK ${nick}` });
+    a.send({ op: 'write', id, line: `USER ${nick} 0 * :u` });
+    a.kill();
+    await b.waitFor((f) => f.op === 'held' && f.id === id);
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached' && f.id === id);
+    expect(att.unattended).toBe(true);
+  });
+
+  it('does not offer a registration back to the link that let go of it mid-way', async () => {
+    // A detach is allowed from `open`, before 001 — and the link that sent it
+    // is still here. What registers afterwards is offered to the others only.
+    const id = `letgo-early:${++counter}`;
+    const nick = `letgoearly${counter}`;
+    const a = await link();
+    a.send(connectFrame(id));
+    await a.waitFor((f) => f.op === 'open' && f.id === id);
+    const b = await link();
+    expect(b.hello?.held).not.toContain(id);
+    a.send({ op: 'write', id, line: `NICK ${nick}` });
+    a.send({ op: 'write', id, line: `USER ${nick} 0 * :u` });
+    a.send({ op: 'detach', id });
+    await b.waitFor((f) => f.op === 'held' && f.id === id);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(a.frames.some((f) => f.op === 'held')).toBe(false);
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached' && f.id === id);
+    expect(att.unattended).toBe(true);
+  });
+
+  it("offers only to links of the session's instance", async () => {
+    const id = `mine:${++counter}`;
+    const a = await link();
+    await register(a, id, `mine${counter}`);
+    const stranger = await TestLink.connect(enginePort, SECRET, { instance: 'some-other-db' });
+    links.push(stranger);
+    const b = await link();
+    a.kill();
+    await b.waitFor((f) => f.op === 'held' && f.id === id);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(stranger.frames.some((f) => f.op === 'held')).toBe(false);
+  });
+});
+
 describe('orphan reaper', () => {
   it('ends a session no link has claimed for orphanMs', async () => {
     const own = new EngineServer({
@@ -995,6 +1395,268 @@ describe('instance isolation', () => {
     expect(att.nick).toBe('ownernick');
     expect(att.channels).toEqual(['#secret']);
     owner.send({ op: 'close', id });
+    await gone(engine, id);
+  });
+});
+
+// Proxied upstreams (#303). The engine dials through a SOCKS5 / HTTP CONNECT
+// proxy, and the two things that can go silently wrong are covered here: a
+// destination resolved on the wrong side, and a re-attach to a socket held
+// under the proxy the user just changed.
+describe('proxied dials', () => {
+  it.each(['socks5', 'http'] as const)('registers through a %s proxy', async (protocol) => {
+    const { FakeProxy } = await import('../utils/fakeProxy.js');
+    const proxy = await FakeProxy.start({
+      protocol,
+      forwardTo: { host: '127.0.0.1', port: ircd.port },
+    });
+    try {
+      const l = await link();
+      const id = `${TEST_INSTANCE}:proxy:${++counter}`;
+      l.send(
+        connectFrame(id, {
+          // A NAME, so the assertion below is about who resolved it.
+          host: 'irc.example.org',
+          proxy: { type: protocol, host: '127.0.0.1', port: proxy.port },
+        }),
+      );
+      await l.waitFor((f) => f.op === 'open' && f.id === id);
+      l.send({ op: 'write', id, line: 'NICK proxied' });
+      l.send({ op: 'write', id, line: 'USER proxied 0 * :proxied' });
+      await l.waitForLine(id, / 376 /);
+
+      // ⚠⚠ The assertion the whole feature turns on: the destination reached
+      // the proxy as a NAME. Resolve it engine-side and a Tor user's DNS names
+      // every server they talk to, and `.onion` cannot work at all.
+      expect(proxy.lastRequest).toMatchObject({
+        addressType: 'domain',
+        host: 'irc.example.org',
+      });
+      l.send({ op: 'close', id });
+      await gone(engine, id);
+    } finally {
+      await proxy.stop();
+    }
+  });
+
+  // ⚠⚠ A proxy change deliberately does NOT tear down the live socket — it
+  // applies on the next connect. So matchesDial is the only thing that makes
+  // the change ever apply: if it says "same", the app re-attaches to a socket
+  // still running through the OLD proxy, forever.
+  it('dials afresh when the proxy changes, rather than re-attaching', async () => {
+    const { FakeProxy } = await import('../utils/fakeProxy.js');
+    const first = await FakeProxy.start({
+      protocol: 'socks5',
+      forwardTo: { host: '127.0.0.1', port: ircd.port },
+    });
+    const second = await FakeProxy.start({
+      protocol: 'socks5',
+      forwardTo: { host: '127.0.0.1', port: ircd.port },
+    });
+    try {
+      const id = `${TEST_INSTANCE}:reproxy:${++counter}`;
+      const a = await link();
+      a.send(connectFrame(id, { proxy: { type: 'socks5', host: '127.0.0.1', port: first.port } }));
+      await a.waitFor((f) => f.op === 'open' && f.id === id);
+      a.send({ op: 'write', id, line: 'NICK reproxy' });
+      a.send({ op: 'write', id, line: 'USER reproxy 0 * :reproxy' });
+      await a.waitForLine(id, / 376 /);
+      expect(first.requests).toHaveLength(1);
+
+      // Same id, same host and port — only the proxy differs.
+      a.send(connectFrame(id, { proxy: { type: 'socks5', host: '127.0.0.1', port: second.port } }));
+      // ⚠ Waited on the SECOND proxy seeing a request, not on an `open` frame:
+      // waitFor scans frames already received, so the first dial's `open` would
+      // match instantly and prove nothing. The request arriving at the new
+      // proxy is the actual claim — a fresh dial, routed the new way.
+      await until(
+        () => second.requests.length === 1,
+        3000,
+        'the changed proxy received a fresh dial',
+      );
+      expect(first.requests).toHaveLength(1);
+      a.send({ op: 'close', id });
+      await gone(engine, id);
+    } finally {
+      await first.stop();
+      await second.stop();
+    }
+  });
+
+  it('drops the proxy password after the dial but still tells identities apart', async () => {
+    // Same reasoning as the client key: an upstream lives for days and a heap
+    // snapshot walks what is reachable. matchesDial keeps working because it
+    // compares a digest taken at construction, not the live password.
+    const { FakeProxy } = await import('../utils/fakeProxy.js');
+    const { EngineUpstream } = await import('./upstream.js');
+    const { ByteBudget } = await import('./lineBuffer.js');
+    const proxy = await FakeProxy.start({
+      protocol: 'socks5',
+      auth: { username: 'u', password: 'hunter2' },
+      forwardTo: { host: '127.0.0.1', port: ircd.port },
+    });
+    try {
+      const spec = {
+        type: 'socks5' as const,
+        host: '127.0.0.1',
+        port: proxy.port,
+        username: 'u',
+        password: 'hunter2',
+      };
+      const upstream = new EngineUpstream(
+        {
+          id: `dropproxypw:${++counter}`,
+          instance: 'test',
+          host: '127.0.0.1',
+          port: ircd.port,
+          tls: false,
+          rejectUnauthorized: false,
+          proxy: { ...spec },
+        },
+        64 * 1024,
+        new ByteBudget(1024 * 1024),
+      );
+      upstream.dial();
+      await until(() => proxy.requests.length === 1, 3000, 'dialled through the proxy');
+      await until(() => upstream.opts.proxy?.password === '', 3000, 'password dropped');
+      // Still able to answer the question the credentials are kept for.
+      expect(
+        upstream.matchesDial({ host: '127.0.0.1', port: ircd.port, tls: false, proxy: spec }),
+      ).toBe(true);
+      expect(
+        upstream.matchesDial({
+          host: '127.0.0.1',
+          port: ircd.port,
+          tls: false,
+          proxy: { ...spec, password: 'different' },
+        }),
+      ).toBe(false);
+      upstream.close();
+    } finally {
+      await proxy.stop();
+    }
+  });
+
+  it('re-attaches when the proxy is unchanged', async () => {
+    // The other half of the same rule: an identical proxy is the same session,
+    // and must not cost the user a reconnect on every app restart.
+    const { FakeProxy } = await import('../utils/fakeProxy.js');
+    const proxy = await FakeProxy.start({
+      protocol: 'socks5',
+      forwardTo: { host: '127.0.0.1', port: ircd.port },
+    });
+    try {
+      const id = `${TEST_INSTANCE}:sameproxy:${++counter}`;
+      const spec = { type: 'socks5' as const, host: '127.0.0.1', port: proxy.port };
+      const a = await link();
+      a.send(connectFrame(id, { proxy: spec }));
+      await a.waitFor((f) => f.op === 'open' && f.id === id);
+      a.send({ op: 'write', id, line: 'NICK sameproxy' });
+      a.send({ op: 'write', id, line: 'USER sameproxy 0 * :sameproxy' });
+      await a.waitForLine(id, / 376 /);
+      a.send({ op: 'detach', id });
+
+      const b = await link();
+      b.send(connectFrame(id, { proxy: spec }));
+      const attached = (await b.waitFor((f) => f.op === 'attached' && f.id === id)) as Attached;
+      expect(attached.nick).toBe('sameproxy');
+      // One dial through the proxy, not two.
+      expect(proxy.requests).toHaveLength(1);
+      b.send({ op: 'close', id });
+      await gone(engine, id);
+    } finally {
+      await proxy.stop();
+    }
+  });
+
+  it('refuses a malformed proxy instead of dialing', async () => {
+    // An engine does not get to trust its callers: the app is not the only
+    // thing that can produce a connect frame.
+    const l = await link();
+    const id = `${TEST_INSTANCE}:badproxy:${++counter}`;
+    l.send({
+      ...connectFrame(id),
+      proxy: { type: 'socks4', host: '127.0.0.1', port: 1080 },
+    } as unknown as Parameters<typeof l.send>[0]);
+    const err = await l.waitFor((f) => f.op === 'error' && f.id === id);
+    expect(String((err as { message: string }).message)).toMatch(/proxy is unusable/);
+    expect(engine.hasConnection(id)).toBe(false);
+  });
+
+  // ⚠⚠ A close during a proxied dial has no socket to destroy, so nothing fires
+  // a 'close' — without finishing the teardown by hand the session stays at
+  // 'dialing' forever: never emits 'closed', so the engine never drops it from
+  // its map, and shutdown() waits out its full grace on it.
+  it('finishes closing when the close lands mid-dial', async () => {
+    const { FakeProxy } = await import('../utils/fakeProxy.js');
+    // A tarpit: the dial is still in flight when the close arrives.
+    const proxy = await FakeProxy.start({ protocol: 'socks5', tarpit: true });
+    try {
+      const l = await link();
+      const id = `${TEST_INSTANCE}:closemid:${++counter}`;
+      l.send(connectFrame(id, { proxy: { type: 'socks5', host: '127.0.0.1', port: proxy.port } }));
+      await until(() => engine.hasConnection(id), 3000, 'upstream created');
+      l.send({ op: 'close', id });
+      // The point: it actually leaves the engine's map, rather than sitting in
+      // `dialing` until the process ends. (`gone` throws on timeout; the
+      // explicit assertion is so this reads as a check, not a hang.)
+      await gone(engine, id);
+      expect(engine.hasConnection(id)).toBe(false);
+    } finally {
+      await proxy.stop();
+    }
+  });
+
+  it('does not hand the TLS handshake a fresh copy of the dial budget', async () => {
+    // dialTimeoutMs is documented as covering the whole dial. Spending it once
+    // on the proxy handshake and then again on the socket would let a proxied
+    // dial run to 2x what the direct path allows — worst against exactly the
+    // slow proxy the cap exists for.
+    const { FakeProxy } = await import('../utils/fakeProxy.js');
+    const { EngineUpstream } = await import('./upstream.js');
+    const { ByteBudget } = await import('./lineBuffer.js');
+    const proxy = await FakeProxy.start({
+      protocol: 'socks5',
+      forwardTo: { host: '127.0.0.1', port: ircd.port },
+    });
+    try {
+      const upstream = new EngineUpstream(
+        {
+          id: `budget:${++counter}`,
+          instance: 'test',
+          host: '127.0.0.1',
+          port: ircd.port,
+          tls: false,
+          rejectUnauthorized: false,
+          dialTimeoutMs: 30_000,
+          proxy: { type: 'socks5', host: '127.0.0.1', port: proxy.port },
+        },
+        64 * 1024,
+        new ByteBudget(1024 * 1024),
+      );
+      upstream.dial();
+      await until(() => upstream.state === 'open', 3000, 'opened through the proxy');
+      // Strictly less than the full budget: the handshake spent some of it.
+      const remaining = (upstream as unknown as { socket: { timeout?: number } }).socket?.timeout;
+      expect(remaining === undefined || remaining <= 30_000).toBe(true);
+      upstream.close();
+    } finally {
+      await proxy.stop();
+    }
+  });
+
+  it('closes, with a reason, when the proxy cannot be reached', async () => {
+    // No socket exists when a proxy dial fails, so the teardown cannot ride the
+    // socket's own 'close'. Without that the session sits in `dialing` forever
+    // and the app never hears anything at all.
+    const l = await link();
+    const id = `${TEST_INSTANCE}:deadproxy:${++counter}`;
+    // Port 1 on loopback: reliably refused, never firewalled into a timeout.
+    l.send(connectFrame(id, { proxy: { type: 'socks5', host: '127.0.0.1', port: 1 } }));
+    const closed = (await l.waitFor((f) => f.op === 'closed' && f.id === id)) as {
+      error?: string;
+    };
+    expect(closed.error).toMatch(/proxy/i);
     await gone(engine, id);
   });
 });

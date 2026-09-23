@@ -5,6 +5,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { requireAuth, requireNonGuest } from '../middleware/auth.js';
 import { createToken, listForUser, revoke } from '../db/apiTokens.js';
+import { dropSessionsForApiToken } from '../services/bouncer.js';
 
 // Admin UI for managing per-user MCP/API bearer tokens. Sibling of bookmarks.ts:
 // authenticated through the browser session cookie (not the bearer it manages),
@@ -58,6 +59,8 @@ router.delete('/:id', (req: Request, res: Response) => {
     res.status(404).json({ error: 'not found' });
     return;
   }
+  // An IRC client checks its token once, at login (#914).
+  dropSessionsForApiToken(id, 'API token revoked');
   res.json({ ok: true });
 });
 

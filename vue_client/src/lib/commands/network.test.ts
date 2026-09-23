@@ -3,6 +3,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { parseNetworkCommand } from './network.js';
+import type { NetworkCommand } from './network.js';
 
 describe('parseNetworkCommand', () => {
   it('treats no args and `list`/`ls` as a list', () => {
@@ -192,6 +193,122 @@ describe('parseNetworkCommand', () => {
 
     it('needs both a name and a position', () => {
       expect(parseNetworkCommand('move Libera')).toMatchObject({ kind: 'error' });
+    });
+  });
+
+  describe('-cert on add', () => {
+    it('asks for a certificate to be minted with the network', () => {
+      expect(parseNetworkCommand('add -host irc.x -nick n -cert Libera')).toMatchObject({
+        kind: 'add',
+        input: { generate_client_cert: true },
+      });
+    });
+
+    it('is absent unless asked for', () => {
+      const cmd = parseNetworkCommand('add -host irc.x -nick n Libera');
+      expect(cmd).toMatchObject({ kind: 'add' });
+      expect(
+        (cmd as Extract<NetworkCommand, { kind: 'add' }>).input.generate_client_cert,
+      ).toBeUndefined();
+    });
+
+    // Minting has to happen before the first dial, so it rides on creation
+    // only; replacing one later is a different command.
+    it('is refused on modify, and says what to use instead', () => {
+      const cmd = parseNetworkCommand('modify Libera -cert');
+      expect(cmd).toMatchObject({ kind: 'error' });
+      expect((cmd as { message: string }).message).toContain('/network cert Libera new');
+    });
+  });
+
+  describe('cert', () => {
+    it('defaults to showing the fingerprint', () => {
+      expect(parseNetworkCommand('cert Libera')).toEqual({
+        kind: 'cert',
+        ref: 'Libera',
+        action: 'show',
+      });
+    });
+
+    it('takes new and remove', () => {
+      expect(parseNetworkCommand('cert Libera new')).toMatchObject({ action: 'generate' });
+      expect(parseNetworkCommand('cert Libera remove')).toMatchObject({ action: 'remove' });
+      expect(parseNetworkCommand('cert Libera rm')).toMatchObject({ action: 'remove' });
+      expect(parseNetworkCommand('cert Libera NEW')).toMatchObject({ action: 'generate' });
+    });
+
+    it('needs a network', () => {
+      expect(parseNetworkCommand('cert')).toMatchObject({ kind: 'error' });
+    });
+
+    it('rejects an action it does not have', () => {
+      // Importing a PEM is form-only on purpose — a composer keeps history.
+      expect(parseNetworkCommand('cert Libera import')).toMatchObject({ kind: 'error' });
+      expect(parseNetworkCommand('cert Libera new extra')).toMatchObject({ kind: 'error' });
+    });
+  });
+
+  describe('-proxy / -noproxy (#303)', () => {
+    it('splits a URL into the stored columns and enables the proxy', () => {
+      // A URL is how a proxy is written everywhere else (ALL_PROXY, curl -x),
+      // so that is what the flag takes — the columns are parts because the
+      // server never hands the password back.
+      const cmd = parseNetworkCommand('modify Libera -proxy socks5://127.0.0.1:9050');
+      expect(cmd).toMatchObject({
+        kind: 'modify',
+        input: {
+          proxy_enabled: true,
+          proxy_type: 'socks5',
+          proxy_host: '127.0.0.1',
+          proxy_port: 9050,
+        },
+      });
+    });
+
+    it('carries credentials and defaults the port by scheme', () => {
+      expect(parseNetworkCommand('modify Libera -proxy http://u:p@proxy.example')).toMatchObject({
+        input: { proxy_type: 'http', proxy_port: 3128, proxy_username: 'u', proxy_password: 'p' },
+      });
+    });
+
+    it('-noproxy turns it off AND clears it, port included', () => {
+      // So "stop going through a proxy" does not leave credentials — or a
+      // stale port that would reappear as a default — behind.
+      expect(parseNetworkCommand('modify Libera -noproxy')).toMatchObject({
+        input: {
+          proxy_enabled: false,
+          proxy_type: '',
+          proxy_host: '',
+          proxy_port: null,
+          proxy_username: '',
+          proxy_password: '',
+        },
+      });
+    });
+
+    it('rejects a URL the dialer could not use', () => {
+      // The client says what is wrong before sending anything; the server
+      // checks again because it cannot trust that this happened.
+      expect(parseNetworkCommand('modify Libera -proxy socks4://10.0.0.5')).toMatchObject({
+        kind: 'error',
+      });
+      expect(parseNetworkCommand('modify Libera -proxy 127.0.0.1:9050')).toMatchObject({
+        kind: 'error',
+      });
+    });
+
+    it('refuses to both set and clear a proxy', () => {
+      expect(
+        parseNetworkCommand('modify Libera -proxy socks5://127.0.0.1:9050 -noproxy'),
+      ).toMatchObject({ kind: 'error' });
+    });
+
+    it('works on add too', () => {
+      expect(
+        parseNetworkCommand(
+          'add -host irc.libera.chat -nick n -proxy socks5://127.0.0.1:9050 Libera',
+        ),
+      ).toMatchObject({ kind: 'add', input: { proxy_enabled: true, proxy_port: 9050 } });
     });
   });
 

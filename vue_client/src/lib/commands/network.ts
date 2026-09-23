@@ -19,6 +19,7 @@
 // output.
 
 import { tokenizeArgs } from './tokenize.js';
+import { parseProxyUrl, isProxyProblem } from '../../../../shared/proxy.js';
 
 /** The network fields a /network add|modify can set, post-mapping from flags. */
 export interface NetworkInput {
@@ -31,9 +32,22 @@ export interface NetworkInput {
   sasl_account?: string;
   sasl_password?: string;
   server_password?: string;
+  /** CertFP: mint a client certificate with the network, before its first
+   *  connect (add only — `/network cert <name> new` replaces one later). */
+  generate_client_cert?: boolean;
   connect_commands?: string;
   default_channel?: string;
   autoconnect?: boolean;
+  /** Proxy (#303). Written as a URL here because that is how a human types one
+   *  (`ALL_PROXY`, `curl -x`), and split into the stored parts by
+   *  parseProxyUrl — the columns are parts so the form can offer
+   *  "leave blank to keep" for the password. */
+  proxy_enabled?: boolean;
+  proxy_type?: string;
+  proxy_host?: string;
+  proxy_port?: number | null;
+  proxy_username?: string;
+  proxy_password?: string;
 }
 
 /** The parsed intent of a /network invocation. `error` carries a user message. */
@@ -45,6 +59,11 @@ export type NetworkCommand =
   | { kind: 'connect'; ref: string }
   | { kind: 'disconnect'; ref: string }
   | { kind: 'move'; ref: string; position: number }
+  // CertFP (#459). `show` prints the fingerprint to register with services;
+  // generate/remove write. Importing an existing PEM is deliberately NOT here —
+  // pasting a private key into a message composer is a bad place for it (the
+  // input has history), so that stays in the network form.
+  | { kind: 'cert'; ref: string; action: 'show' | 'generate' | 'remove' }
   | { kind: 'error'; message: string };
 
 // irssi-style options. Value flags consume the following token; bool flags
@@ -60,8 +79,9 @@ const VALUE_FLAGS = new Set([
   'password',
   'autosendcmd',
   'channel',
+  'proxy',
 ]);
-const BOOL_FLAGS = new Set(['tls', 'notls', 'auto', 'noauto']);
+const BOOL_FLAGS = new Set(['tls', 'notls', 'auto', 'noauto', 'cert', 'noproxy']);
 
 function isKnownFlag(name: string): boolean {
   return VALUE_FLAGS.has(name) || BOOL_FLAGS.has(name);
@@ -138,6 +158,42 @@ function buildInput(flags: Flags): NetworkInput | { error: string } {
   if (bools.has('tls')) input.tls = true;
   if (bools.has('notls')) input.tls = false;
 
+  if (bools.has('cert')) input.generate_client_cert = true;
+
+  // A URL is how a proxy is written everywhere else, so that is what -proxy
+  // takes; the parser splits it into the stored columns.
+  //
+  // ⚠ A URL with a password in it goes through the composer, whose input has
+  // history — the same argument that kept CertFP *import* out of /network.
+  // Unlike a PEM this is one short token people genuinely will type, so it
+  // stays, but the form is the better place for one carrying a password.
+  if (values.proxy !== undefined && bools.has('noproxy')) {
+    return { error: 'cannot combine -proxy and -noproxy' };
+  }
+  if (values.proxy !== undefined) {
+    const parsed = parseProxyUrl(values.proxy);
+    if (isProxyProblem(parsed)) return { error: parsed.error };
+    input.proxy_enabled = true;
+    input.proxy_type = parsed.type;
+    input.proxy_host = parsed.host;
+    input.proxy_port = parsed.port;
+    input.proxy_username = parsed.username ?? '';
+    input.proxy_password = parsed.password ?? '';
+  }
+  // Turns the proxy OFF and clears it, so `-noproxy` reads as "stop going
+  // through a proxy" rather than leaving credentials behind.
+  if (bools.has('noproxy')) {
+    input.proxy_enabled = false;
+    input.proxy_type = '';
+    input.proxy_host = '';
+    // Cleared too, or "stop going through a proxy" leaves a stale port sitting
+    // in the column — inert, since the type and host are gone, but it would
+    // reappear as a default the next time someone enabled a proxy here.
+    input.proxy_port = null;
+    input.proxy_username = '';
+    input.proxy_password = '';
+  }
+
   if (bools.has('auto') && bools.has('noauto')) {
     return { error: 'cannot combine -auto and -noauto' };
   }
@@ -200,6 +256,14 @@ export function parseNetworkCommand(argLine: string): NetworkCommand {
       if (built.default_channel !== undefined) {
         return { kind: 'error', message: '-channel can only be set when adding a network' };
       }
+      // Minting rides on network creation (it has to happen before the first
+      // dial). Replacing one on an existing network is `/network cert <name> new`.
+      if (built.generate_client_cert !== undefined) {
+        return {
+          kind: 'error',
+          message: `-cert can only be set when adding a network — use /network cert ${ref} new`,
+        };
+      }
       if (!Object.keys(built).length) {
         return { kind: 'error', message: `/network modify ${ref}: no changes given` };
       }
@@ -225,6 +289,22 @@ export function parseNetworkCommand(argLine: string): NetworkCommand {
       const ref = singleRef(rest, 'disconnect');
       if (typeof ref !== 'string') return { kind: 'error', message: ref.error };
       return { kind: 'disconnect', ref };
+    }
+
+    case 'cert': {
+      if (!rest.length) return { kind: 'error', message: '/network cert <network> [new|remove]' };
+      const action = (rest[1] ?? 'show').toLowerCase();
+      if (rest.length > 2) {
+        return { kind: 'error', message: '/network cert <network> [new|remove]' };
+      }
+      if (action === 'show') return { kind: 'cert', ref: rest[0], action: 'show' };
+      // "new" rather than "generate": it replaces whatever is there, and a
+      // replaced certificate has to be re-registered at NickServ.
+      if (action === 'new') return { kind: 'cert', ref: rest[0], action: 'generate' };
+      if (action === 'remove' || action === 'rm') {
+        return { kind: 'cert', ref: rest[0], action: 'remove' };
+      }
+      return { kind: 'error', message: `/network cert: unknown action "${rest[1]}"` };
     }
 
     case 'move': {

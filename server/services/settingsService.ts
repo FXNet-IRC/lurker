@@ -52,6 +52,21 @@ function valuesEqual(a: SettingValue, b: SettingValue): boolean {
   return false;
 }
 
+// The keys among `keys` the user has changed: stored, and different from the
+// registry default. update() drops a row set back to its default, so a default
+// stored some other way (an import, say) isn't a change either. Unknown keys
+// never are.
+export function changedSettings(userId: number, keys: readonly string[]): Set<string> {
+  const stored = getUserSettings(userId);
+  const out = new Set<string>();
+  for (const key of keys) {
+    const opt = getOption(key);
+    if (!opt || !Object.prototype.hasOwnProperty.call(stored, key)) continue;
+    if (!valuesEqual(stored[key] as SettingValue, opt.default)) out.add(key);
+  }
+  return out;
+}
+
 class SettingsService extends EventEmitter {
   // changes: { [key]: rawValue }; resets: keys to delete outright (theme apply
   // clears every themed override alongside its pointer write, atomically).

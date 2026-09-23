@@ -395,7 +395,7 @@ import { useContextMenu, type ContextMenuItem } from '../composables/useContextM
 import { useWhoisStore } from '../stores/whois.js';
 import { addressNick } from '../composables/useComposerOverlay.js';
 import { setViewedBuffer } from '../composables/useViewedBuffer.js';
-import { isChannelTarget } from '../../../shared/channels.js';
+import { isChannelTarget, dccChatPeer } from '../../../shared/channels.js';
 
 // Extended BufferMessage fields accessed in the template and script
 // (beyond the core BufferMessage definition which uses [key: string]: unknown).
@@ -649,7 +649,9 @@ const nickSet = computed((): Set<string> => {
     if (n) set.add(n);
   }
   if (b.target && !isChannelTarget(b.target) && !b.target.startsWith(':server:')) {
-    set.add(b.target);
+    // For a `=nick` DCC chat the speaker is the peer, not the buffer name —
+    // adding `=bob` would colour the sigil and make it a mention candidate.
+    set.add(dccChatPeer(b.target));
   }
   const sn = b.networkId != null ? networks.states[b.networkId]?.nick : undefined;
   if (sn) set.add(sn);

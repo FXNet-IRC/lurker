@@ -13,15 +13,19 @@ process.env.DATABASE_PATH = path.join(tmpDir, 'test.db');
 let settingsService: typeof SettingsServiceModule.default;
 let effectiveSetting: typeof SettingsServiceModule.effectiveSetting;
 let effectiveSettings: typeof SettingsServiceModule.effectiveSettings;
+let changedSettings: typeof SettingsServiceModule.changedSettings;
 let createUser: typeof import('../db/users.js').createUser;
+let setUserSetting: typeof import('../db/settings.js').setUserSetting;
 let user: ReturnType<typeof createUser>;
 
 beforeAll(async () => {
   ({ createUser } = await import('../db/users.js'));
+  ({ setUserSetting } = await import('../db/settings.js'));
   const mod = await import('./settingsService.js');
   settingsService = mod.default;
   effectiveSetting = mod.effectiveSetting;
   effectiveSettings = mod.effectiveSettings;
+  changedSettings = mod.changedSettings;
   user = createUser('ss-alice');
 });
 
@@ -147,5 +151,31 @@ describe('effectiveSettings (bulk)', () => {
     expect(s['ctcp.version']).toBe('');
     expect(s['ctcp.time']).toBe('${time}');
     expect(s['no.such.key']).toBeUndefined();
+  });
+});
+
+describe('changedSettings', () => {
+  it('names the keys stored with a value other than the default, empty included', () => {
+    const u = createUser('ss-changed');
+    settingsService.update(u.id, { 'ctcp.version': '', 'ctcp.replies': false });
+    expect(changedSettings(u.id, ['ctcp.version', 'ctcp.replies', 'ctcp.time'])).toEqual(
+      new Set(['ctcp.version', 'ctcp.replies']),
+    );
+  });
+
+  it('does not count a stored copy of the default, or an unknown key', () => {
+    const u = createUser('ss-changed-default');
+    setUserSetting(u.id, 'ctcp.version', '${name} ${version}');
+    setUserSetting(u.id, 'ctcp.replies', true);
+    setUserSetting(u.id, 'no.such.key', 'x');
+    expect(changedSettings(u.id, ['ctcp.version', 'ctcp.replies', 'no.such.key'])).toEqual(
+      new Set(),
+    );
+  });
+
+  it('reads only the keys it is asked about', () => {
+    const u = createUser('ss-changed-keys');
+    settingsService.update(u.id, { 'ctcp.time': '' });
+    expect(changedSettings(u.id, ['ctcp.version'])).toEqual(new Set());
   });
 });

@@ -8,6 +8,7 @@ import {
   hasMessageForTarget,
   hasConversationForTarget,
   hasMessageWithMsgid,
+  hasSameMessageWithMsgid,
   hasRecentMessageLike,
 } from '../db/messages.js';
 import { renameBuffer as renameDmBuffer } from '../db/renameBuffer.js';
@@ -45,7 +46,7 @@ import type { RestoreSlot } from './restoreGate.js';
 import { envInt as reconnectEnvInt } from '../utils/envInt.js';
 import { decideStamp } from './insertDecisions.js';
 import * as systemLog from './systemLog.js';
-import { effectiveSetting, effectiveSettings } from './settingsService.js';
+import { changedSettings, effectiveSetting, effectiveSettings } from './settingsService.js';
 import { APP_NAME, APP_VERSION } from '../utils/userAgent.js';
 import { findUserById } from '../db/users.js';
 import { isNodeMode } from '../utils/edition.js';
@@ -55,6 +56,16 @@ import {
   getWebircConfig,
 } from '../utils/forcedNetwork.js';
 import { deriveIdent, lockedAccountIdent } from '../../shared/ident.js';
+import { validateClientCertPair, isClientCertProblem } from '../utils/clientCert.js';
+import { networkProxy } from '../db/networks.js';
+import { isProxyProblem } from '../../shared/proxy.js';
+import type { ProxyConfig } from '../../shared/proxy.js';
+import { mayUseProxy } from './networkPolicy.js';
+import { ProxyTransport } from './proxyTransport.js';
+import { MonitorList } from './monitorList.js';
+import type { MonitorHolder, MonitorSync } from './monitorList.js';
+import { ReplyRouter } from './replyRouter.js';
+import type { Asker, ReplyOwner } from './replyRouter.js';
 import { classifyModeChange, modeLetter } from '../../shared/modes.js';
 import type { ModeChange } from '../../shared/modes.js';
 import { registerIdent, unregisterIdent, isIdentdEnabled, isOidentdFileEnabled } from './identd.js';
@@ -71,27 +82,55 @@ import { e2eDbg } from './e2e/debug.js';
 import { RateLimiter } from './e2e/rateLimiter.js';
 import {
   buildCtcpReply,
+  CTCP_ANSWER_SETTINGS,
   CTCP_SOURCE,
+  ctcpAnsweredBySettings,
+  ctcpInText,
   enabledCtcpTypes,
+  formatCtcpForwardedLine,
   formatCtcpReplyLine,
   formatCtcpRequestLine,
   formatCtcpTime,
+  isAnswerableCtcp,
   parseCtcp,
+  type CtcpAnswerer,
   type CtcpReplyConfig,
 } from './ctcp.js';
+import { attachedIrcClients } from './attachedIrcClients.js';
 import fs from 'fs';
 import path from 'path';
+import net from 'net';
 import {
+  buildDccChat,
+  buildDccChatPassive,
+  buildDccChatReverse,
   crc32Hex,
+  encodeDccAddress,
   formatBytes,
   formatDccOfferLine,
   isBlockedDccHost,
   parseCrcFromFilename,
   parseDcc,
+  parseDccChatLine,
+  PASSIVE_DCC_FAKE_HOST,
 } from './dcc.js';
-import type { DccAccept, DccSend } from './dcc.js';
-import { dccAllowPrivateHosts, dccEnabledForUser, dccMaxFileBytes } from './dccConfig.js';
+import type { DccAccept, DccChat as DccChatOffer, DccSend } from './dcc.js';
+import {
+  dccActiveListenAvailable,
+  dccAllowPrivateHosts,
+  dccEnabledForUser,
+  dccExternalHost,
+  dccMaxFileBytes,
+} from './dccConfig.js';
 import { hasFreeSpaceFor, resolveDccDestination } from './dccPaths.js';
+import { DccChat } from './dccChat.js';
+import { openDccListener, type DccListenHandle } from './dccListener.js';
+import {
+  dccChatHostFor,
+  dccChatKey,
+  registerDccChatHost,
+  unregisterDccChatHost,
+} from './dccChatSessions.js';
 import { DccReceiver } from './dccReceiver.js';
 import {
   type DccTransferRow,
@@ -109,7 +148,12 @@ import {
 import { getChannelConfig as getE2eChannelConfig } from '../db/e2e.js';
 import type { ChannelMode } from '../db/e2e.js';
 import { randomBytes } from 'node:crypto';
-import { isChannelTarget, CHANNEL_PREFIX_CLASS } from '../../shared/channels.js';
+import {
+  isChannelTarget,
+  isDccChatTarget,
+  CHANNEL_PREFIX_CLASS,
+  DCC_CHAT_PREFIX,
+} from '../../shared/channels.js';
 
 // Optional source address for outbound IRC connections (LURKER_OUTGOING_ADDR),
 // passed to irc-framework as `outgoing_addr` → the socket's localAddress. Lets a
@@ -171,6 +215,8 @@ const MAX_CONSECUTIVE_SASL_FAILURES = 3;
 // answer as a line of history on every app restart. Kept quiet per channel for a
 // short window after the restore — see RESTORE_QUIET_MS.
 const RESTORE_QUIET_NUMERICS = new Set(['221', '324', '329', '331', '332', '333']);
+// LURKER_RESTORE_QUIET_MS overrides it, read per restore, so a test can show
+// what the restore's own replies do without it.
 const RESTORE_QUIET_MS = 10_000;
 // The per-channel state requests after a restore go out one channel at a time,
 // and the next channel waits for this one's replies (drainRestoreQueue). This
@@ -209,6 +255,24 @@ const ENGINE_REATTACH_WAIT_MS = 10_000;
 // System-buffer line for a shutdown detach, in place of "Disconnected" — which
 // is exactly what did not happen.
 const DETACHED_LOG = 'Detached — the engine is keeping this connection open for the next start';
+
+// How long a passive DCC chat offer waits for the peer to reply with a port
+// before we stop expecting one. Matches the listener's own default so the two
+// halves of an offer time out together.
+const PASSIVE_DCC_TIMEOUT_MS = 120_000;
+
+// Bound the dial to a peer's advertised address so an unreachable one fails
+// promptly instead of hanging until the OS SYN timeout (~1-2 minutes).
+const DCC_CHAT_CONNECT_TIMEOUT_MS = 15_000;
+
+// How long an unsolicited inbound chat offer stays acceptable. Generous, because
+// the cost of a stale one is only a dial that fails — but not unbounded, so a
+// drive-by offer doesn't sit accepted-able forever.
+const INBOUND_DCC_CHAT_OFFER_TTL_MS = 10 * 60_000;
+
+// Matches the rate limiter's own backoff, so the user is told once per period
+// rather than once per dropped offer.
+const DCC_FLOOD_WARN_GAP_MS = 5 * 60_000;
 
 const NON_PERSISTED_TYPES = new Set([
   'state',
@@ -391,9 +455,17 @@ interface EnrichedEvent extends IrcEvent {
 // Module-level helpers
 // ---------------------------------------------------------------------------
 
+// "Is this target a nick we could address on the wire?" — NOT merely "is it not
+// a channel". Two shapes are buffers without being IRC targets: the `:server:`
+// console, and a `=nick` DCC chat.
+//
+// ⚠⚠ Every caller of this is a place that would otherwise put the target into an
+// IRC command: say/action/notice mark a DM peer from it, probePresence feeds it
+// to MONITOR, sendTyping puts it in a TAGMSG. Adding a shape here is how a new
+// pseudo-target stays off the wire.
 function isDmTargetName(target: string | undefined | null): boolean {
   if (!target) return false;
-  return !isChannelTarget(target) && !target.startsWith(':server:');
+  return !isChannelTarget(target) && !target.startsWith(':server:') && !isDccChatTarget(target);
 }
 
 // Persisted timestamps prefer IRCv3 server-time (#450): irc-framework parses
@@ -431,7 +503,10 @@ function extractExtras(event: IrcEvent): Record<string, unknown> | null {
   let extras: Record<string, unknown> | null = null;
   switch (event.type) {
     case 'kick':
-      extras = { kicked: event.kicked };
+      // `selfKicked` is persisted alongside the kicked nick so a backlog row
+      // carries the same shape the live frame did. It records that the kick
+      // was of US at the time, which no later nick comparison can recover.
+      extras = { kicked: event.kicked, selfKicked: event.selfKicked };
       break;
     case 'invite':
       // The invited nick — `nick` (the standard actor column) holds the
@@ -524,6 +599,15 @@ function normalizeAccount(raw: unknown): string | null | undefined {
   return s;
 }
 
+// The watch limit a MONITOR ISUPPORT token gives. irc-framework stores a token
+// without a value as `true`, and the spec reads MONITOR with no value as no
+// limit. 0 means the network doesn't offer MONITOR.
+export function monitorLimitFromIsupport(token: unknown): number {
+  if (token === true || token === '') return Infinity;
+  const n = Number(token);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
 // Why a nick is on the presence watch list. Only 'dm' today; the reason set is
 // reference-counted (see IrcConnection.trackedPeers) so a future second reason
 // (e.g. favorites) shares the MONITOR watch + peer_presence_state row.
@@ -533,23 +617,76 @@ interface PeerWatch {
   reasons: Set<TrackReason>;
 }
 
+// What makes a registration line the line it is: the command and its params,
+// less the target. Tags are per-delivery (time, msgid, batch), the source is the
+// server's name, and the target is OUR NICK — a server re-sending its ISUPPORT
+// addresses it to the nick of the moment, so without dropping it every line
+// would look new after a /nick. The replay rewrites the target anyway
+// (bouncer.rewriteNumericTarget).
+function burstPayload(line: string): string {
+  const afterSpace = (s: string) => {
+    const sp = s.indexOf(' ');
+    return sp === -1 ? s : s.slice(sp + 1);
+  };
+  let rest = line;
+  if (rest.startsWith('@')) rest = afterSpace(rest);
+  if (rest.startsWith(':')) rest = afterSpace(rest);
+  const command = rest.indexOf(' ');
+  if (command === -1) return rest;
+  const target = rest.indexOf(' ', command + 1);
+  return target === -1 ? rest.slice(0, command) : rest.slice(0, command) + rest.slice(target);
+}
+
 export class IrcConnection {
   network: Network;
   onEvent: (event: EnrichedEvent) => void;
   client: IrcClient;
   state: string;
+  /** Mutate only through setChannel/deleteChannel/forgetJoinedChannels —
+   *  never `.set`/`.delete`/`.clear` directly — so joinedFoldedCache can't
+   *  drift from what's actually in here. Reads (`.get`, `.values()`, `.has()`,
+   *  iteration) are fine raw.
+   *
+   *  The CURRENT socket's membership and nothing else (#908): only our own
+   *  JOIN echo (or the engine replay's synthesised one) adds an entry, a reply
+   *  that merely names a channel (NAMES, TOPIC) never does, and every entry
+   *  goes when the socket does. */
   channels: Map<string, ChannelState>;
   /** Lazily-built per-network-folded index over `channels` for
-   *  isChannelJoined. null = rebuild on next probe. MUST be nulled by every
-   *  channels-map mutation and by a CASEMAPPING change (the folds move). */
+   *  isChannelJoined. null = rebuild on next probe. Nulled by setChannel/
+   *  deleteChannel/forgetJoinedChannels on every mutation, and separately by a
+   *  CASEMAPPING change (the folds move even though membership doesn't). */
   joinedFoldedCache: Set<string> | null;
   // Join keys awaiting their echo, keyed by lowercased channel. Nothing is
   // persisted on a join REQUEST (the buffers row is echo-written), so the key
-  // rides here until the join lands; a forward (470) discards it. Lost on a
-  // process restart mid-join — the user just re-/joins with the key.
+  // rides here until the join lands; a forward (470) discards it, and so does
+  // the socket dying (forgetJoinedChannels). Lost on a process restart
+  // mid-join — the user just re-/joins with the key.
   private pendingJoinKeys = new Map<string, string>();
+  // Channels whose JOIN is on the wire with no answer yet, folded. Membership
+  // is echo-written, so between the request and its echo isChannelJoined says
+  // "no" for a channel we are about to be in — indistinguishable, to a caller,
+  // from one we left. mayBeJoined() is what tells those apart. Emptied by the
+  // same four things that answer a JOIN: the echo, a forward (470), a
+  // rejection naming the channel, and the socket dying.
+  private pendingJoins = new Set<string>();
+  // The mirror: channels whose PART is on the wire with no answer yet, folded.
+  // Membership is echo-written in BOTH directions, so between a PART and its
+  // echo the map still says we are in a channel we have already left — and a
+  // caller that acts on that sends a second PART, which the server answers 442
+  // (#967). Emptied wherever membership leaves the map (deleteChannel: the
+  // echo, a kick, a 442's eviction, the engine's prune) and by a JOIN for the
+  // same channel, which supersedes it.
+  private pendingParts = new Set<string>();
   userModes: Set<string>;
   awayState: AwayState;
+  // Caps this socket's server has answered a REQ for with a NAK. A refusal is
+  // an answer, and nothing in irc-framework records one: without this the
+  // post-restore REQ (requestUnnegotiatedCaps) would ask again every time the
+  // app re-attaches. Kept for the life of this connection object rather than
+  // cleared per socket — a fresh dial negotiates from CAP LS anyway, and that
+  // path never reads this. (#888)
+  private capsRefused: Set<string>;
   // One presence watch list keyed by lowercased nick. Each entry records WHY
   // we're watching it. The MONITOR watch and the shared peer_presence_state row
   // are reference-counted against those reasons — added when the first reason
@@ -562,6 +699,43 @@ export class IrcConnection {
   // Active DCC downloads (#270), keyed by dcc_transfers.id, so their sockets
   // aren't GC'd mid-transfer and can be cancelled on dispose.
   private readonly dccReceivers = new Map<number, DccReceiver>();
+  // Live DCC CHAT sessions, keyed by the peer's lowercased nick. Each is a
+  // direct TCP line-chat surfaced as a `=nick` buffer. Process-bound: the socket
+  // is independent of the IRC connection (so it survives a reconnect, exactly as
+  // irssi's does) but cannot outlive the process, while the buffer and its
+  // history persist — hence the once-per-peer notice in dccChatSend when a line
+  // is typed into a chat this process no longer holds.
+  private readonly dccChats = new Map<string, { nick: string; chat: DccChat }>();
+  // Peers we've already told "that chat is gone" since their last live session,
+  // so typing repeatedly into a dead `=nick` buffer doesn't repeat the notice.
+  private readonly dccChatDeadWarned = new Set<string>();
+  // Peer key -> when we last said "too many DCC requests", so the warning about
+  // a flood can't itself become one.
+  private readonly dccFloodWarnedAt = new Map<string, number>();
+  // Listeners for offers we've made that nobody has answered yet; closed on
+  // dispose so their bound ports are released rather than leaked.
+  // handle -> the peer it was opened for, so /dcc close can cancel it.
+  private readonly dccChatListeners = new Map<DccListenHandle, string>();
+  // Listener requests still binding a port, keyed by lowercased peer. The value
+  // is a per-request token, so a request that was cancelled and then re-made
+  // before the first bind returned can't be mistaken for the new one.
+  private readonly dccListenerRequests = new Map<string, object>();
+  // Inbound chat offers awaiting the user's acceptance, keyed by lowercased
+  // nick. ⚠ An offer is NOT auto-accepted: dialling would have this server open
+  // a TCP connection to an address a stranger chose, and hand them its IP, on
+  // nothing but a PRIVMSG. Both mature references refuse by default too —
+  // WeeChat's xfer.file.auto_accept_chats is "off" ("use carefully!",
+  // xfer-config.c:333-338) and irssi's dcc_autochat_masks is empty
+  // (dcc-chat.c:835) — and Lurker's own file path already requires approval.
+  private readonly pendingInboundChats = new Map<
+    string,
+    { nick: string; offer: DccChatOffer; timer: ReturnType<typeof setTimeout> }
+  >();
+  // Passive chat offers awaiting the peer's reverse reply, keyed by our token.
+  private readonly pendingPassiveChats = new Map<
+    number,
+    { nick: string; timer: ReturnType<typeof setTimeout> }
+  >();
   // Resumes awaiting the sender's DCC ACCEPT, keyed by nick|filename. Each holds
   // a timeout so a bot that never accepts fails the transfer cleanly.
   private readonly dccPendingResume = new Map<
@@ -578,6 +752,21 @@ export class IrcConnection {
   useMonitor: boolean;
   monitorLimit: number;
   pendingMonitorSeed: boolean;
+  // The network's MONITOR list: Lurker's nicks plus those of the IRC clients
+  // attached through the bouncer (see monitorList.ts and syncMonitor).
+  readonly monitor: MonitorList;
+  // True once the MOTD (or ERR_NOMOTD) has ended the registration burst, so
+  // every 005 has arrived and useMonitor is settled. Reset with the socket.
+  isupportComplete: boolean;
+  // Nicks watched by MONITOR lines sent raw (connect commands, /quote), kept as
+  // a list of their own on the network's list, like a bouncer client's, so a
+  // raw MONITOR C can't wipe other watches (see takeRawMonitor). Folded nick →
+  // the nick as sent. Cleared with the socket, as the network's list is.
+  private readonly rawMonitored = new Map<string, string>();
+  private readonly rawMonitorHolder: MonitorHolder = {
+    monitorTargets: () => this.rawMonitored.values(),
+    onMonitorDropped: (nicks, limit) => this.dropRawMonitors(nicks, limit),
+  };
   disposed: boolean;
   connectCommandTimer: ReturnType<typeof setTimeout> | null;
   lagMs: number | null;
@@ -632,11 +821,31 @@ export class IrcConnection {
   // notice / ctcp verbs never pass through raw(). `seq` orders the command
   // against outstanding CTCP requests, see takeCtcpIssuer.
   lastNickIntent = new Map<string, { channel: string | null; at: number; seq: number }>();
-  // Channels we auto-issued a WHO for on join (lowercase). The auto-WHO learns
-  // away/ident state and would flood the server buffer if echoed per-member, so
-  // the 'wholist' handler consumes these silently. Any wholist NOT in this set
-  // is a user-typed /who and gets rendered to the server buffer (#342).
-  autoWhoTargets: Set<string>;
+  // Who asked for each reply: Lurker, the user, or a bouncer client. Every query
+  // goes out through it, one of each kind on the wire at a time (replyRouter.ts).
+  readonly replies: ReplyRouter;
+  // Who the server line being handled is for, as the router saw it. Set in the
+  // raw listener and cleared by the same microtask as lineArrivedAt, so the
+  // line's handlers and every bouncer client's relay read one answer: a WHO the
+  // user typed renders, Lurker's own and a client's don't (#931). Null outside
+  // a line's handlers.
+  replyOwner: ReplyOwner | null;
+  // Who answers the CTCP request being handled, for a type Lurker can answer
+  // (ctcpAnswererFor, #932). Set in the raw listener, before any bouncer
+  // client's relay reads it, and cleared with replyOwner. Null for any other
+  // line and outside a line's handlers.
+  ctcpAnswerer: CtcpAnswerer | null;
+  // The command of the server line being handled, for a handler whose event
+  // doesn't say which line raised it. Set in the raw listener and cleared with
+  // replyOwner; null outside a line's handlers. A batch's lines run when the
+  // batch ends, so their handlers read the closing BATCH line's.
+  lineCommand: string | null;
+  // The raw listener's decisions for CTCP requests inside a batch, in arrival
+  // order per batch reference. irc-framework runs a batch's lines only when it
+  // ends, after ctcpAnswerer is cleared, so each request's handler takes its
+  // line's decision from here instead of deciding, and spending the peer's
+  // allowance, a second time. Capped, and cleared with the socket.
+  batchedCtcpAnswerers: Map<string, CtcpAnswerer[]>;
   // In-flight inbound `draft/multiline` batches, keyed by batch reference. Each
   // entry holds the first fragment's event envelope plus the text accumulated
   // so far; flushed as one reassembled message on 'batch end draft/multiline'
@@ -649,6 +858,13 @@ export class IrcConnection {
   // grafts them onto the first fragment. Consumed on first fragment; cleared on
   // socket close with multilineBatches so an unopened batch can't leak.
   multilineBatchTags: Map<string, { time?: string; msgid?: string }>;
+  // When the server line being handled arrived. An event without server-time
+  // takes it as its time, and so does the bouncer's copy of the line, so the
+  // stored row and the relayed line agree: a MARKREAD from an attached client
+  // names the relayed line's time and has to find that row. soju stamps a line
+  // once the same way (upstream.go:679). Null outside a line's handlers, so an
+  // event a timer fires later gets the time it happened.
+  lineArrivedAt: Date | null;
   // Exact ciphertext lines we recently put on the wire for E2E sends, so the
   // echo-message reflection of our OWN ciphertext is recognized by content —
   // not by re-checking channel E2E state at echo time, which races /e2e off
@@ -717,6 +933,10 @@ export class IrcConnection {
   // us from its map so a later /connect builds a fresh IrcConnection instead of
   // finding this corpse and doing nothing.
   private readonly onTakenOver: (() => void) | undefined;
+  // Called when a dial is refused for a reason only a config change can fix, so
+  // the owner can drop this object rather than keep a corpse that will never
+  // retry (see clientCertBlockedReason).
+  private readonly onNeedsRebuild: (() => void) | undefined;
   // Engine mode (services/engineTransport.ts): the IRC socket lives in the
   // engine process and this Client is attached to it over a link.
   //
@@ -763,16 +983,19 @@ export class IrcConnection {
     onEvent,
     reconnectGate,
     onTakenOver,
+    onNeedsRebuild,
   }: {
     network: Network;
     onEvent: (event: EnrichedEvent) => void;
     reconnectGate?: ReconnectGate;
     onTakenOver?: () => void;
+    onNeedsRebuild?: () => void;
   }) {
     this.network = network;
     this.onEvent = onEvent;
     this.reconnectGate = reconnectGate;
     this.onTakenOver = onTakenOver;
+    this.onNeedsRebuild = onNeedsRebuild;
     // ALL CTCP handling lives in our 'ctcp request' handler (VERSION/PING/TIME/
     // SOURCE/CLIENTINFO, rate-limited + surfaced), so irc-framework's built-in
     // VERSION auto-reply is disabled with `version: false`. That MUST go in the
@@ -789,8 +1012,10 @@ export class IrcConnection {
     // 'away'/'back' handlers below already feed markPeerEvent regardless of how
     // the AWAY arrived. requestCap is a no-op on networks that don't advertise
     // the cap — irc-framework only emits a CAP REQ for caps the server lists in
-    // CAP LS. (#310)
+    // CAP LS. (#310) The draft name too, for a network that still offers only
+    // that one, as soju does.
     this.client.requestCap('extended-monitor');
+    this.client.requestCap('draft/extended-monitor');
     // batch + draft/multiline (IRCv3): lets a multi-line compose travel as one
     // logical message instead of N fragmented PRIVMSGs, and lets us reassemble
     // the same from peers (e.g. Ergo). requestCap is a no-op where the server
@@ -803,6 +1028,7 @@ export class IrcConnection {
     this.joinedFoldedCache = null;
     this.userModes = new Set();
     this.awayState = { active: false, message: null, since: null, autoSet: false, backAt: null };
+    this.capsRefused = new Set();
     // Lowercase nicks we watch for presence, each tagged with why. Gates the
     // per-peer presence writes so we don't churn the DB (and the WS broadcast
     // stream) on every JOIN/QUIT for an unrelated user on a busy network.
@@ -818,6 +1044,14 @@ export class IrcConnection {
     this.useMonitor = false;
     this.monitorLimit = 0;
     this.pendingMonitorSeed = false;
+    this.monitor = new MonitorList((line) => {
+      try {
+        this.client.raw(line);
+      } catch (_) {
+        /* ignore */
+      }
+    });
+    this.isupportComplete = false;
     this.disposed = false;
     // Pending timer for the next WAIT-delayed connect command. Cleared on
     // close/dispose so we never call client.raw() after the socket is gone.
@@ -846,9 +1080,28 @@ export class IrcConnection {
     this.identifiedToServices = false;
     this.unsendableTargets = new Set();
     this.lastUserSendAt = new Map();
-    this.autoWhoTargets = new Set();
+    this.replies = new ReplyRouter({
+      write: (line) => {
+        try {
+          this.client.raw(line);
+        } catch (_) {
+          /* ignore */
+        }
+      },
+      canSend: () => this.state === 'connected',
+      fold: (name) => foldTargetFor(this.network.id, name),
+      isJoined: (channel) => this.isChannelJoined(channel),
+      ownNick: () => this.currentNick,
+      listModes: () => this.listModes(),
+      prefixModes: () => this.prefixModes(),
+    });
+    this.replyOwner = null;
+    this.ctcpAnswerer = null;
+    this.lineCommand = null;
+    this.batchedCtcpAnswerers = new Map();
     this.multilineBatches = new Map();
     this.multilineBatchTags = new Map();
+    this.lineArrivedAt = null;
     this.sentCiphertext = [];
     this.lastAdoptedSelfMsgid = null;
     this.ctcpLimiter = new RateLimiter();
@@ -940,9 +1193,9 @@ export class IrcConnection {
     // wanted, while the control events (state, channel-joined, own-nick) are
     // exactly what a re-attached process needs.
     if (this.restoring && this.shouldPersist(event)) return;
-    if (this.catchingUp && this.shouldPersist(event) && this.alreadyPersisted(event)) return;
     event = this.normalizeChannelTarget(event);
-    const time = normalizeEventTime(event.time);
+    const time = normalizeEventTime(event.time ?? this.lineArrivedAt?.getTime());
+    if (this.shouldPersist(event) && this.alreadyPersisted(event, time)) return;
     const enriched: EnrichedEvent = {
       ...event,
       userId: this.network.user_id,
@@ -1017,13 +1270,16 @@ export class IrcConnection {
       ...event,
       userId: this.network.user_id,
       networkId: this.network.id,
-      time: normalizeEventTime(event.time),
+      time: normalizeEventTime(event.time ?? this.lineArrivedAt?.getTime()),
     });
   }
 
   // `opts.log`: false skips the system-buffer line for this transition (the
   // state event still goes to clients); a string replaces its text. Neither
   // reaches the wire.
+  // `extra.error`: why a connection attempt failed, in the words of the error
+  // row the server buffer gets. ircManager keeps the last one for bouncer
+  // clients (BOUNCER NETWORK's `error` attribute) until the next connect.
   setState(
     state: string,
     extra: Record<string, unknown> = {},
@@ -1053,7 +1309,12 @@ export class IrcConnection {
   // the network's *current* name for the raw log, but `fields.networkId` carries
   // the stable id so the client can resolve the live name at render time — the
   // scope string is frozen at write time and goes stale after a rename (#355).
+  // Silent once disposed, like publish(): the socket's close still runs its
+  // handlers after dispose(), and on a deletion the user row is already gone —
+  // its "Disconnected" line failed the foreign key and took the process down
+  // (#936). A disposal writes its own line (ircManager's "Disposing: …").
   logNet(text: string, level?: string): void {
+    if (this.disposed) return;
     systemLog.log({
       userId: this.network.user_id,
       scope: this.logScope(),
@@ -1086,6 +1347,24 @@ export class IrcConnection {
 
   bind(): void {
     const c = this.client;
+    // Every handler registers through this but the socket's own teardown
+    // ('socket close', 'close'), and none of them runs once the connection is
+    // disposed (#936). A line the server sent before it read our QUIT still
+    // arrives, and plenty of handlers write straight to the DB — a tracked
+    // peer's QUIT writes its presence row. On a deletion the network and user
+    // rows are already gone, so the write fails its foreign key, and thrown
+    // from a socket event that exits the process. The teardown still runs: it
+    // releases what the socket held (the identd entry, the restore slot), and
+    // everything it writes goes through publish() or logNet(), both silent
+    // once disposed.
+    // Not an irc-framework raw middleware: middleware-handler runs the rest of
+    // the dispatch inside its try/catch, so installing one would turn every
+    // handler's exception into a console line instead of the fatal exit.
+    const on = (event: string, listener: (payload: never) => void): void => {
+      c.on(event, (payload: unknown) => {
+        if (!this.disposed) listener(payload as never);
+      });
+    };
 
     // The server buffer is the authentic log of everything the server sends:
     // we default to surfacing every numeric here (welcome banner, lusers, SASL
@@ -1096,8 +1375,20 @@ export class IrcConnection {
     // under the old curated allowlist (#342). Pretty surfaces (nicklist, topic
     // bar, whois modal) are rendered additively by their structured handlers;
     // they never replace the raw line here.
-    c.on('raw', (event: { from_server: boolean; line: string }) => {
+    on('raw', (event: { from_server: boolean; line: string }) => {
       if (!event?.from_server || typeof event.line !== 'string') return;
+      // One time for everything this line produces (see lineArrivedAt). This
+      // listener is registered before any bouncer client's, and irc-framework
+      // runs the line's handlers synchronously once its raw listeners return
+      // (connection.js emits raw, then message), so they all read this value
+      // before the microtask clears it.
+      this.lineArrivedAt = new Date();
+      queueMicrotask(() => {
+        this.lineArrivedAt = null;
+        this.replyOwner = null;
+        this.ctcpAnswerer = null;
+        this.lineCommand = null;
+      });
       // A ban-classified ERROR is only believed if it's the link's LAST line
       // (#651). Every server line passes through here, and for the ban line
       // itself raw fires BEFORE the parsed 'irc error' sets the flag
@@ -1113,6 +1404,59 @@ export class IrcConnection {
         return;
       }
       const rawCommand = (msg?.command || '').toString();
+      this.lineCommand = rawCommand;
+      // Who this line is for, before anything reads it (see replyOwner).
+      this.replyOwner = this.replies.noteServerLine(
+        event.line.replace(/[\r\n]+$/, ''),
+        rawCommand,
+        msg?.params ?? [],
+        msg?.prefix?.split('!')[0],
+      );
+      // Who answers a CTCP request, before any bouncer client's relay passes it
+      // on (see ctcpAnswerer).
+      this.ctcpAnswerer = rawCommand === 'PRIVMSG' && msg ? this.ctcpAnswererForLine(msg) : null;
+      // A batch's lines reach their handlers only when it ends, after the
+      // microtask, so a batched request's decision waits for its handler.
+      const batchRef = (msg?.tags as Record<string, string> | undefined)?.batch;
+      if (this.ctcpAnswerer && batchRef) {
+        let queue = this.batchedCtcpAnswerers.get(batchRef);
+        if (!queue) {
+          // Past the cap the oldest batch goes, most likely one the server never
+          // ended. Its requests are decided again if they ever run.
+          if (this.batchedCtcpAnswerers.size >= 100) {
+            const oldest = this.batchedCtcpAnswerers.keys().next().value;
+            if (oldest !== undefined) this.batchedCtcpAnswerers.delete(oldest);
+          }
+          queue = [];
+          this.batchedCtcpAnswerers.set(batchRef, queue);
+        }
+        queue.push(this.ctcpAnswerer);
+      }
+      // ERR_MONLISTFULL: the network refused these nicks, so they aren't on its
+      // list. irc-framework's 'irc error' for it doesn't say which. The line
+      // stays out of the server buffer, since it can name a bouncer client's
+      // nick and that client is sent the 734. Lurker's own nicks get a notice.
+      if (rawCommand === '734') {
+        const refused = String(msg?.params?.[2] ?? '')
+          .split(',')
+          .filter(Boolean);
+        this.monitor.noteRefused(refused);
+        const listLimit = msg?.params?.[1] ?? '?';
+        const own = refused.filter((n) => this.isOwnMonitorNick(n));
+        if (own.length > 0) {
+          this.publish({
+            type: 'notice',
+            target: this.serverTarget(),
+            nick: 'lurker',
+            notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
+            text: `MONITOR limit (${listLimit}) reached; live presence skipped for ${own.join(', ')}.`,
+          });
+        }
+        // A raw MONITOR + (connect command, /quote) failed for these, as a
+        // client's would.
+        const rawRefused = refused.filter((n) => this.rawMonitored.has(n.toLowerCase()));
+        if (rawRefused.length > 0) this.dropRawMonitors(rawRefused, listLimit);
+      }
       // draft/multiline BATCH start: the logical message's msgid/@time ride
       // THIS line per the spec, and irc-framework drops them when it reduces
       // the batch to {id,type,params} — stash them for accumulateMultiline.
@@ -1151,14 +1495,24 @@ export class IrcConnection {
         }
       }
       const burstLine = event.line.replace(/[\r\n]+$/, '');
-      if (rawCommand === '001') this.registrationLines = [burstLine];
-      else if (
+      if (rawCommand === '001') {
+        this.registrationLines = [burstLine];
+      } else if (
         this.registrationLines.length > 0 &&
         (rawCommand === '002' ||
           rawCommand === '003' ||
           rawCommand === '004' ||
           rawCommand === '005')
       ) {
+        // Servers repeat these: solanum sends its whole ISUPPORT again after
+        // every VERSION (show_isupport in m_version.c), and every attach would
+        // replay the pile. A line the burst already holds keeps its one place,
+        // moved to the end so the newest copy is the one that lands last — a
+        // token that went A → B → A is back at A for the client, where dropping
+        // the repeat would leave it at B.
+        const payload = burstPayload(burstLine);
+        const at = this.registrationLines.findIndex((l) => burstPayload(l) === payload);
+        if (at !== -1) this.registrationLines.splice(at, 1);
         this.registrationLines.push(burstLine);
       }
       // Command-result errors (a failed kick / invite / mode / topic) name the
@@ -1175,9 +1529,11 @@ export class IrcConnection {
       // toLowerCase. On an rfc1459 network (where [ \ ] ^ fold to { | } ~) a 482
       // naming #news{dev} while we're joined as #news[dev] would pass the
       // membership test and then publish a target no buffer is keyed by.
+      //
+      // One answering a query a bouncer client sent (`MODE #chan e`) is its own.
       const cmdError = commandResultError(rawCommand, msg?.params ?? []);
       const cmdErrorChannel = cmdError ? this.channelState(cmdError.channel) : undefined;
-      if (cmdError && cmdErrorChannel) {
+      if (cmdError && cmdErrorChannel && this.replyForUser()) {
         this.publish({
           type: 'error',
           target: cmdErrorChannel.name,
@@ -1187,9 +1543,27 @@ export class IrcConnection {
       }
       // A reply to the restore step in flight is what releases the next
       // channel's requests. Before the denylist: 366 is exactly the kind of
-      // line the server buffer never shows.
-      this.noteRestoreReply(rawCommand, msg?.params?.[1]);
-      if (isServerBufferDeniedNumeric(rawCommand)) return;
+      // line the server buffer never shows. Only the restore's own: a bouncer
+      // client's NAMES for the same channel mustn't move the step on.
+      if (this.replyOwner === 'lurker') this.noteRestoreReply(rawCommand, msg?.params?.[1]);
+      // The server buffer is the user's. A reply to Lurker's own query (the
+      // MODE it sends on a join) or to a bouncer client's isn't history (#931).
+      if (!this.replyForUser()) {
+        // The restore's own replies still retire their channel's quiet mark, so
+        // the user's own /topic or /mode a moment later renders.
+        if (this.replyOwner === 'lurker' && RESTORE_QUIET_NUMERICS.has(rawCommand)) {
+          this.isRestoreQuiet(rawCommand, rawCommand === '221' ? '*' : msg?.params?.[1]);
+        }
+        return;
+      }
+      // NAMES replies are denied because a joined channel's nicklist is where
+      // they show. One for a channel we are not in has no nicklist to land in
+      // (see 'userlist'), so it renders verbatim like any other numeric.
+      const namesChannel =
+        rawCommand === '353' ? msg?.params?.[2] : rawCommand === '366' ? msg?.params?.[1] : null;
+      const namesElsewhere =
+        typeof namesChannel === 'string' && !this.isChannelJoined(namesChannel);
+      if (isServerBufferDeniedNumeric(rawCommand) && !namesElsewhere) return;
       if (
         RESTORE_QUIET_NUMERICS.has(rawCommand) &&
         this.isRestoreQuiet(rawCommand, rawCommand === '221' ? '*' : msg?.params?.[1])
@@ -1208,13 +1582,25 @@ export class IrcConnection {
     // display of unmodeled numerics now happens on the 'raw' handler above
     // (#342) — this handler only intercepts cases that belong on a channel/DM
     // surface instead of (or in addition to) the server buffer.
-    c.on('unknown command', (cmd: { command?: string; params?: string[] }) => {
+    on('unknown command', (cmd: { command?: string; params?: string[] }) => {
       const command = (cmd?.command || '').toString();
       const params = Array.isArray(cmd?.params) ? (cmd.params as string[]) : [];
       // These numerics arrive as [nick, <target>, reason] — usually a channel,
       // but see the nick case below.
       const channel = typeof params[1] === 'string' ? params[1] : '';
       const reason = params[params.length - 1] || null;
+      // The join rejections irc-framework doesn't model arrive here rather than
+      // on 'irc error' — 476 and 477 have no entry in its generics, and neither
+      // does 403, which answers a JOIN without having a toast of its own. Same
+      // rule as there: a rejection ends the JOIN, so the mark goes, and only a
+      // numeric that can answer a JOIN clears it.
+      if (
+        channel &&
+        isChannelTarget(channel) &&
+        (joinRejectionMessage(command) || command === '403')
+      ) {
+        this.pendingJoins.delete(foldTargetFor(this.network.id, channel));
+      }
       // ERR_NEEDREGGEDNICK (477) to a channel we're already in is a speak
       // rejection, not a join failure — surface it inline in that channel so
       // the user sees why their message didn't land, instead of a misleading
@@ -1259,7 +1645,7 @@ export class IrcConnection {
     // RPL_LOGGEDIN (900): the user identified to services mid-session (NickServ
     // or SASL). That's exactly what +R/+M channels were waiting on, so drop the
     // unsendable set and let the next message re-probe — typing resumes too (#283).
-    c.on('loggedin', () => {
+    on('loggedin', () => {
       // Also the gate stopAutojoining waits on: account-based channel access
       // (+I/+e $a:) only starts matching once the server considers us
       // identified, so a join rejection before this point says nothing durable.
@@ -1275,7 +1661,12 @@ export class IrcConnection {
     // socket does die we must not reconnect-loop into the same rejection (which
     // on a server that requires auth is a fast failed-login hammer). We don't
     // publish here — the server's own error/ERROR line surfaces the cause.
-    c.on('sasl failed', (event: Record<string, unknown>) => {
+    on('cap nak', (event: Record<string, unknown>) => {
+      const caps = (event?.capabilities as Record<string, unknown> | undefined) || {};
+      for (const name of Object.keys(caps)) this.capsRefused.add(name);
+    });
+
+    on('sasl failed', (event: Record<string, unknown>) => {
       const reason = (event?.reason as string | undefined) || undefined;
       if (isTerminalSaslFailure(reason)) {
         // PENDING, not terminal on sight (#617). On a network where SASL is
@@ -1286,13 +1677,24 @@ export class IrcConnection {
         // Promoted to terminal at 'close' once the streak runs out; see
         // maybePromoteSaslFailure.
         this.saslFailureStreak += 1;
+        // Which credential to go and look at depends on which one was offered:
+        // under EXTERNAL there is no password to check, and the fix is at
+        // NickServ, where the fingerprint has to be registered before the
+        // network will recognise it. (#459)
+        const usingCert = !!this.network.client_cert && !this.network.sasl_password;
+        // Deliberately not "register it while connected": on a network that
+        // REQUIRES SASL this rejection is what stops you connecting, so that
+        // advice is a closed loop. Name the way out of it too.
+        const advice = usingCert
+          ? " — this network doesn't recognise your client certificate. Register its fingerprint with NickServ (CERT ADD); if that means getting in first, remove the certificate here"
+          : " — check the network's account credentials";
         this.pendingSaslFailure = `SASL authentication failed${
           reason && reason !== 'fail' ? ` (${reason})` : ''
-        } — check the network's account credentials`;
+        }${advice}`;
       }
     });
 
-    c.on('registered', (event: Record<string, unknown>) => {
+    on('registered', (event: Record<string, unknown>) => {
       this.userModes.clear();
       this.lagMs = null;
       // A full, registered connection is the only signal that the network is
@@ -1346,6 +1748,12 @@ export class IrcConnection {
           ) {
             continue;
           }
+          // ⚠⚠ Belt to kindForTarget's braces. This loop reads listOpenDms —
+          // raw SQL on `kind = 'dm'` — so it never passes through a shape
+          // predicate, and it runs on EVERY reconnect with no user action. A
+          // `=nick` row minted before the 'dcc' kind existed would still be
+          // 'dm' here and would seed `MONITOR + =nick` upstream.
+          if (isDccChatTarget(buf.target)) continue;
           this.addPeerReason(buf.target.toLowerCase(), 'dm');
         }
         this.sweepUntrackedPresenceRows();
@@ -1406,15 +1814,10 @@ export class IrcConnection {
       // after, the socket-reconnect path runs clearAwayAll({autoSet:true}) and
       // clears it cleanly; if not, staying away across an IRC blip is the
       // correct behavior.
-      // Not on a restore: the socket already carries the away state (this
-      // process set it before it went away), and the 306 the re-assert draws
-      // would land as a server-buffer row on every restart.
+      // Not on a restore: that socket has been told before, and whatever changed
+      // while the link was down goes out when the restore completes ('restored').
       if (this.awayState.active && this.awayState.message && !this.restoring) {
-        try {
-          this.client.raw('AWAY :' + this.awayState.message);
-        } catch (_) {
-          /* ignore */
-        }
+        this.sendAwayState();
       }
       // IRCCloud-style "commands to run on connect" — newline-delimited raw
       // IRC lines fired after 001. `WAIT <seconds>` pauses before the next
@@ -1430,9 +1833,12 @@ export class IrcConnection {
       unregisterIdent(this.identdId);
       this.identdId = null;
       this.userModes.clear();
-      this.autoWhoTargets.clear();
+      // Every query went with the socket. A bouncer client still waiting on one
+      // is sent its end numeric.
+      this.replies.reset();
       this.multilineBatches.clear();
       this.multilineBatchTags.clear();
+      this.batchedCtcpAnswerers.clear();
       // Echo-correlation state is per-socket: no echo can arrive for a line
       // sent on the dead socket.
       this.sentCiphertext.length = 0;
@@ -1461,6 +1867,9 @@ export class IrcConnection {
       this.useMonitor = false;
       this.monitorLimit = 0;
       this.pendingMonitorSeed = false;
+      this.monitor.reset();
+      this.isupportComplete = false;
+      this.rawMonitored.clear();
       // Safety-net presence sweep. The primary one runs in 'socket close',
       // which fires on every disconnect (including auto-reconnect blips), so it
       // has almost always swept already by the time this terminal 'close'
@@ -1478,6 +1887,9 @@ export class IrcConnection {
       }
       this.markAllPeersOffline();
       this.setState('disconnected');
+      // Safety net, like the sweep above: 'socket close' has almost always
+      // forgotten the channels already, and a second call is a no-op.
+      this.forgetJoinedChannels();
       // Decide, now that we know WHEN the socket died, whether a SASL rejection
       // (#617) or a ban-classified ERROR (#651) earlier in this connection is
       // what killed it.
@@ -1494,7 +1906,7 @@ export class IrcConnection {
     // fallback ladder (nick1, nick2, …, nick9) until the server accepts a
     // NICK or we exhaust attempts. Post-registration hits are user-driven
     // /nick attempts — surface a notice and leave the user in control.
-    c.on('nick in use', (event: Record<string, unknown>) => {
+    on('nick in use', (event: Record<string, unknown>) => {
       const requested = (event?.nick as string) || '';
       if (!this.preRegistered) {
         this.publish({
@@ -1535,7 +1947,7 @@ export class IrcConnection {
     // options.MONITOR === '100' (the per-connection watch limit). Without
     // this guard we'd send `MONITOR +` blind and trigger 421 on older
     // ircds, which our 'irc error' path surfaces to the user.
-    c.on('server options', () => {
+    on('server options', () => {
       // 005 lines arrive in multiple bursts; this handler fires once per
       // line as irc-framework accumulates options. The MONITOR token isn't
       // necessarily in the first line, so only act when we transition
@@ -1544,21 +1956,16 @@ export class IrcConnection {
       // (harmless — they're just booleans, and trackDmPeer's per-add path
       // also checks useMonitor before sending).
       const opts = this.client.network?.options || {};
-      const limit = Number(opts.MONITOR) || 0;
+      const limit = monitorLimitFromIsupport(opts.MONITOR);
       if (limit === 0 || this.useMonitor) return;
       this.useMonitor = true;
       this.monitorLimit = limit;
       if (!this.restoring) {
-        this.logNet(`MONITOR (IRCv3 presence) supported, watch limit ${limit}`);
+        const cap = limit === Infinity ? 'no watch limit' : `watch limit ${limit}`;
+        this.logNet(`MONITOR (IRCv3 presence) supported, ${cap}`);
       }
-      if (this.pendingRegainSetup && this.regainNick) {
-        this.pendingRegainSetup = false;
-        try {
-          this.client.addMonitor(this.regainNick);
-        } catch (_) {
-          /* ignore */
-        }
-      }
+      // The regain nick goes on the list with the seed (ownMonitorNicks).
+      this.pendingRegainSetup = false;
       if (this.pendingMonitorSeed) {
         this.pendingMonitorSeed = false;
         const seedCount = this.monitoredNicks().length;
@@ -1566,9 +1973,9 @@ export class IrcConnection {
           this.logNet(
             `Seeding MONITOR with ${seedCount} nick${seedCount === 1 ? '' : 's'} (DM peers)`,
           );
-          this.seedMonitorWatch();
         }
       }
+      this.seedMonitorWatch();
     });
 
     // RPL_MONONLINE — peers in our MONITOR watch list that are currently
@@ -1576,10 +1983,22 @@ export class IrcConnection {
     // state of each newly-added nick) and live when a watched peer
     // connects. The regain handler doesn't react to online events, so
     // there's no conflict to filter.
-    c.on('users online', (event: Record<string, unknown>) => {
+    on('users online', (event: Record<string, unknown>) => {
+      // irc-framework raises this for an ISON reply (303) as well as MONITOR's
+      // 730, with the same payload. ISON is a poll (/ison, or a bouncer client's
+      // notify list on a network without MONITOR) and nothing on such a network
+      // ever marks the peer offline again, so a tracked DM peer would read
+      // online long after they'd gone (#933). Presence is MONITOR's alone.
+      if (this.lineCommand === '303') return;
       const nicks: string[] = Array.isArray(event?.nicks) ? (event.nicks as string[]) : [];
-      if (nicks.length > 0) {
-        this.logNet(`Presence: ${nicks.join(', ')} online`);
+      this.monitor.noteStatus(
+        nicks.filter((n) => typeof n === 'string'),
+        true,
+      );
+      // The list also holds bouncer clients' nicks; log only Lurker's own.
+      const own = nicks.filter((n) => this.isOwnMonitorNick(n));
+      if (own.length > 0) {
+        this.logNet(`Presence: ${own.join(', ')} online`);
       }
       for (const nick of nicks) {
         if (typeof nick === 'string') this.markPeerEvent(nick, 'online');
@@ -1594,10 +2013,15 @@ export class IrcConnection {
     //      offline, write the transition. The two consumers never conflict:
     //      the regain target is never one of our own DM peers, and the
     //      tracked-peer gate inside markPeerEvent filters out anything else.
-    c.on('users offline', (event: Record<string, unknown>) => {
+    on('users offline', (event: Record<string, unknown>) => {
       const nicks: string[] = Array.isArray(event?.nicks) ? (event.nicks as string[]) : [];
-      if (nicks.length > 0) {
-        this.logNet(`Presence: ${nicks.join(', ')} offline`);
+      this.monitor.noteStatus(
+        nicks.filter((n) => typeof n === 'string'),
+        false,
+      );
+      const own = nicks.filter((n) => this.isOwnMonitorNick(n));
+      if (own.length > 0) {
+        this.logNet(`Presence: ${own.join(', ')} offline`);
       }
       if (this.regainNick) {
         const target = this.regainNick.toLowerCase();
@@ -1614,7 +2038,7 @@ export class IrcConnection {
       }
     });
 
-    c.on('pong', (event: Record<string, unknown>) => {
+    on('pong', (event: Record<string, unknown>) => {
       const token = event?.message as string | undefined;
       if (!token || token !== this.lagPendingToken) return;
       this.lagMs = Math.max(0, Date.now() - this.lagPendingSentAt);
@@ -1650,11 +2074,24 @@ export class IrcConnection {
         } else if (engineCode === ENGINE_CLOSE.DETACHED) {
           this.setState('disconnected', {}, { log: DETACHED_LOG });
         } else {
-          this.setState('reconnecting');
+          // `engineLink`: the IRC socket is up, only our link to it is gone, so
+          // a bouncer client hears nothing about it (services/bouncer.ts).
+          this.setState('reconnecting', { engineLink: true });
         }
         return;
       }
-      this.setState('disconnected');
+      const errorText =
+        err && (err.message || err.code)
+          ? formatSocketCloseErrorMessage(
+              err,
+              `${this.network.host}:${this.network.port}`,
+              this.network.trusted_certificates !== 0,
+            )
+          : null;
+      this.setState('disconnected', errorText ? { error: errorText } : {});
+      // The IRC socket itself is gone (the engine-link cases returned above),
+      // and the channels we were in went with it.
+      this.forgetJoinedChannels();
       // Our socket to this network just dropped — from our vantage point every
       // peer we track here is now unreachable, so mark them all offline. This is
       // the fix for the "stuck online" gap on networks without MONITOR: if a
@@ -1674,19 +2111,13 @@ export class IrcConnection {
       // 'raw socket connected' handler above and gets a fresh handle).
       unregisterIdent(this.identdId);
       this.identdId = null;
-      if (err && (err.message || err.code)) {
-        const where = `${this.network.host}:${this.network.port}`;
-        const text = formatSocketCloseErrorMessage(
-          err,
-          where,
-          this.network.trusted_certificates !== 0,
-        );
+      if (errorText) {
         this.publish({
           type: 'error',
           target: this.serverTarget(),
-          text,
+          text: errorText,
         });
-        this.logNet(text, 'error');
+        this.logNet(errorText, 'error');
       }
     });
     // The 'reconnecting' state + notice are now emitted by our own controller
@@ -1696,7 +2127,12 @@ export class IrcConnection {
     // "Connecting…" in the system buffer would describe a connect that isn't
     // happening; the manager already said "Attaching…" and the engine hook
     // says "Re-attached" when it lands.
-    c.on('connecting', () => this.setState('connecting', {}, { log: !this.engineHoldsUs() }));
+    on('connecting', () => {
+      // Re-attaching to a connection the engine still holds isn't the network
+      // connecting: the same flag, and the same silence for bouncer clients.
+      const held = this.engineHoldsUs();
+      this.setState('connecting', held ? { engineLink: true } : {}, { log: !held });
+    });
 
     // Diagnostic: irc-framework fires 'ping timeout' when it hasn't seen data
     // from the server for `ping_timeout` seconds (120s default) — then it QUITs
@@ -1714,7 +2150,7 @@ export class IrcConnection {
     // path. logNet is a single lightweight systemLog line (visible in the app's
     // system buffer), and console.warn lands in `docker logs` next to the
     // [event-loop] stall line for correlation.
-    c.on('ping timeout', () => {
+    on('ping timeout', () => {
       const text = `Ping timeout — no data from ${this.network.host} for the timeout window; reconnecting. If every network did this at once, the server event loop stalled (check logs for [event-loop]).`;
       this.logNet(text, 'warn');
       console.warn(`[irc] ping timeout on network ${this.network.id} (${this.network.host})`);
@@ -1736,7 +2172,7 @@ export class IrcConnection {
     // underlying socket here for exactly this purpose (its own comment:
     // "ideal to read socket pairs for identd"); localPort is already populated
     // at TCP-connect time on both plaintext and TLS sockets.
-    c.on(
+    on(
       'raw socket connected',
       (socket?: {
         localAddress?: string;
@@ -1751,6 +2187,13 @@ export class IrcConnection {
         // In engine mode the engine holds the socket and registered the ident
         // when it dialed; this process serves no identd.
         if (engineConfigured()) return;
+        // ⚠ Through a proxy, identd is unanswerable and the entry would be a
+        // lie (#303). The ircd sends its RFC 1413 query to the address it SEES,
+        // which is the proxy's — it never reaches us, and the 4-tuple here is
+        // ours-to-the-proxy, so it could not match the query even if it did.
+        // Registering anyway would leave a map entry that looks configured and
+        // answers nothing.
+        if (this.proxyConfig()) return;
         // The full 4-tuple identifies the connection to the identd server; the
         // ports alone are ambiguous (see identd.ts). Both addresses and ports
         // are already populated at TCP connect.
@@ -1783,9 +2226,8 @@ export class IrcConnection {
     // RPL_UMODEIS arrives when the server sends our current umode (e.g. on
     // login or in response to /MODE <self>). irc-framework normalises it to
     // 'user info' with the raw mode string ('+iwx').
-    c.on('user info', (event: Record<string, unknown>) => {
-      if (!c.user.nick || (event.nick as string).toLowerCase() !== c.user.nick.toLowerCase())
-        return;
+    on('user info', (event: Record<string, unknown>) => {
+      if (!this.isSelfNick(event.nick as string)) return;
       this.userModes = new Set(((event.raw_modes as string) || '').replace(/^[+-]/, '').split(''));
       this.publishUserModes();
     });
@@ -1805,12 +2247,12 @@ export class IrcConnection {
     // nicklist host there, and renders ONE native line. No client synthesizes
     // the fake QUIT/rejoin — that's a server/bouncer compat shim (znc does it
     // only when relaying to a downstream that didn't negotiate the cap).
-    c.on('user updated', (event: Record<string, unknown>) => {
+    on('user updated', (event: Record<string, unknown>) => {
       if (!event || !event.nick) return;
       if (!event.new_hostname && !event.new_ident) return; // SETNAME — not ours
       const eventNick = event.nick as string;
       const lower = eventNick.toLowerCase();
-      const isSelf = !!c.user.nick && c.user.nick.toLowerCase() === lower;
+      const isSelf = this.isSelfNick(lower);
       // CHGHOST only carries the half that changed on some ircds; fall back to
       // the previous value so the mask we store and show is always complete.
       const newIdent = (event.new_ident as string) || (event.ident as string) || '';
@@ -1857,7 +2299,7 @@ export class IrcConnection {
     // per identify in every shared channel. chghost earns its line because it
     // regressed against the no-cap baseline (#591); this never showed anything.
     // halloy and gamja both treat ACCOUNT as a pure state update too.
-    c.on('account', (event: Record<string, unknown>) => {
+    on('account', (event: Record<string, unknown>) => {
       if (!event || !event.nick) return;
       const eventNick = event.nick as string;
       const lower = eventNick.toLowerCase();
@@ -1870,7 +2312,9 @@ export class IrcConnection {
       }
     });
 
-    c.on('motd', (event: Record<string, unknown>) => {
+    on('motd', (event: Record<string, unknown>) => {
+      // The MOTD, or its absence, ends the registration burst after every 005.
+      this.isupportComplete = true;
       // irc-framework also fires 'motd' for ERR_NOMOTD (no MOTD configured)
       // with `error` instead of `motd`, and for servers with an empty MOTD
       // file `motd` is just ''. Skip the blank-line publish either way.
@@ -1879,7 +2323,7 @@ export class IrcConnection {
       this.publish({ type: 'motd', target: this.serverTarget(), text });
     });
 
-    c.on('message', (event: Record<string, unknown>) => {
+    on('message', (event: Record<string, unknown>) => {
       // Drop server-pushed history replays. Some networks (e.g. Ergo with
       // `relaymsg`/replay enabled, mansionNET) blindly resend recent messages
       // inside a CHATHISTORY (or ZNC playback) BATCH on every reconnect.
@@ -1903,7 +2347,7 @@ export class IrcConnection {
         this.accumulateMultiline(event);
         return;
       }
-      const me = c.user?.nick;
+      const me = this.currentNick;
       const eventNick = event.nick as string | undefined;
       const eventTarget = event.target as string | undefined;
       const eventHostname = event.hostname as string | undefined;
@@ -2092,11 +2536,14 @@ export class IrcConnection {
       // duplicate doesn't double up search results. Skip ignored senders
       // (`fromIgnored`): the home copy is ignore-flagged and client-filtered, so
       // mirroring the raw text would bypass the ignore list (a harassment vector).
+      // Only a notice that was stored gets a mirror: a repeat of one already
+      // stored gets no second copy.
       if (
         isNotice &&
         !isServer &&
         target !== this.serverTarget() &&
-        !published?.fromIgnored &&
+        published &&
+        !published.fromIgnored &&
         isBufferClosed(this.network.user_id, this.network.id, target)
       ) {
         this.publish({
@@ -2125,7 +2572,7 @@ export class IrcConnection {
       if (eventNick) this.markPeerEvent(eventNick, 'online');
     });
 
-    c.on('batch end draft/multiline', (info: Record<string, unknown>) => {
+    on('batch end draft/multiline', (info: Record<string, unknown>) => {
       // irc-framework buffers a batch's PRIVMSGs and replays them (each firing
       // the 'message' handler above with event.batch set) before emitting this
       // close event — so accumulateMultiline already holds every fragment. (#381)
@@ -2138,7 +2585,7 @@ export class IrcConnection {
     // `.message` (framing stripped) and the first word in `.type`. We claim only
     // RPEE2E and hand the body to the manager, which returns the bodies to NOTICE
     // straight back to the sender's nick (re-framed) plus an optional user notice.
-    c.on('ctcp response', (event: Record<string, unknown>) => {
+    on('ctcp response', (event: Record<string, unknown>) => {
       // Under echo-message the server reflects our own CTCP-framed NOTICEs
       // (RPE2E handshake replies, standard CTCP answers) back to us — without
       // this guard our own KEYREQ/KEYRSP would re-enter handleHandshakeBody
@@ -2187,7 +2634,7 @@ export class IrcConnection {
 
     // Inbound CTCP request (a peer probed us over PRIVMSG, e.g. VERSION/PING).
     // ACTION never reaches here — irc-framework emits it as an 'action' message.
-    c.on('ctcp request', (event: Record<string, unknown>) => {
+    on('ctcp request', (event: Record<string, unknown>) => {
       if (event.type === CTCP_TAG) {
         // RPE2E rides NOTICE; an RPEE2E PRIVMSG is a misconfigured peer, not a
         // real CTCP query. Log it for interop debugging and don't auto-answer.
@@ -2200,14 +2647,21 @@ export class IrcConnection {
       this.handleInboundCtcpRequest(event);
     });
 
-    c.on('join', (event: Record<string, unknown>) => {
+    on('join', (event: Record<string, unknown>) => {
       const eventChannel = event.channel as string;
       const eventNick = event.nick as string;
-      const ch = this.upsertChannel(eventChannel);
+      // Case-insensitive, like the part and kick handlers: a server that echoes
+      // our nick in a different case is still telling us about our own join.
+      const isSelf = this.isSelfNick(eventNick);
+      // Only our own JOIN makes a channel ours (#908). Someone else's updates a
+      // channel we are in and creates nothing for one we are not — a backlog
+      // line replayed for a channel we have since left, say. Fold-aware, like
+      // the NAMES and TOPIC handlers.
+      const ch = isSelf ? this.upsertChannel(eventChannel) : this.channelState(eventChannel);
       // extended-join: irc-framework parses the account param when the cap is
       // enabled, and omits the key when it isn't (#508).
       const joinAccount = normalizeAccount(event.account);
-      ch.members.set(eventNick.toLowerCase(), {
+      ch?.members.set(eventNick.toLowerCase(), {
         nick: eventNick,
         modes: [],
         away: false,
@@ -2226,7 +2680,7 @@ export class IrcConnection {
         // off every join row on networks without the cap.
         ...(joinAccount ? { account: joinAccount } : {}),
       });
-      if (eventNick !== c.user.nick) {
+      if (!isSelf) {
         // JOIN means they're online. If they were marked away and JOIN fires,
         // the away marker stays — markPeerEvent is idempotent against the
         // current state, and 'online' from JOIN doesn't fire if state is
@@ -2234,7 +2688,13 @@ export class IrcConnection {
         // The away-notify 'back' event is the authoritative back signal.
         this.markPeerEvent(eventNick, 'online');
       }
-      if (eventNick === c.user.nick && this.restoring) {
+      // Before the restoring arm below returns: any self-JOIN answers the JOIN
+      // we sent, replayed or live, so the mark goes either way. Left behind in
+      // the replay case it would never be cleared again (only a dial forgets
+      // the set, and a re-attach doesn't dial), and a close of that channel
+      // would PART it forever after — the 442 this all exists to stop.
+      if (isSelf) this.pendingJoins.delete(foldTargetFor(this.network.id, eventChannel));
+      if (isSelf && this.restoring) {
         // A synthesised JOIN from the engine's replay. autojoin is lowered only
         // by a part, a kick or a close (db/buffers.ts) — so a channel the socket
         // is still in whose row says autojoin=0 means the user left it while
@@ -2246,7 +2706,7 @@ export class IrcConnection {
           row &&
           (!row.autojoin || isBufferClosed(this.network.user_id, this.network.id, eventChannel))
         ) {
-          this.channels.delete(eventChannel.toLowerCase());
+          this.deleteChannel(eventChannel.toLowerCase());
           try {
             c.raw('PART', eventChannel);
           } catch (_) {
@@ -2257,7 +2717,7 @@ export class IrcConnection {
         this.publish({ type: 'channel-joined', target: eventChannel });
         return;
       }
-      if (eventNick === c.user.nick) {
+      if (isSelf) {
         // The ECHO is the only signal the join actually landed on the channel
         // we asked for, so this is where the buffers row is written: creation,
         // autojoin, and the key stashed at request time. A forwarded (470) or
@@ -2315,12 +2775,9 @@ export class IrcConnection {
         // No system-buffer "Joined #x" line — the channel buffer already shows
         // the join event, so logging it here too is just noise (#355).
         // Most servers volunteer 324 on join, but a few don't. Request it so
-        // the channel's mode flags reach the status bar consistently.
-        try {
-          c.raw('MODE', eventChannel);
-        } catch (_) {
-          /* ignore */
-        }
+        // the channel's mode flags reach the status bar consistently. The reply
+        // is Lurker's own, so no bouncer client sees it (#931).
+        this.replies.send('lurker', `MODE ${eventChannel}`);
       }
     });
 
@@ -2335,16 +2792,17 @@ export class IrcConnection {
     // corrects that; the stashed join key is discarded since no echo for
     // `from` will ever consume it. The forward itself is still logged to the
     // server buffer verbatim by the 'raw' handler.
-    c.on('channel_redirect', (event: Record<string, unknown>) => {
+    on('channel_redirect', (event: Record<string, unknown>) => {
       const from = event?.from as string | undefined;
       if (!from) return;
       this.takeStashedJoinKey(from);
+      this.pendingJoins.delete(foldTargetFor(this.network.id, from));
       // forget: a channel we were never in must not keep an autojoin or a row
       // with nothing to show.
       this.evictChannel(from, { forget: true });
     });
 
-    c.on('part', (event: Record<string, unknown>) => {
+    on('part', (event: Record<string, unknown>) => {
       const eventChannel = event.channel as string;
       const eventNick = event.nick as string;
       // Resolve the canonical (joined-case) channel name *before* the self-part
@@ -2362,16 +2820,34 @@ export class IrcConnection {
         userhost: buildUserhost(event),
         time: event.time,
       });
-      if (eventNick === c.user.nick) {
-        this.channels.delete(eventChannel.toLowerCase());
-        this.joinedFoldedCache = null;
+      // Case-insensitive self-match, like the self-kick branch below: this
+      // branch now lowers autojoin, so a server that echoes our nick in the
+      // PART prefix with different casing must not skip the correction.
+      if (this.isSelfNick(eventNick)) {
+        this.deleteChannel(eventChannel.toLowerCase());
+        // The echo lowers autojoin, not just ircManager.partChannel. That path
+        // is the app's own /part and buffer-close, so a PART Lurker did not
+        // originate — a raw /quote PART, another client on the bouncer, a
+        // script, a server forcing one — left the row flagged for auto-rejoin,
+        // and the next reconnect put the user back into a channel they had
+        // left. It reads as the part having silently failed. Nothing converged
+        // either: the restoring branch in the join handler that sends a late
+        // PART for exactly this case reads the same flag, so a row stuck at 1
+        // defeats the correction too. Same reasoning as the self-kick below.
+        // The second write on the app's own path is idempotent, and this is
+        // update-only, so a PART for a channel with no row conjures nothing.
+        try {
+          setBufferAutojoin(this.network.user_id, this.network.id, channel, false);
+        } catch (_) {
+          /* ignore */
+        }
         this.publish({ type: 'channel-parted', target: channel });
         // No system-buffer "Parted #x" line — symmetric with the join above; the
         // part already shows in the channel buffer (#355).
       }
     });
 
-    c.on('kick', (event: Record<string, unknown>) => {
+    on('kick', (event: Record<string, unknown>) => {
       const eventChannel = event.channel as string;
       const eventNick = event.nick as string;
       const eventKicked = event.kicked as string;
@@ -2383,6 +2859,22 @@ export class IrcConnection {
       const channel = canonicalChannelTarget(eventChannel, this.channels) ?? eventChannel;
       const ch = this.channels.get(eventChannel.toLowerCase());
       if (ch) ch.members.delete(eventKicked.toLowerCase());
+      // Were WE the one kicked? Decided here because this is the only place
+      // that knows both the kicked nick and our current one — decorateMessage
+      // sees neither, and a nick comparison made later would answer for the
+      // nick we hold THEN, not the one we were wearing when it happened.
+      // ⚠ Not `self`, which means "we sent this line": the kicker is someone
+      // else. This says the kicked party is us (#968).
+      //
+      // isSelfNick reads `this.currentNick` — the server-tracked nick — where
+      // this used to read `c.user.nick`. The framework lags: it fires the 'all'
+      // proxy that routes events to us BEFORE its own listener updates
+      // user.nick, which is why RPL_WELCOME and snapshot() already route around
+      // it (#362). A nick fallback at registration is the case that bites — the
+      // server lands you on `me_`, c.user.nick still says `me`, and a kick of
+      // `me_` reads as someone else's: no notification, and the buffer stays
+      // styled as joined with its autojoin intact.
+      const selfKicked = this.isSelfNick(eventKicked);
       this.publish({
         type: 'kick',
         target: channel,
@@ -2391,14 +2883,14 @@ export class IrcConnection {
         text: event.message as string | undefined,
         userhost: buildUserhost(event),
         time: event.time,
+        ...(selfKicked ? { selfKicked: true } : {}),
       });
       // Mirror the self-PART path when we ourselves are the one kicked, so
       // the buffer dims in the sidebar instead of staying styled as joined.
       // Lowering autojoin also prevents the reconnect replay — rejoining a
       // channel that just kicked you reads as ban evasion to ops.
-      if (eventKicked && c.user.nick && eventKicked.toLowerCase() === c.user.nick.toLowerCase()) {
-        this.channels.delete(eventChannel.toLowerCase());
-        this.joinedFoldedCache = null;
+      if (selfKicked) {
+        this.deleteChannel(eventChannel.toLowerCase());
         try {
           setBufferAutojoin(this.network.user_id, this.network.id, channel, false);
         } catch (_) {
@@ -2408,14 +2900,14 @@ export class IrcConnection {
       }
     });
 
-    c.on('invite', (event: Record<string, unknown>) => {
+    on('invite', (event: Record<string, unknown>) => {
       // irc-framework parses an inbound INVITE as { nick: inviter, invited:
       // target nick, channel }. Three cases land here (#261):
       const inviter = event.nick as string | undefined;
       const invited = event.invited as string | undefined;
       const rawChannel = event.channel as string | undefined;
       if (!inviter || !rawChannel || !invited) return;
-      const me = c.user?.nick;
+      const me = this.currentNick;
       const meLower = me?.toLowerCase();
       const channel = canonicalChannelTarget(rawChannel, this.channels) ?? rawChannel;
 
@@ -2446,7 +2938,7 @@ export class IrcConnection {
       this.publish({ type: 'invite', target: channel, nick: inviter, invited, time: event.time });
     });
 
-    c.on('invited', (event: Record<string, unknown>) => {
+    on('invited', (event: Record<string, unknown>) => {
       // RPL_INVITING (341): the server confirms OUR /invite was relayed.
       // irc-framework gives { nick: the invited nick, channel }. Render the same
       // persisted channel line as the op-visibility path, attributed to us — so
@@ -2454,13 +2946,13 @@ export class IrcConnection {
       // and the invite-notify self-echo above is deduped against it (#261).
       const invited = event.nick as string | undefined;
       const rawChannel = event.channel as string | undefined;
-      const me = c.user?.nick;
+      const me = this.currentNick;
       if (!invited || !rawChannel || !me) return;
       const channel = canonicalChannelTarget(rawChannel, this.channels) ?? rawChannel;
       this.publish({ type: 'invite', target: channel, nick: me, invited, time: event.time });
     });
 
-    c.on('quit', (event: Record<string, unknown>) => {
+    on('quit', (event: Record<string, unknown>) => {
       const eventNick = event.nick as string;
       const lower = eventNick.toLowerCase();
       const userhost = buildUserhost(event);
@@ -2482,7 +2974,7 @@ export class IrcConnection {
       this.markPeerEvent(eventNick, 'offline');
     });
 
-    c.on('nick', (event: Record<string, unknown>) => {
+    on('nick', (event: Record<string, unknown>) => {
       const eventNick = event.nick as string;
       const eventNewNick = event.new_nick as string;
       const oldLower = eventNick.toLowerCase();
@@ -2493,7 +2985,27 @@ export class IrcConnection {
       // Detect self by matching the event's old nick against the current
       // tracked nick, mirroring what the framework's own listener does at
       // client.js:265 before it updates user.nick.
-      const isSelfNick = !!c.user.nick && c.user.nick.toLowerCase() === oldLower;
+      //
+      // ⚠⚠ …and against OUR nick too, because the framework's copy goes stale
+      // and stays stale. client.js:266 refuses to store a nick beginning with a
+      // digit ("reserved for uuids... they cannot be used"), which is exactly
+      // what a server hands you when it resolves a netsplit nick collision —
+      // Libera SAVEs you to your UID ("042AAEL37 Nick collision, forcing nick
+      // change to your unique ID"). So `user.nick` keeps the pre-collision nick
+      // forever, and the NEXT change — the one taking you back to a real nick —
+      // has an old nick that matches neither. Keying on that alone lost the
+      // user's identity for the rest of the session: own-nick never updated,
+      // the auto-highlight rule kept the old name, and self-echo filtering
+      // started treating our own lines as a stranger's.
+      //
+      // ⚠⚠ And OUR record is the authority, not the framework's. Preferring
+      // theirs is not merely less accurate, it is wrong in a way that hands our
+      // identity to someone else: while we sit on a UID, their `user.nick` still
+      // names our old nick — which is now FREE. A stranger takes it, renames,
+      // and we would follow them, because their rename's old nick matches the
+      // stale copy. currentNick is seeded in the constructor and never unset, so
+      // the framework check is a fallback that should never be needed.
+      const isSelfNick = this.isSelfNick(eventNick);
       if (isSelfNick) {
         try {
           highlightRulesService.upsertAutoNickRule(
@@ -2510,18 +3022,6 @@ export class IrcConnection {
         // silently). Either way the watch is now stale.
         if (this.regainNick) {
           const reclaimed = newLower === this.regainNick.toLowerCase();
-          // Only tear down a watch we could actually have placed. The regain
-          // `MONITOR +` is gated on `useMonitor` (set from ISUPPORT), so on a
-          // server without MONITOR — or before ISUPPORT lands — nothing was
-          // ever watched and a blind `MONITOR -` here just draws a 421
-          // "MONITOR Unknown command" (#384). Skipping it is a true no-op.
-          if (this.useMonitor) {
-            try {
-              this.client.removeMonitor(this.regainNick);
-            } catch (_) {
-              /* ignore */
-            }
-          }
           if (reclaimed) {
             this.publish({
               type: 'notice',
@@ -2533,8 +3033,19 @@ export class IrcConnection {
           }
           this.regainNick = null;
           this.pendingRegainSetup = false;
+          // Drop the regain watch. syncMonitor sends nothing on a server without
+          // MONITOR, where no watch was placed and a `MONITOR -` would only draw
+          // a 421 (#384). It keeps the nick listed if a bouncer client watches it.
+          this.syncMonitor();
         }
         this.currentNick = eventNewNick;
+        // Repair the framework's copy when it would otherwise stay behind. Its
+        // own rule is kept — a digit-leading UID still isn't stored, because
+        // other parts of it treat user.nick as something you could send as —
+        // but the moment we're back on a usable nick the two agree again.
+        // Without this, ircManager publishes self-messages under `client.user
+        // .nick`, so a stale one puts the WRONG name on the user's own lines.
+        if (!/^\d/.test(eventNewNick)) c.user.nick = eventNewNick;
         this.publish({ type: 'own-nick', nick: eventNewNick });
       }
       const userhost = buildUserhost(event);
@@ -2574,16 +3085,21 @@ export class IrcConnection {
       }
     });
 
-    c.on('topic', (event: Record<string, unknown>) => {
+    on('topic', (event: Record<string, unknown>) => {
       const eventChannel = event.channel as string;
       const eventTopic = event.topic as string | undefined;
-      const ch = this.upsertChannel(eventChannel);
+      // A topic for a channel we are not in answers a query (/topic #elsewhere,
+      // which the 'raw' handler already showed in the server buffer); it is not
+      // membership (#908). Fold-aware, so a reply spelled #a{b} lands on the
+      // #a[b] we joined.
+      const ch = this.channelState(eventChannel);
+      if (!ch) return;
       ch.topic = eventTopic ?? null;
       if (event.nick) {
         // Live TOPIC change — persist + render in the message list.
         this.publish({
           type: 'topic',
-          target: eventChannel,
+          target: ch.name,
           nick: event.nick as string,
           text: eventTopic,
           time: event.time,
@@ -2592,11 +3108,11 @@ export class IrcConnection {
         // RPL_TOPIC on join — sync the topic bar without printing a row, so
         // rejoining an already-open buffer doesn't repeat the same topic line
         // every time.
-        this.publishEphemeral({ type: 'channel-topic', target: eventChannel, topic: eventTopic });
+        this.publishEphemeral({ type: 'channel-topic', target: ch.name, topic: eventTopic });
       }
     });
 
-    c.on('mode', (event: Record<string, unknown>) => {
+    on('mode', (event: Record<string, unknown>) => {
       const target = event.target as string | undefined;
 
       const eventModes = (event.modes as ModeEntry[] | undefined) || [];
@@ -2605,7 +3121,7 @@ export class IrcConnection {
       const eventNick = event.nick as string | undefined;
 
       // Self user-mode change (e.g. server sets +i on connect, /OPER yields +o, etc.)
-      if (target && c.user.nick && target.toLowerCase() === c.user.nick.toLowerCase()) {
+      if (target && this.isSelfNick(target)) {
         let changed = false;
         for (const m of eventModes) {
           if (!m || !m.mode) continue;
@@ -2713,7 +3229,7 @@ export class IrcConnection {
     // RPL_CHANNELMODEIS (324) and friends. Sent on join by most servers and
     // on demand via `MODE #chan`. Captures the current flag set without
     // requiring us to have observed the +/− history.
-    c.on('channel info', (event: Record<string, unknown>) => {
+    on('channel info', (event: Record<string, unknown>) => {
       const eventChannel = event.channel as string | undefined;
       const eventModes = event.modes as ModeEntry[] | undefined;
       if (!eventChannel || !eventModes) return;
@@ -2735,11 +3251,17 @@ export class IrcConnection {
       }
     });
 
-    c.on('userlist', (event: Record<string, unknown>) => {
+    on('userlist', (event: Record<string, unknown>) => {
       const tHandler = Date.now();
       const eventChannel = event.channel as string;
       const eventUsers = (event.users as Record<string, unknown>[]) || [];
-      const ch = this.upsertChannel(eventChannel);
+      // Only a channel we are in has a nicklist to replace. A NAMES reply for
+      // any other — a typed /names #elsewhere, a restore step answered after a
+      // KICK — used to create one, and the channel then read as joined with a
+      // nicklist that didn't have us in it (#908). The 'raw' handler shows such
+      // a reply in the server buffer instead.
+      const ch = this.channelState(eventChannel);
+      if (!ch) return;
       // Preserve known away flags AND user/host across re-issued NAMES
       // (e.g. on /NAMES or a fresh join). NAMES doesn't carry ident/host on
       // most ircds — the JOIN event and WHO reply do — so we hold onto
@@ -2774,34 +3296,32 @@ export class IrcConnection {
       this.namesHeard.add(foldTargetFor(this.network.id, eventChannel));
       this.publishNames(ch);
       // Issue a WHO so we learn the current away state for everyone in the
-      // channel. away-notify keeps it live after this initial sync. Mark it so
-      // the 'wholist' handler consumes the reply silently instead of echoing
-      // every member to the server buffer (#342).
+      // channel. away-notify keeps it live after this initial sync. The reply is
+      // Lurker's own, so the 'wholist' handler takes it in silently instead of
+      // echoing every member to the server buffer (#342). Only after the NAMES
+      // a JOIN brings or a restore asks for: by the time the user or a bouncer
+      // client asks for NAMES, the away state is already live.
       //
       // Exception: on a RESTORE, a very large channel's away-sync WHO is skipped
       // (RESTORE_WHO_MAX_MEMBERS) — its 352-per-member reply is the heaviest part
-      // of the reconnect burst. restoreQuiet marks exactly the channels
-      // drainRestoreQueue just requested, so this never touches a fresh
-      // interactive join (which WHOs in full, any size).
+      // of the reconnect burst. The restore's own NAMES is Lurker's, and
+      // restoreQuiet marks the channels whose NAMES the previous process asked
+      // for, so this never touches a fresh interactive join (which WHOs in
+      // full, any size).
+      const owner = this.replyOwner;
+      const syncAway = owner === null || owner === 'unasked' || owner === 'lurker';
       const rq = this.restoreQuiet.get(eventChannel.toLowerCase());
-      const inRestore = !!rq && Date.now() < rq.until;
+      const inRestore = owner === 'lurker' || (!!rq && Date.now() < rq.until);
       const whoMax = reconnectEnvInt('LURKER_RESTORE_WHO_MAX_MEMBERS', RESTORE_WHO_MAX_MEMBERS);
-      if (inRestore && ch.members.size > whoMax) {
+      if (syncAway && inRestore && ch.members.size > whoMax) {
         // Diagnostic only (docker logs), never a server-buffer row: on a big
         // multi-network restore this can fire per channel.
         console.log(
           `[irc] restore: skipped away-sync WHO for ${eventChannel} (${ch.members.size} members > ${whoMax}) ` +
             `on network ${this.network.id}; away-notify keeps it live`,
         );
-      } else {
-        try {
-          c.who(eventChannel);
-          // Mark only after a successful send: if c.who() throws, a stale flag
-          // would silently suppress a later user-typed /who for this channel.
-          this.autoWhoTargets.add(eventChannel.toLowerCase());
-        } catch (_) {
-          /* ignore */
-        }
+      } else if (syncAway) {
+        this.sendAwaySyncWho(eventChannel);
       }
       const ms = Date.now() - tHandler;
       if (IRC_HANDLER_WARN_MS > 0 && ms >= IRC_HANDLER_WARN_MS) {
@@ -2813,21 +3333,20 @@ export class IrcConnection {
       }
     });
 
-    c.on('wholist', (event: Record<string, unknown>) => {
+    on('wholist', (event: Record<string, unknown>) => {
       const tHandler = Date.now();
       const eventTarget = event.target as string | undefined;
       const targetKey = eventTarget?.toLowerCase() ?? '';
       const users = (event.users as Record<string, unknown>[]) || [];
 
       // Render a user-typed /who to the server buffer. The auto-WHO we fire on
-      // join is flagged in autoWhoTargets and consumed silently (echoing one
-      // line per member would flood the buffer); anything else is the user
-      // asking, so surface it like any other server response (#342). This runs
+      // join is Lurker's own and taken in silently (echoing one line per member
+      // would flood the buffer), and a bouncer client's is the client's (#931);
+      // the user's surfaces like any other server response (#342). This runs
       // before the channel lookup below so /who <nick> and /who <unjoined-chan>
-      // — where we have no tracked channel — still render.
-      if (this.autoWhoTargets.has(targetKey)) {
-        this.autoWhoTargets.delete(targetKey);
-      } else {
+      // — where we have no tracked channel — still render. Whoever asked, the
+      // members' away state below is still news.
+      if (this.replyForUser()) {
         for (const u of users) {
           const text = formatWhoReplyLine(u);
           if (text) this.publish({ type: 'motd', target: this.serverTarget(), text });
@@ -2897,12 +3416,12 @@ export class IrcConnection {
     // Per-user away/back. away-notify drives the non-self events; self events
     // come from RPL_NOWAWAY/RPL_UNAWAY in response to our own /AWAY. We honor
     // both so the self nick also dims in the nicklist.
-    c.on('away', (event: Record<string, unknown>) => {
+    on('away', (event: Record<string, unknown>) => {
       if (!event || !event.nick) return;
       this.applyMemberAway(event.nick as string, true);
       this.markPeerEvent(event.nick as string, 'away', (event.message as string | null) || null);
     });
-    c.on('back', (event: Record<string, unknown>) => {
+    on('back', (event: Record<string, unknown>) => {
       if (!event || !event.nick) return;
       this.applyMemberAway(event.nick as string, false);
       this.markPeerEvent(event.nick as string, 'back');
@@ -2911,16 +3430,26 @@ export class IrcConnection {
     // irc-framework aggregates RPL_WHOIS* (311/312/317/319/330/...) into a
     // single 'whois' event when RPL_ENDOFWHOIS arrives. We fan it out as a
     // structured `whois_result` event so the client can render it in the
-    // user-profile modal (issue #92). `error: 'not_found'` surfaces here too
-    // (irc-framework synthesizes a whois event with that shape on
-    // ERR_NOSUCHNICK) so the modal can flip to its empty state.
+    // user-profile modal (issue #92). `error: 'not_found'` surfaces here too so
+    // the modal can flip to its empty state.
+    //
+    // ⚠ It is synthesized at RPL_ENDOFWHOIS when the preceding numerics filled
+    // nothing in (irc-framework `handlers/user.js`), NOT at ERR_NOSUCHNICK —
+    // that numeric is mapped to a different event entirely (`irc error`, with
+    // `error: 'no_such_nick'`) and never touches the whois reply. The two look
+    // identical in practice, because a conforming server sends the 401 and then
+    // the 318. They differ for anything that waits: a 401 with no 318 following
+    // it produces no signal at all. (This comment said ERR_NOSUCHNICK for a
+    // year and misled a reviewer into reading the protocol docs as wrong.)
     //
     // The server buffer gets the *raw* whois lines instead — every numeric is
     // rendered straight off the wire by the default-show 'raw' handler (#281,
     // #342), not the parsed JSON this event carries — so nothing whois-related
     // is published here beyond the modal payload.
-    c.on('whois', (event: Record<string, unknown>) => {
+    on('whois', (event: Record<string, unknown>) => {
       if (!event || !event.nick) return;
+      // A bouncer client's /whois is its own, not the profile modal's (#931).
+      if (!this.replyForUser()) return;
       this.publishEphemeral({ type: 'whois_result', whois: event });
     });
 
@@ -2928,8 +3457,11 @@ export class IrcConnection {
     // again at RPL_LISTEND. Each batch lands in the per-network SQLite cache;
     // clients only see progress events (running count) — the actual rows are
     // fetched via the chanlist-search WS handler against the cache. Keeps a
-    // 6k-row libera.chat list off the wire and out of client memory.
-    c.on('channel list start', () => {
+    // 6k-row libera.chat list off the wire and out of client memory. Only the
+    // user's LIST touches the cache: a bouncer client's used to wipe and
+    // rewrite it under the web app (#931).
+    on('channel list start', () => {
+      if (!this.replyForUser()) return;
       const nid = this.network.id;
       try {
         chanlistDb.clearChannels(nid);
@@ -2940,7 +3472,8 @@ export class IrcConnection {
       this.publishEphemeral({ type: 'chanlist-start' });
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    c.on('channel list', (channels: any) => {
+    on('channel list', (channels: any) => {
+      if (!this.replyForUser()) return;
       const nid = this.network.id;
       try {
         chanlistDb.upsertChannels(nid, channels || []);
@@ -2951,7 +3484,8 @@ export class IrcConnection {
         console.warn(`[chanlist:${nid}] batch failed:`, (e as Error)?.message || e);
       }
     });
-    c.on('channel list end', () => {
+    on('channel list end', () => {
+      if (!this.replyForUser()) return;
       const nid = this.network.id;
       let total = 0;
       try {
@@ -2967,7 +3501,7 @@ export class IrcConnection {
       this.publishEphemeral({ type: 'chanlist-end', total });
     });
 
-    c.on('irc error', (event: Record<string, unknown>) => {
+    on('irc error', (event: Record<string, unknown>) => {
       // irc-framework maps the IRC ERROR command (sent right before the
       // server drops you) and ERR_* numerics to this event. `error` is a
       // short tag like 'irc' / 'no_such_nick' / 'password_mismatch';
@@ -3001,6 +3535,9 @@ export class IrcConnection {
       // below because it is the more specific signal: an explicit command,
       // aimed at a named channel, seconds ago — against "we have DM history
       // with this nick at some point in the past".
+      // A 401 answering a bouncer client's WHOIS is that client's; the raw
+      // handler kept it out of the server buffer too (#931).
+      if (tag === 'no_such_nick' && !this.replyForUser()) return;
       if (tag === 'no_such_nick' && eventNick) {
         // The command's `seq` rides along for the CTCP bucket below: a nick-only
         // command (/whois, /whowas) is not a SEND, so takeCtcpIssuer's "is the
@@ -3088,6 +3625,15 @@ export class IrcConnection {
         });
         return;
       }
+      // A 401 nothing above claimed is already reported: the raw handler logged
+      // "<nick> No such nick/channel" in the server buffer. The generic line at
+      // the bottom would be a second copy, and as an 'error' row it counts
+      // toward the server buffer's unread badge — so a /whois for someone
+      // offline, whose miss the profile modal already shows, badged the server
+      // tab (#904). Same call as the command-result tags below. A 401 is only
+      // ever an answer to something we sent, never the killed/banned/dropped
+      // class that badge is for.
+      if (tag === 'no_such_nick') return;
       // Channel-join rejections (full / invite-only / banned / bad key / too
       // many channels) carry the target in event.channel. Route them to that
       // channel as an ephemeral toast so the failure surfaces where the user
@@ -3095,6 +3641,20 @@ export class IrcConnection {
       // client waits for channel-joined before opening the buffer, so on
       // failure there is no buffer to render into.
       const rejectChannel = event?.channel as string | undefined;
+      // A rejection of a JOIN ends it, so the mark goes (see pendingJoins) —
+      // every join rejection, not just the durable ones below, since a 471 we
+      // will retry still ended THIS join.
+      //
+      // ⚠ Only the ones that can answer a JOIN. `event.channel` is set on
+      // plenty of errors that answer something else — a 404 refusing a message
+      // to the channel, a 482 refusing a mode — and clearing on those drops a
+      // mark for a JOIN still in flight. The close that followed would then
+      // send no PART, and the echo would reopen the buffer it had just closed.
+      // Being too narrow here is the safer miss: an exotic rejection nobody
+      // listed leaves the mark, and the close sends the PART it always used to.
+      if (rejectChannel && joinRejectionMessageByTag(tag)) {
+        this.pendingJoins.delete(foldTargetFor(this.network.id, rejectChannel));
+      }
       // ERR_NOTONCHANNEL (442) is authoritative: the server says we are not on
       // that channel, so the PART echo that normally evicts it from
       // this.channels is never coming. Evict here instead. Without this, any
@@ -3154,6 +3714,8 @@ export class IrcConnection {
       // server buffer of what the raw handler already logged verbatim there, so
       // it goes — whether or not the routing found a buffer to use (#434).
       if (isCommandResultErrorTag(tag)) return;
+      // ERR_MONLISTFULL is handled off the raw line, which says which nicks.
+      if (tag === 'monitor_list_full') return;
       // ERR_UNKNOWNCOMMAND (421) carries the rejected command name in
       // event.command (irc-framework parses it from the numeric's params).
       // Include it so the buffer line names the offending command —
@@ -3184,8 +3746,8 @@ export class IrcConnection {
       });
     });
 
-    c.on('tagmsg', (event: Record<string, unknown>) => {
-      const me = c.user?.nick;
+    on('tagmsg', (event: Record<string, unknown>) => {
+      const me = this.currentNick;
       const eventNick = event.nick as string | undefined;
       // Case-folded, matching the message handler's self check — under
       // echo-message our own TAGMSGs reflect back, and a server relaying a
@@ -3217,7 +3779,7 @@ export class IrcConnection {
   // or null when the caller should no-op.
   eligiblePeer(nick: string | undefined | null): string | null {
     if (!nick) return null;
-    const me = this.client.user?.nick;
+    const me = this.currentNick;
     if (me && nick.toLowerCase() === me.toLowerCase()) return null;
     const lower = nick.toLowerCase();
     if (!this.trackedPeers.has(lower)) return null;
@@ -3315,69 +3877,114 @@ export class IrcConnection {
     }
   }
 
-  // Bulk-seed the MONITOR watch list from the tracked DM peers set. Called
-  // once per connection from the 'server options' handler, after ISUPPORT
-  // confirms MONITOR is supported. Batches nicks into 'MONITOR + n1,n2,…'
-  // lines under the 512-byte IRC wire limit so a 100-peer seed doesn't
-  // trip "Excess Flood" on Libera (same pattern used for channel JOIN
-  // batching in ircManager.startNetwork). Any nicks beyond monitorLimit
-  // are kept in the in-memory set but skipped on the wire; we surface a
-  // notice so the user knows live presence is degraded for the overflow.
   // Deduped union of the nicks we want MONITORed — every tracked reason shares
   // the one per-connection MONITOR budget.
   monitoredNicks(): string[] {
     return Array.from(this.trackedPeers.keys());
   }
 
+  // Lurker's own nicks for the MONITOR list: the regain nick, then the tracked
+  // peers. Bouncer clients' nicks are added after these.
+  private ownMonitorNicks(): string[] {
+    const nicks = this.monitoredNicks();
+    return this.regainNick ? [this.regainNick, ...nicks] : nicks;
+  }
+
+  // Whether Lurker itself watches `nick`: a tracked peer or the regain nick.
+  private isOwnMonitorNick(nick: unknown): boolean {
+    if (typeof nick !== 'string') return false;
+    const lower = nick.toLowerCase();
+    return this.trackedPeers.has(lower) || this.regainNick?.toLowerCase() === lower;
+  }
+
+  // Bring the network's MONITOR list in line with Lurker's nicks and those of
+  // every attached bouncer client (see monitorList.ts). Sends nothing until
+  // ISUPPORT confirms MONITOR, or while the socket is down; the seed catches up.
+  syncMonitor(): MonitorSync | null {
+    if (!this.useMonitor || this.state !== 'connected' || this.disposed) return null;
+    return this.monitor.sync(this.ownMonitorNicks(), this.monitorLimit);
+  }
+
+  // Apply a raw MONITOR +, - or C (a connect command, or /quote) to the raw
+  // sender's own list and sync, the way a bouncer client's MONITOR works. Sent
+  // verbatim it would change the network's list behind MonitorList's back: a
+  // MONITOR C would clear every watch while the list still counted them. L and S
+  // go out as sent, and so does anything on a network known to lack MONITOR,
+  // which answers 421. True if the line was handled here.
+  private takeRawMonitor(line: string): boolean {
+    if (!this.applyRawMonitor(line)) return false;
+    this.syncMonitor();
+    return true;
+  }
+
+  // takeRawMonitor's change to the raw sender's list, without the sync. False
+  // if the line isn't a MONITOR +, - or C, or has to go out as sent.
+  private applyRawMonitor(line: string): boolean {
+    const m = /^MONITOR\s+([+\-C])(?:\s+:?(\S+))?\s*$/i.exec(line.trim());
+    if (!m || (this.isupportComplete && !this.useMonitor)) return false;
+    if (m[1].toUpperCase() === 'C') {
+      this.rawMonitored.clear();
+    } else {
+      for (const target of (m[2] ?? '').split(',').filter(Boolean)) {
+        const key = target.toLowerCase();
+        if (m[1] === '-') this.rawMonitored.delete(key);
+        else if (!this.rawMonitored.has(key)) this.rawMonitored.set(key, target);
+      }
+    }
+    this.monitor.addHolder(this.rawMonitorHolder);
+    return true;
+  }
+
+  // A raw MONITOR + failed for these nicks, for lack of room or because the
+  // network refused them. Stop asking for them and say so, because the 734
+  // itself stays out of the server buffer.
+  private dropRawMonitors(nicks: string[], limit: number | string): void {
+    for (const nick of nicks) this.rawMonitored.delete(nick.toLowerCase());
+    this.publish({
+      type: 'notice',
+      target: this.serverTarget(),
+      nick: 'lurker',
+      notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
+      text: `MONITOR limit (${limit}) reached; not watching ${nicks.join(', ')}.`,
+    });
+  }
+
+  // Seed the MONITOR list once per connection, from the 'server options' handler
+  // after ISUPPORT confirms MONITOR. MonitorList packs the nicks into lines under
+  // the 512-byte limit, so a 100-peer seed doesn't trip "Excess Flood" on Libera.
+  // Nicks past monitorLimit stay tracked in memory but aren't watched; a notice
+  // tells the user live presence is degraded for them.
   seedMonitorWatch(): void {
-    const peers = this.monitoredNicks();
-    if (peers.length === 0) return;
-    const cap = this.monitorLimit > 0 ? this.monitorLimit : peers.length;
-    const watched = peers.slice(0, cap);
-    const overflow = peers.length - watched.length;
+    // A re-attach finds the socket's list as the last app process left it,
+    // nicks its bouncer clients watched included. Start from an empty one. The
+    // connect commands don't run again on a re-attach (they ran when the socket
+    // registered), so apply their MONITOR lines from the network's config
+    // first, or the clear would drop those watches for good.
+    if (this.restoring) {
+      const commands = this.network.connect_commands;
+      if (typeof commands === 'string') {
+        for (const line of commands.split(/\r?\n/)) this.applyRawMonitor(line);
+      }
+      try {
+        this.client.raw('MONITOR C');
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    // MonitorList.sync asks for the state of what it adds with a MONITOR S
+    // (#302): the server is only advised to volunteer it in reply to the +, and
+    // markPeerEvent's idempotency gate eats duplicate replies.
+    const result = this.syncMonitor();
+    if (!result) return;
+    const overflow = result.skipped.length;
     if (overflow > 0) {
       this.publish({
         type: 'notice',
         target: this.serverTarget(),
         nick: 'lurker',
         notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
-        text: `MONITOR limit (${this.monitorLimit}) reached; live presence skipped for ${overflow} nick${overflow === 1 ? '' : 's'}.`,
+        text: `MONITOR limit (${result.limit}) reached; live presence skipped for ${overflow} nick${overflow === 1 ? '' : 's'}.`,
       });
-    }
-    // "MONITOR + " prefix is 11 bytes; leave headroom for trailing \r\n
-    // and the comma separators. Cap line content at 400 bytes (matches the
-    // channel-JOIN batcher).
-    const MAX = 400;
-    let chunk: string[] = [];
-    let len = 0;
-    const flush = () => {
-      if (chunk.length === 0) return;
-      const line = 'MONITOR + ' + chunk.join(',');
-      try {
-        this.client.raw(line);
-      } catch (_) {
-        /* ignore */
-      }
-      chunk = [];
-      len = 0;
-    };
-    for (const nick of watched) {
-      const add = chunk.length === 0 ? nick.length : nick.length + 1;
-      if (len + add > MAX) flush();
-      chunk.push(nick);
-      len += add;
-    }
-    flush();
-    // Belt-and-suspenders: per IRCv3 spec the server SHOULD reply to each
-    // MONITOR + with the current state of each added nick, but the wording
-    // is "advised" not "required". MONITOR S explicitly asks for the
-    // current state of every monitored nick, so it backfills anyone the
-    // initial + didn't volunteer state for. markPeerEvent's idempotency
-    // gate eats duplicate replies, so this is safe to send unconditionally.
-    try {
-      this.client.raw('MONITOR S');
-    } catch (_) {
-      /* ignore */
     }
   }
 
@@ -3538,7 +4145,6 @@ export class IrcConnection {
         this.lastUserSendAt.delete(oldLower);
         this.lastUserSendAt.set(newLower, lastSend);
       }
-      if (this.autoWhoTargets.delete(oldLower)) this.autoWhoTargets.add(newLower);
       // lastNickIntent is deliberately NOT re-keyed, though it looks like it
       // belongs here. The maps above are keyed by the TARGET, which follows the
       // buffer through a rename; that one is keyed by the nick as we addressed
@@ -3599,7 +4205,7 @@ export class IrcConnection {
   // handlers recognize the nick — they just get no live presence.
   private addPeerWatch(nick: string | undefined | null, reason: TrackReason): boolean {
     if (!nick) return false;
-    const me = this.client.user?.nick;
+    const me = this.currentNick;
     if (me && nick.toLowerCase() === me.toLowerCase()) return false;
     const lower = nick.toLowerCase();
     const existing = this.trackedPeers.get(lower);
@@ -3613,46 +4219,42 @@ export class IrcConnection {
     }
     this.addPeerReason(lower, reason);
     if (!this.useMonitor || this.state !== 'connected') return true;
-    if (this.monitoredNicks().length > this.monitorLimit) {
-      // Over-limit add: keep the in-memory tracking but skip MONITOR. Surface
-      // once so the user knows live presence is degraded for this nick.
-      this.publish({
-        type: 'notice',
-        target: this.serverTarget(),
-        nick: 'lurker',
-        notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
-        text: `MONITOR limit (${this.monitorLimit}) reached; live presence skipped for ${nick}.`,
-      });
+    const listed = this.monitor.status(nick);
+    if (listed === true || listed === false) {
+      // A bouncer client already has the nick on the list, and the network
+      // won't answer a second add, so use its last answer.
+      this.markPeerEvent(nick, listed ? 'online' : 'offline');
       return true;
     }
-    try {
-      this.client.raw('MONITOR + ' + nick);
-      // Same belt-and-suspenders as seedMonitorWatch: per IRCv3 the server only
-      // SHOULD (not MUST) volunteer the nick's current state in reply to
-      // MONITOR +, so a freshly-added watch can land with no state. That leaves
-      // the peer at 'unknown' on the client, which presence dots render
-      // undimmed — i.e. indistinguishable from online — until a reconnect
-      // re-seeds. MONITOR S asks for every monitored nick's state explicitly;
-      // markPeerEvent's idempotency gate eats the duplicate replies for nicks we
-      // already had state for, so it's safe to send on every add. (#302)
-      this.client.raw('MONITOR S');
-    } catch (_) {
-      /* ignore */
+    if (listed === undefined) {
+      const result = this.syncMonitor();
+      if (result?.skipped.some((n) => n.toLowerCase() === lower)) {
+        // Over-limit add: keep the in-memory tracking but skip MONITOR. Surface
+        // once so the user knows live presence is degraded for this nick.
+        this.publish({
+          type: 'notice',
+          target: this.serverTarget(),
+          nick: 'lurker',
+          notable: false, // #470: status line — not counted as unread (see MessageInput.notable)
+          text: `MONITOR limit (${result.limit}) reached; live presence skipped for ${nick}.`,
+        });
+      }
+      // The sync asked for the new nick's state along with its MONITOR +.
+      return true;
     }
+    // Listed by a bouncer client but not answered yet. Per IRCv3 the server only
+    // SHOULD volunteer a nick's state, and a peer left at 'unknown' renders like
+    // online until a reconnect re-seeds, so ask (#302). markPeerEvent's
+    // idempotency gate eats duplicate replies.
+    this.monitor.requestStatus();
     return true;
   }
 
   // Tear down the shared MONITOR watch + peer_presence_state row for a nick we
   // no longer watch for any reason. Safe on an untracked nick (clears a stale
-  // row); the MONITOR - is a harmless no-op server-side if it was never watched.
+  // row). The sync keeps the nick listed while a bouncer client still watches it.
   private teardownPeerWatch(nick: string): void {
-    if (this.useMonitor && this.state === 'connected') {
-      try {
-        this.client.raw('MONITOR - ' + nick);
-      } catch (_) {
-        /* ignore */
-      }
-    }
+    this.syncMonitor();
     try {
       deletePeerPresence(this.network.id, nick);
     } catch (e) {
@@ -3774,10 +4376,10 @@ export class IrcConnection {
       return;
     }
     const why = PERMANENT_JOIN_REJECTION_REASONS[tag] ?? 'the server refused the join';
-    // The retry has to name a key for +k: joinChannel coerces an absent key to
-    // undefined and passes that straight to client.join, so a bare `/join #x`
-    // does NOT resend the stored one. Telling a user to run the command that
-    // reproduces their failure is worse than saying nothing.
+    // The retry has to name a key for +k: a bare `/join #x` repeats the JOIN
+    // that just failed, with the same stored key or with none. Telling a user
+    // to run the command that reproduces their failure is worse than saying
+    // nothing.
     const retry = tag === 'bad_channel_key' ? `/join ${canonical} <key>` : `/join ${canonical}`;
     this.publish({
       type: 'notice',
@@ -3802,7 +4404,18 @@ export class IrcConnection {
    *  channel that keeps retrying (the status quo), while a false negative
    *  un-subscribes someone mid-race. When in doubt, wait. */
   private awaitingIdentification(): boolean {
-    if (this.network.sasl_account) return true;
+    // sasl_password, not just sasl_account: connect() attempts SASL whenever a
+    // PASSWORD is set, falling back to the nick as the authcid — so keying only
+    // on the account missed a password-only setup entirely. It matters because
+    // identifiedToServices is set by RPL_LOGGEDIN (900) alone, and a server may
+    // answer a successful SASL with 903 and no 900 at all; the gate is then the
+    // only thing standing between an early 473 and a durable unsubscribe.
+    if (this.network.sasl_account || this.network.sasl_password) return true;
+    // A CertFP network identifies on the certificate, which means SASL EXTERNAL
+    // leaves sasl_account empty — and a NickServ that recognises the fingerprint
+    // passively needs no account field at all. Either way identification is
+    // pending, and a +R channel's rejoin must wait for it. (#459)
+    if (this.network.client_cert) return true;
     const commands = this.network.connect_commands;
     return !!commands && SERVICES_IDENTIFY_HINT.test(commands);
   }
@@ -3828,8 +4441,7 @@ export class IrcConnection {
   // nothing.
   private evictChannel(name: string, { forget = false }: { forget?: boolean } = {}): void {
     const canonical = canonicalChannelTarget(name, this.channels) ?? name;
-    this.channels.delete(name.toLowerCase());
-    this.joinedFoldedCache = null;
+    this.deleteChannel(name.toLowerCase());
     let favoritesChanged = false;
     try {
       if (forget && !hasMessageForTarget(this.network.id, canonical)) {
@@ -3881,6 +4493,36 @@ export class IrcConnection {
     return this.joinedFoldedCache.has(foldTargetFor(this.network.id, name));
   }
 
+  /** Whether we are in `name`, or about to be: membership plus the one state
+   *  the channels map can't see, a JOIN we sent whose echo hasn't landed.
+   *  Membership is echo-written, so between the request and its echo the map
+   *  says "no" for a channel we are about to be in, and a command sent now
+   *  reaches the server behind that JOIN.
+   *
+   *  This is the probe for a caller deciding whether to ACT on the network —
+   *  whether a close owes a PART. Being wrong one way leaks a 442 to every
+   *  attached client (#967); being wrong the other leaves the user in a
+   *  channel they closed. isChannelJoined stays the probe for rendering what
+   *  we know now.
+   *
+   *  ⚠ And a PART on the wire takes it back off. Membership is echo-written in
+   *  both directions, so the map still says yes for a channel we have already
+   *  parted — from an attached client, from another tab, or from this very
+   *  close a moment ago. Acting on that is the second PART and the 442 all over
+   *  again, which also makes a close of an already-closed buffer idempotent on
+   *  the wire.
+   *
+   *  ⚠ `restoring` is deliberately NOT part of this. A restore's replayed
+   *  self-JOIN already reconciles a channel whose row says autojoin=0 or
+   *  closed by PARTing it ("this is that PART, late", in the join handler), so
+   *  a caller that also parted would send it twice and the loser would draw
+   *  the 442. The replay owns that window; nobody else writes into it. */
+  mayBeJoined(name: string): boolean {
+    const folded = foldTargetFor(this.network.id, name);
+    if (this.pendingParts.has(folded)) return false;
+    return this.isChannelJoined(name) || this.pendingJoins.has(folded);
+  }
+
   /** The live ChannelState for `name`, resolved the same fold-aware way
    *  isChannelJoined resolves membership (#707). Callers that need the
    *  channel's CONTENTS (topic, members) rather than a yes/no must come
@@ -3904,16 +4546,151 @@ export class IrcConnection {
     return undefined;
   }
 
+  // setChannel and deleteChannel exist so that we don't forget to null
+  // joinedFoldedCache.
+  private setChannel(key: string, ch: ChannelState): void {
+    this.channels.set(key, ch);
+    this.joinedFoldedCache = null;
+  }
+
+  private deleteChannel(key: string): boolean {
+    const folded = foldTargetFor(this.network.id, key);
+    // The one place membership leaves the map, so the one place a part awaiting
+    // its answer has been answered: the PART echo, a kick, a 442's eviction, the
+    // engine's prune on re-attach. Unconditional — the mark must go even when
+    // there was no entry to delete, or a PART for a channel we had already left
+    // would leave one behind forever.
+    this.pendingParts.delete(folded);
+    // ⚠ Fold-aware, like isChannelJoined and channelState (#707). Every caller
+    // hands this a raw `.toLowerCase()` of whatever the SERVER said, while the
+    // map is keyed by the name we joined under — and those differ whenever an
+    // ircd echoes a fold variant, `#foo{bar}` for a `#foo[bar]` we are in on an
+    // rfc1459 network. An exact-key delete misses that entry, so membership
+    // goes on claiming we are in a channel we have left for the life of the
+    // connection: the next close sends a second PART, the server answers 442,
+    // and that is #967 by another road. Exact hit first, so the ordinary case
+    // stays one probe; the fallback scans the joined channels, a handful, for
+    // the same reason channelState is deliberately a scan.
+    let actual = key;
+    if (!this.channels.has(key)) {
+      for (const k of this.channels.keys()) {
+        if (foldTargetFor(this.network.id, k) === folded) {
+          actual = k;
+          break;
+        }
+      }
+    }
+    const deleted = this.channels.delete(actual);
+    if (deleted) this.joinedFoldedCache = null;
+    return deleted;
+  }
+
+  // The joined set belongs to one socket, so it dies with it (#908). Kept, a
+  // channel whose rejoin the server refused — a 477 before services identify
+  // us, a ban set while we were away — read as joined for the life of the
+  // process: the snapshot said joined, nothing arrived, and a 477 for it was
+  // taken for a speak rejection. Each one is announced parted so clients dim
+  // it; a rejoin that lands lights it again through its echo.
+  //
+  // autojoin is deliberately untouched: a dropped socket is not the user
+  // leaving, and that flag is what the reconnect's rejoin reads.
+  private forgetJoinedChannels(): void {
+    // A join key rides until its echo, and no echo comes for a JOIN sent on a
+    // dead socket. Left behind, it would be taken by the next echo for that
+    // name — a keyless /join on the new socket — and stored as the channel's
+    // key. Cleared even with no channels joined: the join that never landed is
+    // exactly the case with none.
+    this.pendingJoinKeys.clear();
+    this.pendingJoins.clear();
+    this.pendingParts.clear();
+    if (this.channels.size === 0) return;
+    const names = Array.from(this.channels.values(), (ch) => ch.name);
+    this.channels.clear();
+    this.joinedFoldedCache = null;
+    for (const name of names) this.publish({ type: 'channel-parted', target: name });
+  }
+
   upsertChannel(name: string): ChannelState {
     const key = name.toLowerCase();
     let ch = this.channels.get(key);
     if (!ch) {
       ch = { name, topic: null, members: new Map(), modes: new Set() };
-      this.channels.set(key, ch);
-      this.joinedFoldedCache = null;
+      this.setChannel(key, ch);
     }
     if (!ch.modes) ch.modes = new Set();
     return ch;
+  }
+
+  /** Mark a JOIN put on the wire, for every channel in a comma list.
+   *
+   *  A JOIN supersedes a PART still in flight for the same channel: rejoining is
+   *  the whole point, and a stale part mark would have the next close send
+   *  nothing and leave us in it.
+   *
+   *  ⚠ And superseding one is itself the reason to track this JOIN. While that
+   *  PART is unanswered the map still says joined, so the membership test reads
+   *  "already in it" and marks nothing — then the PART echo lands, membership
+   *  goes false, and NOTHING says a JOIN is outstanding. A close in that gap
+   *  sends no PART and the JOIN echo reopens the buffer it closed. A cycle has
+   *  to be tracked even though we look like a member: we are about to stop
+   *  being one, briefly.
+   *
+   *  ⚠ Only a channel whose outcome is UNKNOWN otherwise. A JOIN for one we are
+   *  already in is answered by nothing — no echo, as ircManager.joinChannel says
+   *  in the branch that sends it — so a mark would never be cleared, and after
+   *  the user later parted, mayBeJoined would still say yes and the close would
+   *  PART a channel we had left. That is #967 again, from the guard meant to
+   *  prevent it. */
+  private noteJoinSent(channelList: string): void {
+    for (const one of channelList.split(',')) {
+      if (!one) continue;
+      const folded = foldTargetFor(this.network.id, one);
+      const supersededPart = this.pendingParts.delete(folded);
+      if (supersededPart || !this.isChannelJoined(one)) this.pendingJoins.add(folded);
+    }
+  }
+
+  /** Mark a PART put on the wire, for every channel in a comma list. Leaving
+   *  also ends any join we were still waiting on: a JOIN the server never
+   *  answered leaves its mark behind (nothing else clears one), and the next
+   *  close would read it as "maybe in there" and PART again. */
+  private notePartSent(channelList: string): void {
+    for (const one of channelList.split(',')) {
+      if (!one) continue;
+      const folded = foldTargetFor(this.network.id, one);
+      this.pendingJoins.delete(folded);
+      this.pendingParts.add(folded);
+    }
+  }
+
+  /** The same marks for a JOIN or PART that reaches the socket as a raw line.
+   *
+   *  ⚠ `/quote PART #x` and `/raw JOIN #x` do not go through part() or join() —
+   *  they are handed to raw() verbatim (wsHub's 'raw' verb) — so without this
+   *  the marks are simply missing, and a close right after a raw PART sends the
+   *  duplicate this all exists to stop. Read on the way out, like
+   *  takeRawMonitor and noteOutgoingCommand beside it: raw() is the one path
+   *  every slash command and member-menu action takes. */
+  private noteRawMembership(line: string): void {
+    // The verb, past an IRCv3 tag block the caller may have put in front of it.
+    const parsed = /^\s*(?:@\S+\s+)?(JOIN|PART)\s+(\S+)/i.exec(line);
+    if (!parsed) return;
+    const targets = parsed[2];
+    if (parsed[1].toUpperCase() === 'PART') return this.notePartSent(targets);
+    // `JOIN 0` leaves every channel at once (RFC 2812 3.2.1) — it is a PART of
+    // all of them, and it is what a bouncer client's `JOIN 0` relays to.
+    if (targets === '0') {
+      for (const ch of this.channels.values()) this.notePartSent(ch.name);
+      // Including channels whose own JOIN is still in flight: those are not in
+      // the map yet, so the loop above misses them, and the mark left behind
+      // would have a close PART the very channel this command is abandoning.
+      // Moved rather than dropped, so the answer still holds once their JOIN
+      // echo lands and briefly makes them members.
+      for (const folded of this.pendingJoins) this.pendingParts.add(folded);
+      this.pendingJoins.clear();
+      return;
+    }
+    this.noteJoinSent(targets);
   }
 
   /** Hold a join key until its echo (see pendingJoinKeys). */
@@ -4045,6 +4822,39 @@ export class IrcConnection {
     // Unlocked, it mirrors the row exactly (upstream behavior). Identity fields
     // (nick / user / SASL / server password) always come from the user's row.
     const target = resolveConnectTarget(this.network);
+    // CertFP (#459). The certificate is presented whenever one is attached: a
+    // network may recognise it passively (NickServ identifies you on the spot),
+    // which works alongside a SASL password rather than instead of it. The
+    // MECHANISM is what the password decides — PLAIN when there is one,
+    // EXTERNAL when the certificate is the only credential there is. EXTERNAL
+    // carries no account name: the fingerprint is the identity, and the network
+    // maps it to whichever account it was registered on.
+    // ⚠ Checked BEFORE the certificate one only because the order has to be
+    // stable; both refuse the same way. A proxy that cannot be used stops the
+    // dial — see proxyBlockedReason.
+    const blocked = this.proxyBlockedReason() ?? this.clientCertBlockedReason();
+    if (blocked) {
+      // Never dial past this. Connecting without the certificate is not a
+      // degraded version of what the user asked for, it is a different
+      // identity: they arrive as an unrecognised stranger, +R channels refuse
+      // them, and under EXTERNAL the registration fails with a SASL error that
+      // points at the wrong thing entirely.
+      const text = `Not connecting: ${blocked}.`;
+      this.publish({ type: 'error', target: this.serverTarget(), text });
+      this.logNet(`Connect blocked: ${blocked}`, 'warn');
+      this.setState('disconnected', { error: text });
+      // Nothing here will retry — no socket opened, so no 'close' to schedule
+      // one from — and every one of these reasons is fixed by editing the
+      // network. Ask to be dropped, or the manager's map keeps a connection
+      // that no longer matches the row: startNetwork is a documented no-op when
+      // one already exists, so /connect would answer ok having done nothing,
+      // forever, even after the certificate is removed. Same reasoning as
+      // gateReconnect's delete (#616).
+      this.onNeedsRebuild?.();
+      return;
+    }
+    const clientCert = this.clientCertificate();
+    const saslMechanism = clientCert && !sasl_password ? ('EXTERNAL' as const) : undefined;
     // In engine mode the notice waits for the engine to say it is dialing — a
     // CONNECT it answers with ATTACH connects nothing (see onEnginePhase).
     if (!engineConfigured()) this.announceConnecting();
@@ -4086,6 +4896,8 @@ export class IrcConnection {
       gecos: this.network.realname || nick,
       password: this.network.server_password || undefined,
       account,
+      client_certificate: clientCert,
+      sasl_mechanism: saslMechanism,
       // Lurker owns the reconnect policy (scheduleReconnectIfWarranted), so
       // irc-framework's built-in is disabled outright. Its heuristic only retries
       // a connection that was healthy for >5s and died cleanly, ~3 times — which
@@ -4117,8 +4929,126 @@ export class IrcConnection {
       // network's RFC 1413 callback lands on the built-in identd rather than the
       // host's (outgoingAddr → irc-framework outgoing_addr → socket localAddress).
       outgoing_addr: outgoingAddr(),
+      // Route this network's socket through its proxy (#303). Spread BEFORE
+      // engineConnectOptions on purpose: in engine mode the dial happens in
+      // another process, so the engine's transport must win — it carries the
+      // proxy in its CONNECT frame instead (see engineConnectOptions).
+      ...this.proxyConnectOptions(),
       ...this.engineConnectOptions(),
     });
+  }
+
+  /** Why this network's proxy cannot be used, or null when there isn't one and
+   *  nothing is wrong.
+   *
+   *  ⚠⚠ EVERY answer here is a refusal to dial, never a fallback to a direct
+   *  connection. A proxy is not a preference that degrades gracefully: dialling
+   *  direct hands the ircd — and everyone running /whois on it — the address
+   *  the user was specifically trying not to expose, with no signal that
+   *  anything went wrong, and the connection WORKS, which is the worst possible
+   *  outcome. Same shape as clientCertBlockedReason, and for a stronger reason.
+   *
+   *  Re-validated on every connect rather than trusted from the write path,
+   *  because the routes are not the only writer: archive import inserts the
+   *  proxy columns verbatim (exportSchema drives its column list), so a
+   *  hand-edited archive can plant an unusable proxy that never passed a
+   *  route. */
+  private proxyBlockedReason(): string | null {
+    const proxy = networkProxy(this.network);
+    if (!proxy) return null;
+    if (isProxyProblem(proxy)) {
+      return `this network's proxy is unusable (${proxy.error})`;
+    }
+    // The instance lockdown applies on the connect path too, not only on write
+    // — an admin who closes the instance must close the connections it already
+    // has, the same way isNetworkHostAllowed is re-checked here.
+    if (!mayUseProxy()) {
+      return 'this server does not allow connecting through a proxy of your own';
+    }
+    // ⚠⚠ Engine mode dials in ANOTHER process. An engine below protocol minor 5
+    // has no field to carry the proxy in and would ignore it silently — so the
+    // app would report a proxied network while the engine opened a direct
+    // socket carrying the user's real address. Worse than the certificate case
+    // at minor 2, which at least fails visibly. Only refuse once the engine has
+    // actually said hello; before that its minor is unknown, and the transport
+    // makes the same check again at frame-build time.
+    const link = EngineLink.shared();
+    if (engineConfigured() && link.engineMinor !== null && !link.supportsProxy()) {
+      return 'the IRC engine this deployment connects through cannot route a connection via a proxy — update the engine, or remove the proxy';
+    }
+    return null;
+  }
+
+  /** This network's usable proxy, or undefined. Only ever reached once
+   *  proxyBlockedReason() has passed, so anything here is valid and allowed. */
+  private proxyConfig(): ProxyConfig | undefined {
+    const proxy = networkProxy(this.network);
+    return proxy && !isProxyProblem(proxy) ? proxy : undefined;
+  }
+
+  /** DCC cannot be used on a proxied network (#303).
+   *
+   *  ⚠⚠ DCC bypasses the tunnel completely and in both directions: a receive
+   *  dials the peer straight out (`dccReceiver.ts` is a bare `net.connect`),
+   *  and an offer advertises an address the peer must be able to reach. So on a
+   *  proxied network the first file transfer is the user's real address, out,
+   *  with no warning — while every IRC line they send is still going through
+   *  the proxy.
+   *
+   *  Refusing is the honest v1. Routing DCC properly needs passive DCC and
+   *  belongs to the DCC milestone, not here. Cheap today: DCC is off by default
+   *  and needs both a cell-wide switch and a per-user capability, so the
+   *  intersection is small — which is exactly why to close it before someone
+   *  ships an fserve on top of it. */
+  private dccBlockedByProxy(): boolean {
+    return !!this.proxyConfig();
+  }
+
+  /** Why an attached CertFP pair cannot be presented on this connect, or null
+   *  when there is nothing attached or nothing wrong. Checked before dialing:
+   *  every case here would otherwise become a connection that looks fine and
+   *  authenticates as nobody.
+   *
+   *  The PEMs are re-validated on each connect rather than trusted from the
+   *  write path, because the routes are not the only writer — archive import
+   *  inserts both columns verbatim (exportSchema drives its column list), so a
+   *  hand-edited or truncated archive can plant half a pair or an unparseable
+   *  key. An unparseable key reaching tls.connect throws SYNCHRONOUSLY out of
+   *  client.connect(), and on a backoff retry that is an uncaught exception in
+   *  a shared process. */
+  private clientCertBlockedReason(): string | null {
+    const { client_cert, client_key } = this.network;
+    if (!client_cert && !client_key) return null;
+    if (!client_cert || !client_key) {
+      return 'this network has half a client certificate — a certificate and its key are only usable together';
+    }
+    const pair = validateClientCertPair(client_cert, client_key);
+    if (isClientCertProblem(pair)) {
+      return `this network's client certificate is unusable (${pair.error})`;
+    }
+    if (!this.network.tls) {
+      return 'a client certificate can only be presented over TLS — enable TLS for this network, or remove the certificate';
+    }
+    const link = EngineLink.shared();
+    if (engineConfigured() && link.engineMinor !== null && !link.supportsClientCert()) {
+      // Engine mode dials in ANOTHER process. An engine below protocol minor 2
+      // has no field to carry the certificate in and would ignore it silently,
+      // so the app would ask for SASL EXTERNAL over a socket that presented
+      // nothing. Only refuse once the engine has actually said hello — before
+      // that its minor is unknown, and the transport makes the same check again
+      // at frame-build time, where readiness is guaranteed.
+      return 'the IRC engine this deployment connects through cannot present a client certificate — update the engine, or remove the certificate';
+    }
+    return null;
+  }
+
+  /** The attached CertFP pair in irc-framework's shape, or undefined. Only ever
+   *  reached once clientCertBlockedReason() has passed, so both halves are
+   *  present and parse. */
+  private clientCertificate(): { certificate: string; private_key: string } | undefined {
+    const { client_cert, client_key } = this.network;
+    if (!client_cert || !client_key) return undefined;
+    return { certificate: client_cert, private_key: client_key };
   }
 
   private announceConnecting(): void {
@@ -4139,6 +5069,19 @@ export class IrcConnection {
     // and manual connects (attempt 0) still persist their one "Connecting…" line.
     if (this.reconnectAttempt > 0) this.publishEphemeral(connectingNotice);
     else this.publish(connectingNotice);
+  }
+
+  /** Route this network through its proxy (#303).
+   *
+   *  `proxy` goes out in BOTH modes — in engine mode the transport puts it on
+   *  the CONNECT frame and the engine dials through it. Only the transport
+   *  override is direct-mode-only: in engine mode this process opens no socket
+   *  at all, and engineConnectOptions (spread after this one) sets its own. */
+  private proxyConnectOptions(): Partial<ConnectOptions> {
+    const proxy = this.proxyConfig();
+    if (!proxy) return {};
+    if (engineConfigured()) return { proxy };
+    return { transport: ProxyTransport as unknown as ConnectOptions['transport'], proxy };
   }
 
   // Engine mode: route this Client through the engine-backed transport. The id
@@ -4173,6 +5116,10 @@ export class IrcConnection {
     switch (phase) {
       case 'dialing':
         this.resetRestoreState();
+        // A new socket. Anything we still think we are in belonged to one that
+        // died while our link to the engine was down, so 'socket close' never
+        // saw it go.
+        this.forgetJoinedChannels();
         this.announceConnecting();
         break;
       case 'attached': {
@@ -4187,8 +5134,7 @@ export class IrcConnection {
         const live = new Set((info.channels ?? []).map((c) => c.toLowerCase()));
         for (const [key, ch] of this.channels) {
           if (live.has(key)) continue;
-          this.channels.delete(key);
-          this.joinedFoldedCache = null;
+          this.deleteChannel(key);
           this.publish({ type: 'channel-parted', target: ch.name });
         }
         const away = info.detachedForMs
@@ -4212,22 +5158,27 @@ export class IrcConnection {
         // +i`), so they are not in the replay either; one line, asked at once
         // — it is the per-channel replies the cap bounds, not this.
         this.restoreQuiet.set('*', {
-          until: Date.now() + RESTORE_QUIET_MS,
+          until: Date.now() + reconnectEnvInt('LURKER_RESTORE_QUIET_MS', RESTORE_QUIET_MS),
           mode: true,
           topic: false,
         });
         this.rawQuiet('MODE', this.currentNick);
+        // The account's away state, sent again. This socket missed any change
+        // made while the link was down, or while no process was attached, and
+        // nothing here knows what it was last told. The 305/306 is Lurker's.
+        this.sendAwayState();
+        this.requestUnnegotiatedCaps();
         this.restoreQueue = [...this.channels.values()].map((ch) => ch.name);
-        // Every queued channel is marked quiet now, not when its own step goes
-        // out: the LAST process may have let go with a step in flight, and
-        // that step's replies sit in the engine backlog, delivered right after
-        // this phase — the size gate on the WHO and the server-buffer filter
-        // must read them as the restore's. With the cap full, even the first
-        // channel's step can still be queued when they land. Each step re-marks
-        // its channel as it goes out, so a long wait cannot outlive the window.
+        // Every queued channel is marked quiet now: the LAST process may have
+        // let go with a step in flight, and that step's replies sit in the
+        // engine backlog, delivered right after this phase — the size gate on
+        // the WHO and the server-buffer filter must read them as the restore's.
+        // Nothing in this process asked for them, so the reply router can't
+        // tell. The replies to this process's own steps are Lurker's, which
+        // both read without a mark (replyRouter.ts).
         for (const name of this.restoreQueue) {
           this.restoreQuiet.set(name.toLowerCase(), {
-            until: Date.now() + RESTORE_QUIET_MS,
+            until: Date.now() + reconnectEnvInt('LURKER_RESTORE_QUIET_MS', RESTORE_QUIET_MS),
             mode: true,
             topic: true,
           });
@@ -4308,8 +5259,9 @@ export class IrcConnection {
   // backlog, which counts the moment it lands. Read from that one fact rather
   // than from the restore queue's position: a channel waiting its turn at the
   // restoreGate cap is in neither the queue nor the in-flight step, and a
-  // step the deadline ended without a reply has still not heard anything.
-  private membersPending(name: string): boolean {
+  // step the deadline ended without a reply has still not heard anything. The
+  // bouncer's attach burst holds such a channel's NAMES back until it has.
+  membersPending(name: string): boolean {
     return !this.namesHeard.has(foldTargetFor(this.network.id, name));
   }
 
@@ -4337,11 +5289,11 @@ export class IrcConnection {
   // channel every 400 ms was "Excess Flood" by the seventh channel on every
   // restart. Gated on replies, the server's queue never holds more than four
   // lines of ours on any ircd — these three plus the WHO the NAMES reply
-  // triggers ('userlist'), which irc-framework already serialises behind its
-  // 315 (`who_queue`) — and a server that throttles simply sets the pace. The
-  // WHO is deliberately NOT part of the gate: irc-framework's queue never
-  // recovers from a 315 that does not come, and a step waiting on it would
-  // turn that one lost reply into a deadline wait for every channel after it.
+  // triggers ('userlist'), which waits behind any WHO already on the wire
+  // (replyRouter.ts) — and a server that throttles simply sets the pace. The
+  // WHO is deliberately NOT part of the gate: a 315 that does not come holds
+  // the WHO queue for the router's whole timeout, and a step waiting on it
+  // would turn that one lost reply into a wait for every channel after it.
   //
   // Across connections each step is also a turn at the process-wide cap
   // (restoreGate, #842). A re-attach brings every held connection back in the
@@ -4355,7 +5307,7 @@ export class IrcConnection {
   // connection's whole walk at a time. Under the cap the step goes out
   // synchronously, so a small instance sees no change. The turn ends with the
   // step's replies, so the WHO those trigger is outside the cap too — one in
-  // flight per connection (the framework's queue), size-gated, but across
+  // flight per connection (the router's WHO queue), size-gated, but across
   // connections as parallel as before.
   private drainRestoreQueue(): void {
     this.endRestoreStep();
@@ -4386,11 +5338,6 @@ export class IrcConnection {
       return;
     }
     try {
-      this.restoreQuiet.set(name.toLowerCase(), {
-        until: Date.now() + RESTORE_QUIET_MS,
-        mode: true,
-        topic: true,
-      });
       // Keyed by the network's own fold: the replies echo the channel as the
       // server spells it, which on an rfc1459 network is not a toLowerCase
       // away.
@@ -4436,12 +5383,72 @@ export class IrcConnection {
     }
   }
 
-  private rawQuiet(command: string, arg: string): void {
-    try {
-      this.client.raw(command, arg);
-    } catch (_) {
-      /* ignore */
+  // Caps this app wants that the socket it just re-attached to never
+  // negotiated. The engine holds sockets across deploys, so a cap added in a
+  // release only reaches a held socket when the user next really reconnects —
+  // weeks, on a connection whose whole point is that it doesn't drop. A CAP REQ
+  // after registration is legal under CAP 302: the server answers ACK or NAK
+  // and no CAP END is owed. The ACK arrives as an ordinary line, and the engine
+  // records it so the NEXT re-attach replays it too (#888).
+  //
+  // Only the caps this app asked for through requestCap(): irc-framework's own
+  // want list is internal to its CAP handler, and it cannot drift under a held
+  // socket anyway — bumping irc-framework moves the engine image, and an engine
+  // recreate is a fresh dial with a fresh negotiation.
+  private requestUnnegotiatedCaps(): void {
+    const cap = this.client.network?.cap;
+    if (!cap) return;
+    const enabled = new Set(cap.enabled || []);
+    // Only what the server advertised and has not already refused. Both halves
+    // matter: a cap the server never listed is a NAK at best, and one it NAKed
+    // stays advertised-but-not-enabled for the life of the socket — so without
+    // the refusal set this would re-send the identical REQ on every re-attach,
+    // which on a socket whose whole point is that it never drops is every
+    // deploy and every link blip, forever.
+    const missing = (this.client.request_extra_caps || []).filter(
+      (name) => cap.available?.has(name) && !enabled.has(name) && !this.capsRefused.has(name),
+    );
+    if (missing.length === 0) return;
+    // One REQ per cap, not one batch: a REQ is all-or-nothing, so a server that
+    // would grant `batch` and refuse `draft/multiline` NAKs both — and the NAK
+    // names both, which would put a perfectly grantable cap in the refusal set
+    // for good. There are only ever a handful.
+    for (const name of missing) {
+      try {
+        this.client.raw(`CAP REQ :${name}`);
+      } catch (_) {
+        /* ignore */
+      }
     }
+  }
+
+  // A restore's own request. Its reply is Lurker's, so it reaches neither the
+  // server buffer nor a bouncer client (replyRouter.ts).
+  private rawQuiet(command: string, arg: string): void {
+    this.replies.send('lurker', `${command} ${arg}`);
+  }
+
+  // The away-sync WHO, as irc-framework's who() sends it: WHOX where the network
+  // has it, with a token irc-framework parses the reply by (it drops a 354 whose
+  // token it didn't hand out). The token is taken when the WHO goes out, not
+  // when it's queued, so a client's WHOX carrying the same number can't use it
+  // up first. Not who() itself: its queue moves on at any WHO's end, a client's
+  // included, and stops for good at one that never comes.
+  private sendAwaySyncWho(channel: string): void {
+    this.replies.send('lurker', `WHO ${channel}`, () =>
+      this.client.network.supports('whox')
+        ? `WHO ${channel} %tcuhsnfdaor,${this.client.whox_token.next()}`
+        : `WHO ${channel}`,
+    );
+  }
+
+  // Whether the server line being handled is the user's to see: a reply to
+  // their own query, or a line nobody asked for. Not a reply to Lurker's own
+  // query, to a bouncer client's, or to one nobody here is waiting on (#931).
+  // True outside a line's handlers, where nothing says otherwise.
+  private replyForUser(): boolean {
+    const owner = this.replyOwner;
+    return owner === null || owner === 'user' || owner === 'unasked';
   }
 
   // Is this numeric the reply to a request the restore made for this channel
@@ -4472,25 +5479,28 @@ export class IrcConnection {
     return false;
   }
 
-  // Catch-up dedupe: has this line already been written by the process that
-  // was attached before us? By msgid where the network provides one; otherwise
-  // by the same target/kind/sender/text within a few seconds of the same time.
-  private alreadyPersisted(event: IrcEvent): boolean {
-    if (typeof event.msgid === 'string') {
-      return hasMessageWithMsgid(this.network.id, event.msgid);
-    }
+  // Whether this line is already stored.
+  // - By msgid, always. A server can send a message twice with the same msgid
+  //   and server-time: that's a match on msgid, buffer, kind, sender and text.
+  //   In the catch-up window the msgid counts anywhere on the network. The next
+  //   process after an engine hand-over is given lines the last one stored, and
+  //   a later line in that backlog can have moved the row: a NICK renames the
+  //   DM buffer, and our own NICK routes a notice elsewhere.
+  // - Without a msgid, only in the catch-up window: the same buffer, kind,
+  //   sender and text within a few seconds. Outside it that would drop real
+  //   lines, such as a pasted block of repeated lines stamped in the same
+  //   millisecond.
+  private alreadyPersisted(event: IrcEvent, time: string): boolean {
     const target = event.target as string;
     const type = event.type;
     if (!target || !type) return false;
-    const time = normalizeEventTime(event.time);
-    return hasRecentMessageLike(
-      this.network.id,
-      target,
-      type,
-      (event.nick as string | undefined) ?? null,
-      (event.text as string | undefined) ?? null,
-      time,
-    );
+    const nick = (event.nick as string | undefined) ?? null;
+    const text = (event.text as string | undefined) ?? null;
+    if (typeof event.msgid === 'string' && event.msgid !== '') {
+      if (this.catchingUp) return hasMessageWithMsgid(this.network.id, event.msgid);
+      return hasSameMessageWithMsgid(this.network.id, target, event.msgid, type, nick, text);
+    }
+    return this.catchingUp && hasRecentMessageLike(this.network.id, target, type, nick, text, time);
   }
 
   // Engine mode shutdown: leave the IRC socket in the engine for the next app
@@ -4533,9 +5543,23 @@ export class IrcConnection {
     // calls .match() on the last arg, so a numeric key throws a TypeError that,
     // with no global uncaught handler (see wsHub sendSnapshot backstop), would
     // drop the whole (shared, on hosted) process.
+    // One JOIN can carry many channels: the reconnect rejoin batches them
+    // (planChannelRejoins packs `#a,#b,#c` up to the line limit), and an echo
+    // names one. Marking the blob would leave an entry no echo ever clears and
+    // no lookup ever matches — the guard inert on exactly the path where a
+    // close races a join most often.
+    //
+    // ⚠ Only a channel whose outcome is UNKNOWN is marked. A JOIN for one we
+    // are already in is answered by nothing — no echo, as ircManager.joinChannel
+    // says in the branch that sends it — so a mark would never be cleared, and
+    // after the user later parted, mayBeJoined would still say yes and the
+    // close would PART a channel we had left. That is #967 again, from the
+    // guard meant to prevent it. We are in it, so membership already answers.
+    this.noteJoinSent(channel);
     this.client.join(channel, typeof key === 'string' ? key : undefined);
   }
   part(channel: string, reason?: string): void {
+    this.notePartSent(channel);
     this.client.part(channel, reason);
   }
   say(target: string, text: string): void {
@@ -4578,6 +5602,21 @@ export class IrcConnection {
   // A stable per-peer key for rate limiting inbound CTCP: the sender's
   // ident@host when known, else the nick (lowercased). Mirrors how the E2E path
   // keys peers, so a nick-churning flooder still maps to bounded state.
+  // One line per backoff window per peer. The limiter's backoff is five minutes,
+  // so re-warning on every dropped offer would just move the flood into the
+  // user's buffer.
+  private warnDccFlood(nick: string, event: Record<string, unknown>): void {
+    const key = this.ctcpPeerKey(event);
+    const now = Date.now();
+    const last = this.dccFloodWarnedAt.get(key);
+    if (last !== undefined && now - last < DCC_FLOOD_WARN_GAP_MS) return;
+    this.dccFloodWarnedAt.set(key, now);
+    this.routeCtcpStatus(
+      event,
+      `Ignoring further DCC requests from ${nick} for a few minutes — too many arrived at once.`,
+    );
+  }
+
   private ctcpPeerKey(event: Record<string, unknown>): string {
     const ident = (event.ident as string) || '';
     const host = (event.hostname as string) || '';
@@ -4807,25 +5846,116 @@ export class IrcConnection {
     // Parse + validate BEFORE the rate-limit check so a malformed/empty CTCP
     // can't burn a peer's budget and suppress its legitimate probes.
     if (!type) return;
-    if (!this.ctcpLimiter.allowIncoming(this.ctcpPeerKey(event))) return;
+    // Who answers a type Lurker can answer was decided in the raw listener,
+    // before any bouncer client's relay passed the request on. A batched
+    // request's decision waited for irc-framework to run its line at the
+    // batch's end. Only a request that came through no raw line is decided
+    // here, so the peer's allowance goes once.
+    const answerer = isAnswerableCtcp(type)
+      ? (this.ctcpAnswerer ??
+        this.takeBatchedCtcpAnswerer(event) ??
+        this.ctcpAnswererFor(type, event))
+      : null;
+    if (answerer === 'nobody') return;
     // DCC rides CTCP but is never an auto-reply type. When DCC is enabled for
     // this user, hand the offer to the download manager instead of the generic
     // probe path; when disabled, fall through so it surfaces as an ordinary
     // unsupported CTCP ("requested CTCP DCC (no reply)"), unchanged from today.
+    //
+    // ⚠⚠ Ahead of the shared incoming-CTCP limiter, and with a bucket of its
+    // own. That limiter exists to stop us ANSWERING a VERSION/PING storm, and
+    // its budget is 3 per minute per peer followed by a five-minute silent
+    // backoff — fine for noise nobody asked for, ruinous for a DCC offer, which
+    // is a user-facing action the peer will naturally retry while getting their
+    // own client configured. Sharing the bucket meant a fourth `/dcc chat` in a
+    // minute vanished with no trace on either side, which is exactly how it
+    // presented in QA.
     if (type === 'DCC' && dccEnabledForUser(this.network.user_id)) {
+      // Say why, rather than letting it fall through to the generic
+      // "requested CTCP DCC (no reply)". Only reached when DCC is otherwise
+      // enabled for this user, so nobody who never had DCC sees a new line.
+      if (this.dccBlockedByProxy()) {
+        this.publish({
+          type: 'error',
+          target: this.serverTarget(),
+          text: `Ignored a DCC offer from ${nick}: DCC does not go through this network's proxy, and accepting it would connect directly from this server.`,
+        });
+        return;
+      }
+      // Still bounded — a DCC offer flood is a real nuisance vector — but on its
+      // own key, and NEVER silently: a dropped offer the user can't see is
+      // indistinguishable from a broken feature.
+      if (!this.ctcpLimiter.allowIncoming(`dcc:${this.ctcpPeerKey(event)}`)) {
+        this.warnDccFlood(nick, event);
+        return;
+      }
       // DCC handling (parse + DB writes + socket setup) must never throw out of
       // the CTCP event path and disrupt the connection.
       try {
         this.handleInboundDccRequest(nick, args, event);
-      } catch {
-        /* malformed offer / transient DB error — drop it, keep the connection */
+      } catch (e) {
+        // ⚠ Swallowed so a malformed offer can't kill the connection, but say
+        // SOMETHING — a bare catch here made a bug in the DCC path look
+        // identical to the offer never arriving.
+        this.routeCtcpStatus(
+          event,
+          `Couldn't handle a DCC request from ${nick}: ${(e as Error)?.message || e}`,
+        );
       }
+      return;
+    }
+    if (answerer === null && !this.ctcpLimiter.allowIncoming(this.ctcpPeerKey(event))) return;
+    if (answerer === 'clients') {
+      this.routeCtcpStatus(event, formatCtcpForwardedLine(nick, type));
       return;
     }
     const config = this.ctcpReplyConfig();
     const reply = buildCtcpReply(type, args, config, this.ctcpTemplateVars(config));
     if (reply !== null) this.client.ctcpResponse(nick, type, reply);
     this.routeCtcpStatus(event, formatCtcpRequestLine(nick, type, reply));
+  }
+
+  // Who answers a server line's CTCP request, for the raw listener: null for a
+  // line that isn't a request Lurker could answer, and for our own.
+  private ctcpAnswererForLine(msg: {
+    nick?: string;
+    ident?: string;
+    hostname?: string;
+    params?: string[];
+  }): CtcpAnswerer | null {
+    const ctcp = ctcpInText(String(msg.params?.[1] ?? ''));
+    if (!ctcp || !msg.nick || this.isSelfNick(msg.nick)) return null;
+    return this.ctcpAnswererFor(ctcp.type, msg);
+  }
+
+  // Who answers a CTCP request of `type` from this peer (#932), or null for a
+  // type Lurker has no answer for. One side answers, as in ZNC
+  // (IRCSock.cpp:550):
+  // - nobody, once the peer is over its limit;
+  // - Lurker, once the user changed that type's reply or turned replies off;
+  // - the IRC clients attached through the bouncer, while one counts as the
+  //   user on this network;
+  // - Lurker, otherwise.
+  // Each call takes one of the peer's allowance.
+  private ctcpAnswererFor(type: string, peer: Record<string, unknown>): CtcpAnswerer | null {
+    if (!isAnswerableCtcp(type)) return null;
+    if (!this.ctcpLimiter.allowIncoming(this.ctcpPeerKey(peer))) return 'nobody';
+    const userId = this.network.user_id;
+    if (ctcpAnsweredBySettings(type, changedSettings(userId, CTCP_ANSWER_SETTINGS))) {
+      return 'lurker';
+    }
+    return attachedIrcClients(userId, this.network.id) > 0 ? 'clients' : 'lurker';
+  }
+
+  // The raw listener's decision for a CTCP request inside a batch, which
+  // irc-framework runs only when the batch ends (batchedCtcpAnswerers).
+  private takeBatchedCtcpAnswerer(event: Record<string, unknown>): CtcpAnswerer | null {
+    const ref = (event.tags as Record<string, string> | undefined)?.batch;
+    const queue = ref ? this.batchedCtcpAnswerers.get(ref) : undefined;
+    if (!ref || !queue) return null;
+    const answerer = queue.shift() ?? null;
+    if (queue.length === 0) this.batchedCtcpAnswerers.delete(ref);
+    return answerer;
   }
 
   // Arm-on-trigger (#270): when the user sends an `XDCC SEND #n` to a bot (a DM
@@ -4839,7 +5969,7 @@ export class IrcConnection {
     // mentioned mid-sentence in ordinary conversation doesn't arm an auto-accept.
     const m = /^\s*xdcc\s+(?:send|get)\s+(#?\d+)/i.exec(text);
     if (!m) return;
-    if (!dccEnabledForUser(this.network.user_id)) return;
+    if (!dccEnabledForUser(this.network.user_id) || this.dccBlockedByProxy()) return;
     // ⚠ NOT a channel test (#724): `#` here is the XDCC PACK-NUMBER sigil.
     const pack = m[1].startsWith('#') ? m[1] : `#${m[1]}`;
     insertDccTransfer(this.network.user_id, {
@@ -4866,6 +5996,10 @@ export class IrcConnection {
     const parsed = parseDcc(args);
     if (parsed.kind === 'accept') {
       this.handleDccAccept(nick, parsed);
+      return;
+    }
+    if (parsed.kind === 'chat') {
+      this.handleInboundDccChat(nick, parsed, event);
       return;
     }
     if (parsed.kind !== 'send') {
@@ -5166,6 +6300,21 @@ export class IrcConnection {
   // stale (the bot stopped listening) — that surfaces as a connect failure.
   acceptPendingDcc(row: DccTransferRow): void {
     if (this.disposed) return;
+    // ⚠⚠ Gated HERE as well as at the offer, because a pending row outlives the
+    // setting that let it in: an offer recorded while the network was direct is
+    // still sitting in the Transfers view after the user configures a proxy and
+    // reconnects, and accepting it dials the peer with a bare net.connect —
+    // leaking exactly the address the proxy exists to hide. The offer-side gate
+    // stops new ones; this stops the backlog.
+    if (this.dccBlockedByProxy()) {
+      updateDccTransferState(
+        row.id,
+        'failed',
+        'this network goes through a proxy — a direct file transfer would reveal this server’s address',
+      );
+      this.publishDcc(row.id);
+      return;
+    }
     // Only an unsolicited offer still awaiting a decision can be accepted; a row
     // that already moved on (receiving/terminal) is a no-op.
     if (row.state !== 'pending_approval') return;
@@ -5227,6 +6376,710 @@ export class IrcConnection {
       this.dccPendingResume.delete(key);
       return;
     }
+  }
+
+  // --- DCC CHAT (#270) -------------------------------------------------------
+  //
+  // A DCC chat is a direct TCP conversation with one peer, surfaced as a `=nick`
+  // buffer. Nothing about it touches the IRC connection except the CTCP offer
+  // that sets it up, so a live chat survives a reconnect the way irssi's does —
+  // but it cannot outlive the process, while the buffer and its history do.
+  //
+  // ⚠⚠ `=nick` is a buffer name, never an IRC target. ircManager's send paths are
+  // the guard that keeps it off the wire; see the note there.
+
+  // Bind a listening port for a chat with `nick`, handing it back only if the
+  // chat is still wanted once the port is bound — else null, port released.
+  //
+  // ⚠⚠ The gap between "may we offer?" and the port actually being bound is
+  // real, and everything that ends an offer used to miss it: the listener only
+  // joins dccChatListeners once bound, so a `/dcc close chat` landing in the gap
+  // found nothing ("no live DCC chat") while the offer went out anyway, and a
+  // dispose() there sent the offer on a connection being torn down and leaked
+  // the port for its full timeout. So the request is registered BEFORE binding,
+  // cancel and teardown remove it, and the resolution re-checks it — along with
+  // the link, which a CTCP offer or reverse reply needs and which can drop in
+  // the gap too.
+  private openDccChatListener(nick: string): Promise<DccListenHandle | null> {
+    const key = nick.toLowerCase();
+    const request = {};
+    this.dccListenerRequests.set(key, request);
+    const settle = (): boolean => {
+      const current = this.dccListenerRequests.get(key) === request;
+      if (current) this.dccListenerRequests.delete(key);
+      return current;
+    };
+    return openDccListener().then(
+      (handle) => {
+        const current = settle();
+        if (current && !this.disposed && this.state === 'connected') return handle;
+        handle.close();
+        // Cancelled or torn down: nothing to say — the canceller said it. A
+        // link that dropped by itself mid-bind would otherwise vanish silently.
+        if (current && !this.disposed) {
+          this.dccChatNotice(
+            nick,
+            `Couldn't send the DCC chat offer — ${this.network.name} disconnected.`,
+          );
+        }
+        return null;
+      },
+      (err) => {
+        if (!settle() || this.disposed) return null; // cancelled: stay quiet
+        throw err;
+      },
+    );
+  }
+
+  // A token correlating a passive offer with its reverse reply. irssi and
+  // repartee both mint `rand() % 64` (dcc-chat.c:527, handlers_dcc.rs:204), and
+  // staying in that range keeps us inside what every implementation round-trips.
+  private mintDccToken(): number {
+    // ⚠ Only 6 bits, so two outstanding passive offers collide about 1 time in
+    // 64. Skip a token already in flight: reusing one would have the displaced
+    // offer's timer fire against the NEW entry (timing out the wrong chat, and
+    // naming the wrong peer), and the real reply arrive with nothing to match.
+    for (let i = 0; i < 64; i++) {
+      const token = Math.floor(Math.random() * 64);
+      if (!this.pendingPassiveChats.has(token)) return token;
+    }
+    return -1; // every token in flight — caller reports it
+  }
+
+  private dccChatTarget(nick: string): string {
+    return `${DCC_CHAT_PREFIX}${nick}`;
+  }
+
+  // Chat lifecycle status (offered / connected / closed / failed). PERSISTED via
+  // publish rather than surfaceCtcp's ephemeral path, and deliberately: the
+  // `=nick` buffer only exists because something was written to it, so an
+  // ephemeral line would leave a failed or still-pending chat with no buffer at
+  // all and the user with no idea what happened.
+  private dccChatNotice(nick: string, text: string): void {
+    this.publish({ type: 'notice', target: this.dccChatTarget(nick), nick: 'DCC', text });
+  }
+
+  // A chat line, persisted + fanned out so the buffer has real history like a DM.
+  // `kind: 'dcc-chat'` marks the row's transport; the column is free-form.
+  private publishDccChatLine(nick: string, text: string, self: boolean, action = false): void {
+    this.publish({
+      type: action ? 'action' : 'message',
+      target: this.dccChatTarget(nick),
+      nick: self ? this.currentNick || 'me' : nick,
+      text,
+      kind: 'dcc-chat',
+      self,
+    });
+  }
+
+  /** Whether a live DCC chat with `nick` exists. */
+  hasDccChat(nick: string): boolean {
+    return this.dccChats.has(nick.toLowerCase());
+  }
+
+  /** Display nicks of every peer with a live session right now. */
+  liveDccChatPeers(): string[] {
+    return Array.from(this.dccChats.values(), (e) => e.nick);
+  }
+
+  // Tell the client whether the `=nick` buffer has a live session behind it, so
+  // it can say so the way a DM says its peer is offline. Ephemeral: the current
+  // state also rides every snapshot (ircManager.snapshotForUser), which is what
+  // a reloaded tab reads — a live event alone would leave it guessing.
+  private publishDccChatState(nick: string, live: boolean): void {
+    this.publishEphemeral({
+      type: 'dcc-chat-state',
+      target: this.serverTarget(),
+      from: nick,
+      live,
+    });
+  }
+
+  // Both tiers of the DCC gate plus the proxy rule, checked at every chat entry
+  // point. The gate is per-entry-point by doctrine (routes/dcc.ts), and the proxy
+  // rule matters because DCC bypasses the tunnel in BOTH directions — a chat dial
+  // or listen leaks the real address exactly as a file transfer would.
+  // Sending a DCC offer or reverse reply rides the IRC link. During reconnect
+  // backoff irc-framework silently DROPS the write, so without this the user
+  // was told "offered … waiting for them to connect", a listening port from the
+  // configured range was held for the full 120s, and the eventual timeout
+  // blamed the peer. Accepting an ACTIVE offer needs no link — it only dials —
+  // so this guards the sends alone.
+  private dccCanSendOffer(nick: string): boolean {
+    if (this.state === 'connected') return true;
+    this.dccChatNotice(
+      nick,
+      `Can't send a DCC chat offer while ${this.network.name} is not connected.`,
+    );
+    return false;
+  }
+
+  private dccChatAllowed(nick: string, verb: string): boolean {
+    if (this.disposed) return false;
+    if (!dccEnabledForUser(this.network.user_id)) return false;
+    if (this.dccBlockedByProxy()) {
+      this.dccChatNotice(nick, `Can't ${verb} — DCC does not go through this network's proxy.`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Offer a DCC chat to `nick`.
+   *
+   * Active by default: we listen and advertise a port. Passive (we ask the peer
+   * to listen) is opt-in via `/dcc chat -passive`, NOT an automatic fallback —
+   * WeeChat leaves the untokenized tail in its port field, so it reads our
+   * passive offer's port as 0 and quietly dials nowhere (irc-ctcp.c:1332-1345,
+   * :1381), and HexDroid does the same. Silently degrading into that is worse
+   * than refusing, so an unconfigured server says so instead.
+   */
+  offerDccChat(nick: string, opts: { passive?: boolean } = {}): void {
+    // ⚠⚠ A peer, never a channel. The offer goes out as a CTCP to `nick`, so a
+    // channel name here broadcasts it to everyone in the channel — and an
+    // active offer also opens a listening port any of them can race for. All
+    // four sigils, via isChannelTarget: a `#`-only test is this codebase's most
+    // repeated bug. Guarded here rather than at the route alone because this is
+    // where every caller converges.
+    if (isChannelTarget(nick)) return;
+    if (!this.dccChatAllowed(nick, 'offer a DCC chat')) return;
+    const key = nick.toLowerCase();
+    // ⚠ Across every owner, not just this connection: after a Disconnect and
+    // reconnect the live chat belongs to the OLD connection, and checking only
+    // our own map would open a second socket to the same peer.
+    if (
+      this.dccChats.has(key) ||
+      dccChatHostFor(dccChatKey(this.network.user_id, this.network.id), nick)
+    ) {
+      this.dccChatNotice(nick, `Already in a DCC chat with ${nick}.`);
+      return;
+    }
+    // `/dcc chat <nick>` doubles as "accept the offer they already made", which
+    // is how irssi spells it too — making a fresh offer at someone who is
+    // already waiting for us would just deadlock the two halves.
+    const inbound = this.clearPendingInboundChat(key);
+    if (inbound) {
+      this.acceptInboundDccChat(inbound.nick, inbound.offer);
+      return;
+    }
+    if (!this.dccCanSendOffer(nick)) return;
+    if (opts.passive) {
+      this.offerPassiveDccChat(nick);
+      return;
+    }
+    if (!dccActiveListenAvailable()) {
+      this.dccChatNotice(
+        nick,
+        "Can't offer a DCC chat: this server has no public address and listening port range " +
+          'configured (LURKER_DCC_EXTERNAL_HOST, LURKER_DCC_LISTEN_PORT_MIN/_MAX). ' +
+          `Accepting a chat ${nick} offers you still works. ` +
+          '`/dcc chat -passive` asks them to listen instead, but only irssi, HexChat and ' +
+          'repartee handle that correctly.',
+      );
+      return;
+    }
+    const externalHost = dccExternalHost();
+    if (!externalHost || encodeDccAddress(externalHost) === null) {
+      this.dccChatNotice(
+        nick,
+        `DCC chat: LURKER_DCC_EXTERNAL_HOST is not a usable address (${externalHost ?? 'unset'}).`,
+      );
+      return;
+    }
+    this.openDccChatListener(nick)
+      .then((handle) => {
+        if (!handle) return;
+        const body = buildDccChat(externalHost, handle.port);
+        if (body === null) {
+          handle.close();
+          this.dccChatNotice(nick, 'DCC chat: external host is misconfigured.');
+          return;
+        }
+        this.dccChatListeners.set(handle, nick);
+        this.client.ctcpRequest(nick, 'DCC', body);
+        this.dccChatNotice(nick, `Offered a DCC chat to ${nick} — waiting for them to connect…`);
+        handle.accepted
+          .then((socket) => {
+            this.dccChatListeners.delete(handle);
+            this.startDccChat(nick, socket);
+          })
+          .catch((err) => {
+            // ⚠ Gone already means someone removed it on purpose — /dcc close chat
+            // cancelling the offer, or teardown. Reporting that as "failed: DCC
+            // listener closed" right after "Cancelled the pending DCC chat offer"
+            // told the user their own cancel had broken something.
+            if (!this.dccChatListeners.delete(handle)) return;
+            this.dccChatNotice(
+              nick,
+              `DCC chat offer to ${nick} failed: ${err instanceof Error ? err.message : err}`,
+            );
+          });
+      })
+      .catch((err) => {
+        this.dccChatNotice(
+          nick,
+          `Couldn't open a DCC listening port: ${err instanceof Error ? err.message : err}`,
+        );
+      });
+  }
+
+  // Passive/reverse offer: port 0 + a token, and the peer listens. The address we
+  // advertise is a placeholder the peer is meant to ignore — irssi and repartee
+  // both send 1.1.1.1 (16843009) here, so we match rather than HexChat's `199`,
+  // which some receivers reject as unroutable.
+  private offerPassiveDccChat(nick: string): void {
+    const token = this.mintDccToken();
+    if (token < 0) {
+      this.dccChatNotice(nick, 'Too many passive DCC chat offers are already pending.');
+      return;
+    }
+    // Always the placeholder. The peer replies with the address to dial and
+    // ignores this one — irssi hardcodes 16843009 here — so advertising the
+    // real host only added a way to fail: a hostname in LURKER_DCC_EXTERNAL_HOST
+    // can't be encoded, and made `-passive`, the mode meant for servers WITHOUT
+    // a usable external address, refuse with "misconfigured".
+    const body = buildDccChatPassive(PASSIVE_DCC_FAKE_HOST, token);
+    if (body === null) {
+      this.dccChatNotice(nick, 'DCC chat: external host is misconfigured.');
+      return;
+    }
+    this.client.ctcpRequest(nick, 'DCC', body);
+    this.dccChatNotice(
+      nick,
+      `Offered a passive DCC chat to ${nick} — waiting for them to connect back… ` +
+        '(passive chat only works if their client supports it: irssi, HexChat and repartee do; ' +
+        'WeeChat and HexDroid do not.)',
+    );
+    const timer = setTimeout(() => {
+      if (this.pendingPassiveChats.delete(token)) {
+        this.dccChatNotice(nick, `Passive DCC chat offer to ${nick} timed out.`);
+      }
+    }, PASSIVE_DCC_TIMEOUT_MS);
+    timer.unref?.();
+    this.pendingPassiveChats.set(token, { nick, timer });
+  }
+
+  /**
+   * An inbound `DCC CHAT` offer. Three shapes reach here:
+   *   - a reply to OUR passive offer (real port carrying a token we minted) → dial;
+   *   - a peer's own passive offer (port 0 + their token) → we listen and reply;
+   *   - a plain active offer (real port) → dial.
+   *
+   * Port 0 with no token never reaches this method: parseDcc refuses it, because
+   * it is the one shape that turns into a dial to port 0.
+   */
+  private handleInboundDccChat(
+    nick: string,
+    offer: DccChatOffer,
+    event: Record<string, unknown>,
+  ): void {
+    if (!this.dccChatAllowed(nick, 'accept a DCC chat')) return;
+    // Our own passive offer being answered? That we DO proceed with — we
+    // initiated it, and the token proves this is the reply to ours.
+    if (!offer.passive && offer.token !== null) {
+      const pending = this.pendingPassiveChats.get(offer.token);
+      if (pending && pending.nick.toLowerCase() === nick.toLowerCase()) {
+        clearTimeout(pending.timer);
+        this.pendingPassiveChats.delete(offer.token);
+        this.dialDccChat(nick, offer.host, offer.port);
+        return;
+      }
+    }
+    // ⚠⚠ Our OWN offer echoed back to us, which a network with echo-message will
+    // do. A token we minted can only appear in a line we sent, so a PASSIVE
+    // offer carrying one is ours — note the asymmetry with the branch above,
+    // which matches a non-passive REPLY to our offer. Without this the echo
+    // fell through as "unsolicited" and prompted the user to accept a chat
+    // with themselves, which is how it turned up in QA.
+    //
+    // Checked on the token rather than the sender because it holds regardless
+    // of nick tracking. In the QA case that found this, the generic self-echo
+    // guard in handleInboundCtcpRequest missed because currentNick had been
+    // lost in a netsplit collision — that root cause is fixed (#972), but the
+    // token is proof of authorship that no nick bookkeeping can get wrong, so
+    // it stays the decisive check for our own passive offer.
+    if (offer.passive && offer.token !== null && this.pendingPassiveChats.has(offer.token)) {
+      return;
+    }
+    // Belt and braces for the active shape, which carries no token of ours.
+    //
+    // ⚠⚠ isSelfNick — currentNick ONLY, never the configured nick as well.
+    // currentNick follows the server, including through a netsplit collision
+    // that SAVEs us to our UID (#972), so it names who we are right now. The
+    // configured nick names who we ASKED to be, and when that was taken and we
+    // registered as `alice_`, the configured `alice` belongs to someone else —
+    // treating it as us would silently drop that person's genuine chat offer
+    // as if it were our own echo. The token check above covers our own passive
+    // offer however we are named.
+    if (this.isSelfNick(nick)) return;
+    if (this.dccChats.has(nick.toLowerCase())) {
+      this.dccChatNotice(nick, `${nick} offered a DCC chat, but one is already open.`);
+      return;
+    }
+    // Anything else is an unsolicited offer: record it and ask. `/dcc chat
+    // <nick>` accepts, exactly as it does in irssi.
+    const key = nick.toLowerCase();
+    const prior = this.pendingInboundChats.get(key);
+    if (prior) clearTimeout(prior.timer);
+    const timer = setTimeout(() => {
+      if (this.clearPendingInboundChat(key)) {
+        // Ephemeral, and to the server buffer: the prompt never created a
+        // `=nick` buffer, so its expiry must not create one either.
+        this.surfaceCtcp(this.serverTarget(), `The DCC chat offer from ${nick} expired.`);
+      }
+    }, INBOUND_DCC_CHAT_OFFER_TTL_MS);
+    timer.unref?.();
+    this.pendingInboundChats.set(key, { nick, offer, timer });
+    // ⚠ routeCtcpStatus, NOT dccChatNotice: the prompt is a CTCP surface like
+    // any other, so it honours ctcp.msgbuffer — and, more to the point, a
+    // persisted notice would MINT a `=stranger` buffer into the sidebar on
+    // nothing but an unsolicited PRIVMSG. The `=nick` buffer appears when the
+    // user accepts, which is also when irssi opens its window.
+    this.routeCtcpStatus(
+      event,
+      `${nick} wants to start a DCC chat — /dcc chat ${nick} to accept` +
+        (offer.passive ? ' (they are firewalled, so this server would listen)' : ''),
+    );
+    // …and an actionable toast, the same shape a channel invite uses: ephemeral,
+    // routed through the server pseudo-buffer, read by the client from `from`
+    // rather than `target`. An offer is a decision someone has to make, so the
+    // client makes this one sticky — which is only safe because the offer's own
+    // lifecycle is broadcast too (see clearPendingInboundChat).
+    this.publishEphemeral({
+      type: 'dcc-chat-offer',
+      target: this.serverTarget(),
+      from: nick,
+      passive: offer.passive,
+    });
+  }
+
+  // Drop a pending inbound offer and tell the client, whatever the reason —
+  // accepted, declined, expired or torn down. ⚠ Without this the sticky toast
+  // outlives the offer, and its Accept button silently stops meaning "accept"
+  // and starts meaning "make a fresh offer at them", which is a different act.
+  private clearPendingInboundChat(key: string): { nick: string; offer: DccChatOffer } | null {
+    const pending = this.pendingInboundChats.get(key);
+    if (!pending) return null;
+    clearTimeout(pending.timer);
+    this.pendingInboundChats.delete(key);
+    this.publishEphemeral({
+      type: 'dcc-chat-offer-closed',
+      target: this.serverTarget(),
+      from: pending.nick,
+    });
+    return { nick: pending.nick, offer: pending.offer };
+  }
+
+  // Accept an offer already recorded by handleInboundDccChat. Active: dial them.
+  // Passive: they are firewalled, so we listen and reverse-reply with our port
+  // and their token.
+  private acceptInboundDccChat(nick: string, offer: DccChatOffer): void {
+    if (offer.passive) {
+      if (!this.dccCanSendOffer(nick)) return;
+      // The peer is firewalled and wants US to listen.
+      if (!dccActiveListenAvailable() || offer.token === null) {
+        this.dccChatNotice(
+          nick,
+          `${nick} offered a passive DCC chat, but this server has no listening port range ` +
+            'configured so it cannot accept one.',
+        );
+        return;
+      }
+      const externalHost = dccExternalHost();
+      if (!externalHost) return;
+      const token = offer.token;
+      // ⚠ No expectPeerHost pin: a passive offer's advertised address is a
+      // placeholder (1.1.1.1 / 0.0.0.199) and the peer dials from its real,
+      // often NAT'd, source — pinning would reject exactly the peers this path
+      // exists for. This is JawshTheDark's fix from #528 (73c76fc4).
+      this.openDccChatListener(nick)
+        .then((handle) => {
+          if (!handle) return;
+          const body = buildDccChatReverse(externalHost, handle.port, token);
+          if (body === null) {
+            handle.close();
+            // The active path reports this same condition; staying silent here
+            // meant a port was bound, released, and nothing was ever said.
+            this.dccChatNotice(nick, 'DCC chat: external host is misconfigured.');
+            return;
+          }
+          this.dccChatListeners.set(handle, nick);
+          this.client.ctcpRequest(nick, 'DCC', body);
+          this.dccChatNotice(nick, `${nick} wants to DCC chat — waiting for them to connect…`);
+          handle.accepted
+            .then((socket) => {
+              this.dccChatListeners.delete(handle);
+              this.startDccChat(nick, socket);
+            })
+            .catch((err) => {
+              // ⚠ Gone already means someone removed it on purpose — /dcc close chat
+              // cancelling the offer, or teardown. Reporting that as "failed: DCC
+              // listener closed" right after "Cancelled the pending DCC chat offer"
+              // told the user their own cancel had broken something.
+              if (!this.dccChatListeners.delete(handle)) return;
+              this.dccChatNotice(
+                nick,
+                `DCC chat with ${nick} failed: ${err instanceof Error ? err.message : err}`,
+              );
+            });
+        })
+        .catch((err) => {
+          this.dccChatNotice(
+            nick,
+            `Couldn't open a DCC listening port for ${nick}: ${
+              err instanceof Error ? err.message : err
+            }`,
+          );
+        });
+      return;
+    }
+    this.dialDccChat(nick, offer.host, offer.port);
+  }
+
+  private dialDccChat(nick: string, host: string, port: number): void {
+    if (port === 0) return; // parseDcc refuses this; belt and braces
+    if (!dccAllowPrivateHosts() && isBlockedDccHost(host)) {
+      this.dccChatNotice(
+        nick,
+        `Refusing a DCC chat with ${nick} — ${host} is a private or reserved address.`,
+      );
+      return;
+    }
+    this.dccChatNotice(nick, `Connecting to ${nick} at ${host}:${port} for DCC chat…`);
+    const sock = net.connect({ host, port });
+    // Bound the connect so an unreachable peer fails promptly and legibly
+    // instead of hanging until the OS SYN timeout (~1–2 minutes).
+    sock.setTimeout(DCC_CHAT_CONNECT_TIMEOUT_MS);
+    const onDialTimeout = (): void => {
+      sock.destroy(new Error('connection timed out'));
+    };
+    sock.once('timeout', onDialTimeout);
+    sock.once('connect', () => {
+      sock.setTimeout(0);
+      // ⚠ These belong to the DIAL. Past connect the socket is DccChat's and it
+      // does its own error handling, so leaving ours attached means a peer
+      // dropping mid-session prints the real error AND a "couldn't connect,
+      // check your port forwarding" paragraph that is nonsense by then.
+      sock.off('timeout', onDialTimeout);
+      sock.off('error', onDialError);
+      this.startDccChat(nick, sock);
+    });
+    const onDialError = (err: Error): void => {
+      // DCC is peer-to-peer and Lurker runs on the SERVER, so the peer's
+      // advertised address:port has to be reachable FROM the server. A refusal
+      // here is usually a topology problem, not a Lurker one — say so, because
+      // the alternative is a user retrying forever.
+      this.dccChatNotice(
+        nick,
+        `Couldn't connect to ${nick} at ${host}:${port} — ${err.message}. ` +
+          'DCC connects from the Lurker server, so that address and port must be reachable ' +
+          'from it; a peer behind home NAT needs the port forwarded, or must offer a passive ' +
+          'chat instead.',
+      );
+    };
+    sock.once('error', onDialError);
+  }
+
+  private startDccChat(nick: string, socket: net.Socket): void {
+    const key = nick.toLowerCase();
+    // ⚠ Glare: we can offer a chat AND accept theirs, so both halves complete
+    // and a second socket arrives for a peer we're already chatting with. Keep
+    // the established session and drop the newcomer — overwriting the map would
+    // orphan the live socket (still publishing into the buffer, never closed)
+    // and its eventual onClose would then delete the REPLACEMENT's entry,
+    // leaving a live chat that every send reports as dead.
+    if (this.dccChats.has(key)) {
+      socket.destroy();
+      return;
+    }
+    const chat = new DccChat({
+      socket,
+      onLine: (line) => {
+        const parsed = parseDccChatLine(line);
+        this.publishDccChatLine(nick, parsed.text, false, parsed.action);
+      },
+      onClose: () => {
+        if (this.forgetDccChat(key, chat)) {
+          this.dccChatNotice(nick, `DCC chat with ${nick} closed.`);
+        }
+      },
+      onError: (err) => {
+        if (this.forgetDccChat(key, chat)) {
+          this.dccChatNotice(nick, `DCC chat with ${nick} ended: ${err.message}`);
+        }
+      },
+    });
+    this.dccChats.set(key, { nick, chat });
+    this.dccChatDeadWarned.delete(key);
+    // Reachable even after ircManager drops this connection from its map on a
+    // user-initiated disconnect — the socket outlives the IRC link, as irssi's
+    // does (dcc.c:300-312).
+    registerDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
+    chat.start();
+    this.dccChatNotice(nick, `DCC chat with ${nick} connected.`);
+    this.publishDccChatState(nick, true);
+  }
+
+  // Drop `key` only if it still maps to `chat` — an identity check, not a bare
+  // delete, so a late callback from a superseded session can't evict the live
+  // one (see the glare note in startDccChat).
+  private forgetDccChat(key: string, chat: DccChat): boolean {
+    const entry = this.dccChats.get(key);
+    if (entry?.chat !== chat) return false;
+    this.dccChats.delete(key);
+    this.releaseDccChatHost();
+    this.publishDccChatState(entry.nick, false);
+    return true;
+  }
+
+  // Stop holding this connection open for DCC once its last chat is gone.
+  private releaseDccChatHost(): void {
+    if (this.dccChats.size > 0) return;
+    unregisterDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
+  }
+
+  /**
+   * Send a line in a live DCC chat and echo it into the `=nick` buffer. Returns
+   * false when there is no session, which is how the caller distinguishes "typed
+   * into a dead chat" from a successful send.
+   *
+   * An action goes out as bare `\x01ACTION text\x01` — the only form WeeChat,
+   * HexChat, HexDroid and repartee parse. irssi's own default is to prefix
+   * `CTCP_MESSAGE `, which nothing else understands, but it switches to this
+   * form the moment it sees a bare \x01 from us (dcc-chat.c:685-687).
+   */
+  dccChatSend(nick: string, text: string, opts: { action?: boolean } = {}): boolean {
+    // A bare `=` target yields no peer. It must still be refused — it's a
+    // pseudo-target, never a wire target — just not announced as a dead chat.
+    if (!nick) return false;
+    const key = nick.toLowerCase();
+    const entry = this.dccChats.get(key);
+    if (!entry) {
+      // ⚠ A chat dies with the process but its buffer and history persist, so
+      // this is the ordinary state of every `=nick` buffer after a restart.
+      // Saying nothing leaves the user typing into a buffer that silently eats
+      // their lines; the composer's own not-sent toast doesn't explain why.
+      if (!this.dccChatDeadWarned.has(key)) {
+        this.dccChatDeadWarned.add(key);
+        this.dccChatNotice(
+          nick,
+          `No live DCC chat with ${nick} — a chat ends when this server restarts, and cannot ` +
+            `be resumed. \`/dcc chat ${nick}\` starts a new one.`,
+        );
+      }
+      return false;
+    }
+    const wire = opts.action ? `\u0001ACTION ${text}\u0001` : text;
+    if (!entry.chat.send(wire)) return false;
+    this.publishDccChatLine(nick, text, true, !!opts.action);
+    return true;
+  }
+
+  /** Close a live DCC chat (`/dcc close chat <nick>`, irssi's syntax). */
+  closeDccChat(nick: string): boolean {
+    const key = nick.toLowerCase();
+    const entry = this.dccChats.get(key);
+    // Also cancels a still-unaccepted inbound offer, which is the other thing
+    // "close this chat" can reasonably mean.
+    const pending = this.clearPendingInboundChat(key);
+    if (pending) {
+      this.surfaceCtcp(this.serverTarget(), `Declined the DCC chat offer from ${pending.nick}.`);
+      if (!entry) return true;
+    }
+    // An offer WE made is cancellable too. Without this a mistyped
+    // `/dcc chat bbo` holds one of the configured listening ports for the whole
+    // 120s timeout, and the range IS the documented concurrency cap.
+    // A bind still in flight counts: without this, cancelling in that window
+    // answered "no live DCC chat" and the offer went out anyway.
+    let cancelledOutgoing = this.dccListenerRequests.delete(key);
+    for (const [token, pending] of this.pendingPassiveChats) {
+      if (pending.nick.toLowerCase() !== key) continue;
+      clearTimeout(pending.timer);
+      this.pendingPassiveChats.delete(token);
+      cancelledOutgoing = true;
+    }
+    for (const [handle, forNick] of this.dccChatListeners) {
+      if (forNick.toLowerCase() !== key) continue;
+      this.dccChatListeners.delete(handle);
+      handle.close();
+      cancelledOutgoing = true;
+    }
+    if (cancelledOutgoing) {
+      this.dccChatNotice(nick, `Cancelled the pending DCC chat offer to ${nick}.`);
+      if (!entry) return true;
+    }
+    if (!entry) return false;
+    this.dccChats.delete(key);
+    this.releaseDccChatHost();
+    entry.chat.close();
+    this.dccChatNotice(entry.nick, `DCC chat with ${entry.nick} closed.`);
+    this.publishDccChatState(entry.nick, false);
+    return true;
+  }
+
+  // A deliberate disconnect (stopNetwork, account suspend, shutdown — never the
+  // auto-reconnect ladder, which reuses this object and keeps its place in the
+  // map) ends the HANDSHAKES in flight on this connection, but not established
+  // chats.
+  //
+  // ⚠⚠ Why the line falls there. An established chat is a socket that needs no
+  // IRC, so it survives, as irssi's does. A pending offer is different: it is
+  // only reachable through this connection, and stopNetwork is about to drop
+  // it from the map, so after the user reconnects the NEW connection knows
+  // nothing about it. Left alone, the offer toast stayed up and its Accept went
+  // to the new connection, which found no offer and sent the peer a FRESH one
+  // — a different act than the button names. Our own passive offers go too:
+  // their reply can only arrive over IRC, and it would land on the new
+  // connection, which never minted the token. Ending them here retires the
+  // toast immediately and says why; the peer can offer again.
+  private endDccChatHandshakes(): void {
+    const dropped = this.pendingDccChatOffers();
+    for (const key of this.pendingInboundChats.keys()) this.clearPendingInboundChat(key);
+    for (const pending of this.pendingPassiveChats.values()) clearTimeout(pending.timer);
+    this.pendingPassiveChats.clear();
+    this.dccListenerRequests.clear(); // an offer still binding is a handshake too
+    for (const nick of dropped) {
+      this.surfaceCtcp(
+        this.serverTarget(),
+        `Dropped the DCC chat offer from ${nick} — ${this.network.name} was disconnected.`,
+      );
+    }
+  }
+
+  /** End every session this connection owns. ircManager's dispose paths call
+   *  this through the session registry, because after a user Disconnect the
+   *  connection holding a chat is no longer in the map they walk. */
+  closeAllDccChats(reason: string): void {
+    this.teardownDccChats(reason);
+  }
+
+  /** Peers with an offer to us still awaiting an answer. Rides the snapshot so
+   *  a client can retire an offer toast whose offer has gone. */
+  pendingDccChatOffers(): string[] {
+    return Array.from(this.pendingInboundChats.values(), (p) => p.nick);
+  }
+
+  // Tear down every chat session, listener and pending passive offer. Called
+  // from dispose() — and ⚠ called BEFORE `disposed` is set, because publish()
+  // and publishEphemeral() both return silently once it is, which would swallow
+  // the very notice that tells the user their chats went away.
+  private teardownDccChats(reason: string): void {
+    for (const [key, entry] of this.dccChats) {
+      this.dccChats.delete(key);
+      entry.chat.close();
+      this.dccChatNotice(entry.nick, `DCC chat ended — ${reason}.`);
+      this.publishDccChatState(entry.nick, false);
+    }
+    // Deleting the current key mid-iteration is well-defined for a Map, and
+    // clearPendingInboundChat is what tells the client to retire its toast —
+    // so this must go through it rather than a bare clear().
+    for (const key of this.pendingInboundChats.keys()) this.clearPendingInboundChat(key);
+    unregisterDccChatHost(dccChatKey(this.network.user_id, this.network.id), this);
+    this.dccListenerRequests.clear(); // binds in flight resolve, see this, and release
+    for (const handle of this.dccChatListeners.keys()) handle.close();
+    this.dccChatListeners.clear();
+    for (const pending of this.pendingPassiveChats.values()) clearTimeout(pending.timer);
+    this.pendingPassiveChats.clear();
   }
 
   // Surface an inbound CTCP reply (a peer answered a query we sent), routed back
@@ -5955,6 +7808,12 @@ export class IrcConnection {
               : tags,
         };
       }
+      // Without server-time the message would be stored when the batch ends,
+      // but each fragment is relayed with the time it arrived. The first
+      // fragment's time lets a MARKREAD naming any of them reach the stored row.
+      if (event.time == null && this.lineArrivedAt) {
+        event = { ...event, time: this.lineArrivedAt.getTime() };
+      }
       this.multilineBatches.set(id, { event, text: line });
       return;
     }
@@ -6098,7 +7957,7 @@ export class IrcConnection {
     // would let a kick nobody ever saw place an unrelated 401 on the new one.
     this.lastNickIntent.clear();
   }
-  raw(line: string): void {
+  raw(line: string, asker: Asker = 'user'): void {
     // Strip CR/LF/NUL before the line hits the socket. irc-framework's
     // writeLine appends its own \r\n and writes verbatim, so any embedded
     // newline in a caller-built line (a kick reason, topic, ban host, etc.)
@@ -6108,11 +7967,16 @@ export class IrcConnection {
     // Matching control chars is the whole point, so the lint rule is moot here.
     // eslint-disable-next-line no-control-regex
     const clean = line.replace(/[\u000d\u000a\u0000]/g, '');
+    if (this.takeRawMonitor(clean)) return;
     // Read it before it goes out, so a 401 bouncing back off it can be placed
     // in the channel it was aimed at (#434). Cheap and total: this is the one
     // path every slash command and member-menu action takes.
     this.noteOutgoingCommand(clean);
-    this.client.raw(clean);
+    // A raw JOIN/PART changes membership just as join()/part() do, and nothing
+    // else would record it.
+    this.noteRawMembership(clean);
+    // A query waits its turn, and its reply goes to `asker` (replyRouter.ts).
+    this.replies.send(asker, clean);
   }
   // Whether the network negotiated IRCv3 message-tags. Client-only tags
   // (+typing, +draft/react, …) and TAGMSG only mean anything to a server that
@@ -6149,8 +8013,8 @@ export class IrcConnection {
   // Mirror the user-level self-presence state onto this connection. Called by
   // ircManager after it persists and is responsible for any guard logic — this
   // method is a dumb applier. Emits AWAY to the IRC server when the new state
-  // disagrees with what the network already thinks (active flip), and always
-  // publishes the away-state event so clients refresh their dividers.
+  // differs from the last (active flips, or a new message while away), and
+  // always publishes the away-state event so clients refresh their dividers.
   applyAwayState(next: AwayState): void {
     const prev = this.awayState;
     this.awayState = {
@@ -6161,24 +8025,32 @@ export class IrcConnection {
       backAt: next.backAt ?? null,
     };
     if (this.state === 'connected') {
-      if (next.active && next.message && !prev.active) {
-        try {
-          this.client.raw('AWAY :' + next.message);
-        } catch (_) {
-          /* ignore */
-        }
-      } else if (!next.active && prev.active) {
-        try {
-          this.client.raw('AWAY');
-        } catch (_) {
-          /* ignore */
-        }
-      }
+      const changed = next.active
+        ? !!next.message && (!prev.active || prev.message !== next.message)
+        : prev.active;
+      // Not during a restore's replay, when this socket is marked connected
+      // early: the 'restored' phase sends the final state once.
+      if (changed && !this.restoring) this.sendAwayState();
     }
     this.publishAwayState();
   }
 
+  // The account's away state, to the network: `AWAY :<message>`, or a bare
+  // `AWAY`. It goes through the router as Lurker's, so its 305/306 reach no
+  // bouncer client (each gets its own from the bouncer) and write no row.
+  private sendAwayState(): void {
+    const { active, message } = this.awayState;
+    // A newline would split the line in two, and nothing on this path strips it.
+    // eslint-disable-next-line no-control-regex
+    const text = (message ?? '').replace(/[\r\n\u0000]/g, ' ').trim();
+    // Away, but nothing left to say. A bare AWAY would clear the network's away
+    // while the account is still away, so send nothing.
+    if (active && !text) return;
+    this.replies.send('lurker', active ? `AWAY :${text}` : 'AWAY');
+  }
+
   disconnect(reason?: string, opts: { announceCancelledRetry?: boolean } = {}): void {
+    this.endDccChatHandshakes();
     // The user/system asked to disconnect — record intent BEFORE quit() so the
     // 'close' handler doesn't fight them by auto-reconnecting, and drop any
     // pending backoff so an earlier drop's retry can't resurrect the connection.
@@ -6286,13 +8158,10 @@ export class IrcConnection {
    */
   private stopReconnecting(reason: string): void {
     this.clearReconnectTimer();
-    this.publish({
-      type: 'error',
-      target: this.serverTarget(),
-      text: `Not reconnecting automatically: ${reason}.`,
-    });
+    const text = `Not reconnecting automatically: ${reason}.`;
+    this.publish({ type: 'error', target: this.serverTarget(), text });
     this.logNet(`Auto-reconnect blocked: ${reason}`, 'warn');
-    this.setState('disconnected');
+    this.setState('disconnected', { error: text });
   }
 
   private scheduleReconnectIfWarranted(): void {
@@ -6301,12 +8170,11 @@ export class IrcConnection {
     if (this.terminalDisconnect) {
       // Won't self-heal — surface why and stop. A manual reconnect (which
       // rebuilds the connection from scratch) clears this and tries again.
-      this.publish({
-        type: 'error',
-        target: this.serverTarget(),
-        text: `Not reconnecting automatically: ${this.terminalDisconnect}. Fix the issue and reconnect manually.`,
-      });
+      const text = `Not reconnecting automatically: ${this.terminalDisconnect}. Fix the issue and reconnect manually.`;
+      this.publish({ type: 'error', target: this.serverTarget(), text });
       this.logNet(`Auto-reconnect stopped: ${this.terminalDisconnect}`, 'error');
+      // 'socket close' already said disconnected; this says why it stays that way.
+      this.setState('disconnected', { error: text });
       return;
     }
     const attempt = this.reconnectAttempt;
@@ -6379,6 +8247,12 @@ export class IrcConnection {
   }
 
   dispose(reason: string = 'network removed'): void {
+    // ⚠⚠ BEFORE `disposed` is set. publish() and publishEphemeral() both return
+    // silently once it is, so a "your chat ended" notice written after the flag
+    // is swallowed and the user's `=nick` buffer just goes quiet. DCC chats are
+    // the only teardown that has something to say to a buffer, so this is the
+    // one place the ordering matters.
+    this.teardownDccChats(reason);
     this.disposed = true;
     this.clearReconnectTimer();
     this.stopLagPinger();
@@ -6434,7 +8308,7 @@ export class IrcConnection {
           return;
         }
         try {
-          this.client.raw(line);
+          if (!this.takeRawMonitor(line)) this.replies.send('user', line);
         } catch (_) {
           /* ignore */
         }
@@ -6560,6 +8434,13 @@ export function formatSocketCloseErrorMessage(
   const code = typeof err.code === 'string' ? err.code : '';
   const message =
     typeof err.message === 'string' && err.message.length > 0 ? err.message : 'unknown error';
+  // ⚠ A proxy failure must not be reported as an ircd failure (#303). Without
+  // this the user reads "Connection failed (irc.libera.chat:6697): connection
+  // refused" when what refused was Tor on their own machine, and they go and
+  // debug the wrong host. ProxyDialError already names the proxy and what it
+  // said, so it is passed through whole rather than wrapped in an address that
+  // was never dialled.
+  if (code.startsWith('PROXY_')) return `Connection failed: ${message}.`;
   if (onlyTrustedCertificates && isCertificateVerificationTlsError(code, message)) {
     return `Connection failed (${where}): The server certificate could not be verified. To connect anyway, uncheck "Only allow trusted certificates" in this network's settings and reconnect.`;
   }
@@ -6592,11 +8473,14 @@ const SERVER_BUFFER_DENIED_NUMERICS = new Set<string>([
   // so the raw per-batch lines are a redundant flood in the server buffer.
   '353',
   '366',
-  // RPL_MON* — MONITOR presence, surfaced by the presence rail, not the buffer.
+  // RPL_MON* and ERR_MONLISTFULL — MONITOR presence, surfaced by the presence
+  // rail, not the buffer. A 734 can name a bouncer client's nick, and that
+  // client gets it; the 'raw' handler gives Lurker's own nicks a notice.
   '730',
   '731',
   '732',
   '733',
+  '734',
   // RPL_MOTDSTART/RPL_MOTD/RPL_ENDOFMOTD/ERR_NOMOTD — shown as a single block by
   // the 'motd' handler.
   '375',

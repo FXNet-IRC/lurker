@@ -16,6 +16,7 @@ import { listNetworksForUser, getNetwork, setNetworkClientIp } from '../db/netwo
 import type { Network } from '../db/networks.js';
 import {
   ensureOpen as ensureOpenBuffer,
+  getBuffer,
   setAutojoin as setBufferAutojoin,
   setChannelKey as setBufferChannelKey,
   deleteBuffer,
@@ -26,6 +27,7 @@ import { DCC_ACTIVE_STATES, getDccTransfer, updateDccTransferState } from '../db
 import { findUserById } from '../db/users.js';
 import { isNetworkHostAllowed } from './networkPolicy.js';
 import { getUserAwayState, writeAwayMarker, writeBackMarker } from '../db/userAwayState.js';
+import { getReadState, setReadState } from '../db/bufferReads.js';
 import { listPinnedForUser } from '../db/pinnedBuffers.js';
 import { listCollapsedForUser } from '../db/nicklistCollapsed.js';
 import { listChannelNotifyForUser } from '../db/channelNotify.js';
@@ -50,6 +52,30 @@ import { e2eManager } from './e2e/manager.js';
 import { contextKey, isChannelContext } from './e2e/context.js';
 import { e2eDbg } from './e2e/debug.js';
 import db from '../db/index.js';
+import { isDccChatTarget, dccChatPeer } from '../../shared/channels.js';
+import {
+  dccChatHostFor,
+  dccChatHostsFor,
+  dccChatHostsForUser,
+  dccChatKey,
+  type DccChatHost,
+} from './dccChatSessions.js';
+
+// A buffer's read pointer moved forward: what markRead emits as 'read-marker'.
+export interface ReadMarkerMove {
+  userId: number;
+  networkId: number | null;
+  target: string;
+  lastReadId: number;
+}
+
+// The account's away turned on or off: what setAwayAll and clearAwayAll emit as
+// 'away'. `origin` is whatever asked for the change, if it passed itself.
+export interface AwayChange {
+  userId: number;
+  active: boolean;
+  origin?: unknown;
+}
 
 // RPE2E is wired for real IRC channels only in this phase (#382). DM
 // pseudochannels (`@ident@host`) need the peer's server-stamped handle resolved
@@ -144,11 +170,72 @@ function engineHolds(userId: number, networkId: number): boolean {
 
 class IrcManager extends EventEmitter {
   byUser: Map<number, Map<number, IrcConnection>>;
-  private engineReconcileHooked = false;
+  // The link whose 'ready' and 'held' events reconcile listens on — held so a
+  // link replaced under us (tests rebuild the singleton) is hooked afresh
+  // rather than left to the listeners on its predecessor.
+  private reconcileHookedLink: EngineLink | null = null;
+  // Why each network's last connection attempt failed, until it next connects:
+  // the `error` a failing attempt's state event carries (IrcConnection.setState),
+  // read off the event stream.
+  // Held here rather than on the connection, because a connect refused over the
+  // network's settings drops its connection from the map as it reports why.
+  // `seq` counts the times a reason was recorded, so a caller can tell a fresh
+  // failure from the one it already knew — the same host refusing the same
+  // certificate twice reads identically.
+  private connectionErrors = new Map<number, Map<number, { text: string; seq: number }>>();
+  private connectionErrorSeq = 0;
 
   constructor() {
     super();
     this.byUser = new Map();
+    // The first listener, so an error is recorded before anyone reading it
+    // hears the event.
+    this.on('event', (event) => this.noteConnectionError(event));
+  }
+
+  connectionError(userId: number, networkId: number): string | null {
+    return this.connectionErrors.get(userId)?.get(networkId)?.text ?? null;
+  }
+
+  /** Which recording the current reason is, or 0 for none. Only identity matters. */
+  connectionErrorSeqFor(userId: number, networkId: number): number {
+    return this.connectionErrors.get(userId)?.get(networkId)?.seq ?? 0;
+  }
+
+  private noteConnectionError(event: {
+    type: string;
+    userId: number;
+    networkId: number;
+    [key: string]: unknown;
+  }): void {
+    if (event.type !== 'state') return;
+    const { userId, networkId } = event;
+    if (typeof event.error === 'string' && event.error) {
+      let errors = this.connectionErrors.get(userId);
+      if (!errors) {
+        errors = new Map();
+        this.connectionErrors.set(userId, errors);
+      }
+      this.connectionErrorSeq += 1;
+      errors.set(networkId, { text: event.error, seq: this.connectionErrorSeq });
+    } else if (event.state === 'connected') {
+      this.forgetConnectionError(userId, networkId);
+    }
+  }
+
+  // Drops the account's entry with its last error, so an account whose errors
+  // have all cleared holds nothing.
+  private forgetConnectionError(userId: number, networkId: number): void {
+    const errors = this.connectionErrors.get(userId);
+    if (!errors?.delete(networkId)) return;
+    if (errors.size === 0) this.connectionErrors.delete(userId);
+  }
+
+  // A network row was created, edited or deleted. The bouncer tells its
+  // bouncer-networks-notify clients; call it once the row is written (or gone).
+  networkChanged(userId: number, networkId: number): void {
+    if (!getNetwork(networkId, userId)) this.forgetConnectionError(userId, networkId);
+    this.emit('network-changed', { userId, networkId });
   }
 
   connectionsForUser(userId: number): Map<number, IrcConnection> {
@@ -205,11 +292,15 @@ class IrcManager extends EventEmitter {
     for (const id of userIds) this.initForUser(id);
     if (engineConfigured()) {
       this.reconcileEngine();
-      // Again whenever the link (re)connects: an engine that answered after the
-      // boot-time wait, or came back from an outage, reports a fresh held list.
-      if (!this.engineReconcileHooked) {
-        this.engineReconcileHooked = true;
-        EngineLink.shared().on('ready', () => this.reconcileEngine());
+      // Again whenever the link (re)connects — an engine that answered after
+      // the boot-time wait, or came back from an outage, reports a fresh held
+      // list — and whenever the engine offers a session after that: one whose
+      // previous link was still on the books at hello and has since let go.
+      const link = EngineLink.shared();
+      if (this.reconcileHookedLink !== link) {
+        this.reconcileHookedLink = link;
+        link.on('ready', () => this.reconcileEngine());
+        link.on('held', (id: string) => this.reconcileHeld(link, id));
       }
     }
   }
@@ -223,39 +314,42 @@ class IrcManager extends EventEmitter {
   reconcileEngine(): void {
     const link = EngineLink.shared();
     if (link.state !== 'ready') return;
-    for (const id of link.held) {
-      // The engine only offers us our own instance's sessions, but this is
-      // where a foreign id would do its damage — parsed into someone else's
-      // rowids and adopted as ours — so check the prefix here too rather than
-      // trusting the other side to have filtered.
-      if (!isOurConnectionId(id)) {
-        console.warn(`[lurker] engine offered ${id}, which is not this instance's — ignoring`);
-        continue;
-      }
-      const m = /^[0-9a-f]+:(\d+):(\d+)$/.exec(id);
-      if (!m) continue;
-      const userId = Number(m[1]);
-      const networkId = Number(m[2]);
-      if (this.getConnection(userId, networkId)) continue;
-      const gate = this.connectGate(userId, networkId);
-      if (gate.ok) {
-        systemLog.log({
-          userId,
-          scope: `net:${gate.network.name}`,
-          fields: { networkId },
-          text: 'Adopting the connection the engine kept open',
-        });
-        this.startNetwork(userId, networkId);
-      } else {
-        console.warn(`[lurker] engine holds ${id} but ${gate.reason} — closing it`);
-        // requestClose, not a bare send: the link can drop between the check at
-        // the top of this loop and here, and a policy close that silently
-        // evaporates leaves a paused account on IRC. The queue is also what
-        // makes this decision stick — EngineLink flushes pending closes before
-        // it emits 'ready', i.e. before anything can decide those sockets are
-        // worth adopting.
-        link.requestClose(id);
-      }
+    for (const id of link.held) this.reconcileHeld(link, id);
+  }
+
+  // One held session: adopt it, close it, or leave it to the connection that
+  // already speaks for it.
+  private reconcileHeld(link: EngineLink, id: string): void {
+    // The engine only offers us our own instance's sessions, but this is
+    // where a foreign id would do its damage — parsed into someone else's
+    // rowids and adopted as ours — so check the prefix here too rather than
+    // trusting the other side to have filtered.
+    if (!isOurConnectionId(id)) {
+      console.warn(`[lurker] engine offered ${id}, which is not this instance's — ignoring`);
+      return;
+    }
+    const m = /^[0-9a-f]+:(\d+):(\d+)$/.exec(id);
+    if (!m) return;
+    const userId = Number(m[1]);
+    const networkId = Number(m[2]);
+    if (this.getConnection(userId, networkId)) return;
+    const gate = this.connectGate(userId, networkId);
+    if (gate.ok) {
+      systemLog.log({
+        userId,
+        scope: `net:${gate.network.name}`,
+        fields: { networkId },
+        text: 'Adopting the connection the engine kept open',
+      });
+      this.startNetwork(userId, networkId);
+    } else {
+      console.warn(`[lurker] engine holds ${id} but ${gate.reason} — closing it`);
+      // requestClose, not a bare send: the link can drop between the check
+      // above and here, and a policy close that silently evaporates leaves a
+      // paused account on IRC. The queue is also what makes this decision
+      // stick — EngineLink flushes pending closes before it emits 'ready',
+      // i.e. before anything can decide those sockets are worth adopting.
+      link.requestClose(id);
     }
   }
 
@@ -356,6 +450,23 @@ class IrcManager extends EventEmitter {
       // (and tear its timers down — the transport is already dead, so the QUIT
       // dispose() sends goes nowhere) so the next /connect builds afresh
       // instead of finding it and doing nothing.
+      // A dial refused over configuration (a client certificate that cannot be
+      // presented) never retries, and the fix is an edit to the network row —
+      // so the object built from the OLD row must not outlive the refusal.
+      onNeedsRebuild: () => {
+        if (this.connectionsForUser(userId).get(networkId) !== conn) return;
+        this.connectionsForUser(userId).delete(networkId);
+        // Disposed, not just dropped, for the same reason onTakenOver does it:
+        // once nothing holds a reference, stopNetwork/disposeNetwork can't
+        // reach it — and a refused RECONNECT (an engine rolled back below the
+        // certificate field) leaves a connection that still owns DCC sockets,
+        // resume timers and a lag pinger.
+        try {
+          conn?.dispose('client certificate cannot be presented');
+        } catch (_) {
+          /* ignore */
+        }
+      },
       onTakenOver: () => {
         if (this.connectionsForUser(userId).get(networkId) === conn) {
           this.connectionsForUser(userId).delete(networkId);
@@ -413,6 +524,11 @@ class IrcManager extends EventEmitter {
     // is NOT in — a socket the engine registered on its own (no channels), or
     // one whose autojoin list grew while this process was away.
     const rejoin = (onlyMissing: boolean): void => {
+      // Registered directly on the client, outside IrcConnection's gate, so it
+      // checks for itself (#936): a network edit mid-registration disposes the
+      // connection with the 001 already on its way, and the rejoin would log
+      // an "Auto-joining" line for a connection that no longer exists.
+      if (connRef.disposed) return;
       const joined = listAutojoinChannels(networkId)
         .filter((b) => !onlyMissing || !connRef.isChannelJoined(b.target))
         .map((b) => ({ name: b.target, key: b.key }));
@@ -506,6 +622,7 @@ class IrcManager extends EventEmitter {
     // rfc1459 network IS the already-in case — a raw map probe would miss it,
     // stash a key no echo will consume, and hand the orphaned stash to the
     // next join's echo (the exact hazard above).
+    let wireKey = safeKey;
     if (conn.isChannelJoined(name)) {
       ensureOpenBuffer(userId, networkId, name, {
         kind: 'channel',
@@ -514,8 +631,26 @@ class IrcManager extends EventEmitter {
       });
     } else if (safeKey !== undefined) {
       conn.stashJoinKey(name, safeKey);
+    } else {
+      // Keyless and not in the channel: send the key on file, as the reconnect
+      // rejoin does. A part or kick only clears autojoin, so without this the
+      // Join Channel menu item, the invite toast and a bare /join all draw a
+      // 475 on a parted +k channel (#873). ZNC does the same (CChan::JoinUser);
+      // soju joins keyless. Nothing to stash, since the row already holds it.
+      //
+      // A key still stashed here belongs to an earlier keyed JOIN that got no
+      // echo, most likely refused. Drop it, or this JOIN's echo would store the
+      // refused key over the one that just worked.
+      conn.takeStashedJoinKey(name);
+      // decryptSecret throws on a key stored under a rotated key-id, and this
+      // is the unguarded ws path, so an unreadable key means a keyless JOIN.
+      try {
+        wireKey = getBuffer(userId, networkId, name)?.key || undefined;
+      } catch (_) {
+        /* unreadable key: join without one */
+      }
     }
-    conn.join(name, safeKey);
+    conn.join(name, wireKey);
     return true;
   }
 
@@ -591,12 +726,92 @@ class IrcManager extends EventEmitter {
     return true;
   }
 
+  // Whatever can reach the DCC chat with `peer` on this network.
+  //
+  // ⚠⚠ The host that OWNS that peer's session first, the mapped connection only
+  // as a fallback. After a Disconnect and reconnect those are different
+  // objects: startNetwork builds a new IrcConnection while the old one still
+  // holds the chat socket. Asking the mapped connection first sent every line
+  // to the new one ("No live DCC chat with bob") while bob's lines kept arriving
+  // through the old. The fallback exists so a send with no live chat anywhere
+  // still reaches a connection that can say so.
+  private dccChatOwner(userId: number, networkId: number, peer: string): DccChatHost | null {
+    return (
+      dccChatHostFor(dccChatKey(userId, networkId), peer) ?? this.getConnection(userId, networkId)
+    );
+  }
+
+  /** Offer a DCC chat to a peer. False when the network has no connection object
+   *  at all; a connection that merely isn't registered still reports its own
+   *  failure into the `=nick` buffer, which is more useful than a bare false. */
+  dccChatOpen(
+    userId: number,
+    networkId: number,
+    nick: string,
+    opts: { passive?: boolean } = {},
+  ): boolean {
+    const conn = this.getConnection(userId, networkId);
+    if (!conn) return false;
+    conn.offerDccChat(nick, opts);
+    return true;
+  }
+
+  /** Close a live DCC chat. False when there was no session to close. */
+  dccChatClose(userId: number, networkId: number, nick: string): boolean {
+    // Both the session's owner and the mapped connection, because they can be
+    // different objects and each can hold something `/dcc close chat` means to
+    // end: the live session on the owner, and on the mapped connection a
+    // pending offer — ours to them, or theirs to us.
+    const owner = dccChatHostFor(dccChatKey(userId, networkId), nick);
+    const mapped = this.getConnection(userId, networkId);
+    let closed = false;
+    for (const host of new Set([owner, mapped])) {
+      if (host && host.closeDccChat(nick)) closed = true;
+    }
+    return closed;
+  }
+
+  /** End every DCC chat on a network, whoever owns it. For a network being
+   *  DELETED — deliberately not part of disposeNetwork, which Reconnect also
+   *  runs through (restartNetwork), and a chat that survived a Disconnect
+   *  should survive the reconnect too.
+   *
+   *  ⚠⚠ Required before the row goes: after a Disconnect the connection that
+   *  owns a chat is no longer in the map disposeNetwork walks, so its socket
+   *  kept running — and the peer's next line published into a network that no
+   *  longer existed, throwing from a socket 'data' handler. */
+  endDccChats(userId: number, networkId: number, reason: string): void {
+    for (const host of dccChatHostsFor(dccChatKey(userId, networkId))) {
+      try {
+        host.closeAllDccChats(reason);
+      } catch (_) {
+        /* ignore — teardown must reach the rest */
+      }
+    }
+  }
+
   // Long messages need to be split: irc-framework breaks anything past ~350
   // bytes into separate PRIVMSGs on the wire, but we used to publish the full
   // text as a single self-message event — so the sender saw one bubble while
   // peers saw N. Splitting on our side and publishing per chunk keeps the
   // local view symmetric with what was actually transmitted.
   send(userId: number, networkId: number, target: string, text: string): boolean {
+    // ⚠⚠ A `=nick` buffer is a DCC CHAT, not IRC. Its text rides a TCP socket we
+    // own and must NEVER reach the wire as a target. This is THE chokepoint for
+    // that: the composer (wsHub `send`), the MCP `send_message` verb — which
+    // validates only that the target is non-empty — and an attached bouncer
+    // client's PRIVMSG all converge here, so guarding the composer alone would
+    // leave two open doors.
+    //
+    // ⚠ Ahead of the writable/connected gate on purpose: a DCC chat is an
+    // independent socket, so it keeps working while the IRC network is down or
+    // in reconnect backoff. Only getConnection (which returns a connection in any
+    // state) is needed to reach the session map.
+    if (isDccChatTarget(target)) {
+      const dcc = this.dccChatOwner(userId, networkId, dccChatPeer(target));
+      return dcc ? dcc.dccChatSend(dccChatPeer(target), text) : false;
+    }
+
     // writableConnection, not getConnection: a network in reconnect backoff still
     // has a connection object, and every line written to it is silently dropped.
     // Reporting success there persisted a self row and fanned it out to every
@@ -655,7 +870,7 @@ class IrcManager extends EventEmitter {
         conn.publish({
           type: 'message',
           target,
-          nick: conn.client.user?.nick,
+          nick: conn.currentNick,
           text,
           kind: 'privmsg',
           self: true,
@@ -683,7 +898,7 @@ class IrcManager extends EventEmitter {
     // row can only come from here.
     const adoptEcho = conn.echoActive();
     if (hasInteriorNewline(text) && conn.supportsMultiline()) {
-      const nick = conn.client.user?.nick;
+      const nick = conn.currentNick;
       const echoes = conn.sendMultiline(target, text);
       if (!adoptEcho) {
         for (const echo of echoes) {
@@ -699,7 +914,7 @@ class IrcManager extends EventEmitter {
       conn.publish({
         type: 'message',
         target,
-        nick: conn.client.user?.nick,
+        nick: conn.currentNick,
         text: chunk,
         kind: 'privmsg',
         self: true,
@@ -732,6 +947,22 @@ class IrcManager extends EventEmitter {
   }
 
   action(userId: number, networkId: number, target: string, text: string): boolean {
+    // ⚠⚠ A `=nick` buffer is a DCC CHAT, not IRC. Its text rides a TCP socket we
+    // own and must NEVER reach the wire as a target. This is THE chokepoint for
+    // that: the composer (wsHub `send`), the MCP `send_message` verb — which
+    // validates only that the target is non-empty — and an attached bouncer
+    // client's PRIVMSG all converge here, so guarding the composer alone would
+    // leave two open doors.
+    //
+    // ⚠ Ahead of the writable/connected gate on purpose: a DCC chat is an
+    // independent socket, so it keeps working while the IRC network is down or
+    // in reconnect backoff. Only getConnection (which returns a connection in any
+    // state) is needed to reach the session map.
+    if (isDccChatTarget(target)) {
+      const dcc = this.dccChatOwner(userId, networkId, dccChatPeer(target));
+      return dcc ? dcc.dccChatSend(dccChatPeer(target), text, { action: true }) : false;
+    }
+
     // Same phantom-send gate as send() — see the comment there (#809).
     const conn = this.writableConnection(userId, networkId);
     if (!conn) return false;
@@ -745,7 +976,7 @@ class IrcManager extends EventEmitter {
       conn.publish({
         type: 'action',
         target,
-        nick: conn.client.user?.nick,
+        nick: conn.currentNick,
         text: chunk,
         // Shape parity with the adopted echo, which stamps kind:'action'.
         kind: 'action',
@@ -761,6 +992,22 @@ class IrcManager extends EventEmitter {
   // send/action. splitSay applies because NOTICE shares PRIVMSG's length
   // budget.
   notice(userId: number, networkId: number, target: string, text: string): boolean {
+    // ⚠⚠ A `=nick` buffer is a DCC CHAT, not IRC. Its text rides a TCP socket we
+    // own and must NEVER reach the wire as a target. This is THE chokepoint for
+    // that: the composer (wsHub `send`), the MCP `send_message` verb — which
+    // validates only that the target is non-empty — and an attached bouncer
+    // client's PRIVMSG all converge here, so guarding the composer alone would
+    // leave two open doors.
+    //
+    // ⚠ Ahead of the writable/connected gate on purpose: a DCC chat is an
+    // independent socket, so it keeps working while the IRC network is down or
+    // in reconnect backoff. Only getConnection (which returns a connection in any
+    // state) is needed to reach the session map.
+    if (isDccChatTarget(target)) {
+      const dcc = this.dccChatOwner(userId, networkId, dccChatPeer(target));
+      return dcc ? dcc.dccChatSend(dccChatPeer(target), text) : false;
+    }
+
     // Same phantom-send gate as send() — see the comment there (#809).
     const conn = this.writableConnection(userId, networkId);
     if (!conn) return false;
@@ -773,7 +1020,7 @@ class IrcManager extends EventEmitter {
       conn.publish({
         type: 'notice',
         target,
-        nick: conn.client.user?.nick,
+        nick: conn.currentNick,
         text: chunk,
         kind: 'notice',
         self: true,
@@ -785,7 +1032,10 @@ class IrcManager extends EventEmitter {
   typing(userId: number, networkId: number, target: string, state: string): boolean {
     const conn = this.getConnection(userId, networkId);
     if (!conn) return false;
-    if (!target || target.startsWith(':server:')) return false;
+    // No typing notifications on the server pseudo-buffer or a DCC chat. DCC
+    // CHAT has no TAGMSG — and `=nick` is not a nick, so a TAGMSG carrying it
+    // would be a wire leak fired on every keystroke.
+    if (!target || target.startsWith(':server:') || isDccChatTarget(target)) return false;
     if (!['active', 'paused', 'done'].includes(state)) return false;
     conn.sendTyping(target, state);
     return true;
@@ -819,6 +1069,12 @@ class IrcManager extends EventEmitter {
   // could see go out wait forever for a reply that could never arrive. wsHub has
   // a "this network isn't connected" warning on the false branch that had no way
   // to fire.
+  //
+  // ⚠⚠ Never to a `=nick` DCC chat. A CTCP rides the IRC wire, so `/ping` typed
+  // bare in `=bob` (both clients default it to the buffer's target) went out as
+  // `PRIVMSG =bob :\x01PING …\x01`. The send/action/notice/typing guards above
+  // never covered it because this path is its own. wsHub explains the refusal to
+  // the user; this is the chokepoint for any other caller.
   ctcpRequest(
     userId: number,
     networkId: number,
@@ -827,31 +1083,54 @@ class IrcManager extends EventEmitter {
     type: string,
     args: string,
   ): boolean {
+    if (isDccChatTarget(target)) return false;
     const conn = this.writableConnection(userId, networkId);
     if (!conn) return false;
     conn.sendCtcpRequest(issuingTarget, target, type, args);
     return true;
   }
 
+  // Canonical read-pointer writer, for everything a user's clients follow: the
+  // apps' mark-read and mark-all-read, and MARKREAD from an attached IRC client.
+  // setReadState only moves the pointer forward. When it did move, 'read-marker'
+  // says so, which is how the bouncer tells its clients about a move made
+  // anywhere. The apps' read-state frame stays with the caller. Returns the
+  // pointer after the write.
+  markRead(userId: number, networkId: number | null, target: string, messageId: number): number {
+    const before = getReadState(userId, networkId, target);
+    const after = setReadState(userId, networkId, target, messageId);
+    if (after > before) {
+      const move: ReadMarkerMove = { userId, networkId, target, lastReadId: after };
+      this.emit('read-marker', move);
+    }
+    return after;
+  }
+
   // Canonical /away writer. Persists the user-level state in user_away_state,
   // then fans the new state out to every IrcConnection so each one issues
   // AWAY on its IRC server and publishes an away-state event. Auto-away
-  // (autoSet=true) is gated by the persisted current state so it can never
-  // overwrite a manual /away. Returns the count of connections that received
-  // the update.
+  // (autoSet=true) never replaces an away already set, manual or auto: the
+  // first one's time is when the user left, and a second would send every
+  // network a new message. Returns the count of connections that received the
+  // update.
   // `since` backdates the away timestamp — auto-away passes the moment the user
   // went idle rather than when the timer fired (#155). Manual /away omits it and
   // gets "now".
+  // `origin` rides the 'away' event, so whatever asked can answer for itself: a
+  // bouncer client sends its own 306.
   setAwayAll(
     userId: number,
     message: string,
-    { autoSet = false, since }: { autoSet?: boolean; since?: Date } = {},
+    { autoSet = false, since, origin }: { autoSet?: boolean; since?: Date; origin?: unknown } = {},
   ): number {
     const trimmed = (message || '').trim();
     if (!trimmed) return 0;
     const current = getUserAwayState(userId) as AwayStateRow | null;
     const currentlyAway = !!(current && current.away_datetime && !current.back_datetime);
-    if (currentlyAway && !current!.auto_set && autoSet) return 0;
+    if (currentlyAway && autoSet) return 0;
+    // The same manual away again changes nothing. irssi sends its /away to every
+    // network, and through the bouncer each copy lands here.
+    if (currentlyAway && !current!.auto_set && current!.away_message === trimmed) return 0;
     const awayAt = (since ?? new Date()).toISOString();
     writeAwayMarker(userId, { awayDatetime: awayAt, awayMessage: trimmed, autoSet });
     const state = { active: true, message: trimmed, since: awayAt, autoSet, backAt: null };
@@ -861,13 +1140,18 @@ class IrcManager extends EventEmitter {
       n += 1;
     }
     // Away is user-scoped (every connection), so the system buffer is its home.
-    // Past the no-op guards above, this only fires on a real transition — not on
+    // Past the no-op guards above, this only fires on a real change — not on
     // per-connection reconnect re-asserts (those call applyAwayState directly).
     systemLog.log({
       userId,
       scope: 'away',
       text: autoSet ? `Auto-away: ${trimmed}` : `You're now marked away: ${trimmed}`,
     });
+    // A new message while already away is a change, but not of state.
+    if (!currentlyAway) {
+      const change: AwayChange = { userId, active: true, origin };
+      this.emit('away', change);
+    }
     return n;
   }
 
@@ -876,8 +1160,11 @@ class IrcManager extends EventEmitter {
   // the client can render the completed pair) and pushes the new state to
   // every connection. Auto-clear (autoSet=true) is a no-op when the current
   // away was manual; that's how scheduleAutoAway → socket-reconnect leaves a
-  // manual /away undisturbed.
-  clearAwayAll(userId: number, { autoSet = false } = {}): number {
+  // manual /away undisturbed. `origin` is as for setAwayAll.
+  clearAwayAll(
+    userId: number,
+    { autoSet = false, origin }: { autoSet?: boolean; origin?: unknown } = {},
+  ): number {
     const current = getUserAwayState(userId) as AwayStateRow | null;
     const currentlyAway = !!(current && current.away_datetime && !current.back_datetime);
     if (!currentlyAway) return 0;
@@ -901,6 +1188,8 @@ class IrcManager extends EventEmitter {
       scope: 'away',
       text: autoSet ? 'Auto-away cleared — welcome back' : "You're no longer marked away",
     });
+    const change: AwayChange = { userId, active: false, origin };
+    this.emit('away', change);
     return n;
   }
 
@@ -922,6 +1211,16 @@ class IrcManager extends EventEmitter {
       }
       this.byUser.delete(userId);
     }
+    // Chats owned by connections a Disconnect already dropped from the map —
+    // disposing the mapped ones above never reaches them (see endDccChats).
+    for (const host of dccChatHostsForUser(userId)) {
+      try {
+        host.closeAllDccChats(reason);
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    this.connectionErrors.delete(userId);
     this.emit('user-disposed', { userId });
   }
 
@@ -1006,6 +1305,26 @@ class IrcManager extends EventEmitter {
         ignoredMasks: ignoresByNetwork.get(networkId) || [],
         nickNotes: notesByNetwork.get(networkId) || [],
         relayBots: relayBotsByNetwork.get(networkId) || [],
+        // ⚠ Here, not in conn.snapshot(), because a DCC chat outlives its
+        // connection's place in the map: a user-initiated disconnect drops the
+        // connection but the chat socket stays up, and that network's blob is
+        // then synthesized below from the DB. The session registry is what
+        // still knows, so reading it here keeps a reloaded tab from showing a
+        // live chat as disconnected.
+        dccChats: dccChatHostsFor(dccChatKey(userId, networkId)).flatMap((h) =>
+          h.liveDccChatPeers(),
+        ),
+        // Offers still awaiting an answer. The client's offer toast is sticky,
+        // and a toast whose offer expired or was lost while the tab was
+        // disconnected never gets the live close event — so it reconciles
+        // against this on every snapshot instead.
+        //
+        // ⚠ The mapped connection alone is correct, not an oversight: a pending
+        // offer only ever lives on a mapped connection, because disconnect()
+        // ends a connection's handshakes before stopNetwork unmaps it (see
+        // endDccChatHandshakes). Live CHATS are different — they do outlive
+        // the map, which is why `dccChats` above reads the registry instead.
+        dccChatOffers: this.getConnection(userId, networkId)?.pendingDccChatOffers() ?? [],
       };
     };
     const live = this.listConnections(userId);

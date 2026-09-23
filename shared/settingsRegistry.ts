@@ -54,7 +54,7 @@ interface BaseOption {
   // (a cosmetic gate on a knob that still works), a flagged-off feature has no server behind it
   // at all — the routes aren't even mounted — so the option is HIDDEN rather than shown and
   // ignored. Offering a switch that silently does nothing is worse than offering none.
-  requiresFeature?: 'linkPreviews';
+  requiresFeature?: FeatureFlag;
 
   // Conditions under which this setting actually does anything, ORed together:
   // the option is live if ANY clause holds. Resolution is TRANSITIVE — an
@@ -137,6 +137,9 @@ export interface StringListOption extends BaseOption {
 /** Any entry in the settings REGISTRY. Narrow on `.type` for type-specific fields. */
 export type SettingOption = StringOption | IntOption | BoolOption | EnumOption | StringListOption;
 
+/** An instance feature a settings surface depends on, as advertised by /api/config. */
+export type FeatureFlag = 'linkPreviews' | 'bouncer';
+
 /**
  * A Settings-sidebar category. `registry` categories are auto-rendered from
  * REGISTRY entries; `bespoke` ones have a hand-written pane component.
@@ -148,9 +151,13 @@ export interface SettingCategory {
   // As on BaseOption: hide the whole category in the hosted (node) edition.
   selfHostedOnly?: boolean;
   // FXNet: hide the category when LURKER_PUBLIC_MODE is on. Used for the
-  // AI-agent API-tokens surface, which the server also refuses to mount in
-  // public mode (see app.ts) — guests must not mint bearer tokens.
+  // AI-agent API-tokens / authorized-apps surfaces, which the server also
+  // refuses to mount in public mode (see app.ts) — guests must not mint bearer
+  // tokens or authorize OAuth apps.
   hideInPublicMode?: boolean;
+  // As on BaseOption: the category exists only where the instance runs the
+  // feature behind it. A pane explaining a bouncer nobody runs is worse than none.
+  requiresFeature?: FeatureFlag;
 }
 
 // ─── Shared dependency clauses ─────────────────────────────────────────────
@@ -1126,6 +1133,18 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
       'like any other link.',
   },
   {
+    key: 'chat.inline_media.hide_urls',
+    label: 'Hide inline media URLs',
+    category: 'chat',
+    group: 'viewing',
+    type: 'bool',
+    default: true,
+    description:
+      'When enabled, URLs that are rendered as inline media will be hidden from the message ' +
+      'and will instead appear as a button in the inline media modal. ' +
+      'When disabled, URLs will render normally as part of the message like link preview cards.',
+  },
+  {
     key: 'chat.link_previews.enabled',
     requiresFeature: 'linkPreviews',
     label: 'Link previews',
@@ -1162,7 +1181,8 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
   // (project URL), ${time} (server time), ${clientinfo} (the types still
   // answered), ${nick} (your nick). Defaults reproduce the standard replies.
   // PING isn't templated — it only echoes the asker's token — but the master
-  // switch silences it too.
+  // switch silences it too. While an IRC client is attached through the bouncer,
+  // it answers each type whose setting is unchanged (#932, ctcp.ts).
   {
     key: 'ctcp.replies',
     label: 'Answer CTCP queries',
@@ -1173,8 +1193,10 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     description:
       'Master switch for replying to CTCP queries from other users (VERSION, ' +
       'TIME, SOURCE, CLIENTINFO, PING). Turn off to publish nothing — Lurker ' +
-      'stays completely silent to CTCP, like a client with CTCP disabled. The ' +
-      'per-type reply templates below apply only while this is on.',
+      'stays completely silent to CTCP, like a client with CTCP disabled, and ' +
+      'IRC clients attached through the bouncer are not sent the queries. The ' +
+      'per-type reply templates below apply only while this is on. While an IRC ' +
+      'client is attached, it answers each type whose reply you have not changed.',
   },
   {
     key: 'ctcp.msgbuffer',
@@ -1203,7 +1225,9 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     description:
       'Reply sent for a CTCP VERSION query. Placeholders: ${name}, ${version}, ' +
       '${source}, ${time}, ${clientinfo}, ${nick}. Leave EMPTY to not answer ' +
-      'VERSION at all — disclosing your exact client/version aids fingerprinting.',
+      'VERSION at all — disclosing your exact client/version aids fingerprinting. ' +
+      'While this is unchanged and an IRC client is attached through the bouncer, ' +
+      'that client answers instead, with "via Lurker <version>" added.',
   },
   {
     key: 'ctcp.time',
@@ -1251,8 +1275,9 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     default: true,
     description:
       'Automatically set you AWAY on every connected network when no Lurker client ' +
-      'is attached, and clear AWAY when a client reconnects. Modeled on the WeeChat ' +
-      'screen_away.py script.',
+      'is in front of you and no IRC client is attached through the bouncer (a ' +
+      'background connection that sent AWAY * does not count), and clear AWAY when ' +
+      'one comes back. Modeled on the WeeChat screen_away.py script.',
   },
   {
     key: 'away.auto.delay_seconds',
@@ -1264,7 +1289,7 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     max: 3600,
     default: 900,
     description:
-      'How long to wait after the last client disconnects before setting AWAY. ' +
+      'How long to wait after the last client goes before setting AWAY. ' +
       'Avoids flapping on browser refreshes or brief network blips.',
   },
   {
@@ -1560,6 +1585,55 @@ export const REGISTRY: readonly SettingOption[] = Object.freeze([
     max: 100,
     default: 60,
     description: 'Playback volume for the always-notify sound, 0–100.',
+  },
+
+  {
+    // Not a channel signal, so it has no dependency on the notify-always bell:
+    // being removed from a channel is a thing that happened to YOU, and it is
+    // worth hearing about wherever it happens (#968).
+    key: 'notifications.kicked.enabled',
+    label: 'Kick notifications',
+    category: 'notifications',
+    group: 'alerts',
+    type: 'bool',
+    default: true,
+    description:
+      'Notify me when I am kicked from a channel. Independent of the notify-always ' +
+      'bell, so it applies to every channel — but a muted channel still stays silent.',
+  },
+  {
+    key: 'notifications.kicked.sound.enabled',
+    label: 'Kick sound',
+    category: 'notifications',
+    group: 'alerts',
+    type: 'bool',
+    default: true,
+    description:
+      'Play a short sound when I am kicked from a channel. Dependent on ' +
+      'notifications.kicked.enabled.',
+  },
+  {
+    key: 'notifications.kicked.sound.choice',
+    label: 'Kick sound choice',
+    category: 'notifications',
+    group: 'alerts',
+    type: 'enum',
+    choices: ['ping', 'chime', 'pop', 'beep', 'knock', 'plink'],
+    default: 'beep',
+    description:
+      'Which bundled sound to play when I am kicked. Distinct default from the ' +
+      'highlight/DM sounds so being removed from a channel is recognizable by ear.',
+  },
+  {
+    key: 'notifications.kicked.sound.volume',
+    label: 'Kick sound volume',
+    category: 'notifications',
+    group: 'alerts',
+    type: 'int',
+    min: 0,
+    max: 100,
+    default: 60,
+    description: 'Playback volume for the kick sound, 0–100.',
   },
 
   // ─── Push-side filters ────────────────────────────────────────────────
@@ -1952,6 +2026,15 @@ export const CATEGORIES: readonly SettingCategory[] = Object.freeze([
   { id: 'ignores', label: 'Ignores', kind: 'bespoke' },
   { id: 'away', label: 'Away', kind: 'registry' },
   { id: 'networks', label: 'Networks', kind: 'bespoke' },
+  // How to attach an IRC client to this instance's bouncer. Self-hosted only
+  // (a hosted cell runs no bouncer), and only where the operator enabled it.
+  {
+    id: 'bouncer',
+    label: 'Bouncer',
+    kind: 'bespoke',
+    selfHostedOnly: true,
+    requiresFeature: 'bouncer',
+  },
   { id: 'account', label: 'Account', kind: 'bespoke' },
   // Disabled in node edition: bearer clients can't be routed through the
   // per-cell proxy, so the server doesn't mount /api/api-tokens or /mcp there
@@ -1964,6 +2047,10 @@ export const CATEGORIES: readonly SettingCategory[] = Object.freeze([
     selfHostedOnly: true,
     hideInPublicMode: true,
   },
+  // Apps approved through OAuth sign-in (#891), in both editions. FXNet hides it
+  // in public mode — the server refuses to mount /api/oauth there (see app.ts),
+  // so throwaway guests can't authorize third-party OAuth clients.
+  { id: 'authorized-apps', label: 'Authorized apps', kind: 'bespoke', hideInPublicMode: true },
   { id: 'data', label: 'Data', kind: 'bespoke' },
   { id: 'about', label: 'About', kind: 'bespoke' },
 ]);

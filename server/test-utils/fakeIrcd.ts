@@ -23,9 +23,15 @@ import { EventEmitter, once } from 'node:events';
 import { generate as generateSelfSigned } from 'selfsigned';
 import { ircLineParser } from 'irc-framework';
 import { CHANNEL_PREFIX_CHARS, isChannelTarget } from '../../shared/channels.js';
+import { stripFormatting } from '../../shared/textMatch.js';
 
 export interface FakeIrcdOptions {
   tls?: boolean;
+  // Strip mIRC formatting codes from every PRIVMSG/NOTICE relayed, whoever sent
+  // it — a client's own, and a peer's through say() — the way a channel in
+  // UnrealIRCd's +S or InspIRCd's stripcolor does. The sender's own echo comes
+  // back stripped too, which is what breaks a byte-exact echo match (#612).
+  stripFormatting?: boolean;
   // Advertise these in CAP LS (and ACK them when requested).
   caps?: string[];
   // false → 422 instead of a MOTD.
@@ -38,8 +44,32 @@ export interface FakeIrcdOptions {
   // Rename every client to this DURING registration (between 005 and the MOTD),
   // the way nick enforcement or a SANICK would.
   burstNickTo?: string;
+  // Raw lines injected in the same place, for the rest of what a server or a
+  // service can do to a client mid-registration (an auto-join, a rename of the
+  // channel it just put you in). Called per client so a line can carry the
+  // client's own hostmask. Deliberately raw: they go straight out and touch
+  // none of the fake's own bookkeeping, so an injected JOIN does NOT make the
+  // client a member — a later PART of it answers 442, and NAMES answers empty.
+  // Inject the replies you want too, or join for real.
+  burstLines?: (c: FakeClient) => string[];
   serverName?: string;
   network?: string;
+  // Ask every TLS client for a certificate and record what it presents, the way
+  // an ircd doing CertFP does — it hashes what you show it rather than
+  // verifying a chain, so anything is accepted. Meaningless without `tls`.
+  requestClientCert?: boolean;
+  // Offer SASL: advertises `sasl=<mechanisms>` in CAP LS and answers
+  // AUTHENTICATE. Defaults to PLAIN + EXTERNAL when passed `true`.
+  sasl?: boolean | { mechanisms: string[] };
+  // Caps that are advertised but NAKed when requested — a cap behind a
+  // privilege, or one the server lists and then declines. A REQ is
+  // all-or-nothing, so a batch containing one of these is NAKed whole.
+  refuse?: string[];
+  // Answer WHO for real: advertise WHOX, and send a 352 for each member of the
+  // channel (or a 354, for `WHO <mask> %<fields>[,<token>]`) before the 315.
+  whox?: boolean;
+  // Follow a channel's 324 with its 329 (RPL_CREATIONTIME), as most ircds do.
+  creationTime?: boolean;
 }
 
 export interface FakeClient {
@@ -51,11 +81,19 @@ export interface FakeClient {
   caps: Set<string>;
   capNegotiating: boolean;
   channels: Set<string>;
+  // The SHA-256 of the certificate this client presented, bare lowercase hex —
+  // the form services want it registered in. null when it presented none (or
+  // the listener isn't asking).
+  certfp: string | null;
+  // The SASL mechanism in flight, between AUTHENTICATE <mech> and the outcome.
+  saslMech: string | null;
+  // The account this client authenticated as, once SASL has succeeded.
+  account: string | null;
   // Every line this client sent, in order.
   sent: string[];
 }
 
-const DEFAULT_CAPS = [
+export const DEFAULT_CAPS = [
   'server-time',
   'message-tags',
   'batch',
@@ -69,10 +107,34 @@ const DEFAULT_CAPS = [
   'echo-message',
 ];
 
+// The end of each list-mode query the fake answers, by mode letter. Its lists
+// are always empty.
+const LIST_ENDS: Record<string, string | undefined> = { b: '368', e: '349', I: '347' };
+
+// `sasl=PLAIN,EXTERNAL` → `sasl`.
+function capName(cap: string): string {
+  return cap.split('=')[0];
+}
+
+// The SHA-256 of a peer's certificate as services want it registered: bare
+// lowercase hex. Null for a plain socket, or a TLS one that presented nothing.
+function peerCertFingerprint(socket: net.Socket): string | null {
+  if (!(socket instanceof tls.TLSSocket)) return null;
+  const peer = socket.getPeerCertificate();
+  if (!peer || !peer.fingerprint256) return null;
+  return peer.fingerprint256.replace(/:/g, '').toLowerCase();
+}
+
 export class FakeIrcd extends EventEmitter {
   readonly clients: FakeClient[] = [];
   readonly registrations: Array<{ nick: string; at: number }> = [];
   readonly topics = new Map<string, string>();
+  // Fingerprint → account, i.e. what `/msg NickServ CERT ADD` leaves behind.
+  // SASL EXTERNAL succeeds for a client whose presented certfp is in here and
+  // fails for one whose isn't, which is the whole of CertFP as a client sees it.
+  readonly certfpAccounts = new Map<string, string>();
+  // account → password, for SASL PLAIN.
+  readonly saslAccounts = new Map<string, string>();
   // Test hook: return true to swallow a client command — no reply of any kind —
   // for a test of what the client does when a reply never comes.
   hold: ((cmd: string, params: string[], c: FakeClient) => boolean) | null = null;
@@ -85,7 +147,14 @@ export class FakeIrcd extends EventEmitter {
 
   private constructor(private readonly opts: FakeIrcdOptions) {
     super();
-    this.caps = opts.caps ?? DEFAULT_CAPS;
+    this.caps = [...(opts.caps ?? DEFAULT_CAPS)];
+    if (opts.sasl) {
+      const mechanisms =
+        typeof opts.sasl === 'object' ? opts.sasl.mechanisms : ['PLAIN', 'EXTERNAL'];
+      // Advertised with its value, as SASL 3.2 does: irc-framework reads the
+      // mechanism list off the cap and refuses to try one that isn't there.
+      this.caps.push(`sasl=${mechanisms.join(',')}`);
+    }
     this.serverName = opts.serverName ?? 'fake.test';
     this.network = opts.network ?? 'FakeNet';
   }
@@ -106,7 +175,17 @@ export class FakeIrcd extends EventEmitter {
           },
         ],
       });
-      ircd.server = tls.createServer({ key: pems.private, cert: pems.cert }, (s) => ircd.accept(s));
+      ircd.server = tls.createServer(
+        {
+          key: pems.private,
+          cert: pems.cert,
+          requestCert: !!opts.requestClientCert,
+          // A CertFP client cert is self-signed by definition; verifying it
+          // would reject every one of them.
+          rejectUnauthorized: false,
+        },
+        (s) => ircd.accept(s),
+      );
     } else {
       ircd.server = net.createServer((s) => ircd.accept(s));
     }
@@ -172,7 +251,8 @@ export class FakeIrcd extends EventEmitter {
   // Deliver a line from a synthetic peer to a nick or a channel.
   say(from: string, target: string, text: string): string {
     const msgid = `m${++this.msgidCounter}`;
-    const line = `:${from}!~${from}@peer.fake PRIVMSG ${target} :${text}`;
+    const body = this.opts.stripFormatting ? stripFormatting(text) : text;
+    const line = `:${from}!~${from}@peer.fake PRIVMSG ${target} :${body}`;
     if (isChannelTarget(target)) {
       for (const c of this.members(target)) this.tagged(c, line, msgid);
     } else {
@@ -230,6 +310,9 @@ export class FakeIrcd extends EventEmitter {
       caps: new Set(),
       capNegotiating: false,
       channels: new Set(),
+      certfp: peerCertFingerprint(socket),
+      saslMech: null,
+      account: null,
       sent: [],
     };
     this.clients.push(client);
@@ -310,6 +393,8 @@ export class FakeIrcd extends EventEmitter {
         return this.maybeRegister(c);
       case 'PASS':
         return;
+      case 'AUTHENTICATE':
+        return this.onAuthenticate(c, p[0] ?? '');
       case 'PING':
         return this.raw(c, `:${this.serverName} PONG ${this.serverName} :${p[p.length - 1] ?? ''}`);
       case 'PONG':
@@ -358,7 +443,8 @@ export class FakeIrcd extends EventEmitter {
       case 'PRIVMSG':
       case 'NOTICE': {
         const target = p[0] ?? '';
-        const text = p[1] ?? '';
+        const raw = p[1] ?? '';
+        const text = this.opts.stripFormatting ? stripFormatting(raw) : raw;
         const msgid = `m${++this.msgidCounter}`;
         const out = `:${this.hostmask(c)} ${cmd} ${target} :${text}`;
         if (isChannelTarget(target)) {
@@ -395,11 +481,26 @@ export class FakeIrcd extends EventEmitter {
         return;
       }
       case 'MODE': {
-        if (isChannelTarget(p[0]) && p.length === 1) return this.num(c, '324', p[0], '+nt');
+        if (isChannelTarget(p[0]) && p.length === 1) {
+          this.num(c, '324', p[0], '+nt');
+          if (this.opts.creationTime) this.num(c, '329', p[0], '1700000000');
+          return;
+        }
+        // A list query: `MODE #chan b`, or `+b` with no mask.
+        const listEnd =
+          isChannelTarget(p[0]) && p.length === 2 ? LIST_ENDS[p[1].replace(/^\+/, '')] : undefined;
+        if (listEnd) return this.num(c, listEnd, p[0], 'End of list');
         return;
       }
       case 'WHO':
-        return this.num(c, '315', p[0] ?? '*', 'End of WHO list');
+        return this.who(c, p[0] ?? '*', p[1]);
+      case 'LIST': {
+        this.num(c, '321', 'Channel', 'Users  Name');
+        for (const chan of this.channelNames()) {
+          this.num(c, '322', chan, String(this.members(chan).length), this.topics.get(chan) ?? '');
+        }
+        return this.num(c, '323', 'End of /LIST');
+      }
       case 'AWAY':
         return p[0]
           ? this.num(c, '306', 'You have been marked as being away')
@@ -434,7 +535,14 @@ export class FakeIrcd extends EventEmitter {
       }
     } else if (sub === 'REQ') {
       const wanted = (p[1] ?? '').split(' ').filter(Boolean);
-      const ok = wanted.every((w) => this.caps.includes(w.replace(/^-/, '')));
+      // Match on the cap NAME: an advertised cap may carry a value (`sasl=PLAIN`),
+      // and a client REQs the bare name.
+      const offered = new Set(this.caps.map(capName));
+      const refused = new Set(this.opts.refuse ?? []);
+      const ok = wanted.every((w) => {
+        const name = capName(w.replace(/^-/, ''));
+        return offered.has(name) && !refused.has(name);
+      });
       if (ok) {
         for (const w of wanted) {
           if (w.startsWith('-')) c.caps.delete(w.slice(1));
@@ -448,6 +556,62 @@ export class FakeIrcd extends EventEmitter {
       c.capNegotiating = false;
       this.maybeRegister(c);
     }
+  }
+
+  // SASL, as much of it as a client can tell apart: the mechanism is offered or
+  // it isn't, the credential is right or it isn't. EXTERNAL is the one that
+  // matters here — it carries no credential at all, so the answer turns entirely
+  // on the certificate presented back at the handshake.
+  private onAuthenticate(c: FakeClient, arg: string): void {
+    const mechanisms = this.saslMechanisms();
+    if (!mechanisms.length) return this.num(c, '904', 'SASL authentication failed');
+    if (!c.saslMech) {
+      const mech = arg.toUpperCase();
+      if (!mechanisms.includes(mech)) {
+        return this.num(c, '904', 'SASL authentication failed');
+      }
+      c.saslMech = mech;
+      // '+' means "go ahead": the client answers with its payload, or with a
+      // bare '+' for EXTERNAL, which has none.
+      return this.raw(c, 'AUTHENTICATE +');
+    }
+    const mech = c.saslMech;
+    c.saslMech = null;
+    if (mech === 'EXTERNAL') {
+      const account = c.certfp ? this.certfpAccounts.get(c.certfp) : undefined;
+      if (!account) {
+        // What an ircd says to a certificate nobody registered — and, just as
+        // importantly, to a client that presented none at all.
+        return this.num(c, '904', 'SASL authentication failed');
+      }
+      return this.saslSucceeded(c, account);
+    }
+    // PLAIN: authzid\0authcid\0password
+    const [, authcid, password] = Buffer.from(arg === '+' ? '' : arg, 'base64')
+      .toString('utf8')
+      .split('\u0000');
+    if (!authcid || this.saslAccounts.get(authcid) !== password) {
+      return this.num(c, '904', 'SASL authentication failed');
+    }
+    return this.saslSucceeded(c, authcid);
+  }
+
+  private saslSucceeded(c: FakeClient, account: string): void {
+    c.account = account;
+    this.num(
+      c,
+      '900',
+      `${c.nick ?? '*'}!${c.user ?? 'u'}@127.0.0.1`,
+      account,
+      `You are now logged in as ${account}`,
+    );
+    this.num(c, '903', 'SASL authentication successful');
+  }
+
+  private saslMechanisms(): string[] {
+    const advertised = this.caps.find((cap) => capName(cap) === 'sasl');
+    if (!advertised) return [];
+    return (advertised.split('=')[1] ?? '').split(',').filter(Boolean);
   }
 
   private maybeRegister(c: FakeClient): void {
@@ -469,6 +633,7 @@ export class FakeIrcd extends EventEmitter {
       'NICKLEN=32',
       'PREFIX=(ov)@+',
       'MONITOR=100',
+      ...(this.opts.whox ? ['WHOX'] : []),
       'are supported by this server',
     );
     if (this.opts.burstNickTo) {
@@ -476,6 +641,7 @@ export class FakeIrcd extends EventEmitter {
       this.raw(c, `:${this.hostmask(c)} NICK :${to}`);
       c.nick = to;
     }
+    for (const line of this.opts.burstLines?.(c) ?? []) this.raw(c, line);
     this.num(c, '251', 'There are 1 users on 1 servers');
     if (this.opts.motd === false) {
       this.num(c, '422', 'MOTD File is missing');
@@ -492,6 +658,65 @@ export class FakeIrcd extends EventEmitter {
       this.num(c, '376', 'End of /MOTD command.');
     }
     this.emit('registered', c);
+  }
+
+  // WHO for a channel's members, or for one nick. A `%<fields>[,<token>]` second
+  // argument asks for WHOX: a 354 with the fields in the spec's fixed order.
+  // Without the `whox` option, just the 315.
+  private who(c: FakeClient, mask: string, options: string | undefined): void {
+    if (this.opts.whox) {
+      const onChannel = isChannelTarget(mask);
+      const found = onChannel ? this.members(mask) : [this.client(mask)];
+      const whox = options?.startsWith('%') ? options.slice(1).split(',') : null;
+      for (const m of found) {
+        if (!m) continue;
+        const user = `~${m.user ?? 'u'}`;
+        const realname = m.user ?? '';
+        if (!whox) {
+          this.num(
+            c,
+            '352',
+            onChannel ? mask : '*',
+            user,
+            'fake.host',
+            this.serverName,
+            m.nick!,
+            'H',
+            `0 ${realname}`,
+          );
+          continue;
+        }
+        const [fields = '', token = ''] = whox;
+        const value: Record<string, string> = {
+          t: token,
+          c: onChannel ? mask : '*',
+          u: user,
+          i: '255.255.255.255',
+          h: 'fake.host',
+          s: this.serverName,
+          n: m.nick!,
+          f: 'H',
+          d: '0',
+          l: '0',
+          a: m.account ?? '0',
+          o: 'n/a',
+          r: realname,
+        };
+        const params = [...'tcuihsnfdlaor'].filter((f) => fields.includes(f)).map((f) => value[f]);
+        this.num(c, '354', ...params);
+      }
+    }
+    this.num(c, '315', mask, 'End of WHO list');
+  }
+
+  // Every channel someone is in, folded.
+  private channelNames(): string[] {
+    const names = new Set<string>();
+    for (const c of this.clients) {
+      if (c.socket.destroyed) continue;
+      for (const chan of c.channels) names.add(chan);
+    }
+    return [...names];
   }
 
   private names(c: FakeClient, chan: string): void {

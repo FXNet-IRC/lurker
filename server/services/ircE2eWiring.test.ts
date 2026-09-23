@@ -38,6 +38,14 @@ beforeAll(() => {
 function makeConn(): IrcConnection {
   return new IrcConnection({
     network: {
+      client_cert: null,
+      client_key: null,
+      proxy_enabled: 0,
+      proxy_type: null,
+      proxy_host: null,
+      proxy_port: null,
+      proxy_username: null,
+      proxy_password: null,
       id: 1,
       user_id: 1,
       name: 'n',
@@ -136,6 +144,10 @@ describe('rekey distribution ship (flushE2eRekeys)', () => {
     const notice = vi.fn<(target: string, text: string) => void>();
     conn.client.notice = notice;
     // A JOIN populates membership so the recipient handle resolves to a nick.
+    // Ours first: someone else's JOIN only reaches us for a channel we are in
+    // (#908).
+    conn.client.user.nick = 'alice';
+    conn.client.emit('join', { channel: '#x', nick: 'alice' });
     conn.client.emit('join', { channel: '#x', nick: 'carol', ident: 'c', hostname: 'c.host' });
     vi.spyOn(e2eManager, 'takePendingRekeySends').mockReturnValue([
       { channel: '#x', targetHandle: 'c@c.host', body: 'RPEE2E REKEY v=1 c=#x' },

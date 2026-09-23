@@ -3,6 +3,7 @@
 
 import { defineStore } from 'pinia';
 import { socketSend } from '../composables/useSocket.js';
+import { dccChatPeer } from '../../../shared/channels.js';
 
 // Cache of the most recent `whois_result` for each (network, nick), plus the
 // open/close state for the UserProfileModal. The modal mounts once at the top
@@ -85,8 +86,16 @@ export const useWhoisStore = defineStore('whois', {
       // same nick never retried it (#818).
       if (this.refreshingKey === k) this.refreshingKey = null;
     },
-    openViewer(networkId: number | string, nick: string) {
-      if (!networkId || !nick) return;
+    openViewer(networkId: number | string, rawNick: string) {
+      if (!networkId || !rawNick) return;
+      // ⚠⚠ A `=bob` DCC chat is a conversation with bob, so "whois this" means
+      // bob. And it must be normalized HERE, because the lookup below goes out
+      // as a `raw` line — which bypasses every `=` guard in ircManager by design
+      // (it is what /quote uses) — so any caller handing us a buffer target
+      // would otherwise put `WHOIS =bob` straight on the wire. The DCC header
+      // in DesktopChat did exactly that. Doing it once here covers every entry
+      // point: the top bar, the buffer menu, the member list and /whois.
+      const nick = dccChatPeer(rawNick);
       const k = key(networkId, nick);
       this.viewer = { open: true, networkId: Number(networkId), nick };
       // Always kick a fresh whois on open. The cached entry (if any) renders

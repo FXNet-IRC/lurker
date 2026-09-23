@@ -1,0 +1,173 @@
+// Copyright (c) 2026 Brad Root
+// SPDX-License-Identifier: MPL-2.0
+
+// Revoking access reaches a bouncer connection (#914): revoking an API token
+// closes the clients that logged in with it, and a SASL client that hasn't
+// finished registering is covered by a pause, a deletion or a revoke. Through
+// the real api-tokens route. See bouncerHarness.ts.
+
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import type { Express } from 'express';
+import { setupTestDb, createTestApp, createAuthedAgent } from '../test-utils/testApp.js';
+
+const ctx = setupTestDb('services-bouncer-revocation');
+
+let harnessMod: typeof import('../test-utils/bouncerHarness.js');
+let bouncerMod: typeof import('./bouncer.js');
+let ircManager: typeof import('./ircManager.js').default;
+let users: typeof import('../db/users.js');
+let apiTokens: typeof import('../db/apiTokens.js');
+let harness: import('../test-utils/bouncerHarness.js').Harness;
+let app: Express;
+
+type Client = Awaited<ReturnType<import('../test-utils/bouncerHarness.js').Harness['connect']>>;
+type Account = import('../test-utils/bouncerHarness.js').HarnessAccount;
+
+beforeAll(async () => {
+  process.env.LURKER_BOUNCER_ENABLED = 'true';
+  harnessMod = await import('../test-utils/bouncerHarness.js');
+  bouncerMod = await import('./bouncer.js');
+  ircManager = (await import('./ircManager.js')).default;
+  users = await import('../db/users.js');
+  apiTokens = await import('../db/apiTokens.js');
+  const router = (await import('../routes/apiTokens.js')).default;
+  app = createTestApp({ '/api/api-tokens': router });
+  harness = await harnessMod.startHarness();
+});
+
+afterAll(() => {
+  harness.stop();
+  ctx.cleanup();
+});
+
+beforeEach(() => {
+  bouncerMod.resetAuthThrottle();
+});
+
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
+});
+
+function newToken(acct: Account): { id: number; token: string } {
+  const created = apiTokens.createToken({ userId: acct.user.id, name: 'irc', scope: 'read-write' });
+  return { id: created.id, token: created.token };
+}
+
+// Attached to the account's network with PASS and `secret`.
+async function attachWithPass(acct: Account, secret: string): Promise<Client> {
+  const c = await harness.connect();
+  cleanups.push(() => c.close());
+  c.send(`PASS ${acct.user.username}:${secret}`);
+  c.send('NICK client');
+  c.send('USER client 0 * :client');
+  await c.waitForCommand('001');
+  return c;
+}
+
+// Logged in over SASL with `secret` (903), but not registered: no CAP END yet.
+async function authenticatedOnly(acct: Account, secret: string): Promise<Client> {
+  const c = await harness.connect();
+  cleanups.push(() => c.close());
+  c.send('CAP LS 302');
+  await c.waitFor((l) => l.includes('CAP') && l.includes('LS'));
+  c.send('NICK client');
+  c.send('USER client 0 * :client');
+  c.send('CAP REQ :sasl');
+  await c.waitFor((l) => l.includes('ACK'));
+  c.send('AUTHENTICATE PLAIN');
+  await c.waitFor((l) => l === 'AUTHENTICATE +');
+  const plain = Buffer.from(['', acct.user.username, secret].join('\u0000')).toString('base64');
+  c.send(`AUTHENTICATE ${plain}`);
+  await c.waitForCommand('903');
+  return c;
+}
+
+function closed(c: Client): Promise<void> {
+  return new Promise((resolve) => {
+    if (c.socket.destroyed) resolve();
+    else c.socket.once('close', () => resolve());
+  });
+}
+
+let pingSeq = 0;
+// Resolves once the bouncer has answered everything sent before it.
+async function answered(c: Client): Promise<void> {
+  const token = `rev${++pingSeq}`;
+  c.send(`PING :${token}`);
+  await c.waitFor((l) => l.includes(' PONG ') && l.endsWith(`:${token}`));
+}
+
+describe('revoking an API token', () => {
+  it('closes the clients attached with it, and only those', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const revoked = newToken(acct);
+    const kept = newToken(acct);
+    const withRevoked = await attachWithPass(acct, revoked.token);
+    const withKept = await attachWithPass(acct, kept.token);
+    const withPassword = await attachWithPass(acct, acct.password);
+    const agent = await createAuthedAgent(app, acct.user.id);
+
+    const res = await agent.delete(`/api/api-tokens/${revoked.id}`);
+    expect(res.status).toBe(200);
+
+    await withRevoked.waitFor((l) => l === 'ERROR :API token revoked');
+    await closed(withRevoked);
+    await answered(withKept);
+    await answered(withPassword);
+    expect(harnessMod.attachedFor(acct)).toBe(2);
+  });
+
+  it('closes a client that logged in with it over SASL but has not registered yet', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const token = newToken(acct);
+    const c = await authenticatedOnly(acct, token.token);
+    const agent = await createAuthedAgent(app, acct.user.id);
+
+    await agent.delete(`/api/api-tokens/${token.id}`);
+
+    await c.waitFor((l) => l === 'ERROR :API token revoked');
+    await closed(c);
+    expect(harnessMod.attachedFor(acct)).toBe(0);
+  });
+});
+
+describe('a SASL client that has not registered yet', () => {
+  it('is closed when the account is paused', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const c = await authenticatedOnly(acct, acct.password);
+
+    users.setUserPaused(acct.user.id, true);
+    ircManager.suspendUser(acct.user.id);
+
+    await c.waitFor((l) => l === 'ERROR :Account paused');
+    await closed(c);
+    expect(harnessMod.attachedFor(acct)).toBe(0);
+  });
+
+  it('does not attach to an account paused since it logged in', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const c = await authenticatedOnly(acct, acct.password);
+
+    // The row alone: registration reads the account as it is now.
+    users.setUserPaused(acct.user.id, true);
+    c.send('CAP END');
+
+    await c.waitFor((l) => l.includes(' 464 ') && l.includes('Account is paused'));
+    await closed(c);
+    expect(harnessMod.attachedFor(acct)).toBe(0);
+  });
+
+  it('does not attach to an account deleted since it logged in', async () => {
+    const acct = harnessMod.seedAccount({ networkName: 'alpha' });
+    const c = await authenticatedOnly(acct, acct.password);
+
+    ircManager.connectionsForUser(acct.user.id).clear();
+    users.deleteUser(acct.user.id);
+    c.send('CAP END');
+
+    await c.waitFor((l) => l.includes(' 464 '));
+    await closed(c);
+    expect(bouncerMod.attachedSessionCount(acct.user.id)).toBe(0);
+  });
+});

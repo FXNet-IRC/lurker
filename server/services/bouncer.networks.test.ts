@@ -234,3 +234,256 @@ describe('bouncer-networks-notify', () => {
     c.close();
   });
 });
+
+// A login that names no network registers as a control connection instead of
+// failing, matching soju's register() (which never rejects a missing network
+// name). Goguma is why: its first-run registration negotiates no caps beyond
+// sasl and carries no selector, so a 464 here left it unable to onboard at all.
+describe('selector-less registration (soju parity)', () => {
+  it('registers a capless client with several networks as a control connection', async () => {
+    const acct = harnessMod.seedAccount({ nick: 'sl1', networkName: 'alpha' });
+    harnessMod.seedNetwork(acct.user, { networkName: 'beta', nick: 'sl1b' });
+    const c = await harness.connect();
+    await negotiate(c, acct, 'sasl'); // no soju.im/bouncer-networks
+    c.send('CAP END');
+    const welcome = await c.waitForCommand('005');
+    expect(welcome).not.toContain('BOUNCER_NETID');
+    expect(harnessMod.attachedFor(acct)).toBe(0);
+  });
+
+  it('names the available networks in a NOTICE when the client cannot discover them', async () => {
+    const acct = harnessMod.seedAccount({ nick: 'sl2', networkName: 'alpha' });
+    harnessMod.seedNetwork(acct.user, { networkName: 'beta', nick: 'sl2b' });
+    const c = await harness.connect();
+    await negotiate(c, acct, 'sasl');
+    c.send('CAP END');
+    const notice = await c.waitForCommand('NOTICE');
+    expect(notice).toContain(`${acct.user.username}/<network>`);
+    expect(notice).toContain('alpha');
+    expect(notice).toContain('beta');
+  });
+
+  it('stays quiet for a bouncer-networks client, which discovers them itself', async () => {
+    const acct = harnessMod.seedAccount({ nick: 'sl3', networkName: 'alpha' });
+    harnessMod.seedNetwork(acct.user, { networkName: 'beta', nick: 'sl3b' });
+    const c = await harness.connect();
+    await negotiate(c, acct, 'sasl soju.im/bouncer-networks');
+    c.send('CAP END');
+    // The notice precedes 422 in the burst, so seeing 422 is a sufficient
+    // barrier for asserting its absence — no arrival race here.
+    await c.waitForCommand('422');
+    expect(c.lines.some((l) => harnessMod.commandOf(l) === 'NOTICE')).toBe(false);
+  });
+
+  it('stays quiet for a -notify-only client, which still reads BOUNCER NETWORK', async () => {
+    const acct = harnessMod.seedAccount({ nick: 'sl6', networkName: 'alpha' });
+    harnessMod.seedNetwork(acct.user, { networkName: 'beta', nick: 'sl6b' });
+    const c = await harness.connect();
+    // Requesting -notify without the base cap is a client error, but the advice
+    // would flatly contradict the network dump that follows it.
+    await negotiate(c, acct, 'sasl soju.im/bouncer-networks-notify');
+    c.send('CAP END');
+    await c.waitForCommand('422');
+    expect(c.lines.some((l) => harnessMod.commandOf(l) === 'NOTICE')).toBe(false);
+    await c.waitFor((l) => l.includes('BOUNCER NETWORK') && l.includes('name=alpha'));
+  });
+
+  it('keeps the advice under the wire cap when the account has many networks', async () => {
+    const acct = harnessMod.seedAccount({ nick: 'sl7', networkName: 'a-long-network-name-00' });
+    for (let i = 1; i < 25; i++) {
+      harnessMod.seedNetwork(acct.user, {
+        networkName: `a-long-network-name-${String(i).padStart(2, '0')}`,
+        nick: `sl7n${i}`,
+      });
+    }
+    const c = await harness.connect();
+    await negotiate(c, acct, 'sasl');
+    c.send('CAP END');
+    const notice = await c.waitForCommand('NOTICE');
+    // Names are unbounded TEXT, so a bare join would run past 512 bytes and the
+    // client would truncate or drop the very advice it needs.
+    expect(Buffer.byteLength(notice + '\r\n')).toBeLessThanOrEqual(512);
+    expect(notice).toContain('a-long-network-name-00');
+    expect(notice).toMatch(/\+\d+ more$/);
+  });
+
+  it('still auto-binds the only network for a capless client (ZNC floor)', async () => {
+    const acct = harnessMod.seedAccount({ nick: 'sl4', networkName: 'solo' });
+    const c = await harness.connect();
+    await negotiate(c, acct, 'sasl');
+    c.send('CAP END');
+    await c.waitForCommand('422');
+    expect(harnessMod.attachedFor(acct)).toBe(1);
+  });
+
+  it('registers an account with no networks and says why it is empty', async () => {
+    const acct = harnessMod.seedAccount({ nick: 'sl5' });
+    harnessMod.dropNetworks(acct.user);
+    const c = await harness.connect();
+    await negotiate(c, acct, 'sasl'); // capless: this pairing used to 464
+    c.send('CAP END');
+    const notice = await c.waitForCommand('NOTICE');
+    expect(notice).toContain('No IRC networks configured yet');
+    await c.waitForCommand('422');
+  });
+
+  it("registers Goguma's pipelined first-run burst, which waits for nothing", async () => {
+    const acct = harnessMod.seedAccount({ nick: 'gog', networkName: 'alpha' });
+    harnessMod.seedNetwork(acct.user, { networkName: 'beta', nick: 'gogb' });
+    const c = await harness.connect();
+    // Goguma sends registration in one shot without reading CAP LS first, so it
+    // requests only sasl and its AUTHENTICATE precedes our `AUTHENTICATE +`.
+    c.send('CAP LS 302');
+    c.send('NICK client');
+    c.send('USER client 0 * :client');
+    c.send('CAP REQ :sasl');
+    c.send('AUTHENTICATE PLAIN');
+    c.send(`AUTHENTICATE ${saslPlain(acct.user.username, acct.password)}`);
+    c.send('CAP END');
+    await c.waitForCommand('903');
+    await c.waitForCommand('001');
+    await c.waitForCommand('422');
+    expect(c.lines.some((l) => harnessMod.commandOf(l) === '464')).toBe(false);
+    expect(harnessMod.attachedFor(acct)).toBe(0); // control mode, not a blind bind
+  });
+});
+
+// soju.im/FILEHOST (routes/filehost.ts): goguma and gamja read it on a bound
+// connection, halloy on the unbound one, so both carry it.
+describe('soju.im/FILEHOST in ISUPPORT', () => {
+  const TOKEN = 'soju.im/FILEHOST=https://irc.example.test/api/filehost';
+
+  // The 005 lines a client gets up to its 422.
+  async function isupportFor(
+    bound: boolean,
+    registration?: (nick: string) => string[],
+  ): Promise<string> {
+    const acct = harnessMod.seedAccount({ nick: `fh${Math.random().toString(36).slice(2, 7)}` });
+    if (registration) acct.upstream.registrationLines = registration(acct.upstream.currentNick);
+    const c = await harness.connect();
+    if (bound) {
+      c.send(`PASS ${acct.user.username}:${acct.password}`);
+      c.send('NICK client');
+      c.send('USER client 0 * :client');
+    } else {
+      harnessMod.seedNetwork(acct.user, { networkName: 'second' });
+      await negotiate(c, acct, 'sasl soju.im/bouncer-networks');
+      c.send('CAP END');
+    }
+    await c.waitForCommand('422');
+    c.close();
+    return c.lines.filter((l) => harnessMod.commandOf(l) === '005').join('\n');
+  }
+
+  async function withBaseUrl<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+    const prev = process.env.PUBLIC_BASE_URL;
+    if (value === undefined) delete process.env.PUBLIC_BASE_URL;
+    else process.env.PUBLIC_BASE_URL = value;
+    try {
+      return await fn();
+    } finally {
+      if (prev === undefined) delete process.env.PUBLIC_BASE_URL;
+      else process.env.PUBLIC_BASE_URL = prev;
+    }
+  }
+
+  it('is advertised on bound and control connections with an https PUBLIC_BASE_URL', async () => {
+    await withBaseUrl('https://irc.example.test/', async () => {
+      expect(await isupportFor(true)).toContain(TOKEN);
+      expect(await isupportFor(false)).toContain(TOKEN);
+    });
+  });
+
+  it('is advertised for a base with whitespace around it', async () => {
+    await withBaseUrl(`  https://irc.example.test/  `, async () => {
+      expect(await isupportFor(true)).toContain(TOKEN);
+    });
+  });
+
+  it('is not advertised without a usable https PUBLIC_BASE_URL', async () => {
+    await withBaseUrl(undefined, async () => {
+      expect(await isupportFor(true)).not.toContain('FILEHOST');
+    });
+    const advertised: string[] = [];
+    for (const base of [
+      'https://irc.example.test?x=1',
+      'https://irc.example.test#top',
+      'https://admin:secret@irc.example.test',
+      'https://irc.example.test:99999',
+    ]) {
+      await withBaseUrl(base, async () => {
+        if ((await isupportFor(true)).includes('FILEHOST')) advertised.push(base);
+      });
+    }
+    expect(advertised).toEqual([]);
+    await withBaseUrl('http://irc.example.test', async () => {
+      expect(await isupportFor(true)).not.toContain('FILEHOST');
+      expect(await isupportFor(false)).not.toContain('FILEHOST');
+    });
+  });
+
+  // A client uploads to the URL with its Lurker credentials, so a network's own
+  // (an upstream soju's) must not reach it, advertised or not.
+  it("never passes on the network's own FILEHOST", async () => {
+    const registration = (nick: string) => [
+      `:irc.example.net 001 ${nick} :Welcome`,
+      `:irc.example.net 005 ${nick} CHANTYPES=# soju.im/FILEHOST=https://upstream.example/up draft/FILEHOSTING=1 :are supported by this server`,
+      `:irc.example.net 005 ${nick} FILEHOST=https://upstream.example/x :are supported by this server`,
+      `:irc.example.net 005 ${nick} -vendor.example/filehost :are supported by this server`,
+      // With no text after the tokens, which halloy would read the last of.
+      `:irc.example.net 005 ${nick} AWAYLEN=200 soju.im/FILEHOST=https://upstream.example/y`,
+      `:irc.example.net 005 ${nick} SAFELIST :soju.im/FILEHOST=https://upstream.example/z`,
+      `:irc.example.net 005 ${nick} soju.im/FILEHOST=https://upstream.example/w`,
+    ];
+    await withBaseUrl(undefined, async () => {
+      expect(await isupportFor(true, registration)).toBe(
+        [
+          ':irc.example.net 005 client CHANTYPES=# draft/FILEHOSTING=1 :are supported by this server',
+          ':irc.example.net 005 client AWAYLEN=200',
+          ':irc.example.net 005 client SAFELIST',
+        ].join('\n'),
+      );
+    });
+    await withBaseUrl('https://irc.example.test', async () => {
+      const isupport = await isupportFor(true, registration);
+      expect(isupport).toContain(TOKEN);
+      expect(isupport).not.toContain('upstream.example');
+    });
+  });
+
+  // A network's later 005 isn't relayed at all (RELAY_DROP); IrcConnection adds
+  // it to registrationLines, whose replay strips the token.
+  it("doesn't relay a network's own FILEHOST sent after registration", async () => {
+    const acct = harnessMod.seedAccount({ nick: 'fhlive' });
+    const c = await harness.connect();
+    c.send(`PASS ${acct.user.username}:${acct.password}`);
+    c.send('NICK client');
+    c.send('USER client 0 * :client');
+    await c.waitForCommand('422');
+    const from = c.lines.length;
+    acct.upstream.pushUpstream(
+      `:irc.example.net 005 fhlive soju.im/FILEHOST=https://upstream.example/up :are supported by this server`,
+    );
+    acct.upstream.pushUpstream(':bot!b@h PRIVMSG #chan :sentinel');
+    await c.waitFor((l) => l.endsWith(':sentinel'));
+    expect(c.lines.slice(from).join('\n')).not.toContain('upstream.example');
+    c.close();
+  });
+
+  it('is not advertised to an account with no usable uploader', async () => {
+    const { default: db } = await import('../db/index.js');
+    const defaults = db
+      .prepare(`SELECT id FROM uploader_config WHERE scope = 'instance' AND is_default = 1`)
+      .all() as Array<{ id: number }>;
+    db.prepare(`UPDATE uploader_config SET is_default = 0 WHERE scope = 'instance'`).run();
+    try {
+      await withBaseUrl('https://irc.example.test', async () => {
+        expect(await isupportFor(true)).not.toContain('FILEHOST');
+      });
+    } finally {
+      for (const { id } of defaults) {
+        db.prepare('UPDATE uploader_config SET is_default = 1 WHERE id = ?').run(id);
+      }
+    }
+  });
+});

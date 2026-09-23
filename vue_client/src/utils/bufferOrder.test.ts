@@ -3,6 +3,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
+  bufferSortKey,
   flattenBufferOrder,
   flattenUnreadOrder,
   FRIENDS_GROUP_ID,
@@ -159,5 +160,14 @@ describe('flattenUnreadOrder', () => {
       pins: makePins({}),
     };
     expect(flattenUnreadOrder(args).map((e) => e.key)).toEqual([srvKey(1), '1::#busy']);
+  });
+});
+
+describe('bufferSortKey — DCC chats', () => {
+  // A `=nick` chat belongs beside a DM with the same person, not piled at the
+  // top of the DM block under '='.
+  it('sorts a DCC chat under its peer nick', () => {
+    expect(bufferSortKey('=Bob')).toBe('bob');
+    expect(bufferSortKey('=alice')).toBe(bufferSortKey('alice'));
   });
 });

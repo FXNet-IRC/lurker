@@ -158,6 +158,32 @@ export class EngineTransport extends EventEmitter implements FrameHandler {
     this.link.register(this.id, this);
     const go = () => {
       const o = this.options;
+      // The authoritative skew check, made where the link is known to be ready
+      // and its protocol minor is therefore known. ircConnection refuses
+      // earlier and more quietly when it can, but on a cold start the first
+      // dial can outrun the engine's hello — and an engine that predates
+      // minor 2 would simply ignore the field, leaving the app to authenticate
+      // with a certificate that was never presented.
+      // ⚠ The authoritative proxy check, for the same reason as the certificate
+      // one below: on a cold start the first dial can outrun the engine's
+      // hello, and an engine below minor 5 ignores the field and dials direct.
+      // Refusing late is still refusing; connecting is not recoverable.
+      if (o.proxy && !this.link.supportsProxy()) {
+        this.end(
+          new Error(
+            'the IRC engine this deployment connects through cannot route a connection via a proxy — update the engine, or remove the proxy from this network',
+          ),
+        );
+        return;
+      }
+      if (o.client_certificate && !this.link.supportsClientCert()) {
+        this.end(
+          new Error(
+            'the IRC engine this deployment connects through cannot present a client certificate — update the engine, or remove the certificate from this network',
+          ),
+        );
+        return;
+      }
       this.link.send({
         op: 'connect',
         id: this.id,
@@ -167,6 +193,15 @@ export class EngineTransport extends EventEmitter implements FrameHandler {
         rejectUnauthorized: o.rejectUnauthorized !== false,
         ...(o.outgoing_addr ? { outgoingAddr: o.outgoing_addr } : {}),
         ...(o.engineIdent ? { ident: o.engineIdent } : {}),
+        ...(o.client_certificate
+          ? {
+              clientCert: {
+                cert: o.client_certificate.certificate,
+                key: o.client_certificate.private_key,
+              },
+            }
+          : {}),
+        ...(o.proxy ? { proxy: o.proxy } : {}),
       });
       this.armReplyTimer();
     };

@@ -4,14 +4,17 @@
 // One held IRC socket. The engine's whole reason to exist is that this object
 // outlives the app process that asked for it.
 //
-// It understands exactly six IRC things, and nothing else:
+// It understands exactly eight IRC things, and nothing else:
 //   1. PING       — answered here, always, never forwarded. A detached (or
 //                   stalled) app can't ping out because the app isn't in the loop.
 //   2. 001        — our nick, as the server confirmed it.
 //   3. 376 / 422  — the end of the registration burst we record for replay.
 //   4. own NICK   — so a replay lands on the live nick.
 //   5. own JOIN / PART / KICK — the channel set a replay must re-enter.
-//   6. own CHGHOST — the hostmask the synthesised JOINs carry.
+//   6. RENAME — the same set, under the name the channel has now.
+//   7. CAP ACK / DEL — the caps that are on, which the burst alone stops
+//                   describing the moment one changes.
+//   8. own CHGHOST — the hostmask the synthesised JOINs carry.
 // Every other line is bytes: numbered, buffered until acked, relayed.
 //
 // Re-attach is a replay: the recorded burst (verbatim — irc-framework walks it
@@ -27,9 +30,12 @@
 // no matter how long the socket has lived: the burst is capped in bytes, the
 // nick is one line, and the channel set is what we are in NOW (own JOIN/PART/
 // KICK lines are deliberately not recorded into the burst, so a channel joined
-// during registration and left later is not replayed as joined).
+// during registration and left later is not replayed as joined). A burst line
+// ABOUT such a channel — the 353/366/332 a server-side auto-join volunteers —
+// is held back at replay time for the same reason: see replaySet.
 
 import net from 'node:net';
+import { createHash } from 'node:crypto';
 import tls from 'node:tls';
 import { EventEmitter } from 'node:events';
 import { ircLineParser } from 'irc-framework';
@@ -42,6 +48,9 @@ import {
   isIdentdEnabled,
   isOidentdFileEnabled,
 } from '../services/identd.js';
+import { dialThroughProxy } from '../utils/proxyDial.js';
+import { sameProxyRoute } from '../../shared/proxy.js';
+import type { ProxyConfig } from '../../shared/proxy.js';
 
 export interface UpstreamOptions {
   id: string;
@@ -56,8 +65,16 @@ export interface UpstreamOptions {
   rejectUnauthorized: boolean;
   outgoingAddr?: string;
   ident?: string;
+  // CertFP (#459): the client certificate to present on the TLS handshake. The
+  // caller has already checked that the pair parses and matches — tls.connect
+  // throws synchronously on a malformed key, and this dial runs inside the
+  // process holding every other session.
+  clientCert?: { cert: string; key: string };
   // How long a dial (TCP + TLS handshake) may take before it is given up on.
   dialTimeoutMs?: number;
+  // Route this socket through a SOCKS5 / HTTP CONNECT proxy (#303). Validated
+  // by the engine's connect handler before this object is built.
+  proxy?: ProxyConfig;
 }
 
 // Where frames for the attached app go. `send` answers false when the link is
@@ -104,6 +121,17 @@ export const CLOSE_GRACE_MS = 10_000;
 
 const FALLBACK_USERHOST = '~lurker@engine.invalid';
 
+// A stable fingerprint of a proxy's credentials, so `matchesDial` can still tell
+// one identity from another after the password itself has been dropped (#303).
+// Equality is the only question ever asked of it, which is exactly what a digest
+// answers — see the note where the password is wiped.
+function proxyCredDigest(proxy: ProxyConfig | undefined): string {
+  if (!proxy) return '';
+  return createHash('sha256')
+    .update(`${proxy.username ?? ''}\u0000${proxy.password ?? ''}`)
+    .digest('hex');
+}
+
 function prefixNick(prefix: string | undefined): string {
   if (!prefix) return '';
   const bang = prefix.indexOf('!');
@@ -113,6 +141,13 @@ function prefixNick(prefix: string | undefined): string {
 export class EngineUpstream extends EventEmitter {
   readonly id: string;
   state: 'dialing' | 'open' | 'closed' = 'dialing';
+  private dialed = false;
+  /** The proxy credentials this socket was dialled with, as a digest. Survives
+   *  the password being dropped below; see matchesDial. */
+  private readonly proxyCred: string;
+  /** A proxy dial is in flight and has produced no socket yet. The window in
+   *  which `destroy()` has nothing to destroy. */
+  private proxyDialPending = false;
   // `close()`/`quit()` were called: the socket is on its way out. Not a state
   // of its own because `open`-specific bookkeeping still applies until 'close'
   // fires, but every entry point treats it as gone.
@@ -128,7 +163,10 @@ export class EngineUpstream extends EventEmitter {
   private inbuf = '';
   private lastError: string | null = null;
   private identdId: number | null = null;
-  private burst: string[] = [];
+  // The recorded registration burst. Each line remembers which of our channels
+  // it was about (folded), if any, so a replay can leave out what is no longer
+  // true — see replaySet.
+  private burst: Array<{ line: string; chan?: string }> = [];
   private burstBytes = 0;
   // Latched once a line didn't fit, so the burst is a contiguous prefix.
   private burstFull = false;
@@ -139,6 +177,18 @@ export class EngineUpstream extends EventEmitter {
   private registeredUnattended = false;
   private nickAtBurstEnd: string | null = null;
   private hostmask: string | null = null;
+  // The caps the server has said are on for this socket, from the first CAP
+  // ACK onwards. A cap-notify exchange after registration (a `CAP NEW` we
+  // asked for, a `CAP DEL` the server sent) is an ordinary live line: relayed
+  // once and dropped from the buffer as soon as the app acks it. The burst
+  // stops being the truth about this socket the moment one lands. (#888)
+  private caps = new Set<string>();
+  // What the burst on its own leaves a fresh Client with — the baseline the
+  // replay's delta is measured against. Null until the burst closes.
+  private capsAtBurstEnd: Set<string> | null = null;
+  // The server's own name, off the 001 prefix, so a synthesised CAP line looks
+  // like the ones around it.
+  private serverName: string | null = null;
   // folded name → name as the server spelled it on JOIN
   private channels = new Map<string, string>();
 
@@ -166,6 +216,7 @@ export class EngineUpstream extends EventEmitter {
     super();
     this.id = opts.id;
     this.buffer = new LineBuffer(bufferBytes, budget);
+    this.proxyCred = proxyCredDigest(opts.proxy);
   }
 
   get attached(): boolean {
@@ -184,19 +235,56 @@ export class EngineUpstream extends EventEmitter {
   // Is this the same session a CONNECT with these parameters would open? A
   // changed host/port/TLS/source address means the user edited the network and
   // wants a fresh dial, not the old socket under new settings.
-  matchesDial(frame: { host: string; port: number; tls: boolean; outgoingAddr?: string }): boolean {
+  matchesDial(frame: {
+    host: string;
+    port: number;
+    tls: boolean;
+    outgoingAddr?: string;
+    clientCert?: { cert: string; key: string };
+    proxy?: ProxyConfig;
+  }): boolean {
     return (
       this.opts.host === frame.host &&
       this.opts.port === frame.port &&
       this.opts.tls === !!frame.tls &&
-      (this.opts.outgoingAddr || '') === (frame.outgoingAddr || '')
+      (this.opts.outgoingAddr || '') === (frame.outgoingAddr || '') &&
+      // A changed client certificate is a changed IDENTITY: this socket is
+      // still presenting the old one, and services still know the user by the
+      // old fingerprint. Re-attaching would make the new certificate look
+      // applied while nothing about the connection had changed. (#459)
+      (this.opts.clientCert?.cert || '') === (frame.clientCert?.cert || '') &&
+      // ⚠⚠ A changed proxy is a changed ROUTE, and this comparison is the only
+      // thing that makes a proxy edit ever take effect. Editing a proxy
+      // deliberately does not tear down the live socket — it applies on the
+      // next connect (#303) — so if this says "same", that next connect
+      // re-attaches to the socket still running through the OLD proxy and the
+      // change never lands at all. (#459's certificate arm above is the same
+      // argument about identity; this one is about where the packets go.)
+      //
+      // Credentials count as part of the route — a proxy may accept one
+      // identity and refuse another — but they are compared as a DIGEST,
+      // because the password itself is dropped once the dial has it (see
+      // dialViaProxy). Equality is the only question ever asked here.
+      sameProxyRoute(this.opts.proxy ?? null, frame.proxy ?? null) &&
+      this.proxyCred === proxyCredDigest(frame.proxy)
     );
   }
 
   // May throw synchronously (Node validates the port and the bind address
   // before it ever touches the network); the caller owns that.
   dial(): void {
-    const { host, port, outgoingAddr, rejectUnauthorized } = this.opts;
+    // Once per upstream, and the engine only ever calls it once (a socket that
+    // died is forgotten; a fresh CONNECT builds a new upstream). Stated as a
+    // throw because the client key is dropped below on the way out: a second
+    // dial would otherwise handshake without one and fail somewhere far less
+    // obvious than here.
+    if (this.dialed) throw new Error('EngineUpstream.dial() is once per instance');
+    this.dialed = true;
+    if (this.opts.proxy) {
+      this.dialViaProxy();
+      return;
+    }
+    const { host, port, outgoingAddr, rejectUnauthorized, clientCert } = this.opts;
     const onConnect = () => this.onOpen();
     const base = {
       host,
@@ -214,11 +302,22 @@ export class EngineUpstream extends EventEmitter {
             // SNI only for a name — an IP literal is not a valid server name.
             servername: net.isIP(host) ? undefined : host,
             rejectUnauthorized,
+            key: clientCert?.key,
+            cert: clientCert?.cert,
           },
           onConnect,
         )
       : net.connect(base, onConnect);
     this.socket = socket;
+    // The handshake has the key now — TLS keeps its own copy in native memory
+    // for the life of the socket — so stop holding one here. This upstream can
+    // live for days, and a heap snapshot walks what is still reachable. It is
+    // not an erasure: JS strings are immutable, so this makes the key
+    // collectible rather than gone. The certificate stays, because matchesDial
+    // compares it to decide whether a CONNECT is this session or a new one.
+    if (this.opts.clientCert) {
+      this.opts.clientCert = { cert: this.opts.clientCert.cert, key: '' };
+    }
     // utf8 with a StringDecoder underneath, so a multibyte character split across
     // chunks reassembles correctly. Lurker never negotiates another encoding.
     socket.setEncoding('utf8');
@@ -236,6 +335,115 @@ export class EngineUpstream extends EventEmitter {
       this.lastError = err.message;
     });
     socket.on('close', () => this.onClose());
+  }
+
+  // The proxied half of dial(). Kept separate rather than branching inside the
+  // direct path because almost nothing is shared: there is no 'connect' event
+  // to wait for, no localAddress on the socket that means what it usually
+  // means, and no identd to register.
+  private dialViaProxy(): void {
+    const { host, port, outgoingAddr, rejectUnauthorized, clientCert, proxy } = this.opts;
+    if (!proxy) return;
+    const budget = this.opts.dialTimeoutMs ?? DEFAULT_DIAL_TIMEOUT_MS;
+    const startedAt = Date.now();
+    this.proxyDialPending = true;
+    void dialThroughProxy(
+      proxy,
+      { host, port },
+      { localAddress: outgoingAddr || undefined, deadlineMs: budget },
+    )
+      .then((tunnel) => {
+        this.proxyDialPending = false;
+        // `close()` can land while the dial is in flight. It has no socket to
+        // destroy yet — `destroy()` is `this.socket?.destroy()`, and there is
+        // no socket — so the tunnel would otherwise be an orphan holding an fd
+        // and its budget bytes forever.
+        //
+        // ⚠⚠ And the teardown has to be finished HERE. Destroying the tunnel
+        // produces no 'close' on a socket this upstream ever listened to, so
+        // without onClose() the session stays at state 'dialing' for good: it
+        // never emits 'closed', so EngineServer never drops it from
+        // `this.upstreams`, and shutdown() waits out its full grace on it. The
+        // direct path has no such hole because there `socket.destroy()` fires a
+        // real 'close'. Same reasoning as the .catch arm below.
+        if (this.closing || this.state === 'closed') {
+          tunnel.destroy();
+          if (this.state !== 'closed') this.onClose();
+          return;
+        }
+        const socket = this.opts.tls
+          ? tls.connect({
+              socket: tunnel,
+              // SNI only for a name — an IP literal is not a valid server name.
+              servername: net.isIP(host) ? undefined : host,
+              rejectUnauthorized,
+              key: clientCert?.key,
+              cert: clientCert?.cert,
+            })
+          : tunnel;
+        this.socket = socket;
+        if (this.opts.clientCert) {
+          this.opts.clientCert = { cert: this.opts.clientCert.cert, key: '' };
+        }
+        // Same reasoning as the client key above, and the same lifetime: this
+        // upstream can live for days and a heap snapshot walks what is still
+        // reachable. The tunnel has the credentials now, and the only later
+        // question — "is this the same proxy?" — is answered by proxyCred,
+        // which was taken at construction. Not an erasure (JS strings are
+        // immutable), just no longer reachable from here.
+        if (this.opts.proxy?.password) {
+          this.opts.proxy = { ...this.opts.proxy, password: '' };
+        }
+        socket.setEncoding('utf8');
+        socket.setKeepAlive(true, 60_000);
+        // ⚠ NO 'connect' listener and NO identd. The socket is already
+        // connected, so 'connect' will never fire again — and identd is
+        // unanswerable through a proxy anyway: the ircd sends its RFC 1413
+        // query to the address it SEES, which is the proxy's, and the 4-tuple
+        // here is ours-to-the-proxy. An entry would look configured and answer
+        // nothing.
+        //
+        // The endpoints recorded below are therefore the PROXY's, not the
+        // ircd's. That is the truth about this socket and it is reported as
+        // such: it is also the only way an operator can tell from the UI that
+        // the tunnel is really in use.
+        this.local = { address: socket.localAddress || '', port: socket.localPort || 0 };
+        this.remote = { address: socket.remoteAddress || '', port: socket.remotePort || 0 };
+        // ⚠ What is LEFT of the budget, not the whole of it again. The
+        // proxy handshake has already spent part of it, and `dialTimeoutMs` is
+        // documented as covering the dial — passing `budget` here would let a
+        // proxied dial take up to 2x what the direct path allows, which is
+        // exactly the case (a slow or tarpit proxy) where the cap matters.
+        // Floored at a second so a handshake that used the lot still gets a
+        // bounded, non-zero window rather than setTimeout(0) — which means "no
+        // timeout at all".
+        socket.setTimeout(Math.max(1000, budget - (Date.now() - startedAt)));
+        socket.on('timeout', () => {
+          if (this.state === 'dialing') this.dropPeer('dial timed out');
+        });
+        socket.on('data', (chunk: string) => this.onData(chunk));
+        socket.on('error', (err: Error) => {
+          this.lastError = err.message;
+        });
+        socket.on('close', () => this.onClose());
+        if (this.opts.tls) {
+          (socket as tls.TLSSocket).once('secureConnect', () => this.onOpen());
+        } else {
+          // Consistently asynchronous: a synchronous onOpen() here would emit
+          // 'open' before the caller that called dial() had returned.
+          setImmediate(() => this.onOpen());
+        }
+      })
+      .catch((err: unknown) => {
+        this.proxyDialPending = false;
+        // ⚠ NOT dropPeer(): that destroys `this.socket` and leaves the rest to
+        // the socket's own 'close' event, and here there is no socket — the
+        // dial failed before one existed. The session would sit in 'dialing'
+        // forever and the app would never hear `closed`. onClose() is the same
+        // teardown, called directly.
+        this.lastError = err instanceof Error ? err.message : String(err);
+        if (this.state !== 'closed') this.onClose();
+      });
   }
 
   // TCP is up (before any TLS handshake): the 4-tuple exists, so identd can be
@@ -302,7 +510,11 @@ export class EngineUpstream extends EventEmitter {
       if (!this.sink) this.pingsAnsweredDetached++;
       return;
     }
-    if (command === '001') this.nick = msg.params[0] || null;
+    if (command === '001') {
+      this.nick = msg.params[0] || null;
+      this.serverName = msg.prefix || null;
+    }
+    if (command === 'CAP') this.trackCaps(msg.params);
     // Own state is tracked from the first line on — a NICK forced on us between
     // 001 and 376, or a server that JOINs us to a channel during registration,
     // must not be missed just because the burst is still open.
@@ -310,11 +522,15 @@ export class EngineUpstream extends EventEmitter {
     if (!this.burstDone) {
       // Own channel movement is state, replayed from the channel set; recording
       // the line too would replay a JOIN the tracked set may since have undone.
-      if (!ownState) this.recordBurst(line, command === '376' || command === '422');
+      if (!ownState) {
+        this.recordBurst(line, msg.params, command === '376' || command === '422');
+      }
       if (command === '376' || command === '422') {
         this.burstDone = true;
+        this.capsAtBurstEnd = new Set(this.caps);
         this.nickAtBurstEnd = this.nick;
         this.registeredUnattended = this.sink === null;
+        this.emit('registered', this.registeredUnattended);
       }
     }
     const seq = this.buffer.push(line);
@@ -333,14 +549,56 @@ export class EngineUpstream extends EventEmitter {
   // emits 'motd' only on 376/422, and that event is the one thing that renders
   // the block, since 372/375/376 are on the app's numeric denylist. It is one
   // short line, and it is what makes the truncation well-formed.
-  private recordBurst(line: string, force = false): void {
+  private recordBurst(line: string, params: string[], force = false): void {
     const bytes = Buffer.byteLength(line, 'utf8') + 2;
     if (this.burstFull || this.burstBytes + bytes > MAX_BURST_BYTES) {
       this.burstFull = true;
       if (!force) return;
     }
-    this.burst.push(line);
+    this.burst.push({ line, chan: this.channelNamed(params) });
     this.burstBytes += bytes;
+  }
+
+  // Which of the channels we are in this line names, if any. Matched against
+  // the tracked set rather than by looking for a channel prefix, so the engine
+  // still needs to know nothing about what a channel name looks like — the
+  // server told us on the JOIN.
+  //
+  // The trailing parameter is skipped: every numeric that names a channel puts
+  // it in a middle parameter (353's `= #chan :nicks`, 332's `#chan :topic`,
+  // 366, 324, 329, 333) and the trailing one is free text — a MOTD line that
+  // happens to read exactly `#chan` would otherwise be tagged to it and vanish
+  // from the replay the day we leave, punching a hole in a burst the recorder
+  // works to keep contiguous.
+  private channelNamed(params: string[]): string | undefined {
+    for (const p of params.slice(0, -1)) {
+      const key = typeof p === 'string' ? p.toLowerCase() : '';
+      if (key && this.channels.has(key)) return key;
+    }
+    return undefined;
+  }
+
+  // The two CAP subcommands that change what is ON. LS and NEW only advertise,
+  // and what they advertise is either in the burst already or is re-learned from
+  // a live line — an app that can't see a cap simply doesn't ask for it, which
+  // is the same answer it would have got from the server.
+  private trackCaps(params: string[]): void {
+    // <target> <sub> :<caps>. Without the third the last parameter IS the
+    // subcommand, and reading it as a cap list enables a cap called "ACK".
+    if (params.length < 3) return;
+    const sub = String(params[1] || '').toUpperCase();
+    if (sub !== 'ACK' && sub !== 'DEL') return;
+    for (const token of String(params[params.length - 1] || '').split(' ')) {
+      if (!token) continue;
+      // `CAP ACK :-away-notify` is the server confirming a cap went OFF (the
+      // answer to a `CAP REQ :-away-notify`). Nothing in Lurker sends one, but
+      // reading it as an enable would be a lie the replay then repeats.
+      const off = sub === 'DEL' || token.startsWith('-');
+      const name = (token.startsWith('-') ? token.slice(1) : token).split('=')[0];
+      if (!name) continue;
+      if (off) this.caps.delete(name);
+      else this.caps.add(name);
+    }
   }
 
   private isSelf(nick: string): boolean {
@@ -348,7 +606,9 @@ export class EngineUpstream extends EventEmitter {
   }
 
   // Apply an own-state line. Returns true when the line was own channel
-  // movement (JOIN/PART/KICK of us), which the burst must not record.
+  // movement (JOIN/PART/KICK of us, or a RENAME of a channel we are in), which
+  // the burst must not record: the replay re-enters the set as it stands now,
+  // and a recorded line would replay movement the set has since undone.
   private track(command: string, prefix: string | undefined, params: string[]): boolean {
     const from = prefixNick(prefix);
     if (command === 'NICK' && this.isSelf(from)) {
@@ -368,6 +628,33 @@ export class EngineUpstream extends EventEmitter {
     }
     if (command === 'KICK' && this.isSelf(params[1] || '')) {
       this.channels.delete((params[0] || '').toLowerCase());
+      return true;
+    }
+    // RENAME (draft/channel-rename, #858/#889): the channel kept every bit of
+    // its state and changed its name. The sender is whoever asked for it — an
+    // op, a service, the server — so this is deliberately NOT gated on isSelf;
+    // what makes it ours is that the old name is in our set. A replay built
+    // from the old name would put the fresh Client in a channel the server no
+    // longer has, and the restore's NAMES/TOPIC would go there too.
+    if (command === 'RENAME') {
+      // Not `from` — that is the sender, and this line's subject is a channel.
+      const oldName = params[0] || '';
+      const newName = params[1] || '';
+      if (!oldName || !newName) return false;
+      const key = oldName.toLowerCase();
+      if (!this.channels.has(key)) return false;
+      // The server form MUST carry the reason as a third parameter — an empty
+      // string when there is none, which still parses as a third parameter —
+      // so a two-parameter line is a server handing us its REASON as the new
+      // name. Checked here and nowhere else in this file because a bogus JOIN
+      // only adds a phantom to the set, while a bogus rename DROPS the channel
+      // we are actually in. A comma too: a channel name cannot hold one, and a
+      // server that answered with a list would take the real channel out.
+      if (params.length < 3 || /[\s,]/.test(newName)) return false;
+      this.channels.delete(key);
+      // A rename that only changes case renames the same key, so the delete
+      // above and this set are the same entry — it ends up spelled the new way.
+      this.channels.set(newName.toLowerCase(), newName);
       return true;
     }
     if (command === 'CHGHOST' && this.isSelf(from)) {
@@ -503,14 +790,42 @@ export class EngineUpstream extends EventEmitter {
   }
 
   replaySet(): string[] {
-    const out = [...this.burst];
+    // A burst line about a channel we are no longer in — parted, kicked, or
+    // renamed out from under us — is not replayed. The synthesised JOINs
+    // deliberately do not re-enter it, and a 353 or 332 naming it would put the
+    // fresh Client back in it regardless (irc-framework's userlist handler
+    // creates the channel), which is the restore then sending NAMES and TOPIC
+    // to a channel the server no longer has. (#889)
+    const out = this.burst.filter((b) => !b.chan || this.channels.has(b.chan)).map((b) => b.line);
     if (!this.nick) return out;
+    out.push(...this.capDelta());
     const userhost = this.hostmask || FALLBACK_USERHOST;
     if (this.nickAtBurstEnd && this.nickAtBurstEnd !== this.nick) {
       out.push(`:${this.nickAtBurstEnd}!${userhost} NICK :${this.nick}`);
     }
     for (const chan of this.channels.values()) out.push(`:${this.nick}!${userhost} JOIN ${chan}`);
     return out;
+  }
+
+  // What the caps have done since the burst closed, as the two lines that would
+  // have got them there. irc-framework applies a post-registration ACK and DEL
+  // to the enabled set exactly as it applies the ones inside negotiation, so a
+  // fresh Client walking the replay ends up with the set this socket really
+  // has — including a cap a NEWER app asked for on an already-restored socket,
+  // which is what makes that request stick across the deploy after it. (#888)
+  private capDelta(): string[] {
+    const before = this.capsAtBurstEnd;
+    if (!before) return [];
+    const gone = [...before].filter((cap) => !this.caps.has(cap));
+    const added = [...this.caps].filter((cap) => !before.has(cap));
+    const from = this.serverName ? `:${this.serverName} ` : '';
+    // Addressed to the nick the replay is at by this point — the burst's — not
+    // the one the synthesised NICK below moves it to.
+    const target = this.nickAtBurstEnd || this.nick || '*';
+    const lines: string[] = [];
+    if (gone.length > 0) lines.push(`${from}CAP ${target} DEL :${gone.join(' ')}`);
+    if (added.length > 0) lines.push(`${from}CAP ${target} ACK :${added.join(' ')}`);
+    return lines;
   }
 
   // End the socket. The app asked (a QUIT went out first, or a user disconnected).
@@ -537,6 +852,17 @@ export class EngineUpstream extends EventEmitter {
   destroy(): void {
     this.closing = true;
     this.socket?.destroy();
+    // ⚠⚠ A proxied dial has no socket until it resolves, so the line above is a
+    // no-op during it — and nothing else will ever fire a 'close', because
+    // there is no socket this upstream listened to. Without finishing here the
+    // session stays at state 'dialing' until the dial's own deadline (a MINUTE
+    // by default): it never emits 'closed', so EngineServer never drops it from
+    // its map, and shutdown() waits out its full grace on it.
+    //
+    // The tunnel itself is destroyed when the dial finally settles (the
+    // abandoned check in dialViaProxy), so at worst one fd outlives this by the
+    // remaining dial budget. The session's state does not.
+    if (this.proxyDialPending && this.state !== 'closed') this.onClose();
   }
 
   private onClose(): void {

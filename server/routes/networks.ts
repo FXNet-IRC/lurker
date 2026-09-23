@@ -12,10 +12,23 @@ import {
   updateNetwork,
   deleteNetwork,
   reorderNetworks,
+  setNetworkClientCert,
 } from '../db/networks.js';
+import {
+  generateClientCert,
+  describeClientCert,
+  validateClientCertPair,
+  isClientCertProblem,
+  clientCertBundle,
+} from '../utils/clientCert.js';
 import { listChannelsForNetwork, seedAutojoinChannel } from '../db/buffers.js';
 import ircManager from '../services/ircManager.js';
-import { isNetworkHostAllowed, hostAllowedChecker } from '../services/networkPolicy.js';
+import {
+  isNetworkHostAllowed,
+  hostAllowedChecker,
+  mayUseProxy,
+} from '../services/networkPolicy.js';
+import { validateProxy, isProxyProblem } from '../../shared/proxy.js';
 import { fanOutToUser, favoritesChangedFrame } from '../services/wsHub.js';
 import { renumberFavorites } from '../db/favoriteBuffers.js';
 import { isNetworkLockEnabled } from '../utils/forcedNetwork.js';
@@ -60,14 +73,128 @@ function parseChannelList(raw: unknown): string[] {
   return out;
 }
 
+// A stored certificate that won't parse is NOT the same as no certificate: the
+// dial path refuses to connect while one is attached, so rendering it as null
+// would leave the user looking at a network that says it has no certificate and
+// refuses to connect because of one. Say it is unusable instead, and let the UI
+// offer the one thing that helps — removing it.
+function describeStoredPair(
+  certPem: string | null,
+  keyPem: string | null,
+): ReturnType<typeof describeClientCert> | { unusable: true } | null {
+  if (!certPem && !keyPem) return null;
+  // Half a pair can't complete a handshake, so the dial refuses on it just as
+  // it does on one that won't parse. Same answer here, for the same reason.
+  if (!certPem || !keyPem) return { unusable: true };
+  try {
+    return describeClientCert(certPem);
+  } catch {
+    return { unusable: true };
+  }
+}
+
 // `isAllowed` is injectable so a caller mapping over several networks can resolve
 // the (instance-global) policy once instead of re-reading it per row.
+/** Check a proxy arriving in a create or update body, and answer with the HTTP
+ *  status the route should send. `null` means nothing is wrong.
+ *
+ *  Shared by POST and PATCH because they must refuse identically: a rule
+ *  enforced on one and not the other is a rule you can edit your way around,
+ *  which is how the host lockdown was nearly bypassed before its PATCH arm was
+ *  added. */
+function proxyBodyProblem(
+  body: Record<string, unknown>,
+  existing?: Record<string, unknown>,
+): { status: number; error: string } | null {
+  const KEYS = [
+    'proxy_enabled',
+    'proxy_type',
+    'proxy_host',
+    'proxy_port',
+    'proxy_username',
+    'proxy_password',
+  ];
+  if (!KEYS.some((k) => k in body)) return null;
+  // ⚠ Validate the row as it WILL BE, not the body as it arrived. A PATCH is
+  // partial: `{proxy_enabled: true}` on a network whose host and type are
+  // already stored is the ordinary way to switch a configured proxy back on,
+  // and validating the body alone would refuse it for having no type.
+  const merged = (key: string): unknown => (key in body ? body[key] : existing?.[key]);
+
+  // ⚠⚠ The lockdown refuses a proxy being SET, not a body that merely mentions
+  // one. The network form sends all six columns on every save — it has to, since
+  // that is the only way it can send `proxy_enabled: false` — so gating on key
+  // presence made every save on a locked-down instance 403: renaming a network,
+  // changing a nick, creating one from an admin preset. Worse, it trapped a user
+  // whose stored proxy the connect path now refuses, because turning it off is
+  // itself a body that mentions a proxy. Two consequences fall out:
+  //
+  //   - a request that leaves the network UNPROXIED is always allowed. Turning
+  //     one off must never be the thing you are not permitted to do.
+  //   - a request that changes nothing about the proxy is allowed even when the
+  //     network is proxied, so an unrelated edit still saves. The dial is
+  //     refused separately (ircConnection.proxyBlockedReason), which is where
+  //     that policy belongs.
+  const enabling = !!merged('proxy_enabled');
+  // ⚠ Compared by MEANING, not by JS identity. A client may legitimately send
+  // the port as a string (validateProxy accepts one) and the type in any case
+  // (it lowercases), so a raw `!==` reads `'9050'` vs stored `9050` — or
+  // `'SOCKS5'` vs `'socks5'` — as a change, and under lockdown that 403s a save
+  // that altered nothing. `''` and null are likewise the same "not set" to the
+  // columns, so a form sending empty strings over nulls is not a change either.
+  const norm = (key: string, v: unknown): string => {
+    if (v === null || v === undefined) return '';
+    if (key === 'proxy_enabled') return v ? '1' : '';
+    if (key === 'proxy_port') return String(Number(v));
+    if (key === 'proxy_type') return String(v).toLowerCase();
+    return String(v);
+  };
+  const changed = KEYS.some((k) => k in body && norm(k, body[k]) !== norm(k, existing?.[k]));
+  if (enabling && changed && !mayUseProxy()) {
+    return {
+      status: 403,
+      error: 'this server does not allow connecting through a proxy of your own',
+    };
+  }
+
+  // Only validate what will actually be dialled through. Clearing the fields,
+  // or filling them in while leaving the network direct, is not an error — the
+  // form saves a half-finished proxy the same way it saves a half-finished
+  // anything, and `proxy_enabled` is what decides.
+  if (!enabling) return null;
+  const checked = validateProxy({
+    type: merged('proxy_type') as string | null,
+    host: merged('proxy_host') as string | null,
+    port: merged('proxy_port') as number | null,
+    username: merged('proxy_username') as string | null,
+    password: merged('proxy_password') as string | null,
+  });
+  return isProxyProblem(checked) ? { status: 400, error: checked.error } : null;
+}
+
 function networkPayload(
   network: Network | undefined | null,
   isAllowed: (host: string) => boolean = isNetworkHostAllowed,
 ): Record<string, unknown> | null {
   if (!network) return null;
-  const { server_password, sasl_password, ...safe } = network;
+  // client_key is destructured to keep it OUT of `safe` — the private key leaves
+  // the server through exactly one route, and never in a listing — and because
+  // whether it is THERE decides what the payload says about the pair.
+  const {
+    server_password,
+    sasl_password,
+    client_cert,
+    client_key,
+    // Destructured OUT of `safe` so the raw columns can never ride along: the
+    // password is a secret, and the rest is re-shaped below into one `proxy`
+    // object the client reads instead of six loose fields.
+    proxy_type,
+    proxy_host,
+    proxy_port,
+    proxy_username,
+    proxy_password,
+    ...safe
+  } = network;
   return {
     ...safe,
     tls: !!network.tls,
@@ -75,6 +202,27 @@ function networkPayload(
     autoconnect: !!network.autoconnect,
     has_password: !!server_password,
     has_sasl_password: !!sasl_password,
+    // CertFP (#459). Neither PEM is in the payload: the key is a secret, and the
+    // certificate on its own is of no use to the UI, which needs the digests to
+    // paste at NickServ. `null` means no certificate; `{unusable: true}` means
+    // there is one and it doesn't parse (archive import writes these columns
+    // verbatim, so that is reachable without anyone pasting anything).
+    client_cert: describeStoredPair(client_cert, client_key),
+    // The proxy set (#303), with the password reduced to a boolean — the same
+    // contract server_password and sasl_password have. This is what makes the
+    // stored shape parts rather than a URL: with parts the form can offer
+    // "leave blank to keep", which a redacted URL cannot.
+    proxy:
+      proxy_host || proxy_type
+        ? {
+            enabled: !!network.proxy_enabled,
+            type: proxy_type,
+            host: proxy_host,
+            port: proxy_port,
+            username: proxy_username,
+            has_password: !!proxy_password,
+          }
+        : null,
     // Channel rows in the retired channels-table wire shape (`joined` is the
     // autojoin flag), sourced from the buffers registry.
     channels: listChannelsForNetwork(network.id).map((b) => ({
@@ -99,6 +247,8 @@ router.get('/', (req: Request, res: Response) => {
   res.json({ networks });
 });
 
+// Not an async handler, for the reason attachCertificate documents: the async
+// body answers its own failures so the promise handed back never rejects.
 router.post('/', (req: Request, res: Response) => {
   // Locked accounts get exactly one network, seeded at provisioning. Adding
   // more would let a user reach a non-FXNet server, so creation is disabled.
@@ -106,6 +256,19 @@ router.post('/', (req: Request, res: Response) => {
     res.status(403).json({ error: 'adding networks is disabled on this instance' });
     return;
   }
+  void createAndConnect(req, res);
+});
+
+async function createAndConnect(req: Request, res: Response): Promise<void> {
+  try {
+    await createAndConnectInner(req, res);
+  } catch (err) {
+    console.error('[lurker] network create failed:', err);
+    res.status(500).json({ error: 'failed to create the network' });
+  }
+}
+
+async function createAndConnectInner(req: Request, res: Response): Promise<void> {
   const {
     name,
     host,
@@ -121,6 +284,22 @@ router.post('/', (req: Request, res: Response) => {
     sasl_password,
     default_channel,
     connect_commands,
+    // CertFP at creation (#459). Every network's instructions are the same
+    // shape — connect with the certificate, then register it from that
+    // connection — so a certificate attached after the fact means the first
+    // connect is the one connect that can't do the registering. Both ways of
+    // getting one are offered here for that reason, not just minting: someone
+    // arriving from another client has a pair already, and making them create
+    // the network first would waste the same connect.
+    generate_client_cert,
+    client_cert,
+    client_key,
+    proxy_enabled,
+    proxy_type,
+    proxy_host,
+    proxy_port,
+    proxy_username,
+    proxy_password,
   } = req.body || {};
   if (!name || !host || !nick) {
     res.status(400).json({ error: 'name, host, and nick are required' });
@@ -129,6 +308,35 @@ router.post('/', (req: Request, res: Response) => {
   if (!isNetworkHostAllowed(host)) {
     res.status(403).json({ error: 'this server only allows the networks its admin has listed' });
     return;
+  }
+  const proxyProblem = proxyBodyProblem(req.body || {});
+  if (proxyProblem) {
+    res.status(proxyProblem.status).json({ error: proxyProblem.error });
+    return;
+  }
+  // Checked before anything is written: a network that exists but couldn't be
+  // given the certificate that was asked for is a worse answer than no network.
+  const importing = !!(client_cert || client_key);
+  if (generate_client_cert && importing) {
+    res
+      .status(400)
+      .json({ error: 'send either generate_client_cert or a cert/key pair, not both' });
+    return;
+  }
+  if ((generate_client_cert || importing) && !tls) {
+    res.status(400).json({
+      error: 'a client certificate can only be used on a TLS network — enable TLS first',
+    });
+    return;
+  }
+  let imported: { cert: string; key: string } | null = null;
+  if (importing) {
+    const validated = validateClientCertPair(client_cert, client_key);
+    if (isClientCertProblem(validated)) {
+      res.status(400).json({ error: validated.error });
+      return;
+    }
+    imported = validated;
   }
 
   const network = createNetwork(req.user!.id, {
@@ -145,11 +353,26 @@ router.post('/', (req: Request, res: Response) => {
     sasl_account,
     sasl_password,
     connect_commands,
+    proxy_enabled,
+    proxy_type,
+    proxy_host,
+    proxy_port,
+    proxy_username,
+    proxy_password,
   });
   if (!network) {
     res.status(500).json({ error: 'failed to create network' });
     return;
   }
+  // BEFORE startNetwork, deliberately: the certificate is presented during the
+  // TLS handshake, so one attached after the dial would miss the very connect
+  // the user needs it on.
+  const pair =
+    imported ??
+    (generate_client_cert ? await generateClientCert(network.nick || network.name) : null);
+  const withCert = pair
+    ? (setNetworkClientCert(network.id, req.user!.id, pair) ?? network)
+    : network;
   for (const channel of parseChannelList(default_channel)) {
     seedAutojoinChannel(req.user!.id, network.id, channel);
   }
@@ -158,9 +381,11 @@ router.post('/', (req: Request, res: Response) => {
   // network is connected automatically at cold-start (connectScheduler /
   // ircManager.initAll) and on un-pause resume — not whether this initial,
   // user-initiated setup connects.
+  // Announced first, so a bouncer client hears of the network before its state.
+  ircManager.networkChanged(req.user!.id, network.id);
   ircManager.startNetwork(req.user!.id, network.id);
-  res.status(201).json({ network: networkPayload(network) });
-});
+  res.status(201).json({ network: networkPayload(withCert) });
+}
 
 // Rewrite sidebar order for the caller. Body: { ids: [n1, n2, ...] } in the
 // new order. Must match the user's current set exactly — partial reorders
@@ -213,7 +438,27 @@ router.patch('/:id', (req: Request, res: Response) => {
     res.status(403).json({ error: 'this server only allows the networks its admin has listed' });
     return;
   }
+  // Turning TLS off on a network that carries a client certificate would leave
+  // it permanently unconnectable — there is no handshake to present the
+  // certificate in, so every dial is refused — and the certificate cannot be
+  // cleared through this route (it isn't on the allowlist). Refuse the edit and
+  // name the order to do it in. Reads the post-lock-strip `fields`, so a locked
+  // instance — where tls is a destination field and can't be edited anyway —
+  // never trips this.
+  if ('tls' in fields && !fields.tls && existing.client_cert) {
+    res.status(400).json({
+      error:
+        'remove this network’s client certificate before turning TLS off — a certificate can only be presented over TLS',
+    });
+    return;
+  }
+  const proxyProblem = proxyBodyProblem(fields, existing as unknown as Record<string, unknown>);
+  if (proxyProblem) {
+    res.status(proxyProblem.status).json({ error: proxyProblem.error });
+    return;
+  }
   const updated = updateNetwork(id, req.user!.id, fields);
+  ircManager.networkChanged(req.user!.id, id);
   res.json({ network: networkPayload(updated) });
 });
 
@@ -231,7 +476,11 @@ router.delete('/:id', (req: Request, res: Response) => {
     return;
   }
   ircManager.disposeNetwork(req.user!.id, id, 'network removed');
+  // Before the row goes: a chat that outlived a Disconnect is owned by a
+  // connection disposeNetwork can no longer see (see ircManager.endDccChats).
+  ircManager.endDccChats(req.user!.id, id, 'network removed');
   deleteNetwork(id, req.user!.id);
+  ircManager.networkChanged(req.user!.id, id);
   // The network's buffers cascaded away and took their favorite rows with
   // them, leaving holes mid-sequence in the user's global favorites order.
   // Re-densify and re-publish so open tabs drop the dead entries instead of
@@ -239,6 +488,113 @@ router.delete('/:id', (req: Request, res: Response) => {
   renumberFavorites(req.user!.id);
   fanOutToUser(req.user!.id, favoritesChangedFrame(req.user!.id));
   res.json({ ok: true });
+});
+
+// CertFP (#459). The cert is a validated PEM pair, so it moves through these
+// dedicated routes rather than the PATCH allowlist — nothing that hasn't been
+// parsed and pair-checked can reach tls.connect, where a malformed key throws
+// synchronously. The routes are not the only writer, though (archive import
+// inserts the columns verbatim), so the dial path re-validates before it
+// presents anything.
+//
+// A change takes effect on the next connect: the certificate is presented during
+// the TLS handshake, so there is nothing to renegotiate on a live socket. The
+// client says so; reconnecting is the user's call, the same as for every other
+// network edit.
+// Not an async handler: Express 5 turns a rejection out of one into an
+// unhandled rejection rather than a response, so the async body answers its own
+// failures and the promise handed back here never rejects.
+router.post('/:id/certificate', (req: Request, res: Response) => {
+  void attachCertificate(req, res);
+});
+
+async function attachCertificate(req: Request, res: Response): Promise<void> {
+  try {
+    await attachCertificateInner(req, res);
+  } catch (err) {
+    console.error('[lurker] client certificate write failed:', err);
+    res.status(500).json({ error: 'failed to store the client certificate' });
+  }
+}
+
+async function attachCertificateInner(req: Request, res: Response): Promise<void> {
+  const id = Number(req.params.id);
+  const network = getNetwork(id, req.user!.id);
+  if (!network) {
+    res.status(404).json({ error: 'network not found' });
+    return;
+  }
+  // A certificate is presented during a TLS handshake. On a plaintext network
+  // there is no handshake to present it in, so attaching one would hand the
+  // user a fingerprint to register that the network is never shown.
+  if (!network.tls) {
+    res.status(400).json({
+      error: 'a client certificate can only be used on a TLS network — enable TLS first',
+    });
+    return;
+  }
+  const mode = (req.body || {}).mode;
+  let pair;
+  if (mode === 'generate') {
+    pair = await generateClientCert(network.nick || network.name);
+  } else if (mode === 'import') {
+    const result = validateClientCertPair((req.body || {}).cert, (req.body || {}).key);
+    if (isClientCertProblem(result)) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    pair = result;
+  } else {
+    res.status(400).json({ error: "mode must be 'generate' or 'import'" });
+    return;
+  }
+  // The write can land on nothing: the network is looked up, then written, and
+  // another tab can delete it in between. Answering 200 with a certificate for
+  // a network that no longer exists is worse than the 404 the caller would have
+  // got a moment earlier.
+  const updated = setNetworkClientCert(id, req.user!.id, pair);
+  if (!updated) {
+    res.status(404).json({ error: 'network not found' });
+    return;
+  }
+  res.json({ network: networkPayload(updated), certificate: describeClientCert(pair.cert) });
+}
+
+router.delete('/:id/certificate', (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  if (!getNetwork(id, req.user!.id)) {
+    res.status(404).json({ error: 'network not found' });
+    return;
+  }
+  const updated = setNetworkClientCert(id, req.user!.id, null);
+  if (!updated) {
+    res.status(404).json({ error: 'network not found' });
+    return;
+  }
+  res.json({ network: networkPayload(updated) });
+});
+
+// The pair in the single-file form other clients keep on disk (HexChat's
+// client.pem, WeeChat's ssl.crt). Its own route, never part of a listing: a
+// certificate you can't take with you is lock-in, but a private key must be
+// asked for explicitly rather than shipped with every sidebar refresh.
+router.get('/:id/certificate/export', (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const network = getNetwork(id, req.user!.id);
+  if (!network) {
+    res.status(404).json({ error: 'network not found' });
+    return;
+  }
+  if (!network.client_cert || !network.client_key) {
+    res.status(404).json({ error: 'this network has no client certificate' });
+    return;
+  }
+  res.type('application/x-pem-file');
+  // A 200 carrying an unencrypted private key must not sit in a disk cache (or
+  // in any intermediary in front of a cell that terminates TLS upstream).
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Disposition', `attachment; filename="lurker-${id}-client.pem"`);
+  res.send(clientCertBundle({ cert: network.client_cert, key: network.client_key }));
 });
 
 router.post('/:id/connect', (req: Request, res: Response) => {

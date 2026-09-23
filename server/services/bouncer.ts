@@ -24,17 +24,31 @@
 // (for now) ignored. Multi-upstream `*` is deliberately unsupported (soju
 // removed it too) — attach one network per connection.
 //
+// A login that names no network registers as a *control* connection rather
+// than failing (soju parity — its register() never rejects a missing network
+// name). A bouncer-networks client uses that to enumerate and BIND; a client
+// without the cap gets a NOTICE naming its networks. The exception is the ZNC
+// floor above: no cap, no selector, exactly one network → attach it.
+//
 // Design notes / v1 limitations, all deliberate:
 // - Upstream→client traffic is relayed as the RAW wire lines the network sent
-//   (minus registration/PING plumbing), so semantics stay exact. That means
-//   Lurker-level ignore rules and RPE2E decryption do NOT apply to live relay:
+//   (minus registration/PING plumbing), so semantics stay exact, then trimmed
+//   per client to the caps that client negotiated: the network speaks to Lurker
+//   with Lurker's caps, not the client's (see bouncerClientFilter.ts, which
+//   every line to a client passes through). Raw relay also means Lurker-level
+//   ignore rules and RPE2E decryption do NOT apply to live relay:
 //   an ignored sender is still visible in an attached client, and E2E channel
 //   traffic shows as ciphertext there (your own sends echo as plaintext).
-// - Numeric replies to one attached client's query (WHOIS, LIST, …) are
-//   broadcast to every client attached to that network — the classic
-//   shared-connection bouncer quirk.
+// - A reply to a query (WHO, WHOIS, LIST, NAMES, MODE, …) goes only to whoever
+//   asked: this client, another one, the web app, or Lurker itself. The
+//   network's replies don't say, so each query waits its turn on the connection
+//   (replyRouter.ts, #931).
 // - Detaching (client QUIT / socket drop) never touches the upstream
 //   connection; Lurker stays online exactly like ZNC.
+// - Away is the account's, as in the web and iOS apps: a client's AWAY sets or
+//   clears it on every network, and every client hears the change as a 305 or
+//   306. `AWAY *` (draft/pre-away) marks a connection that isn't the user, and
+//   any other attached client holds auto-away off (presence.ts).
 
 import net from 'net';
 import tls from 'tls';
@@ -43,20 +57,34 @@ import { StringDecoder } from 'node:string_decoder';
 import ircManager from './ircManager.js';
 import type { IrcConnection } from './ircConnection.js';
 import * as systemLog from './systemLog.js';
-import { findUserByUsername, getPasswordHash } from '../db/users.js';
+import { findUserById } from '../db/users.js';
 import type { User } from '../db/users.js';
-import { verifyPassword, hashPassword } from './password.js';
-import { hashToken, findActiveByHash, touchLastUsed } from '../db/apiTokens.js';
-import { listNetworksForUser } from '../db/networks.js';
+import { verifyBouncerLogin } from './bouncerLogin.js';
+import { isNodeMode } from '../utils/edition.js';
+import { configuredBaseUrl } from '../utils/publicOrigin.js';
+import { resolveUploader } from './uploadProviders/resolve.js';
+import { getNetwork, listNetworksForUser } from '../db/networks.js';
 import type { Network } from '../db/networks.js';
 import { closedFoldedSetForNetwork, foldTargetFor } from '../db/buffers.js';
 import {
-  listMessages,
+  HISTORY_EVENT_TYPES,
   listBuffersForNetwork,
+  listRecentMessages,
   loadHistoryWindow,
   listActiveTargetsInWindow,
+  readMarkerTime,
+  newestIdAtOrBefore,
 } from '../db/messages.js';
-import type { MessageEvent } from '../db/messages.js';
+import type { HistoryEvents, MessageEvent } from '../db/messages.js';
+import { getReadState } from '../db/bufferReads.js';
+import { resolveBuffer } from '../db/bufferResolve.js';
+import type { AwayChange, ReadMarkerMove } from './ircManager.js';
+import { broadcastReadState } from './wsHub.js';
+import { evaluatePresence, setPresenceSource } from './presence.js';
+import { setAttachedIrcClientCounter } from './attachedIrcClients.js';
+import { changedSettings } from './settingsService.js';
+import { CTCP_ANSWER_SETTINGS, ctcpAnsweredBySettings, ctcpVersionVia } from './ctcp.js';
+import { getUserAwayState } from '../db/userAwayState.js';
 import { splitSay, splitAction } from './messageSplit.js';
 import { e2eManager } from './e2e/manager.js';
 import { contextKey, isChannelContext } from './e2e/context.js';
@@ -66,26 +94,32 @@ import {
   certFingerprint,
   keyMatchesCert,
 } from '../utils/bouncerCert.js';
-import { isChannelTarget } from '../../shared/channels.js';
+import { isChannelTarget, isDccChatTarget } from '../../shared/channels.js';
+import { stripFormatting } from './textMatch.js';
+import {
+  bouncerBindHost,
+  bouncerPort,
+  bouncerTlsDisabled,
+  setBouncerTlsState,
+} from '../utils/bouncerConfig.js';
+import {
+  ClientLineFilter,
+  EXTENDED_MONITOR_CAPS,
+  parseLine,
+  restrictTags,
+  withoutUpstreamFilehost,
+} from './bouncerClientFilter.js';
+import type { MonitorHolder } from './monitorList.js';
+import type { ReplyClient } from './replyRouter.js';
 
 const SERVER_NAME = 'lurker.bouncer';
 
-// A scrypt hash used ONLY to equalize login latency (see verifyUser): every
-// auth path runs one scrypt so an unknown/passwordless username can't be told
-// apart from a real one by response time. Computed lazily on the first bouncer
-// login rather than at import, so a disabled bouncer costs no startup scrypt.
-let timingDummyHash: string | null = null;
-function timingEqualizerHash(): string {
-  if (timingDummyHash === null) timingDummyHash = hashPassword('lurker-bouncer-timing-equalizer');
-  return timingDummyHash;
-}
-
-// Caps we can honestly offer an attaching client. server-time stamps playback
-// and relayed lines; message-tags passes upstream tags through verbatim;
-// echo-message opts the client into receiving its own sends back (otherwise we
-// suppress the echo, since the client already rendered the message locally);
-// znc.in/self-message is a marker cap — clients that know it render
-// `:you PRIVMSG peer` playback/sync lines as *your* outgoing DMs.
+// Caps we can honestly offer an attaching client, whatever network it binds.
+// server-time stamps playback and relayed lines; message-tags passes upstream
+// tags through verbatim; echo-message opts the client into receiving its own
+// sends back (otherwise we suppress the echo, since the client already rendered
+// the message locally); znc.in/self-message is a marker cap — clients that know
+// it render `:you PRIVMSG peer` playback/sync lines as *your* outgoing DMs.
 const SUPPORTED_CAPS = [
   'sasl',
   'server-time',
@@ -102,11 +136,48 @@ const SUPPORTED_CAPS = [
   'soju.im/bouncer-networks-notify',
   // draft/chathistory: on-demand scrollback fetch (CHATHISTORY BEFORE/AFTER/…).
   'draft/chathistory',
+  // draft/event-playback: joins, parts, quits, nick changes, kicks and mode and
+  // topic changes in that history too. Lurker's own store serves them, so it
+  // doesn't depend on the network (soju offers it the same way).
+  'draft/event-playback',
+  // cap-notify: CAP NEW/DEL as the bound network's caps come and go (see
+  // updateSupportedCaps). CAP LS 302 turns it on without a REQ.
+  'cap-notify',
+  // invite-notify: other people's INVITEs. A network that doesn't send them
+  // just means fewer, which the spec allows; soju offers it regardless too.
+  'invite-notify',
+  // draft/read-marker: MARKREAD reads and moves the account's read pointer, the
+  // one the web and iOS apps share (handleMarkRead). soju offers it everywhere too.
+  'draft/read-marker',
+  // draft/pre-away: AWAY before registration, and `AWAY *` for a connection that
+  // isn't the user, such as goguma's background sync (handleAway). soju offers it
+  // everywhere too.
+  'draft/pre-away',
+];
+
+// Caps offered only while the bound network has them, because the lines they
+// promise come from the network (soju's passthroughDownstreamCaps). Without the
+// cap, the client filter keeps those lines away from the client.
+// userhost-in-names is ZNC's addition; soju doesn't offer it. extended-monitor is
+// offered under both names while the network has either: the filter decides who
+// gets its lines (ClientLineFilter.inAudience), so the name needn't match. Not
+// offered yet: labeled-response (reply routing, #493).
+const PASSTHROUGH_CAPS = [
+  'away-notify',
+  'account-notify',
+  'account-tag',
+  'chghost',
+  'extended-join',
+  'multi-prefix',
+  'userhost-in-names',
+  ...EXTENDED_MONITOR_CAPS,
 ];
 
 const CAP_BOUNCER_NETWORKS = 'soju.im/bouncer-networks';
 const CAP_BOUNCER_NETWORKS_NOTIFY = 'soju.im/bouncer-networks-notify';
 const CAP_CHATHISTORY = 'draft/chathistory';
+const CAP_EVENT_PLAYBACK = 'draft/event-playback';
+const CAP_READ_MARKER = 'draft/read-marker';
 
 // Max messages a single CHATHISTORY request may return (advertised as the
 // CHATHISTORY ISUPPORT token). Requests over this are rejected, not clamped —
@@ -118,11 +189,20 @@ const MAX_CHATHISTORY = 1000;
 const SASL_MECHANISMS = ['PLAIN'];
 
 /** Build the CAP LS token list, attaching cap values when the client sent 302. */
-function capLsList(version: number): string {
-  return SUPPORTED_CAPS.map((c) =>
-    c === 'sasl' && version >= 302 ? `sasl=${SASL_MECHANISMS.join(',')}` : c,
-  ).join(' ');
+function capLsList(caps: Iterable<string>, version: number): string {
+  return [...caps]
+    .map((c) => (c === 'sasl' && version >= 302 ? `sasl=${SASL_MECHANISMS.join(',')}` : c))
+    .join(' ');
 }
+
+export {
+  isBouncerEnabled,
+  bouncerPort,
+  bouncerBindHost,
+  bouncerPublicAddress,
+  bouncerTerminatesTls,
+  bouncerTlsInfo,
+} from '../utils/bouncerConfig.js';
 
 // Upstream wire commands never relayed to attached clients: connection
 // plumbing that belongs to Lurker's own registration/keepalive (we answer the
@@ -354,36 +434,34 @@ export function parseBouncerCredentials(
   return { username: parsed.username, secret, network };
 }
 
-// Rewrite the target-nick param of a server numeric (`:prefix NNN nick …`).
+// Rewrite the target-nick param of a server numeric (`[@tags ]:prefix NNN nick …`).
 // Used to point the replayed registration burst at whatever nick the attaching
-// client asked for, ZNC-style, before we NICK it over to the live one.
+// client asked for, ZNC-style, before we NICK it over to the live one. The burst
+// is stored as it came off the wire, so a leading tag block is stepped over
+// rather than read as an unprefixed line (#892).
 export function rewriteNumericTarget(line: string, nick: string): string {
   // [\s\S] instead of `.` so a stray trailing CR can't stop the tail group
   // short of `$` and silently skip the rewrite.
-  const m = /^(:\S+ \S+ )\S+([\s\S]*)$/.exec(line);
+  const m = /^((?:@\S+ )?:\S+ \S+ )\S+([\s\S]*)$/.exec(line);
   if (!m) return line;
   return `${m[1]}${nick}${m[2]}`;
 }
 
 /**
- * Filter one raw upstream line for an attached client: drop connection
- * plumbing, drop tag-only commands the client can't parse, and strip message
- * tags down to what the client negotiated (everything for message-tags, just
- * `time` for server-time, nothing otherwise). Returns null to drop the line.
+ * Filter one raw upstream line before it is relayed: drop the connection
+ * plumbing Lurker handles itself. What each client may then receive is up to
+ * its ClientLineFilter. Returns null to drop the line.
  */
-export function filterRelayLine(line: string, caps: ReadonlySet<string>): string | null {
+export function filterRelayLine(line: string): string | null {
   // irc-framework's raw event line keeps its trailing CR — strip it so the
   // relayed copy doesn't carry a stray control char into our own CRLF framing.
   line = line.replace(/[\r\n]+$/, '');
-  let tags = '';
-  let rest = line;
-  if (rest.startsWith('@')) {
-    const sp = rest.indexOf(' ');
+  let afterPrefix = line;
+  if (afterPrefix.startsWith('@')) {
+    const sp = afterPrefix.indexOf(' ');
     if (sp === -1) return null;
-    tags = rest.slice(1, sp);
-    rest = rest.slice(sp + 1);
+    afterPrefix = afterPrefix.slice(sp + 1);
   }
-  let afterPrefix = rest;
   if (afterPrefix.startsWith(':')) {
     const sp = afterPrefix.indexOf(' ');
     if (sp === -1) return null;
@@ -391,14 +469,22 @@ export function filterRelayLine(line: string, caps: ReadonlySet<string>): string
   }
   const command = (afterPrefix.split(' ', 1)[0] || '').toUpperCase();
   if (RELAY_DROP.has(command)) return null;
-  if ((command === 'TAGMSG' || command === 'BATCH') && !caps.has('message-tags')) return null;
-  if (!tags) return line;
-  if (caps.has('message-tags')) return line;
-  if (caps.has('server-time')) {
-    const time = tags.split(';').find((t) => t === 'time' || t.startsWith('time='));
-    if (time) return `@${time} ${rest}`;
+  return line;
+}
+
+// The `@tags :prefix ` a server line starts with, either part optional, so the
+// rest of a relayed line can be rewritten.
+function lineHead(line: string): string {
+  let head = '';
+  let rest = line;
+  for (const sigil of ['@', ':']) {
+    if (!rest.startsWith(sigil)) continue;
+    const sp = rest.indexOf(' ');
+    if (sp === -1) return head;
+    head += rest.slice(0, sp + 1);
+    rest = rest.slice(sp + 1);
   }
-  return rest;
+  return head;
 }
 
 // Default IRC prefix ladder, used when the network's ISUPPORT PREFIX isn't
@@ -411,14 +497,19 @@ const DEFAULT_PREFIXES: Array<{ mode: string; symbol: string }> = [
   { mode: 'v', symbol: '+' },
 ];
 
-export function memberPrefixSymbol(
+/**
+ * Every prefix symbol a member's modes earn, highest rank first (`@+` for +ov).
+ * The client filter cuts it to the highest one for a client without
+ * multi-prefix.
+ */
+export function memberPrefixSymbols(
   memberModes: string[],
   prefixes: Array<{ mode: string; symbol: string }> = DEFAULT_PREFIXES,
 ): string {
-  for (const p of prefixes) {
-    if (memberModes.includes(p.mode)) return p.symbol;
-  }
-  return '';
+  return prefixes
+    .filter((p) => memberModes.includes(p.mode))
+    .map((p) => p.symbol)
+    .join('');
 }
 
 /** Chunk a NAMES membership list into 353 lines under the 512-byte wire cap. */
@@ -443,6 +534,53 @@ export function buildNamesLines(nick: string, channel: string, names: string[]):
   return lines;
 }
 
+/**
+ * Join network names onto `head`, dropping the tail as `+N more` so the result
+ * fits `budget` bytes.
+ *
+ * Network names are unbounded TEXT (no length cap on create, unlike API token
+ * names) and an account may hold any number of them, so a bare join can push
+ * these lines past the 512-byte wire cap — where clients truncate or drop them,
+ * defeating the point of listing the networks at all. Same hazard buildNamesLines
+ * chunks NAMES to avoid; one line suffices here because this is advice, not data.
+ * Counted in bytes, not code units: names can be multi-byte and the wire cap is
+ * bytes. The trailing trim is the backstop for a single pathological name.
+ */
+/** `text` cut to `budget` bytes, marked when it was cut. */
+export function clampToBudget(text: string, budget: number): string {
+  if (Buffer.byteLength(text) <= budget) return text;
+  const marker = '…';
+  // The marker is 3 bytes of the budget, not one character of it, and the cut
+  // runs over code points so it can't split a surrogate pair (an emoji in a
+  // server's ban reason) into a lone half.
+  const room = budget - Buffer.byteLength(marker);
+  if (room <= 0) return '';
+  let out = '';
+  for (const ch of text) {
+    if (Buffer.byteLength(out) + Buffer.byteLength(ch) > room) break;
+    out += ch;
+  }
+  return `${out}${marker}`;
+}
+
+export function withNetworkList(head: string, names: string[], budget: number): string {
+  let out = head;
+  let shown = 0;
+  for (const name of names) {
+    const piece = shown === 0 ? name : `, ${name}`;
+    const hidden = names.length - shown - 1;
+    const tail = hidden > 0 ? `, +${hidden} more` : '';
+    if (shown > 0 && Buffer.byteLength(out + piece + tail) > budget) break;
+    out += piece;
+    shown += 1;
+  }
+  if (names.length > shown) out += `, +${names.length - shown} more`;
+  while (Buffer.byteLength(out) > budget && out.length > head.length + 1) {
+    out = out.slice(0, -1);
+  }
+  return out;
+}
+
 function toIrcTime(iso: string): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
@@ -451,15 +589,54 @@ function toIrcTime(iso: string): string {
 // IRCv3 server-time layout used by CHATHISTORY `timestamp=` selectors:
 // exactly `YYYY-MM-DDThh:mm:ss.sssZ` (millisecond precision, literal Z).
 export function isValidServerTime(s: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(s) && !Number.isNaN(Date.parse(s));
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(s) && !Number.isNaN(serverTimeMs(s));
+}
+
+// The time a `YYYY-MM-DDThh:mm:ss…Z` string names, or NaN. Date.parse rolls an
+// impossible date over (2023-02-30 reads as March 2), so the result has to print
+// back as the same date and time.
+function serverTimeMs(s: string): number {
+  const ms = Date.parse(s);
+  if (Number.isNaN(ms)) return NaN;
+  return new Date(ms).toISOString().slice(0, 19) === s.slice(0, 19) ? ms : NaN;
 }
 
 // A CHATHISTORY selector: `*` (LATEST only) or `timestamp=<iso>`. We advertise
-// MSGREFTYPES=timestamp only — deliberately NOT msgid: our persisted history id
-// (messages.id) and the upstream's opaque msgid on live-relayed lines are
-// different namespaces, so honoring `msgid=` would break for a client paging
-// from a live-captured id. Timestamp works off any line's @time. (Matches soju.)
+// MSGREFTYPES=timestamp only, as soju does (its msgid support is a TODO). History
+// lines carry the network's msgid (networkMsgid), but not every message has one,
+// and resolving `msgid=` is #641. Timestamp works off any line's @time.
 type ChatBound = { star: true } | { iso: string };
+
+// soju.im/FILEHOST: where this account's IRC clients upload a file
+// (routes/filehost.ts), or null when there's nowhere to send them. goguma and
+// gamja read it on a bound connection and halloy on an unbound one, so both
+// bursts carry it, spelled exactly: goguma and halloy match it case-sensitively.
+// It needs an https PUBLIC_BASE_URL, which a client on a TLS connection must
+// insist on, and which is the only origin the bouncer can know without an HTTP
+// request to read one from. Not on a hosted cell, which doesn't mount the route,
+// nor for an account with no usable uploader, whose uploads would only fail.
+function filehostToken(userId: number): string | null {
+  if (isNodeMode()) return null;
+  let url: URL;
+  try {
+    url = new URL(configuredBaseUrl());
+  } catch {
+    return null;
+  }
+  // An https origin, maybe with a path, and nothing a path can't follow.
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
+    return null;
+  }
+  const base = `${url.origin}${url.pathname.replace(/\/+$/, '')}`;
+  const user = findUserById(userId);
+  if (!user) return null;
+  try {
+    resolveUploader({ userId, isAdmin: user.role === 'admin', requestedId: null });
+  } catch {
+    return null;
+  }
+  return `soju.im/FILEHOST=${base}/api/filehost`;
+}
 
 function isChannelName(target: string): boolean {
   return isChannelTarget(target);
@@ -498,6 +675,17 @@ export function escapeTagValue(value: string): string {
     .replace(/\n/g, '\\n');
 }
 
+// The msgid a line built from a stored message carries: the network's own
+// (#450), the one a client saw on that message live, or none. The chathistory
+// spec wants the msgid "as originally sent by the IRC server", and soju and ZNC
+// replay the network's or none. A Lurker id would be a second id for the same
+// message, which clients can't match. A decrypted E2E message gets none: its
+// msgid names the ciphertext line, which a client already got live under it.
+function networkMsgid(message: { msgid?: unknown; e2e?: unknown }): string | undefined {
+  if (message.e2e) return undefined;
+  return typeof message.msgid === 'string' && message.msgid !== '' ? message.msgid : undefined;
+}
+
 // Map an IrcConnection state to a bouncer-networks `state` attribute value.
 // soju itself only ever emits connected/disconnected, but the spec defines
 // `connecting` and requires clients to accept it, so we surface the extra
@@ -509,22 +697,50 @@ export function bouncerNetworkState(connState: string | undefined): string {
   return 'disconnected';
 }
 
-// Build the tag-encoded attribute list for one network's BOUNCER NETWORK line.
-// (v1 omits soju's `error`/`username`/`realname` — LISTNETWORKS is read-only and
-// we don't yet plumb a per-network last-error string here.)
-export function buildNetworkAttrs(
+// One network's BOUNCER NETWORK attributes, in wire order. `error` is there only
+// while the network has one: why its last connection attempt failed.
+// (soju's `username` and `realname` aren't attributes here.)
+export function networkAttrs(
   network: { name: string; host: string; port: number; tls: number | boolean; nick: string },
-  opts: { state: string; nickname?: string },
-): string {
-  const attrs: Array<[string, string]> = [
+  opts: { state: string; nickname?: string; error?: string | null },
+): Map<string, string> {
+  const attrs = new Map<string, string>([
     ['name', network.name],
     ['state', opts.state],
     ['host', network.host],
     ['port', String(network.port)],
     ['tls', network.tls ? '1' : '0'],
     ['nickname', opts.nickname || network.nick],
-  ];
-  return attrs.map(([k, v]) => `${k}=${escapeTagValue(v)}`).join(';');
+  ]);
+  if (opts.error) attrs.set('error', opts.error);
+  return attrs;
+}
+
+// Build the tag-encoded attribute list for one network's BOUNCER NETWORK line.
+export function buildNetworkAttrs(
+  network: { name: string; host: string; port: number; tls: number | boolean; nick: string },
+  opts: { state: string; nickname?: string; error?: string | null },
+): string {
+  return formatNetworkAttrs(networkAttrs(network, opts));
+}
+
+function formatNetworkAttrs(attrs: Iterable<[string, string]>): string {
+  return Array.from(attrs, ([k, v]) => `${k}=${escapeTagValue(v)}`).join(';');
+}
+
+// The attributes to notify a client of, given what it was last sent: all of
+// them for a network it hasn't been told about, otherwise only those that
+// changed, which is what the spec asks. A removed attribute goes out as `key=`:
+// HexDroid reads that as a clear and skips a bare `key`. Null if nothing changed.
+export function networkAttrsUpdate(
+  sent: Map<string, string> | undefined,
+  now: Map<string, string>,
+): string | null {
+  if (!sent) return formatNetworkAttrs(now);
+  const changed: Array<[string, string]> = [];
+  for (const [k, v] of now) if (sent.get(k) !== v) changed.push([k, v]);
+  for (const k of sent.keys()) if (!now.has(k)) changed.push([k, '']);
+  return changed.length > 0 ? formatNetworkAttrs(changed) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -570,9 +786,31 @@ export function attachedSessionCount(userId?: number, networkId?: number): numbe
 // Session
 // ---------------------------------------------------------------------------
 
-class BouncerSession {
+class BouncerSession implements MonitorHolder, ReplyClient {
   readonly caps = new Set<string>();
+  // This client's MONITOR list: folded nick → the nick as the client sent it.
+  // The network has one list, which merges this with Lurker's nicks and other
+  // clients' lists (monitorList.ts). soju keeps a list per client the same way.
+  private readonly monitored = new Map<string, string>();
+  // Channels whose NAMES the attach burst held back because the connection
+  // hadn't heard them yet, folded. They go out once it has (onNamesHeard).
+  private readonly namesPending = new Set<string>();
+  // Channels this client has been sent a JOIN for, folded: in its join burst, or
+  // relayed. An engine re-attach replays a JOIN for every channel, and only the
+  // ones not in here reach the client.
+  private readonly joinsSent = new Set<string>();
+  // Whether this client has had a welcome: its attach burst, or any live line
+  // from the network. The rest of an engine re-attach's replay (LUSERS, MOTD)
+  // reaches only a client that hasn't.
+  private welcomed = false;
+  // What the client may request right now: SUPPORTED_CAPS, plus whichever
+  // pass-through caps apply (see handleCap and updateSupportedCaps).
+  private readonly availableCaps = new Set<string>(SUPPORTED_CAPS);
+  // The highest CAP LS version the client sent; 301 until it sends 302.
+  private capVersion = 301;
   userId = 0;
+  // The API token this session authenticated with, or null for the password.
+  apiTokenId: number | null = null;
   networkId = 0;
   lastActivityAt = Date.now();
 
@@ -582,13 +820,16 @@ class BouncerSession {
   // Decode incrementally so a multi-byte UTF-8 character split across two TCP
   // segments isn't corrupted (chunk.toString() per packet would mangle it).
   private readonly decoder = new StringDecoder('utf8');
+  // Every line written to this client passes through it (see write()).
+  private readonly clientFilter: ClientLineFilter;
   private capNegotiating = false;
   // SASL PLAIN state: the requested mechanism (null until AUTHENTICATE <mech>),
-  // an accumulator for base64 payloads that arrive in 400-byte chunks, and the
-  // user/network resolved by a successful exchange (consumed at CAP END).
+  // an accumulator for base64 payloads that arrive in 400-byte chunks, and
+  // whether an exchange succeeded, with the network it named (consumed at CAP
+  // END). The account it authenticated is `userId`.
   private saslMechanism: string | null = null;
   private saslBuffer = '';
-  private saslUser: User | null = null;
+  private saslAuthenticated = false;
   private saslNetwork: string | null = null;
   private passRaw: string | null = null;
   private clientNick: string | null = null;
@@ -601,11 +842,30 @@ class BouncerSession {
   // without binding a network (no conn/networkId). It can only enumerate and
   // manage networks via BOUNCER, never send channel/user traffic.
   private isControl = false;
+  // An AWAY sent before registration (draft/pre-away), applied once the account
+  // is known. null for none; '' for a bare AWAY.
+  private pendingAway: string | null = null;
+  // This client's AWAY before registration was answered then. That 305/306
+  // stands for the account's state too, so the attach burst doesn't repeat it.
+  private awayAnswered = false;
+  // This client said `AWAY *`: it isn't the user, so it doesn't count as the
+  // user being here (presence.ts).
+  private notPresent = false;
   // A pre-registration `BOUNCER BIND <id>` selector, consumed at completeAttach
   // (takes precedence over a username-embedded network name).
   private boundNetId: number | null = null;
   // A per-session counter for BATCH reference tags (LISTNETWORKS / initial dump).
   private batchSeq = 0;
+  // The bound network's state this client was last told about in a notice.
+  private noticedState: string | null = null;
+  // The reason last said with it, so the same state saying something new is news.
+  private noticedError = '';
+  // The attributes this client was last sent for each network: in the network
+  // list or a notification. A notification is a change to what the client
+  // holds, and clients attach at different times, so this is what each
+  // client's notifications are measured against. The networks are the
+  // account's; this only records what this client has been told.
+  private networksSent = new Map<number, Map<string, string>>();
   // Outbound sends awaiting their self-echo event from ircManager, so a
   // client that didn't negotiate echo-message doesn't get its own message
   // back (it already rendered it locally). Other attached clients and web
@@ -614,11 +874,20 @@ class BouncerSession {
   // mismatch cases) can't suppress an identical message sent much later.
   private pendingEcho: Array<{ key: string; at: number }> = [];
   private onRawUpstream: ((event: { from_server: boolean; line: string }) => void) | null = null;
+  private onUpstreamCaps: (() => void) | null = null;
   private regTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(socket: net.Socket) {
     this.socket = socket;
     this.remoteIp = socket.remoteAddress || 'unknown';
+    this.clientFilter = new ClientLineFilter({
+      caps: this.caps,
+      serverName: SERVER_NAME,
+      nick: () => this.currentNick() || this.clientNick,
+      prefixes: () => this.isupportPrefixes(),
+      sharedChannels: (nick) => this.sharedChannels(nick),
+      monitors: (nick) => this.monitored.has(nick.toLowerCase()),
+    });
     socket.setNoDelay(true);
     socket.on('data', (chunk) => this.onData(chunk));
     socket.on('error', () => this.destroy());
@@ -633,14 +902,19 @@ class BouncerSession {
     return this.registered;
   }
 
-  private write(line: string): void {
+  // `relayedAt` marks a line the network sent (see ClientLineFilter.apply).
+  private write(line: string, relayedAt?: Date): void {
     if (this.closed) return;
     try {
       // No generated line legitimately contains CR/LF/NUL; scrub rather than
       // let an embedded newline in interpolated text split into a second
       // injected command. Matching control chars is the point of the regex.
       // eslint-disable-next-line no-control-regex
-      this.socket.write(line.replace(/[\r\n\u0000]/g, ' ') + '\r\n');
+      const scrubbed = line.replace(/[\r\n\u0000]/g, ' ');
+      // The one exit point: whatever wrote the line, the client gets only what
+      // its caps allow (#926).
+      for (const out of this.clientFilter.apply(scrubbed, relayedAt))
+        this.socket.write(out + '\r\n');
     } catch {
       this.destroy();
     }
@@ -651,9 +925,20 @@ class BouncerSession {
     this.write(`:${SERVER_NAME} ${code} ${nick} ${params}`);
   }
 
+  // Bytes of message text that still fit on one 512-byte IRC line after this
+  // session's `:<server> <verb> <nick> :` prefix. Measured against the widest
+  // verb these list lines use (NOTICE), so it also covers the shorter 464.
+  // 480 leaves the same headroom for CRLF and prefix drift as buildNamesLines.
+  private wireTextBudget(): number {
+    const nick = this.currentNick() || this.clientNick || '*';
+    return Math.max(64, 480 - Buffer.byteLength(`:${SERVER_NAME} NOTICE ${nick} :`));
+  }
+
   private notice(text: string): void {
     const nick = this.currentNick() || this.clientNick || '*';
-    this.write(`:${SERVER_NAME} NOTICE ${nick} :${text}`);
+    // A server's own words reach these (a ban reason in a disconnect notice),
+    // and a line past 512 bytes is truncated or dropped by the client.
+    this.write(`:${SERVER_NAME} NOTICE ${nick} :${clampToBudget(text, this.wireTextBudget())}`);
   }
 
   private currentNick(): string | null {
@@ -739,6 +1024,11 @@ class BouncerSession {
       case 'BOUNCER':
         this.handleBouncerPreReg(msg);
         break;
+      case 'AWAY':
+        // draft/pre-away. Accepted with or without the cap, as soju does
+        // (downstream.go:936): goguma sends it ahead of CAP END.
+        this.handleAway(msg);
+        break;
       case 'PING':
         // Answer keepalive PINGs during CAP/registration so strict clients
         // don't treat the missing PONG as a ping timeout and drop the attach.
@@ -763,7 +1053,16 @@ class BouncerSession {
         // 302 = versioned LS (advertise cap values); a bare/absent token is 301.
         const version = Number(msg.params[1]);
         const capVersion = Number.isFinite(version) && version >= 302 ? 302 : 301;
-        this.write(`:${SERVER_NAME} CAP ${nick} LS :${capLsList(capVersion)}`);
+        this.capVersion = Math.max(this.capVersion, capVersion);
+        if (capVersion >= 302) {
+          // Before registration the network isn't known, so a 302 client is
+          // shown the pass-through caps too, and binding takes back the ones
+          // the network lacks with a CAP DEL (soju does the same). 302 also
+          // turns on cap-notify, which is what carries that DEL to the client.
+          if (!this.registered) for (const cap of PASSTHROUGH_CAPS) this.availableCaps.add(cap);
+          this.caps.add('cap-notify');
+        }
+        this.write(`:${SERVER_NAME} CAP ${nick} LS :${capLsList(this.availableCaps, capVersion)}`);
         break;
       }
       case 'LIST':
@@ -775,8 +1074,10 @@ class BouncerSession {
           .split(' ')
           .map((c) => c.trim())
           .filter(Boolean);
-        const supported = requested.every((c) => SUPPORTED_CAPS.includes(c.replace(/^-/, '')));
-        if (!supported || requested.length === 0) {
+        const supported = requested.every((c) => this.availableCaps.has(c.replace(/^-/, '')));
+        // cap-notify can't be turned off once CAP LS 302 has turned it on.
+        const dropsCapNotify = this.capVersion >= 302 && requested.includes('-cap-notify');
+        if (!supported || dropsCapNotify || requested.length === 0) {
           this.write(`:${SERVER_NAME} CAP ${nick} NAK :${requested.join(' ')}`);
           break;
         }
@@ -784,6 +1085,9 @@ class BouncerSession {
           if (cap.startsWith('-')) this.caps.delete(cap.slice(1));
           else this.caps.add(cap);
         }
+        // A client that gives up batch is done with every batch it was sent,
+        // even if it asks for batch again before one ends.
+        if (requested.includes('-batch')) this.clientFilter.forgetSentBatches();
         this.write(`:${SERVER_NAME} CAP ${nick} ACK :${requested.join(' ')}`);
         break;
       }
@@ -794,6 +1098,38 @@ class BouncerSession {
         this.write(`:${SERVER_NAME} 410 ${nick} ${sub || '*'} :Invalid CAP command`);
         break;
     }
+  }
+
+  // soju's updateSupportedCaps: the pass-through caps follow the bound network.
+  // Runs once registration settles on a network (or on none, for a control
+  // connection) and again whenever that network's caps may have changed. A cap
+  // the network lacks leaves both sets, or the client would wait for lines that
+  // never come. `nick` is the one the client knows itself by at that moment.
+  private updateSupportedCaps(nick: string): void {
+    const upstream = new Set<string>(
+      !this.isControl && this.conn?.state === 'connected'
+        ? (this.conn.client.network?.cap?.enabled ?? [])
+        : [],
+    );
+    const added: string[] = [];
+    const removed: string[] = [];
+    const networkHas = (cap: string) =>
+      EXTENDED_MONITOR_CAPS.includes(cap)
+        ? EXTENDED_MONITOR_CAPS.some((name) => upstream.has(name))
+        : upstream.has(cap);
+    for (const cap of PASSTHROUGH_CAPS) {
+      if (networkHas(cap) && !this.availableCaps.has(cap)) {
+        this.availableCaps.add(cap);
+        added.push(cap);
+      } else if (!networkHas(cap) && this.availableCaps.has(cap)) {
+        this.availableCaps.delete(cap);
+        this.caps.delete(cap);
+        removed.push(cap);
+      }
+    }
+    if (!this.caps.has('cap-notify')) return;
+    if (added.length > 0) this.write(`:${SERVER_NAME} CAP ${nick} NEW :${added.join(' ')}`);
+    if (removed.length > 0) this.write(`:${SERVER_NAME} CAP ${nick} DEL :${removed.join(' ')}`);
   }
 
   // SASL PLAIN (IRCv3). Reuses the same credential backend as PASS — the only
@@ -866,18 +1202,24 @@ class BouncerSession {
       noteAuthFailure(this.remoteIp);
       return fail();
     }
-    const user = this.verifyUser(login.username, passwd);
-    if (!user) {
+    const verified = verifyBouncerLogin(login.username, passwd);
+    if (!verified) {
       noteAuthFailure(this.remoteIp);
       return fail();
     }
+    const { user } = verified;
     // Reject a paused account here rather than after signaling 903, so the
     // client isn't told auth succeeded and then killed at CAP END.
     if (user.is_paused) {
       this.write(`:${SERVER_NAME} 904 ${nick} :Account is paused`);
       return;
     }
-    this.saslUser = user;
+    // The session is the account's from here, not from CAP END, which can be a
+    // minute away: a pause, recovery or deletion in between closes it, and so
+    // does revoking the token it used (#914).
+    this.userId = user.id;
+    this.apiTokenId = verified.apiTokenId;
+    this.saslAuthenticated = true;
     this.saslNetwork = login.network;
     this.write(
       `:${SERVER_NAME} 900 ${nick} ${nick}!${user.username}@${SERVER_NAME} ${user.username} :You are now logged in as ${user.username}`,
@@ -900,13 +1242,13 @@ class BouncerSession {
   }
 
   // Called at CAP END / registration completion. Auth may already be resolved
-  // via SASL (this.saslUser); otherwise fall back to the ZNC-style PASS floor.
+  // via SASL (this.saslAuthenticated); otherwise fall back to the ZNC-style PASS floor.
   private authenticate(): void {
-    if (this.saslUser) {
+    if (this.saslAuthenticated) {
       // SASL PLAIN already authenticated; the network selector rides the SASL
       // authcid, falling back to the USER field (`USER user/network …`).
       const networkSel = this.saslNetwork ?? unmarshalLogin(this.clientUser || '').network;
-      this.completeAttach(this.saslUser, networkSel);
+      this.completeAttach(this.userId, networkSel);
       return;
     }
     if (authThrottled(this.remoteIp)) {
@@ -922,13 +1264,15 @@ class BouncerSession {
       this.failRegistration('Invalid credentials format: PASS <username>[/<network>]:<secret>');
       return;
     }
-    const user = this.verifyUser(creds.username, creds.secret);
-    if (!user) {
+    const verified = verifyBouncerLogin(creds.username, creds.secret);
+    if (!verified) {
       noteAuthFailure(this.remoteIp);
       this.failRegistration('Invalid username or password/token');
       return;
     }
-    this.completeAttach(user, creds.network);
+    this.userId = verified.user.id;
+    this.apiTokenId = verified.apiTokenId;
+    this.completeAttach(verified.user.id, creds.network);
   }
 
   private clearRegTimer(): void {
@@ -939,9 +1283,16 @@ class BouncerSession {
   }
 
   // Called at CAP END / registration completion. Resolves the target network
-  // (BIND id > username selector > single-network default), or drops into
-  // control mode for a bouncer-networks client that named no network.
-  private completeAttach(user: User, networkSel: string | null): void {
+  // (BIND id > username selector > capless single-network default), or drops
+  // into control mode for any client that named no network. The account is
+  // read as it is now: a SASL login may be a minute old (soju reads its live
+  // user at attach too).
+  private completeAttach(userId: number, networkSel: string | null): void {
+    const user = findUserById(userId);
+    if (!user) {
+      this.failRegistration('Account removed');
+      return;
+    }
     if (user.is_paused) {
       this.failRegistration('Account is paused');
       return;
@@ -963,15 +1314,26 @@ class BouncerSession {
       return;
     }
 
-    // Control (unbound) mode: a bouncer-networks-aware client that named no
-    // network manages its networks via BOUNCER instead of attaching to one.
+    // Control (unbound) mode. A bouncer-networks-aware client that named no
+    // network manages its networks via BOUNCER instead of attaching to one —
+    // and soju parity means a client that named no network registers even when
+    // it *can't* do that (soju's register() never fails on a missing network
+    // name), rather than eating a 464 mid-onboarding. Goguma is the case that
+    // forced this: its first-run registration negotiates nothing but sasl and
+    // carries no network selector, so it used to hit the "multiple networks"
+    // 464 below and could never get far enough to discover them.
+    //
+    // The one exception is the documented ZNC floor (`PASS user:secret` with a
+    // single network): a client with no bouncer-networks cap can't do anything
+    // useful in our control mode, which carries no channel traffic, so keep
+    // auto-binding its only network.
     const hasSelector = this.boundNetId !== null || !!networkSel;
-    if (!hasSelector && this.caps.has(CAP_BOUNCER_NETWORKS)) {
-      this.registerControl(user);
+    const networks = listNetworksForUser(user.id);
+    if (!hasSelector && (this.caps.has(CAP_BOUNCER_NETWORKS) || networks.length !== 1)) {
+      this.registerControl(user, networks);
       return;
     }
 
-    const networks = listNetworksForUser(user.id);
     if (networks.length === 0) {
       this.failRegistration('No IRC networks configured — add one in the web UI first');
       return;
@@ -993,19 +1355,17 @@ class BouncerSession {
       network = networks.find((n) => n.name.toLowerCase() === sel || String(n.id) === sel);
       if (!network) {
         this.failRegistration(
-          `Unknown network '${networkSel}' — available: ${networks.map((n) => n.name).join(', ')}`,
+          withNetworkList(
+            `Unknown network '${networkSel}' — available: `,
+            networks.map((n) => n.name),
+            this.wireTextBudget(),
+          ),
         );
         return;
       }
-    } else if (networks.length === 1) {
-      network = networks[0];
     } else {
-      this.failRegistration(
-        `Multiple networks — log in as ${user.username}/<network>. Available: ${networks
-          .map((n) => n.name)
-          .join(', ')}`,
-      );
-      return;
+      // Selector-less and capless: the guard above leaves exactly one network.
+      network = networks[0];
     }
     this.bindNetwork(user, network);
   }
@@ -1018,12 +1378,22 @@ class BouncerSession {
     // client attaches. A conn object stuck in 'disconnected' (e.g. its boot-
     // time connect was refused and retries ran out) is restarted — safe here
     // because this session hasn't attached any listeners to it yet.
+    // Which reason the last attempt left before this attach touched anything. A
+    // restart below supersedes it — but a restart that fails on the spot (a
+    // proxy or certificate refusal is synchronous) records a NEW one, which
+    // stands. The recording, not its text: the same host refusing the same
+    // certificate twice says the same words.
+    const errorBefore = ircManager.connectionErrorSeqFor(user.id, network.id);
     let conn = ircManager.getConnection(user.id, network.id);
+    let restarted = false;
     if (!conn) {
       conn = ircManager.startNetwork(user.id, network.id);
+      restarted = true;
     } else if (conn.state === 'disconnected') {
       conn = ircManager.restartNetwork(user.id, network.id, 'bouncer client attached');
+      restarted = true;
     }
+    const superseded = restarted ? errorBefore : 0;
     if (!conn) {
       this.failRegistration('Network is unavailable');
       return;
@@ -1033,10 +1403,18 @@ class BouncerSession {
     this.networkId = network.id;
     this.network = network;
     this.conn = conn;
+    this.noticedState = conn.state;
+    this.noticedError = ircManager.connectionError(user.id, network.id) || '';
     this.registered = true;
     this.clearRegTimer();
     attachToRegistry(this);
-    this.sendAttachBurst();
+    // Before the burst, so everything in it already follows the settled caps.
+    this.updateSupportedCaps(this.clientNick || '*');
+    // Before the burst too, so its 306 follows an AWAY sent before registration.
+    this.applyPendingAway();
+    this.sendAttachBurst(superseded);
+    // An attached client is the user being here, unless it said `AWAY *`.
+    evaluatePresence(this.userId);
     systemLog.log({
       userId: this.userId,
       scope: 'bouncer',
@@ -1045,45 +1423,44 @@ class BouncerSession {
     });
   }
 
+  // True if the client speaks the bouncer-networks extension at all. BIND needs
+  // the base cap, but for *explaining* an unbound connection either cap means
+  // the client can read the BOUNCER NETWORK lines and doesn't need the prose.
+  private knowsBouncerNetworks(): boolean {
+    return this.caps.has(CAP_BOUNCER_NETWORKS) || this.caps.has(CAP_BOUNCER_NETWORKS_NOTIFY);
+  }
+
   // Register a control (unbound) connection: authenticated, bound to no network.
   // It lives only in the global `sessions` set (no per-network registry); state
   // notifications reach it via the user-scoped fan-out in dispatchIrcEvent.
-  private registerControl(user: User): void {
+  private registerControl(user: User, networks: Network[]): void {
     this.userId = user.id;
     this.isControl = true;
     this.registered = true;
     this.clearRegTimer();
-    this.sendControlBurst();
+    this.updateSupportedCaps(this.clientNick || '*');
+    this.applyPendingAway();
+    this.sendControlBurst(user, networks);
+    // failRegistration used to console.warn the reason for the commonest
+    // misconfiguration (bare username, several networks). It no longer fails,
+    // so record the reason where an operator debugging "it connects but shows
+    // nothing" will look.
+    const reason =
+      networks.length === 0
+        ? 'no networks configured'
+        : this.caps.has(CAP_BOUNCER_NETWORKS)
+          ? 'client picks a network itself'
+          : `no network named, ${networks.length} available`;
     systemLog.log({
       userId: this.userId,
       scope: 'bouncer',
-      text: `Bouncer control connection from ${this.remoteIp}`,
+      text: `Bouncer control connection from ${this.remoteIp} (${reason})`,
     });
-  }
-
-  private verifyUser(username: string, secret: string): User | null {
-    // findUserByUsername folds case itself now, so the old explicit
-    // lowercase retry (IRC clients routinely lowercase the SASL username) is
-    // no longer needed.
-    const user = findUserByUsername(username);
-    const storedHash = user ? getPasswordHash(user.id) : null;
-    // Always run exactly one scrypt (against a dummy hash when the user is
-    // unknown or has no password) so login latency can't reveal whether the
-    // username exists — verifyPassword(_, null) would otherwise return instantly.
-    const passwordOk = verifyPassword(secret, storedHash ?? timingEqualizerHash());
-    if (!user) return null;
-    if (passwordOk && storedHash) return user;
-    const token = findActiveByHash(hashToken(secret));
-    if (token && token.userId === user.id && token.scope === 'read-write') {
-      touchLastUsed(token.id);
-      return user;
-    }
-    return null;
   }
 
   // --- attach burst ----------------------------------------------------------
 
-  private sendAttachBurst(): void {
+  private sendAttachBurst(superseded = 0): void {
     const conn = this.conn!;
     const requested = this.clientNick || conn.currentNick || 'user';
     const liveNick = conn.currentNick || requested;
@@ -1093,8 +1470,15 @@ class BouncerSession {
     // the network's own 001–005 when we have them so the client sees the real
     // ISUPPORT tokens (CHANTYPES/PREFIX/NETWORK drive its parsing).
     if (conn.state === 'connected' && conn.registrationLines.length > 0) {
+      // Saved at registration with the upstream's tags, so any per-delivery tag
+      // on them (msgid, batch) is stale by now. Like ZNC, the replay keeps at
+      // most `time`, and write() drops that too unless the client negotiated
+      // server-time (#892). The network's own FILEHOST never goes out: our
+      // clients upload with their Lurker credentials (filehostToken).
       for (const line of conn.registrationLines) {
-        this.write(rewriteNumericTarget(line, requested));
+        const tagged = restrictTags(line, (key) => key === 'time');
+        const out = tagged && withoutUpstreamFilehost(tagged);
+        if (out) this.write(rewriteNumericTarget(out, requested));
       }
     } else {
       this.writeWelcomeNumerics(requested);
@@ -1112,6 +1496,8 @@ class BouncerSession {
     if (this.caps.has(CAP_CHATHISTORY)) {
       extraIsupport.push(`CHATHISTORY=${MAX_CHATHISTORY}`, 'MSGREFTYPES=timestamp');
     }
+    const filehost = filehostToken(this.userId);
+    if (filehost) extraIsupport.push(filehost);
     if (extraIsupport.length > 0) {
       this.write(
         `:${SERVER_NAME} 005 ${liveNick} ${extraIsupport.join(' ')} :are supported by this server`,
@@ -1120,8 +1506,17 @@ class BouncerSession {
     this.write(`:${SERVER_NAME} 422 ${liveNick} :MOTD File is missing`);
 
     if (conn.state !== 'connected') {
+      // Why it's down, for a client that attached after it went: soju sends the
+      // same on attach (user.go:823). `superseded` is the reason this attach's
+      // own restart replaced — saying "not reconnecting automatically" would
+      // contradict the retry under way — while a reason that restart just
+      // recorded is about what's happening now, and is said.
+      const current = ircManager.connectionError(this.userId, this.networkId) || '';
+      const stale = ircManager.connectionErrorSeqFor(this.userId, this.networkId) === superseded;
+      const why = stale ? '' : current;
       this.notice(
-        `Network '${this.network?.name}' is ${conn.state}; channels will appear once it registers.`,
+        `Network '${this.network?.name}' is ${conn.state}; channels will appear once it registers.` +
+          (why ? ` ${why}` : ''),
       );
     } else {
       this.sendJoinBurst();
@@ -1132,20 +1527,95 @@ class BouncerSession {
     // registration completion for bound and control connections alike).
     if (this.caps.has(CAP_BOUNCER_NETWORKS_NOTIFY)) this.sendNetworkList();
 
+    // An account that's away says so, as ZNC does for a client that attaches
+    // (IRCNetwork.cpp:708), but after the channels: halloy keeps its own away
+    // state on each channel's member list.
+    if (!this.awayAnswered && accountIsAway(this.userId)) this.sendAwayReply(true);
+
     // Live relay attaches AFTER playback so replayed history and the live
     // stream don't interleave out of order.
     this.onRawUpstream = (event) => {
       if (this.closed || !event?.from_server || typeof event.line !== 'string') return;
+      // A disposed connection (a network edit, a reconnect) acts on nothing its
+      // socket still delivers (#936), so its raw listener doesn't route the
+      // line either: owner and answerer below would read null and let a reply
+      // to Lurker through. This session is dead with it (see liveConn()).
+      if (conn.disposed) return;
+      // An engine re-attach replays the session into the connection: the
+      // registration burst, LUSERS, MOTD and a JOIN for every channel. What of it
+      // reaches this client is decided below. The backlog after the replay is
+      // what the client missed, and comes through.
+      const replaying = !!conn.restoring;
+      if (!replaying) this.welcomed = true;
+      // A reply goes only to whoever asked for it: this client, another one,
+      // the user or Lurker (replyRouter.ts). The connection decided in its own
+      // raw listener, which runs before this one.
+      const owner = conn.replyOwner;
+      if (owner != null && owner !== 'unasked' && owner !== this) return;
+      // One side answers a CTCP request (IrcConnection.ctcpAnswerer, #932). A
+      // request Lurker answers, or nobody does, never reaches a client.
+      if (conn.ctcpAnswerer === 'lurker' || conn.ctcpAnswerer === 'nobody') return;
       // Some upstreams (Ergo always-on, a chained bouncer, echo-message relays)
       // reflect our OWN PRIVMSG/NOTICE back. dispatchIrcEvent already synthesizes
       // the self-echo, so drop the reflected copy to avoid a duplicate line.
       if (this.isReflectedSelfLine(event.line)) return;
-      const out = filterRelayLine(event.line, this.caps);
-      if (out) this.write(out);
+      // The time the connection gave this line, so a line without server-time
+      // goes out with the time its stored row has (IrcConnection.lineArrivedAt).
+      const relayedAt = conn.lineArrivedAt ?? new Date();
+      const monitorReplies = this.monitorRelay(event.line);
+      if (monitorReplies) {
+        for (const line of monitorReplies) this.write(line, relayedAt);
+        return;
+      }
+      const out = filterRelayLine(event.line);
+      if (!out) return;
+      // `out`, not event.line: irc-framework's raw line keeps its CRLF, which
+      // would end up on the channel name.
+      const joined = selfJoinChannel(out, this.currentNick());
+      // A replayed line reaches this client only if it's news.
+      // - A JOIN: only for a channel the client hasn't been sent a JOIN for.
+      //   irssi rebuilds any channel it gets a second self-JOIN for. A client
+      //   that attached while the link was down, or partway through the replay,
+      //   learns its channels this way.
+      // - The rest: only for a client that hasn't had a welcome.
+      if (replaying) {
+        const news = joined
+          ? !this.joinsSent.has(foldTargetFor(this.networkId, joined))
+          : !this.welcomed;
+        if (!news) return;
+      }
+      this.write(out, relayedAt);
+      // The network's own NAMES for a channel the burst held back: nothing more
+      // to send for it.
+      if (this.namesPending.size > 0) {
+        const names = parseClientLine(out);
+        if (names?.command === '366' && names.params[1]) {
+          this.namesPending.delete(foldTargetFor(this.networkId, names.params[1]));
+        }
+      }
+      if (joined) {
+        this.joinsSent.add(foldTargetFor(this.networkId, joined));
+        // A replayed JOIN brings no NAMES: the restore asks for them itself, and
+        // their replies are Lurker's. They follow once the connection has them.
+        if (replaying && conn.membersPending(joined)) {
+          this.namesPending.add(foldTargetFor(this.networkId, joined));
+        }
+        // The spec wants MARKREAD after our JOIN and before the channel's 366.
+        // The network's NAMES are relayed as they come, so right after the JOIN
+        // is it.
+        if (this.caps.has(CAP_READ_MARKER)) this.sendReadMarker(joined);
+      }
     };
     // irc-framework's Client is an eventemitter3, which has no listener-count
     // cap — several attached clients can listen on one upstream client freely.
     conn.client.on('raw', this.onRawUpstream);
+    // The network's caps can change under a live connection: its own CAP
+    // NEW/DEL, or a REQ Lurker sends after registration (#888).
+    this.onUpstreamCaps = () => {
+      if (!this.closed && !conn.disposed) this.updateSupportedCaps(this.currentNick() || '*');
+    };
+    conn.client.on('cap ack', this.onUpstreamCaps);
+    conn.client.on('cap del', this.onUpstreamCaps);
   }
 
   // --- control (unbound) connection ------------------------------------------
@@ -1164,15 +1634,35 @@ class BouncerSession {
   // Minimal welcome for a control connection: it binds no network, so no
   // registrationLines / JOIN / playback / relay. The bouncer-scoped ISUPPORT
   // omits BOUNCER_NETID (its absence is how a client detects control mode).
-  private sendControlBurst(): void {
+  private sendControlBurst(user: User, networks: Network[]): void {
     const nick = this.clientNick || 'user';
     this.writeWelcomeNumerics(nick);
+    const filehost = filehostToken(user.id);
     this.write(
-      `:${SERVER_NAME} 005 ${nick} NETWORK=${APP_NAME} CASEMAPPING=ascii :are supported by this server`,
+      `:${SERVER_NAME} 005 ${nick} NETWORK=${APP_NAME} CASEMAPPING=ascii${filehost ? ` ${filehost}` : ''} :are supported by this server`,
     );
+    // Say why nothing is here, ahead of the MOTD-missing line that closes the
+    // burst. A bouncer-networks client with networks to pick from needs no
+    // explanation (it's about to LISTNETWORKS/BIND), but an empty account gives
+    // it an empty list, and a client that knows nothing of the extension has
+    // landed somewhere it can't act on at all — that used to be a 464 carrying
+    // this same advice, so keep the advice now that registration succeeds.
+    if (networks.length === 0) {
+      this.notice('No IRC networks configured yet — add one in the web UI, then reconnect.');
+    } else if (!this.knowsBouncerNetworks()) {
+      this.notice(
+        withNetworkList(
+          `Not attached to a network — log in as ${user.username}/<network> to attach. Available: `,
+          networks.map((n) => n.name),
+          this.wireTextBudget(),
+        ),
+      );
+    }
     this.write(`:${SERVER_NAME} 422 ${nick} :MOTD File is missing`);
     // A -notify client gets the full network list up-front as a batch.
     if (this.caps.has(CAP_BOUNCER_NETWORKS_NOTIFY)) this.sendNetworkList();
+    // Away is the account's, so a control connection is told too.
+    if (!this.awayAnswered && accountIsAway(this.userId)) this.sendAwayReply(true);
   }
 
   // --- BOUNCER command -------------------------------------------------------
@@ -1193,7 +1683,7 @@ class BouncerSession {
     }
     // Binding needs an authenticated account. In our flow that means either SASL
     // already succeeded or a PASS is present to verify at CAP END.
-    if (!this.saslUser && !this.passRaw) {
+    if (!this.saslAuthenticated && !this.passRaw) {
       this.write(
         `:${SERVER_NAME} FAIL BOUNCER ACCOUNT_REQUIRED BIND :Authentication needed to bind to bouncer network`,
       );
@@ -1243,10 +1733,6 @@ class BouncerSession {
     }
   }
 
-  // Reply to LISTNETWORKS (and the initial -notify dump) with a BOUNCER NETWORK
-  // line per network. The soju.im/bouncer-networks batch wrapper (and its
-  // `@batch=` message tag) is only used when the client negotiated `batch` —
-  // otherwise we must not emit tags, so send the same lines unwrapped.
   // Run `fn(ref)` wrapped in a BATCH of the given type + params when the client
   // negotiated the `batch` cap (`ref` is the batch reference, or null unbatched
   // — IRCv3: no tags to clients that didn't ask). Mirrors soju's SendBatch.
@@ -1257,24 +1743,54 @@ class BouncerSession {
     if (ref) this.write(`:${SERVER_NAME} BATCH -${ref}`);
   }
 
+  // Reply to LISTNETWORKS (and the initial -notify dump) with a BOUNCER NETWORK
+  // line per network. The soju.im/bouncer-networks batch wrapper (and its
+  // `@batch=` message tag) is only used when the client negotiated `batch` —
+  // otherwise we must not emit tags, so send the same lines unwrapped. The list
+  // is everything the client now knows, so later notifications start from it.
   private sendNetworkList(): void {
+    this.networksSent.clear();
     this.withBatch('soju.im/bouncer-networks', [], (ref) => {
       const tag = ref ? `@batch=${ref} ` : '';
       for (const network of listNetworksForUser(this.userId)) {
-        const conn = ircManager.getConnection(this.userId, network.id);
-        const attrs = buildNetworkAttrs(network, {
-          state: bouncerNetworkState(conn?.state),
-          nickname: conn?.currentNick || network.nick,
-        });
-        this.write(`${tag}:${SERVER_NAME} BOUNCER NETWORK ${network.id} ${attrs}`);
+        const attrs = this.currentNetworkAttrs(network);
+        this.networksSent.set(network.id, attrs);
+        this.write(
+          `${tag}:${SERVER_NAME} BOUNCER NETWORK ${network.id} ${formatNetworkAttrs(attrs)}`,
+        );
       }
     });
   }
 
-  // Push an unsolicited (unbatched) network state change to a -notify client.
-  private notifyNetworkState(networkId: number, attrs: string): void {
-    if (this.closed || !this.caps.has(CAP_BOUNCER_NETWORKS_NOTIFY)) return;
-    this.write(`:${SERVER_NAME} BOUNCER NETWORK ${networkId} ${attrs}`);
+  private currentNetworkAttrs(network: Network): Map<string, string> {
+    const conn = ircManager.getConnection(this.userId, network.id);
+    return networkAttrs(network, {
+      state: bouncerNetworkState(conn?.state),
+      nickname: conn?.currentNick || network.nick,
+      error: ircManager.connectionError(this.userId, network.id),
+    });
+  }
+
+  // One of the account's networks was added, edited or deleted, or changed
+  // state (`network` is its row now, undefined once deleted). A client bound to
+  // it takes the new row, so its notices name the network right. A -notify
+  // client hears what changed since it was last told: every attribute of a
+  // network new to it, `*` for one it knew that's gone (soju's deleteNetwork).
+  onNetworkChanged(networkId: number, network: Network | undefined): void {
+    if (this.closed) return;
+    if (network && this.networkId === networkId) this.network = network;
+    if (!this.caps.has(CAP_BOUNCER_NETWORKS_NOTIFY)) return;
+    const sent = this.networksSent.get(networkId);
+    if (!network) {
+      if (!sent) return;
+      this.networksSent.delete(networkId);
+      this.write(`:${SERVER_NAME} BOUNCER NETWORK ${networkId} *`);
+      return;
+    }
+    const now = this.currentNetworkAttrs(network);
+    const update = networkAttrsUpdate(sent, now);
+    this.networksSent.set(networkId, now);
+    if (update) this.write(`:${SERVER_NAME} BOUNCER NETWORK ${networkId} ${update}`);
   }
 
   // --- CHATHISTORY (draft/chathistory) ---------------------------------------
@@ -1336,9 +1852,9 @@ class BouncerSession {
     // The set holds target_folded values — per-network folds since #707, so
     // the probe must fold the same way or a closed 'foo[m]' (stored 'foo{m}'
     // on an rfc1459 network) slips past and gets re-offered.
-    const targets = listActiveTargetsInWindow(this.networkId, isoA, isoB, limit).filter(
-      (t) => !closed.has(foldTargetFor(this.networkId, t.target)),
-    );
+    const targets = listActiveTargetsInWindow(this.networkId, isoA, isoB, limit, {
+      events: this.historyEvents(),
+    }).filter((t) => !closed.has(foldTargetFor(this.networkId, t.target)));
     this.withBatch('draft/chathistory-targets', [], (ref) => {
       const tag = ref ? `@batch=${ref} ` : '';
       for (const t of targets) {
@@ -1360,23 +1876,31 @@ class BouncerSession {
     limit: number,
   ): MessageEvent[] {
     const nid = this.networkId;
+    const events = this.historyEvents();
     // Only LATEST's bound can be `*` (unbounded); every other bound is a
     // timestamp by the time we get here (the parser rejects `*` elsewhere).
     const iso = (b: ChatBound): string | null => ('iso' in b ? b.iso : null);
     switch (sub) {
       case 'BEFORE':
-        return loadHistoryWindow(nid, target, null, iso(bound0), limit, { newestFirst: true });
+        return loadHistoryWindow(nid, target, null, iso(bound0), limit, {
+          newestFirst: true,
+          events,
+        });
       case 'AFTER':
-        return loadHistoryWindow(nid, target, iso(bound0), null, limit);
+        return loadHistoryWindow(nid, target, iso(bound0), null, limit, { events });
       case 'LATEST':
-        return loadHistoryWindow(nid, target, iso(bound0), null, limit, { newestFirst: true });
+        return loadHistoryWindow(nid, target, iso(bound0), null, limit, {
+          newestFirst: true,
+          events,
+        });
       case 'AROUND': {
         // Split the limit around the point: newest half before, earliest after.
         const afterLimit = Math.floor(limit / 2);
         const older = loadHistoryWindow(nid, target, null, iso(bound0), limit - afterLimit, {
           newestFirst: true,
+          events,
         });
-        const newer = loadHistoryWindow(nid, target, iso(bound0), null, afterLimit);
+        const newer = loadHistoryWindow(nid, target, iso(bound0), null, afterLimit, { events });
         return [...older, ...newer];
       }
       case 'BETWEEN': {
@@ -1387,6 +1911,7 @@ class BouncerSession {
         const ascending = (a ?? '') <= (b ?? '');
         return loadHistoryWindow(nid, target, ascending ? a : b, ascending ? b : a, limit, {
           newestFirst: !ascending,
+          events,
         });
       }
     }
@@ -1397,10 +1922,16 @@ class BouncerSession {
     this.withBatch('chathistory', [target], (ref) => {
       const lines = this.playbackLines(rows, target, isChannelName(target), {
         batchRef: ref ?? undefined,
-        withMsgid: true,
       });
       for (const line of lines) this.write(line);
     });
+  }
+
+  // For a draft/event-playback client, the event rows its history windows also
+  // hold (see historyFilter): everything but those naming our current nick.
+  private historyEvents(): HistoryEvents | null {
+    if (!this.caps.has(CAP_EVENT_PLAYBACK)) return null;
+    return { me: this.currentNick() || this.network?.nick || null };
   }
 
   // Parse a CHATHISTORY selector — `*` (LATEST only) or `timestamp=<iso>`. msgid
@@ -1485,21 +2016,79 @@ class BouncerSession {
     return DEFAULT_PREFIXES;
   }
 
+  // The channels `nick` shares with us, with its modes and account in each, for
+  // the client filter's CHGHOST fallback. Members are keyed by lowercased nick,
+  // the way IrcConnection stores them.
+  private sharedChannels(
+    nick: string,
+  ): Array<{ channel: string; modes: string[]; account?: string | null }> {
+    const key = nick.toLowerCase();
+    const shared: Array<{ channel: string; modes: string[]; account?: string | null }> = [];
+    for (const ch of this.conn?.channels.values() ?? []) {
+      const member = ch.members.get(key);
+      if (member) {
+        shared.push({ channel: ch.name, modes: member.modes || [], account: member.account });
+      }
+    }
+    return shared;
+  }
+
+  // Each channel's JOIN, topic and NAMES, built in their fullest form: an
+  // extended-join JOIN, every prefix, hostmasks where known. write() trims them
+  // to what the client negotiated, as it trims the network's own lines.
   private sendJoinBurst(): void {
     const conn = this.conn!;
+    this.welcomed = true;
     const nick = this.currentNick() || '*';
-    const prefixes = this.isupportPrefixes();
+    const realname = conn.client.user?.gecos || this.network?.realname || nick;
     for (const ch of conn.channels.values()) {
-      this.write(`:${this.selfPrefix()} JOIN ${ch.name}`);
+      // Our own account as this channel knows it, from our extended JOIN or ACCOUNT.
+      const account = ch.members.get(nick.toLowerCase())?.account;
+      const accountParam = typeof account === 'string' ? account : '*';
+      this.write(`:${this.selfPrefix()} JOIN ${ch.name} ${accountParam} :${realname}`);
+      this.joinsSent.add(foldTargetFor(this.networkId, ch.name));
       if (ch.topic) this.write(`:${SERVER_NAME} 332 ${nick} ${ch.name} :${ch.topic}`);
-      const names = Array.from(ch.members.values()).map(
-        (m) => memberPrefixSymbol(m.modes || [], prefixes) + m.nick,
-      );
-      for (const line of buildNamesLines(nick, ch.name, names)) this.write(line);
+      // After the topic and before NAMES, where soju sends it (forwardChannel).
+      this.sendReadMarker(ch.name);
+      // A channel whose NAMES the connection hasn't heard yet (a restore asks
+      // for them one channel at a time) gets its 353/366 once it has
+      // (onNamesHeard). An empty list now would stick: irssi takes a channel's
+      // members from the first NAMES only.
+      if (conn.membersPending(ch.name)) {
+        this.namesPending.add(foldTargetFor(this.networkId, ch.name));
+        continue;
+      }
+      this.sendNames(ch.name);
     }
   }
 
+  // A channel's 353 lines and 366, in their fullest form like the rest of the
+  // burst: every prefix, hostmasks where known.
+  private sendNames(channel: string): void {
+    // Folded the network's way: a restored channel can come back spelled
+    // differently under RFC1459 casemapping.
+    const ch = this.conn?.channelState(channel);
+    if (!ch) return;
+    const nick = this.currentNick() || '*';
+    const prefixes = this.isupportPrefixes();
+    const names = Array.from(ch.members.values()).map((m) => {
+      const mask = m.user && m.host ? `!${m.user}@${m.host}` : '';
+      return memberPrefixSymbols(m.modes || [], prefixes) + m.nick + mask;
+    });
+    for (const line of buildNamesLines(nick, ch.name, names)) this.write(line);
+  }
+
+  // The connection heard a channel's NAMES. If the burst held them back, they go
+  // out now, unless the network's own 353/366 already reached this client.
+  onNamesHeard(channel: string): void {
+    if (this.closed || !this.namesPending.delete(foldTargetFor(this.networkId, channel))) return;
+    this.sendNames(channel);
+  }
+
   private sendPlayback(): void {
+    // A draft/chathistory client fetches its own history, so replaying it here
+    // shows every line twice. soju skips it the same way (downstream.go:1841).
+    if (this.caps.has(CAP_CHATHISTORY)) return;
     const limit = playbackLimit();
     if (limit <= 0) return;
     const conn = this.conn!;
@@ -1526,7 +2115,7 @@ class BouncerSession {
     let budget = maxTotalPlaybackLines();
     for (const { target, isChannel } of targets) {
       if (budget <= 0) break;
-      const rows = listMessages(this.networkId, target, { limit });
+      const rows = listRecentMessages(this.networkId, target, limit);
       for (const line of this.playbackLines(rows, target, isChannel)) {
         this.write(line);
         if (--budget <= 0) break;
@@ -1537,23 +2126,95 @@ class BouncerSession {
   // Assemble the leading IRCv3 tag block for a replayed line, honoring the
   // client's negotiated caps. `batch` ties a line to an open BATCH; `time`
   // needs server-time; `msgid` needs message-tags.
-  private formatTags(opts: { time?: string; msgid?: number; batchRef?: string }): string {
+  private formatTags(opts: { time?: string; msgid?: string; batchRef?: string }): string {
     const tags: string[] = [];
     if (opts.batchRef) tags.push(`batch=${opts.batchRef}`);
     if (opts.time && this.caps.has('server-time')) tags.push(`time=${toIrcTime(opts.time)}`);
-    if (opts.msgid != null && this.caps.has('message-tags')) tags.push(`msgid=${opts.msgid}`);
+    if (opts.msgid && this.caps.has('message-tags')) {
+      tags.push(`msgid=${escapeTagValue(opts.msgid)}`);
+    }
     return tags.length > 0 ? `@${tags.join(';')} ` : '';
+  }
+
+  // A stored message as client lines, one per body line. As in the live
+  // multiline fallback (bouncerClientFilter.ts), blank lines are skipped and
+  // only the first line carries the msgid: halloy drops a later line that
+  // repeats an id as a duplicate.
+  private messageLines(
+    head: string,
+    bodies: string[],
+    tags: { time?: string; msgid?: string; batchRef?: string },
+  ): string[] {
+    const out: string[] = [];
+    for (const body of bodies) {
+      if (body === '') continue;
+      const block = this.formatTags(out.length === 0 ? tags : { ...tags, msgid: undefined });
+      out.push(`${block}${head} :${body}`);
+    }
+    return out;
+  }
+
+  // A stored event as the line the network sent it as, which is what soju
+  // replays. The JOIN is the plain form: an extended JOIN's realname isn't
+  // stored, and goguma would take an empty one as the user's. A row missing
+  // what its line needs gives none.
+  private eventLine(
+    row: MessageEvent,
+    bufferTarget: string,
+    tags: { time?: string; batchRef?: string },
+  ): string | null {
+    const nick = row.nick || '';
+    if (!nick) return null;
+    // Without a stored mask (mode and topic rows keep none), the bare name: a
+    // valid source for a user or a server alike, which is how a server sends
+    // its own MODE. Guessing a server from a dot fails for one named `localhost`
+    // (Copilot, #943).
+    const source = row.userhost?.includes('!') ? row.userhost : nick;
+    const head = `${this.formatTags(tags)}:${source}`;
+    const text = row.text ?? '';
+    // A reason is optional on PART, QUIT and KICK, so an empty one is left off
+    // rather than sent as an empty trailing parameter. TOPIC keeps its: an empty
+    // topic is a cleared one.
+    const reason = text ? ` :${text}` : '';
+    switch (row.type) {
+      case 'join':
+        return `${head} JOIN ${bufferTarget}`;
+      case 'part':
+        return `${head} PART ${bufferTarget}${reason}`;
+      case 'quit':
+        return `${head} QUIT${reason}`;
+      case 'nick':
+        return typeof row.newNick === 'string' && row.newNick
+          ? `${head} NICK ${row.newNick}`
+          : null;
+      case 'kick':
+        return typeof row.kicked === 'string' && row.kicked
+          ? `${head} KICK ${bufferTarget} ${row.kicked}${reason}`
+          : null;
+      case 'mode':
+        return text ? `${head} MODE ${bufferTarget} ${text}` : null;
+      case 'topic':
+        return `${head} TOPIC ${bufferTarget} :${text}`;
+    }
+    return null;
   }
 
   private playbackLines(
     rows: MessageEvent[],
     bufferTarget: string,
     isChannel: boolean,
-    opts: { batchRef?: string; withMsgid?: boolean } = {},
+    opts: { batchRef?: string } = {},
   ): string[] {
     const out: string[] = [];
     const selfNick = this.currentNick() || this.clientNick || '*';
     for (const row of rows) {
+      // Event rows are here only for a draft/event-playback client: the query
+      // decides (historyFilter).
+      if (HISTORY_EVENT_TYPES.includes(row.type)) {
+        const line = this.eventLine(row, bufferTarget, { time: row.time, batchRef: opts.batchRef });
+        if (line) out.push(line);
+        continue;
+      }
       if (row.type !== 'message' && row.type !== 'action' && row.type !== 'notice') continue;
       // Note: `fromIgnored` is deliberately NOT filtered here — the live relay
       // passes ignored senders through (ignore is a client-side Lurker feature,
@@ -1586,14 +2247,13 @@ class BouncerSession {
         row.type === 'action'
           ? [`\u0001ACTION ${row.text.replace(/\n/g, ' ')}\u0001`]
           : row.text.split('\n');
-      for (const body of bodies) {
-        const tags = this.formatTags({
+      out.push(
+        ...this.messageLines(`:${prefix} ${cmd} ${target}`, bodies, {
           time: row.time,
-          msgid: opts.withMsgid ? (row.id as number) : undefined,
+          msgid: networkMsgid(row),
           batchRef: opts.batchRef,
-        });
-        out.push(`${tags}:${prefix} ${cmd} ${target} :${body}`);
-      }
+        }),
+      );
     }
     return out;
   }
@@ -1610,6 +2270,60 @@ class BouncerSession {
       return null;
     }
     return live;
+  }
+
+  // MARKREAD reads or moves the account's read pointer for a buffer, the one the
+  // web and iOS apps share, as soju's handler does (downstream.go:3271). The
+  // pointer is a message id, so a time moves it to the newest message at or
+  // before that time. A time that moves nothing, and a MARKREAD without one, get
+  // the stored marker back.
+  private handleMarkRead(msg: ParsedClientLine): void {
+    const target = msg.params[0] ?? '';
+    if (!target) {
+      this.write(`:${SERVER_NAME} FAIL MARKREAD NEED_MORE_PARAMS :Missing parameters`);
+      return;
+    }
+    if (this.isControl || !this.networkId) {
+      this.write(
+        `:${SERVER_NAME} FAIL MARKREAD INTERNAL_ERROR ${target} :Cannot set read markers on the bouncer connection`,
+      );
+      return;
+    }
+    const lastReadId = getReadState(this.userId, this.networkId, target);
+    const bound = msg.params[1];
+    if (bound !== undefined) {
+      const iso = readMarkerBoundTime(bound);
+      if (!iso) {
+        this.write(`:${SERVER_NAME} FAIL MARKREAD INVALID_PARAMS ${bound} :Invalid timestamp`);
+        return;
+      }
+      const id = newestIdAtOrBefore(this.networkId, target, lastReadId, iso);
+      const lastRead =
+        id > 0 ? ircManager.markRead(this.userId, this.networkId, target, id) : lastReadId;
+      if (lastRead > lastReadId) {
+        // Every client on the network, this one included, has heard the move
+        // through ircManager's 'read-marker' event. The apps hear it as read-state.
+        const buffer = resolveBuffer(this.userId, this.networkId, target);
+        if (buffer) {
+          broadcastReadState(this.userId, this.networkId, buffer.target, lastRead, buffer.id);
+        }
+        return;
+      }
+    }
+    this.write(
+      `:${SERVER_NAME} MARKREAD ${target} ${readMarkerParam(this.networkId, target, lastReadId)}`,
+    );
+  }
+
+  // MARKREAD for one buffer, to a client that negotiated read markers. `param` is
+  // `timestamp=…` or `*`, passed in when several clients get the same move;
+  // without it, the account's current marker is looked up.
+  sendReadMarker(target: string, param?: string): void {
+    if (this.closed || !this.caps.has(CAP_READ_MARKER)) return;
+    const marker =
+      param ??
+      readMarkerParam(this.networkId, target, getReadState(this.userId, this.networkId, target));
+    this.write(`:${SERVER_NAME} MARKREAD ${target} ${marker}`);
   }
 
   private handleCommand(msg: ParsedClientLine): void {
@@ -1646,6 +2360,16 @@ class BouncerSession {
         // when the upstream is disconnected (a bouncer's whole point), bypassing
         // the liveConn() gate below.
         this.handleChatHistory(msg);
+        return;
+      case 'MARKREAD':
+        // The read pointer is Lurker's own state, so like CHATHISTORY this works
+        // with the network down.
+        this.handleMarkRead(msg);
+        return;
+      case 'AWAY':
+        // Away is the account's too, so it works on a control connection and
+        // with the network down.
+        this.handleAway(msg);
         return;
     }
 
@@ -1696,20 +2420,188 @@ class BouncerSession {
         }
         return;
       }
-      case 'AWAY': {
-        const message = (msg.params[0] || '').trim();
-        // Route through the canonical user-level away writers so the web UI
-        // and every other network connection stay in sync.
-        if (message) ircManager.setAwayAll(this.userId, message);
-        else ircManager.clearAwayAll(this.userId);
+      case 'MONITOR':
+        this.handleMonitor(conn, msg);
         return;
-      }
       default:
         // Everything else (MODE, TOPIC, WHOIS, WHO, NAMES, LIST, KICK, INVITE,
         // NICK, …) forwards verbatim; replies come back via the raw relay.
         this.relayRaw(conn, msg);
         return;
     }
+  }
+
+  // --- AWAY ------------------------------------------------------------------
+
+  // A client's AWAY is the account's /away, on every network, as in the web and
+  // iOS apps: `AWAY :<message>` sets it and a bare `AWAY` clears it. `AWAY *`
+  // (draft/pre-away) says this connection isn't the user, as goguma's background
+  // sync says, so it stops counting for auto-away and the account is left alone.
+  // The client always gets its 305 or 306, before registration too: irssi takes
+  // its own away state from them alone, and goguma waits for one.
+  private handleAway(msg: ParsedClientLine): void {
+    const message = (msg.params[0] || '').trim();
+    if (!this.registered) {
+      this.pendingAway = message;
+      this.awayAnswered = true;
+    } else {
+      const counted = this.countsAsPresent();
+      this.setAway(message);
+      if (this.countsAsPresent() !== counted) evaluatePresence(this.userId);
+    }
+    this.sendAwayReply(message !== '');
+  }
+
+  // What a client's AWAY does: to this client's presence, and to the account.
+  private setAway(message: string): void {
+    this.notPresent = message === '*';
+    if (this.notPresent) return;
+    if (message) ircManager.setAwayAll(this.userId, message, { origin: this });
+    else ircManager.clearAwayAll(this.userId, { origin: this });
+  }
+
+  // An AWAY sent before registration, now that the account is known.
+  private applyPendingAway(): void {
+    const pending = this.pendingAway;
+    this.pendingAway = null;
+    if (pending !== null) this.setAway(pending);
+  }
+
+  // Whether this client counts as the user being here (presence.ts): attached to
+  // a network, and not `AWAY *`. A control connection doesn't count, as in soju;
+  // goguma keeps one open beside its networks.
+  countsAsPresent(): boolean {
+    return this.registered && !this.closed && !this.isControl && !this.notPresent;
+  }
+
+  // RPL_NOWAWAY or RPL_UNAWAY.
+  sendAwayReply(away: boolean): void {
+    if (away) this.numeric('306', ':You have been marked as being away');
+    else this.numeric('305', ':You are no longer marked as being away');
+  }
+
+  // --- MONITOR ---------------------------------------------------------------
+
+  // A client's MONITOR changes its own list, not the network's, which Lurker and
+  // every attached client share. L and S answer from the client's list. This is
+  // soju's downstream MONITOR handler.
+  private handleMonitor(conn: IrcConnection, msg: ParsedClientLine): void {
+    const sub = (msg.params[0] || '').toUpperCase();
+    if (!sub) {
+      this.numeric('461', 'MONITOR :Not enough parameters');
+      return;
+    }
+    // A network without MONITOR has no such command, as in soju. That's only
+    // known once its registration burst is over, since the 005 naming MONITOR
+    // comes after the 001 that marks it connected. Until then the list is kept
+    // for the seed.
+    if (conn.state === 'connected' && conn.isupportComplete && !conn.useMonitor) {
+      this.numeric('421', 'MONITOR :Unknown command');
+      return;
+    }
+    const nick = this.currentNick() || this.clientNick || '*';
+    switch (sub) {
+      case '+': {
+        const targets = (msg.params[1] || '').split(',').filter(Boolean);
+        const cap = maxMonitorPerClient();
+        const overCap: string[] = [];
+        for (const target of targets) {
+          const key = target.toLowerCase();
+          if (this.monitored.has(key)) continue;
+          if (this.monitored.size >= cap) overCap.push(target);
+          else this.monitored.set(key, target);
+        }
+        if (overCap.length > 0) this.onMonitorDropped(overCap, cap);
+        conn.monitor.addHolder(this);
+        conn.syncMonitor();
+        // The network won't answer for a nick it already watched, so answer
+        // from its last word. One past the limit already got a 734.
+        let unanswered = false;
+        for (const target of targets) {
+          if (!this.monitored.has(target.toLowerCase())) continue;
+          const online = conn.monitor.status(target);
+          if (online === true) this.write(`:${SERVER_NAME} 730 ${nick} :${target}`);
+          else if (online === false) this.write(`:${SERVER_NAME} 731 ${nick} :${target}`);
+          else if (online === null) unanswered = true;
+        }
+        // A network needn't answer a MONITOR + for a nick it already lists, such
+        // as one a connect command added. So ask about any nick still without
+        // an answer, as Lurker's own adds do (#302).
+        if (unanswered) conn.monitor.requestStatus();
+        return;
+      }
+      case '-':
+        for (const target of (msg.params[1] || '').split(',')) {
+          this.monitored.delete(target.toLowerCase());
+        }
+        conn.syncMonitor();
+        return;
+      case 'C':
+        this.monitored.clear();
+        conn.syncMonitor();
+        return;
+      case 'L':
+        // One nick per line: halloy reads a 732 as a single nick.
+        for (const target of this.monitored.values()) {
+          this.write(`:${SERVER_NAME} 732 ${nick} :${target}`);
+        }
+        this.write(`:${SERVER_NAME} 733 ${nick} :End of MONITOR list`);
+        return;
+      case 'S':
+        // A nick the network hasn't answered for counts as offline, as in soju.
+        for (const target of this.monitored.values()) {
+          const code = conn.monitor.status(target) === true ? '730' : '731';
+          this.write(`:${SERVER_NAME} ${code} ${nick} :${target}`);
+        }
+        return;
+      default:
+        return;
+    }
+  }
+
+  monitorTargets(): Iterable<string> {
+    return this.monitored.values();
+  }
+
+  // Nicks that didn't fit, under the network's limit or maxMonitorPerClient:
+  // the client's MONITOR + failed for them.
+  onMonitorDropped(nicks: string[], limit: number): void {
+    const nick = this.currentNick() || this.clientNick || '*';
+    for (const target of nicks) {
+      this.monitored.delete(target.toLowerCase());
+      this.write(`:${SERVER_NAME} 734 ${nick} ${limit} ${target} :Monitor list is full`);
+    }
+  }
+
+  // The network's MONITOR replies, cut down to this client's nicks, one nick
+  // per line as soju sends them. null for any other line. A 732/733 answers a
+  // MONITOR L that no client sent upstream, so it's dropped.
+  private monitorRelay(line: string): string[] | null {
+    if (!/(^| )73[0-4] /.test(line)) return null;
+    const msg = parseClientLine(line);
+    if (!msg) return null;
+    const { command, params } = msg;
+    if (command === '732' || command === '733') return [];
+    if (command !== '730' && command !== '731' && command !== '734') return null;
+    const head = lineHead(line);
+    const out: string[] = [];
+    if (command === '734') {
+      // The network refused these nicks, so the client isn't watching them.
+      const [nick = '*', limit = '', targets = '', text = 'Monitor list is full'] = params;
+      for (const target of targets.split(',')) {
+        if (!this.monitored.delete(target.toLowerCase())) continue;
+        out.push(`${head}734 ${nick} ${limit} ${target} :${text}`);
+      }
+      return out;
+    }
+    const [nick = '*', targets = ''] = params;
+    for (const target of targets.split(',')) {
+      const name = target.split('!')[0];
+      if (name && this.monitored.has(name.toLowerCase())) {
+        out.push(`${head}${command} ${nick} :${target}`);
+      }
+    }
+    return out;
   }
 
   // Forward a parsed client line to the upstream, re-attaching its client-only
@@ -1720,7 +2612,40 @@ class BouncerSession {
   private relayRaw(conn: IrcConnection, msg: ParsedClientLine): void {
     const forward =
       msg.clientTags && !conn.supportsMessageTags() ? { ...msg, clientTags: undefined } : msg;
-    conn.raw(rebuildLine(forward));
+    // A query waits its turn on the connection, and its reply comes back to
+    // this client alone (replyRouter.ts).
+    conn.raw(rebuildLine(forward), this);
+  }
+
+  // A client's CTCP on its way to the network. Its VERSION reply gets " via
+  // Lurker <version>", as ZNC adds itself (Client.cpp:1378). Not once the user
+  // changed the VERSION reply or turned replies off: the request never reached
+  // the client then (IrcConnection.ctcpAnswererFor), and the suffix would give
+  // away the version they chose not to send.
+  private outgoingCtcp(command: string, text: string): string {
+    if (command !== 'NOTICE') return text;
+    const withVia = ctcpVersionVia(text, `${APP_NAME} ${APP_VERSION}`);
+    if (withVia === text) return text;
+    const changed = changedSettings(this.userId, CTCP_ANSWER_SETTINGS);
+    return ctcpAnsweredBySettings('VERSION', changed) ? text : withVia;
+  }
+
+  // The network's own lines answering this client's query, kept from an earlier
+  // reply: a MODE #chan, answered as soju and ZNC answer it. Their tags were
+  // another delivery's, so none survive.
+  replyFromCache(lines: string[]): void {
+    const nick = this.currentNick() || '*';
+    for (const line of lines) {
+      const out = restrictTags(line, () => false);
+      if (out) this.write(rewriteNumericTarget(out, nick));
+    }
+  }
+
+  // This client's query ended without its reply: the network went away, or
+  // never answered. Its end numeric, so a client waiting on it moves on (irssi's
+  // channel sync, gamja's WHO queue).
+  replyAborted(numeric: string, params: string[]): void {
+    this.numeric(numeric, [...params, ':Command aborted'].join(' '));
   }
 
   private handleClientMessage(msg: ParsedClientLine): void {
@@ -1751,10 +2676,11 @@ class BouncerSession {
     for (const target of targets) {
       const isAction = text.startsWith('\u0001ACTION ') || text.startsWith('\u0001ACTION\u0001');
       if (text.startsWith('\u0001') && !isAction) {
-        // Non-ACTION CTCP (VERSION, PING, replies…): forward on the wire
-        // untouched; these aren't conversation and don't persist. Spread msg so
-        // any client-only tags ride along (gated on upstream message-tags).
-        this.relayRaw(conn, { ...msg, params: [target, text] });
+        // Non-ACTION CTCP (VERSION, PING, replies…): forward on the wire; these
+        // aren't conversation and don't persist. A VERSION reply says Lurker
+        // carried it (outgoingCtcp). Spread msg so any client-only tags ride
+        // along (gated on upstream message-tags).
+        this.relayRaw(conn, { ...msg, params: [target, this.outgoingCtcp(msg.command, text)] });
         continue;
       }
       // /me actions and NOTICEs aren't encrypted yet, so ircManager refuses
@@ -1811,7 +2737,13 @@ class BouncerSession {
 
   // --- events from ircManager -------------------------------------------------
 
-  deliverSelfEcho(type: string, target: string, text: string, time: string | null): void {
+  deliverSelfEcho(
+    type: string,
+    target: string,
+    text: string,
+    time: string | null,
+    msgid?: string,
+  ): void {
     if (this.closed) return;
     this.prunePendingEcho();
     const key = echoKey(type, target, text);
@@ -1833,31 +2765,42 @@ class BouncerSession {
     // second command, so emit one client line per body line.
     const bodies =
       type === 'action' ? [`\u0001ACTION ${text.replace(/\n/g, ' ')}\u0001`] : text.split('\n');
-    for (const body of bodies) {
-      let line = `:${this.selfPrefix()} ${cmd} ${target} :${body}`;
-      if (this.caps.has('server-time') && time) line = `@time=${toIrcTime(time)} ${line}`;
+    const head = `:${this.selfPrefix()} ${cmd} ${target}`;
+    for (const line of this.messageLines(head, bodies, { time: time ?? undefined, msgid })) {
       this.write(line);
     }
   }
 
-  onUpstreamState(state: string): void {
+  onUpstreamState(state: string, error: string): void {
     if (this.closed) return;
+    // Batches the old upstream connection left open will never close.
+    this.clientFilter.resetBatches();
     // liveConn() closes us if the connection object was swapped out.
     if (!this.liveConn() || this.closed) return;
-    if (state === 'connected') this.notice(`Upstream reconnected to '${this.network?.name}'.`);
-    else if (state === 'reconnecting' || state === 'disconnected') {
-      this.notice(`Upstream ${state} ('${this.network?.name}') — Lurker will keep retrying.`);
+    // A connect brings the network's caps; a disconnect takes them away.
+    this.updateSupportedCaps(this.currentNick() || '*');
+    // A connection says its state again without a change: 'socket close' says
+    // disconnected with the reason and 'close' says it again with none. The
+    // same state with a NEW reason is news, though — a stopped retry re-asserts
+    // 'disconnected' to say why it stopped — so the reason, and only a reason,
+    // re-notices (soju dedupes on the error text alone, user.go:741).
+    if (state === this.noticedState && (!error || error === this.noticedError)) return;
+    this.noticedState = state;
+    this.noticedError = error;
+    const name = this.network?.name;
+    if (state === 'connected') this.notice(`Upstream connected to '${name}'.`);
+    else if (state === 'reconnecting') this.notice(`Upstream reconnecting to '${name}'.`);
+    else if (state === 'disconnected') {
+      // Never a promise to keep retrying: a ban, three failed SASL attempts, a
+      // policy stop and a manual disconnect all end here, and a retry that IS
+      // coming announces itself as 'reconnecting'. soju makes no such promise
+      // either, and says why (user.go:753). The reason is a sentence of its own.
+      this.notice(
+        error
+          ? `Upstream disconnected from '${name}': ${error}`
+          : `Upstream disconnected from '${name}'.`,
+      );
     }
-  }
-
-  // A -notify client's view of ANY of the user's networks changing state (both
-  // control and bound connections receive these). Emits only the changed
-  // attributes, soju-style (a connect also clears any prior error).
-  onNetworkNotify(networkId: number, connState: string): void {
-    if (this.closed) return;
-    const state = bouncerNetworkState(connState);
-    const attrs = state === 'connected' ? 'state=connected;error=' : `state=${state}`;
-    this.notifyNetworkState(networkId, attrs);
   }
 
   heartbeat(now: number): void {
@@ -1891,12 +2834,24 @@ class BouncerSession {
     if (this.onRawUpstream && this.conn) {
       try {
         this.conn.client.off('raw', this.onRawUpstream);
+        if (this.onUpstreamCaps) {
+          this.conn.client.off('cap ack', this.onUpstreamCaps);
+          this.conn.client.off('cap del', this.onUpstreamCaps);
+        }
       } catch {
         /* ignore */
       }
     }
     this.onRawUpstream = null;
+    this.onUpstreamCaps = null;
+    // Take this client's nicks off the network's list, except ones someone else
+    // still watches.
+    if (this.conn?.monitor.removeHolder(this)) this.conn.syncMonitor();
+    // Its queries go too, and replies to one already on the wire go nowhere.
+    this.conn?.replies.dropClient(this);
     sessions.delete(this);
+    // It may have been the last thing that counted as the user being here.
+    if (this.registered && !this.isControl) evaluatePresence(this.userId);
     if (this.registered && this.isControl) {
       systemLog.log({
         userId: this.userId,
@@ -1932,37 +2887,150 @@ class BouncerSession {
   }
 }
 
+// The text goes in without its formatting codes (#612): a channel in a
+// strip-formatting mode (UnrealIRCd +S, InspIRCd stripcolor) echoes a message
+// back with the codes gone, and a byte-exact key misses — which hands the
+// sender its own line a second time.
+//
+// ⚠ Two texts that differ only in formatting now share a key. For this session's
+// own sends that costs nothing: either echo consumes either entry. What it
+// widens is the existing hazard of a key nothing ever consumes — a send the
+// network refused (+m, a ban) leaves one behind, and the next message with the
+// same words from ANY surface (the web app, iOS, another client) is what
+// consumes it, so this session doesn't see that one. Before, only a byte-exact
+// repeat could do that; now a repeat that differs in formatting can too. The
+// 30s window is the bound on it, which is the reason not to lengthen it.
 function echoKey(type: string, target: string, text: string): string {
-  return `${type}\u0000${target.toLowerCase()}\u0000${text}`;
+  return `${type}\u0000${target.toLowerCase()}\u0000${stripFormatting(text)}`;
 }
 
 // ---------------------------------------------------------------------------
 // ircManager event fan-in
 // ---------------------------------------------------------------------------
 
+// MARKREAD's marker for a read pointer: `timestamp=` and the time of the message
+// it names (or of the one below it, if that row is gone), or `*` for none.
+function readMarkerParam(networkId: number, target: string, lastReadId: number): string {
+  const time = readMarkerTime(networkId, target, lastReadId);
+  return time ? `timestamp=${toIrcTime(time)}` : '*';
+}
+
+// The time in a client's `timestamp=` MARKREAD bound, as Lurker stores times, or
+// null. The fraction is optional: HexDroid formats with Java's Instant.toString(),
+// which drops a `.000`.
+function readMarkerBoundTime(bound: string): string | null {
+  const match = /^timestamp=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)$/.exec(bound);
+  const ms = match ? serverTimeMs(match[1]) : NaN;
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+}
+
+// The channel a relayed line has `nick` joining, or null for any other line.
+function selfJoinChannel(line: string, nick: string | null): string | null {
+  if (!nick || !/^JOIN /i.test(line.slice(lineHead(line).length))) return null;
+  const msg = parseLine(line);
+  const source = msg?.source?.split('!')[0];
+  if (!msg || !source || source.toLowerCase() !== nick.toLowerCase()) return null;
+  return msg.params[0] || null;
+}
+
+// A read pointer moved, in the apps or over IRC. Every client on that network
+// that negotiated read markers hears it, the one whose MARKREAD moved it included
+// (the spec's reply). The :server: and system buffers aren't IRC targets, and
+// neither is a `=nick` DCC chat — its buffer is deliberately invisible to
+// attached clients (they never see it in playback or CHATHISTORY TARGETS), so
+// a MARKREAD naming one would be the single place a name they can't resolve,
+// and must never PRIVMSG, still reached them.
+function dispatchReadMarker(move: ReadMarkerMove): void {
+  const { networkId, target } = move;
+  if (networkId == null || target.startsWith(':') || isDccChatTarget(target)) return;
+  const set = registry.get(registryKey(move.userId, networkId));
+  if (!set) return;
+  // The apps mark read on every line into a focused buffer, so the time is only
+  // looked up once some client here can take it.
+  let param: string | undefined;
+  for (const session of set) {
+    if (!session.caps.has(CAP_READ_MARKER)) continue;
+    param ??= readMarkerParam(networkId, target, move.lastReadId);
+    session.sendReadMarker(target, param);
+  }
+}
+
+// Whether the account is away, as the apps show it.
+function accountIsAway(userId: number): boolean {
+  const row = getUserAwayState(userId);
+  return !!row?.away_datetime && !row.back_datetime;
+}
+
+// The account's away turned on or off: in the apps, by auto-away, or from a
+// client. Every client of the account hears it as a 305 or 306, so irssi and
+// halloy stay in step. A client whose AWAY made the change sends its own.
+function dispatchAway(change: AwayChange): void {
+  for (const session of sessions) {
+    if (session.userId !== change.userId || !session.isRegistered()) continue;
+    if (session === change.origin) continue;
+    session.sendAwayReply(change.active);
+  }
+}
+
+// How many of a user's clients count as the user being here: on any network,
+// for auto-away (presence.ts), or on one, which is then left its CTCP requests
+// (attachedIrcClients.ts).
+function presentClientCount(userId: number, networkId?: number): number {
+  let n = 0;
+  for (const session of sessions) {
+    if (session.userId !== userId || !session.countsAsPresent()) continue;
+    if (networkId === undefined || session.networkId === networkId) n += 1;
+  }
+  return n;
+}
+
+// One of a user's networks was added, edited, deleted or changed state. The
+// clients bound to a deleted network are closed, as soju and ZNC close theirs;
+// every other client of the user hears of the change. Rare enough (a state
+// transition, a settings save) that reading the row and scanning is cheap.
+function dispatchNetworkChange(userId: number, networkId: number): void {
+  let network: Network | undefined;
+  let read = false;
+  for (const session of sessions) {
+    if (session.userId !== userId || !session.isRegistered()) continue;
+    if (!read) {
+      network = getNetwork(networkId, userId);
+      read = true;
+    }
+    if (!network && session.networkId === networkId) session.closeWithError('Network removed');
+    else session.onNetworkChanged(networkId, network);
+  }
+}
+
 function dispatchIrcEvent(event: Record<string, unknown>): void {
   const userId = Number(event.userId);
   const networkId = Number(event.networkId);
   if (!userId || !networkId) return;
   const type = String(event.type || '');
+  // The app's link to the engine dropped, or came back, while the engine kept
+  // the IRC socket open (IrcConnection's `engineLink`). The network itself never
+  // moved, so no client hears anything: a notice, a CAP DEL/NEW pair and a
+  // BOUNCER NETWORK update would all say something untrue.
+  if (type === 'state' && event.engineLink) return;
   // A -notify client (bound OR control) tracks state for ALL of the user's
-  // networks — including ones no bound session is attached to — so fan state
-  // events across every one of the user's sessions, before the per-network
-  // early-return below. State transitions are infrequent, so the scan is cheap.
-  if (type === 'state') {
-    const state = String(event.state || '');
-    for (const session of sessions) {
-      if (session.userId === userId && session.isRegistered()) {
-        session.onNetworkNotify(networkId, state);
-      }
-    }
-  }
+  // networks — including ones no bound session is attached to — so this goes to
+  // every one of the user's sessions, before the per-network early-return below.
+  if (type === 'state') dispatchNetworkChange(userId, networkId);
   const set = registry.get(registryKey(userId, networkId));
   if (!set || set.size === 0) return;
   if (type === 'state') {
     const state = String(event.state || '');
+    const error = typeof event.error === 'string' ? event.error : '';
     // Deleting from a Set mid-iteration is safe; handlers only ever remove.
-    for (const session of set) session.onUpstreamState(state);
+    for (const session of set) session.onUpstreamState(state, error);
+    return;
+  }
+  // The connection heard a channel's NAMES: a client whose attach burst held
+  // them back gets them now. A list published while they're still pending
+  // isn't them.
+  if (type === 'names' && !event.membersPending) {
+    const target = typeof event.target === 'string' ? event.target : '';
+    if (target) for (const session of set) session.onNamesHeard(target);
     return;
   }
   // Self-originated conversation (sent from the web UI, MCP, or another
@@ -1970,11 +3038,20 @@ function dispatchIrcEvent(event: Record<string, unknown>): void {
   if (!event.self) return;
   if (type !== 'message' && type !== 'action' && type !== 'notice') return;
   const target = typeof event.target === 'string' ? event.target : '';
-  if (!target || target.startsWith(':server:')) return;
+  // ⚠⚠ `=nick` is a DCC chat buffer, not an IRC target. Without this, a line the
+  // user types in the web UI is echoed to attached clients as `PRIVMSG =alice`,
+  // they open a query window named `=alice`, and a reply typed there comes back
+  // through handleClientMessage and onto the wire. This is the one remaining
+  // door in the "a `=` target never reaches IRC" invariant — playback,
+  // CHATHISTORY TARGETS and read markers all exclude these buffers already.
+  if (!target || target.startsWith(':server:') || isDccChatTarget(target)) return;
   const text = typeof event.text === 'string' ? event.text : '';
   if (!text) return;
   const time = typeof event.time === 'string' ? event.time : null;
-  for (const session of set) session.deliverSelfEcho(type, target, text, time);
+  // The msgid the row took from the network's echo (echo-message), so the client
+  // has the id history will give it.
+  const msgid = networkMsgid(event);
+  for (const session of set) session.deliverSelfEcho(type, target, text, time, msgid);
 }
 
 /**
@@ -1989,13 +3066,25 @@ function dispatchIrcEvent(event: Record<string, unknown>): void {
  */
 export function dropSessionsForUser(userId: number, reason: string): void {
   for (const session of sessions) {
-    // Deliberately NOT gated on isRegistered(). userId is assigned at PASS-time
-    // auth, but a session isn't "registered" until NICK/USER completes — and it
-    // gets a 60s grace to get there. Skipping those left a hole: authenticate,
-    // stall before NICK/USER, wait out the recovery, then finish registering and
-    // arrive attached to an account that was just recovered. The isRegistered()
-    // filter belongs to the count/dispatch callers, not to revocation.
+    // Deliberately NOT gated on isRegistered(). A SASL login sets userId when it
+    // succeeds, but the session isn't registered until CAP END, and it gets a
+    // 60s grace to get there. Skipping those left a hole: authenticate, stall,
+    // wait out the recovery, then finish registering and arrive attached to an
+    // account that was just recovered (#914). The isRegistered() filter belongs
+    // to the count/dispatch callers, not to revocation.
     if (session.userId === userId) session.closeWithError(reason);
+  }
+}
+
+/**
+ * Close every bouncer session that authenticated with an API token, registered
+ * or not: the api-tokens revoke route calls this, so a revoked token stops
+ * working on the connections it already opened (#914). The account's other
+ * sessions, on its password or another token, stay up.
+ */
+export function dropSessionsForApiToken(tokenId: number, reason: string): void {
+  for (const session of sessions) {
+    if (session.apiTokenId === tokenId) session.closeWithError(reason);
   }
 }
 
@@ -2009,27 +3098,19 @@ let certReloadTimer: ReturnType<typeof setInterval> | null = null;
 // Paths + current fingerprint of the live TLS cert, so the reload poll can
 // detect a renewed cert on disk and swap it in without a restart. null =
 // plaintext listener.
-let bouncerTlsState: { certPath: string; keyPath: string; fingerprint: string } | null = null;
+let bouncerTlsState: {
+  certPath: string;
+  keyPath: string;
+  fingerprint: string;
+  source: 'configured' | 'self-signed';
+} | null = null;
+
 let onIrcEvent: ((event: Record<string, unknown>) => void) | null = null;
+let onReadMarker: ((move: ReadMarkerMove) => void) | null = null;
+let onAway: ((change: AwayChange) => void) | null = null;
 let onUserDisposed: ((payload: { userId: number }) => void) | null = null;
 let onUserSuspended: ((payload: { userId: number }) => void) | null = null;
-
-export function isBouncerEnabled(): boolean {
-  return /^(1|true|yes|on)$/i.test((process.env.LURKER_BOUNCER_ENABLED || '').trim());
-}
-
-export function bouncerPort(): number {
-  const p = Number(process.env.LURKER_BOUNCER_PORT);
-  return Number.isInteger(p) && p > 0 ? p : 6667;
-}
-
-// Optional bind address (LURKER_BOUNCER_BIND). Unset binds every interface —
-// pair the default with TLS or a private network; plain-text IRC carries the
-// login credential.
-export function bouncerBindHost(): string | undefined {
-  const host = (process.env.LURKER_BOUNCER_BIND || '').trim();
-  return host || undefined;
-}
+let onNetworkChanged: ((payload: { userId: number; networkId: number }) => void) | null = null;
 
 function playbackLimit(): number {
   const n = Number(process.env.LURKER_BOUNCER_PLAYBACK);
@@ -2046,6 +3127,15 @@ export function maxTotalPlaybackLines(): number {
   return Math.floor(n);
 }
 
+// Ceiling on one client's MONITOR list, as soju has. While the network is up
+// its own limit trims the list sooner; this bounds it while the network is down
+// and the list waits for the seed.
+export function maxMonitorPerClient(): number {
+  const n = Number(process.env.LURKER_BOUNCER_MAX_MONITOR);
+  if (!Number.isFinite(n) || n <= 0) return 1000;
+  return Math.floor(n);
+}
+
 // Backstops against unbounded attach connections — a valid login can otherwise
 // open arbitrarily many sessions (fd/memory exhaustion). Generous by default;
 // operators tune via env. Per-user counts a user's sessions across all networks.
@@ -2059,12 +3149,6 @@ export function maxSessionsTotal(): number {
   const n = Number(process.env.LURKER_BOUNCER_MAX_SESSIONS);
   if (!Number.isFinite(n) || n <= 0) return 512;
   return Math.floor(n);
-}
-
-// Plaintext IRC ships the login credential in the clear, so TLS is the default.
-// Only an explicit LURKER_BOUNCER_TLS=off (0/false/no/off) turns it off.
-function bouncerTlsDisabled(): boolean {
-  return /^(0|false|no|off)$/i.test((process.env.LURKER_BOUNCER_TLS || '').trim());
 }
 
 function isLoopbackBind(host: string | undefined): boolean {
@@ -2163,6 +3247,9 @@ export function reloadBouncerTls(): 'reloaded' | 'unchanged' | 'skipped' | 'erro
     }
     (server as tls.Server).setSecureContext({ cert, key });
     bouncerTlsState.fingerprint = fingerprint;
+    // Settings → Bouncer shows this for a member to check against, so a renewal
+    // has to move it: a stale one has them pinning a certificate that's gone.
+    setBouncerTlsState({ selfSigned: bouncerTlsState.source === 'self-signed', fingerprint });
     console.log(`[bouncer] reloaded TLS certificate (SHA-256 ${fingerprint})`);
     systemLog.log({
       scope: 'bouncer',
@@ -2206,12 +3293,18 @@ export async function startBouncer(
       certPath: tlsInfo.certPath,
       keyPath: tlsInfo.keyPath,
       fingerprint: tlsInfo.fingerprint,
+      source: tlsInfo.source,
     };
+    setBouncerTlsState({
+      selfSigned: tlsInfo.source === 'self-signed',
+      fingerprint: tlsInfo.fingerprint,
+    });
     certReloadTimer = setInterval(() => reloadBouncerTls(), CERT_RELOAD_INTERVAL_MS);
     certReloadTimer.unref?.();
   } else {
     server = net.createServer(onConnection);
     bouncerTlsState = null;
+    setBouncerTlsState(null);
   }
   server.on('error', (err) => {
     console.warn(`[bouncer] listener error: ${(err as Error).message}`);
@@ -2240,10 +3333,20 @@ export async function startBouncer(
 
   onIrcEvent = (event) => dispatchIrcEvent(event as Record<string, unknown>);
   ircManager.on('event', onIrcEvent);
+  onReadMarker = (move) => dispatchReadMarker(move);
+  ircManager.on('read-marker', onReadMarker);
+  onAway = (change) => dispatchAway(change);
+  ircManager.on('away', onAway);
+  // An attached client counts as the user being here, for auto-away, and is
+  // left the CTCP requests on its network.
+  setPresenceSource('irc', presentClientCount);
+  setAttachedIrcClientCounter(presentClientCount);
   onUserDisposed = ({ userId }) => dropSessionsForUser(userId, 'Account removed');
   onUserSuspended = ({ userId }) => dropSessionsForUser(userId, 'Account paused');
   ircManager.on('user-disposed', onUserDisposed);
   ircManager.on('user-suspended', onUserSuspended);
+  onNetworkChanged = ({ userId, networkId }) => dispatchNetworkChange(userId, networkId);
+  ircManager.on('network-changed', onNetworkChanged);
 
   heartbeatTimer = setInterval(() => {
     const now = Date.now();
@@ -2263,10 +3366,21 @@ export function stopBouncer(): void {
     certReloadTimer = null;
   }
   bouncerTlsState = null;
+  setBouncerTlsState(null);
   if (onIrcEvent) {
     ircManager.off('event', onIrcEvent);
     onIrcEvent = null;
   }
+  if (onReadMarker) {
+    ircManager.off('read-marker', onReadMarker);
+    onReadMarker = null;
+  }
+  if (onAway) {
+    ircManager.off('away', onAway);
+    onAway = null;
+  }
+  setPresenceSource('irc', null);
+  setAttachedIrcClientCounter(null);
   if (onUserDisposed) {
     ircManager.off('user-disposed', onUserDisposed);
     onUserDisposed = null;
@@ -2274,6 +3388,10 @@ export function stopBouncer(): void {
   if (onUserSuspended) {
     ircManager.off('user-suspended', onUserSuspended);
     onUserSuspended = null;
+  }
+  if (onNetworkChanged) {
+    ircManager.off('network-changed', onNetworkChanged);
+    onNetworkChanged = null;
   }
   for (const session of sessions) session.destroy('Server shutting down');
   if (server) {

@@ -9,7 +9,7 @@ import type { LogLine } from './systemLog.js';
 import type { MessageEvent } from '../db/messages.js';
 import type { PageUnit } from '../../shared/eventFilter.js';
 import { asPageUnit } from '../../shared/eventFilter.js';
-import { isChannelTarget } from '../../shared/channels.js';
+import { dccChatPeer, isChannelTarget, isDccChatTarget } from '../../shared/channels.js';
 import { WS_CLOSE_SESSION_REVOKED } from '../../shared/wsCloseCodes.js';
 import { WebSocketServer } from 'ws';
 import cookie from 'cookie';
@@ -44,6 +44,7 @@ import {
   listSpeakers,
   countNewer,
   countServerBufferUnread,
+  COUNTABLE_TYPES,
   countHighlightsNewer,
   maxIdByBuffer,
   maxIdForBuffer,
@@ -53,7 +54,6 @@ import {
 import {
   listReadStateForUser,
   getReadState,
-  setReadState,
   listClearedStateForUser,
   getClearedState,
   setClearedState,
@@ -106,13 +106,20 @@ import {
   getChannelFlags,
 } from '../db/channelNotify.js';
 import { getUserAwayState } from '../db/userAwayState.js';
+import {
+  evaluatePresence,
+  clearAutoAway,
+  rescheduleAutoAway,
+  setPresenceSource,
+} from './presence.js';
+import { isValidTimeZone, wallClockParts } from '../utils/timeZone.js';
 import { ownsNetwork, listNetworksForUser } from '../db/networks.js';
 import * as chanlistDb from '../db/chanlist.js';
 import { getUserSettings } from '../db/settings.js';
 import { defaultsAsObject, validate } from './settingsRegistry.js';
 import { setBufferRetentionById } from '../db/bufferRetention.js';
 import { markBufferDirty } from '../db/retention.js';
-import { SESSION_COOKIE, loadBearerSession } from '../middleware/auth.js';
+import { SESSION_COOKIE, loadBearerCredential } from '../middleware/auth.js';
 import { PROTOCOL_VERSION, MIN_PROTOCOL_VERSION } from '../protocol.js';
 import { isAllowedBrowserOrigin } from '../utils/corsOrigins.js';
 import { callVerb } from './verbRegistry.js';
@@ -156,6 +163,10 @@ interface LurkerWebSocket extends WebSocket {
   // the first message; see allowInboundMessage.
   floodTokens?: number;
   floodRefilledAt?: number;
+  // The OAuth access token this socket authenticated with (#891), or undefined
+  // for a session. Access is identical either way; this exists only so revoking
+  // an app can find and close the sockets its token opened, and nothing else.
+  oauthTokenId?: number;
 }
 
 // #574: cap a single inbound WS frame. The library default is 100 MB; client→
@@ -349,6 +360,12 @@ interface FanOutOpts {
 interface DecoratedEvent extends MessageEvent {
   dm: boolean;
   notifyAlways: boolean;
+  /** This kick was of US — the signal behind the `kicked` push kind (#968).
+   *  Absent (not `false`) on everything else, matching the producer in
+   *  ircConnection and the reasoning behind `msgid`/`bookmarked`: a snapshot
+   *  ships ~200 rows per buffer across every buffer, and a `false` on each one
+   *  is pure wire weight for a flag that is true on almost no row. */
+  selfKicked?: true;
   notify: boolean;
   kind: string;
 }
@@ -357,67 +374,6 @@ function effectiveSetting(userId: number, key: string): unknown {
   const overrides = getUserSettings(userId) as Record<string, unknown>;
   if (key in overrides) return overrides[key];
   return (defaultsAsObject() as Record<string, unknown>)[key];
-}
-
-function isValidTimeZone(tz: unknown): tz is string {
-  if (!tz || typeof tz !== 'string') return false;
-  try {
-    // Called without `new` purely for validation — it throws RangeError on an
-    // unknown time zone, which the catch below turns into a false return.
-    Intl.DateTimeFormat('en-US', { timeZone: tz });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Wall-clock parts (year/month/day/hour/minute/second) of `date` in the given
-// IANA timezone, or in the server's local zone when `timeZone` is falsy/invalid.
-function wallClockParts(date: Date, timeZone: string | null): Record<string, string> {
-  const dtf = new Intl.DateTimeFormat('en-US', {
-    ...(timeZone ? { timeZone } : {}),
-    hour12: false,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
-  const out: Record<string, string> = {};
-  for (const p of dtf.formatToParts(date)) if (p.type !== 'literal') out[p.type] = p.value;
-  // Some locales render midnight as "24" instead of "00"; normalize so the
-  // offset math below doesn't blow up on Date.UTC.
-  if (out.hour === '24') out.hour = '00';
-  return out;
-}
-
-function tzOffsetMinutes(date: Date, timeZone: string | null): number {
-  if (!timeZone) return -date.getTimezoneOffset();
-  const p = wallClockParts(date, timeZone);
-  const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
-  return Math.round((asUTC - date.getTime()) / 60000);
-}
-
-const pad = (n: number) => String(n).padStart(2, '0');
-
-// "afk since 2026-05-09 15:30:00-0500" — mirrors screen_away.py's default
-// time_format. Renders in `timeZone` when provided, otherwise server local.
-function fmtAwayTimestamp(date: Date, timeZone: unknown): string {
-  const tz = isValidTimeZone(timeZone) ? timeZone : null;
-  const p = wallClockParts(date, tz);
-  const off = tzOffsetMinutes(date, tz);
-  const sign = off >= 0 ? '+' : '-';
-  const aoff = Math.abs(off);
-  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}${sign}${pad(Math.floor(aoff / 60))}${pad(aoff % 60)}`;
-}
-
-function buildAutoAwayMessage(userId: number, since: Date): string {
-  const base =
-    ((effectiveSetting(userId, 'away.auto.message') as string | undefined) || 'afk').trim() ||
-    'afk';
-  const tz = effectiveSetting(userId, 'system.timezone');
-  return `${base} since ${fmtAwayTimestamp(since, tz)}`;
 }
 
 // HH:MM (24h) into minutes-past-midnight, or null on a malformed value. The
@@ -567,7 +523,7 @@ export function bufferNotifyAlways(
 // pass the notify-always answer in, instead of paying a DB point query per row
 // for a value that's constant across the slice (#679 — 52k lookups / 51.9ms on
 // a 104-buffer resume, vs 19 lookups / 0.047ms hoisted). Only the DB answer is
-// hoisted; the per-event guards below (CTCP, self, channel) still run per row.
+// hoisted; the per-event guards below (type, self, channel) still run per row.
 // Omit it on the single-event live path, which is what the function was written
 // for, and on any slice spanning multiple buffers (search results) where the
 // answer genuinely varies per row.
@@ -581,20 +537,47 @@ export function decorateMessage(
   const dm = isDirect(event) && !event.self;
   const target = event.target || '';
   const isChannel = notifyAlwaysApplies(target);
-  // CTCP request/reply/echo lines are status, not conversation — never notify,
-  // even when routed to a notify-always channel (otherwise running /ctcp from
-  // such a channel would self-notify on your own echo). (#263)
-  const isStatus = event.type === 'ctcp';
+  // Only conversation can notify. Every event a connection publishes reaches
+  // here — persisted or ephemeral, `names` and `typing` and `channel-modes`
+  // alongside real chat — and notify-always says "every message in this
+  // channel", not "every frame about it". Without this gate the bell turned
+  // nicklist and lifecycle churn into notifications, and the nick-less ones
+  // (a `names` republish from away-notify, a channel-scoped `error`) pushed as
+  // "someone in #channel" with an empty body (#965).
+  //
+  // COUNTABLE_TYPES is already the "this line is conversation" set — the one a
+  // channel's unread count uses — so the two can't drift into disagreeing about
+  // what a user is meant to be told about. (`:server:` counts `error` on top of
+  // it, which never reaches here: notifyAlwaysApplies excludes that target.) It
+  // subsumes the older CTCP exclusion (request/reply/echo lines are status, and
+  // running /ctcp from a notify-always channel would otherwise self-notify on
+  // your own echo, #263), and leaves the DM and highlight paths exactly where
+  // they were: DM_ELIGIBLE_TYPES and matchEvent's eligible types are both
+  // subsets of it.
+  //
+  // It also takes the PERSISTED lifecycle rows — join/part/quit/nick/mode/
+  // topic/kick — out of the bell. They carry a real nick, so they pushed as
+  // "bob in #channel" with an empty body: a join flood in a belled channel was
+  // a notification each. That's the right trade for a toggle whose promise is
+  // "every message in this channel".
+  const isConversation = COUNTABLE_TYPES.has(event.type);
   const notifyAlways =
-    !isStatus &&
+    isConversation &&
     isChannel &&
     !event.self &&
     // `??`, not `||`: a hoisted `false` is a real answer and must not fall
     // through to the query it was computed to replace.
     (channelNotifyAlways ?? getChannelNotifyAlways(userId, event.networkId, target));
-  // Content says this line is notification-worthy: a highlight, a DM, or a
-  // notify-always channel.
-  const contentNotify = !isStatus && (matched || dm || notifyAlways);
+  // Being kicked is the one event ABOUT you that isn't conversation, so it sits
+  // outside the gate above rather than inside it (#968). It's a signal in its
+  // own right, not a channel one: it fires whether or not the bell is on, for
+  // the same reason a DM does — the channel vanishing from your sidebar with no
+  // word is the thing people were asking not to happen. ircConnection decides
+  // `selfKicked`, since only it knows the nick we were wearing at the time.
+  const selfKicked = event.type === 'kick' && !!event.selfKicked;
+  // Content says this line is notification-worthy: a highlight, a DM, a
+  // notify-always channel, or a kick of us.
+  const contentNotify = (isConversation && (matched || dm || notifyAlways)) || selfKicked;
   // Fold the ignore/mute veto into `notify` so it is the single authoritative
   // "alert the user" gate every consumer can trust — push, the web toast, and
   // native clients all read this one flag instead of each re-deriving the
@@ -624,6 +607,12 @@ export function decorateMessage(
     matchedRuleId,
     dm,
     notifyAlways,
+    // `|| undefined`, not a conditional spread: `...event` may already carry a
+    // raw `selfKicked`, and every other signal here OVERWRITES what came in
+    // rather than letting it through. Undefined both clears a stray one and
+    // drops out of JSON.stringify, so the flag costs nothing on the wire for
+    // the ~every row where it doesn't apply.
+    selfKicked: selfKicked || undefined,
     notify,
     kind: event.kind ?? '',
   } as DecoratedEvent;
@@ -1647,6 +1636,133 @@ export function fanOutToUser(userId: number, payload: WsPayload, opts: FanOutOpt
   fanOut(userId, payload, opts);
 }
 
+// Single path for "tell every tab of this user what the buffer's unread
+// counts are now." Used by mark-read echo, by the live IRC-event fan-out, and
+// by the bouncer when an attached IRC client's MARKREAD moves the pointer — the
+// client doesn't increment locally anymore, so this is the only source of badge
+// state.
+// `bufferId` is threaded from callers that already hold it (the live pipe's
+// decorated event, an id-addressed mark-read) — this runs per countable
+// event, so the resolve is a fallback, not a habit.
+export function broadcastReadState(
+  userId: number,
+  networkId: number | null,
+  target: string,
+  lastReadId: number,
+  bufferId?: number | null,
+): void {
+  const counts = computeUnreadFor(userId, networkId, target, lastReadId);
+  fanOut(userId, {
+    kind: 'read-state',
+    networkId,
+    target,
+    bufferId:
+      bufferId !== undefined ? bufferId : (resolveBuffer(userId, networkId, target)?.id ?? null),
+    lastReadId: counts.lastReadId,
+    unread: counts.unread,
+    highlights: counts.highlights,
+    highlightsCapped: counts.highlightsCapped,
+  });
+}
+
+/**
+ * Close a buffer: the whole of what `/close`, the Close menu item and a
+ * bouncer client's second PART all mean. One implementation because the
+ * bookkeeping is easy to half-do — a close that forgets the pin leaves an
+ * invisible orphan, one that forgets the PART leaves the channel joined.
+ *
+ * ⚠ The PART is gated on MEMBERSHIP, which is what makes a close of a channel
+ * we already left silent on the wire. Parting a channel the server knows we
+ * are not on answers 442, and that 442 reaches every attached bouncer client
+ * (it answers no tracked query, so replyRouter calls it 'unasked') as well as
+ * the server buffer, where it badges the tab — so closing the window of a
+ * channel some other client had already parted reported an error for a
+ * command the user never issued (#967). gamja gates its own close the same
+ * way (`if (buf.joined)`, app.js), and ZNC never forwards a PART for a
+ * channel it isn't on (CClient::OnPartMessage).
+ *
+ * Autojoin comes down either way: partChannel lowers it, and with no
+ * connection (or no membership) this does it directly, so a closed channel
+ * doesn't come back on the next connect. Update-only — closing a buffer that
+ * has no row must never conjure one.
+ */
+export function closeBuffer(
+  userId: number,
+  networkId: number,
+  target: string,
+  opts: { reason?: string; bufferId?: number | null; originWs?: unknown } = {},
+): void {
+  // Resolved BEFORE the close so the buffer-closed frame can carry the id even
+  // though the row's state just flipped.
+  const closedBufferId = opts.bufferId ?? resolveBuffer(userId, networkId, target)?.id ?? null;
+  closeBufferRow(userId, networkId, target);
+  // A `=nick` DCC chat's buffer IS the chat, so closing it ends the session —
+  // or cancels our pending offer, or declines theirs, whichever is there. irssi
+  // does the same when a `=nick` window closes (fe-dcc-chat.c:198-210), and so
+  // does WeeChat (xfer_chat_buffer_close_cb). Before this, Close only hid the
+  // buffer: the chat ran on out of sight, and came back the next time the peer
+  // spoke.
+  //
+  // ⚠ AFTER the row closes. Ending writes "DCC chat with bob closed." into the
+  // buffer, and the live filter drops a non-reopening event for a closed buffer
+  // (reopensClosedBuffer), so no client sees it. Ended first, the line went out
+  // while the row was still open — and a client that had already removed the row
+  // on Close (iOS does, optimistically) minted it again from that line until
+  // buffer-closed arrived.
+  const dccPeer = dccChatPeer(target);
+  if (isDccChatTarget(target) && dccPeer) ircManager.dccChatClose(userId, networkId, dccPeer);
+  // The client renders the pinned section by intersecting pins with open
+  // buffers, so a pin on a now-closed buffer is invisible — and leaving the
+  // row would diverge the client's pin set from ours (issue #112). Close
+  // implies unpin. Match case-insensitively: the registry hides closed buffers
+  // folded, so a differently-cased close would otherwise hide the buffer while
+  // leaving the exact-cased pin row stranded — an invisible orphan (issue #405).
+  if (unpinBufferCaseInsensitive(userId, networkId, target)) {
+    fanOut(userId, pinsChangedFrame(userId, networkId));
+  }
+  // Same reasoning for favorites: the sections render favorites ∩ open
+  // buffers, so a favorite on a closed buffer is an invisible orphan.
+  // Close implies unfavorite.
+  if (unfavoriteBuffer(userId, networkId, target)) {
+    fanOut(userId, favoritesChangedFrame(userId));
+  }
+  if (isChannelTarget(target)) {
+    const conn = ircManager.getConnection(userId, networkId);
+    // mayBeJoined, not isChannelJoined: a close owes a PART for a channel we
+    // are about to be in as well as one we are in, since the channels map
+    // reads "no" between a JOIN and its echo. Without that, closing in the
+    // gap sent nothing, the echo reopened the buffer (reopensClosedBuffer)
+    // and the user was left in a channel they had just closed.
+    //
+    // Nothing goes out mid-restore, though — hence the explicit `restoring`
+    // check rather than leaving it to membership. The map is PRUNED against
+    // the engine's channel set on `attached`, not cleared, so after a link
+    // blip we still read as joined and would PART here; the replay then PARTs
+    // the same channel again for its closed row, and one of the two draws the
+    // 442. The replay's is the one that's owed: lowering the flag IS the
+    // close, and the PART follows when that channel's JOIN is replayed. A
+    // reconnect's gap is a third thing again — there the socket really died,
+    // we really are out, and the lowered autojoin is all that's owed.
+    //
+    // Fold-aware, so closing `#foo{1}` while joined as `#foo[1]` is the same
+    // channel and still owes its PART (#707).
+    if (conn && !conn.restoring && conn.mayBeJoined(target)) {
+      ircManager.partChannel(userId, networkId, target, opts.reason);
+    } else {
+      setBufferAutojoin(userId, networkId, target, false);
+    }
+  } else {
+    // Closing a DM means we stop tracking this peer. Drop them from the
+    // in-memory tracker and the DB row so a future reopen starts from a clean
+    // probe instead of inheriting stale state.
+    ircManager.getConnection(userId, networkId)?.untrackDmPeer(target);
+  }
+  // Drop any draft for the now-closed buffer. The client mirror also drops it
+  // on `buffer-closed`, so the cleanup happens on both sides.
+  draftsService.clear(userId, networkId, target, opts.originWs ?? null);
+  fanOut(userId, { kind: 'buffer-closed', networkId, target, bufferId: closedBufferId });
+}
+
 /**
  * Close every open socket for a user, so a revoked session stops streaming.
  *
@@ -1677,10 +1793,40 @@ export function fanOutToUser(userId: number, payload: WsPayload, opts: FanOutOpt
 const REVOKED_TERMINATE_MS = 2000;
 
 export function closeSocketsForUser(userId: number, reason = 'session revoked'): number {
+  return closeSocketsWhere(userId, reason, () => true);
+}
+
+/**
+ * Close only the sockets a member opened with particular OAuth access tokens
+ * (#891), leaving the rest — the web client, other apps — connected. Revoking an
+ * app deletes its tokens, but a socket authenticated at the upgrade is never
+ * checked again, so without this a revoked app would keep streaming. Same close
+ * code and teardown as closeSocketsForUser. Returns the number of sockets closed.
+ */
+export function closeSocketsForOAuthTokens(
+  userId: number,
+  tokenIds: Iterable<number>,
+  reason = 'app access revoked',
+): number {
+  const ids = new Set(tokenIds);
+  if (ids.size === 0) return 0;
+  return closeSocketsWhere(
+    userId,
+    reason,
+    (ws) => ws.oauthTokenId !== undefined && ids.has(ws.oauthTokenId),
+  );
+}
+
+function closeSocketsWhere(
+  userId: number,
+  reason: string,
+  matches: (ws: LurkerWebSocket) => boolean,
+): number {
   const set = socketsByUser.get(userId);
   if (!set) return 0;
   let closed = 0;
   for (const ws of set) {
+    if (!matches(ws)) continue;
     try {
       // Flag BEFORE closing: from here on the message handler drops anything
       // this socket sends, so the close handshake window is not an authenticated
@@ -1755,7 +1901,8 @@ export function sweepWsHeartbeat(sockets: Iterable<LurkerWebSocket>): number {
 // Read-only introspection of the live socket registry for the admin presence
 // diagnostic. For each user with at least one open socket it reports how many
 // sockets are open and how many currently claim presence.visible=true — the
-// exact quantity auto-away keys on — alongside the persisted away row. Lets an
+// exact quantity push keys on, and auto-away along with attached IRC clients
+// (presence.ts) — alongside the persisted away row. Lets an
 // operator watch a dead socket (e.g. a slept laptop) get reaped by the
 // heartbeat and the user flip to away, confirming the fix on a live cell.
 // Mutates nothing.
@@ -1828,17 +1975,24 @@ export function startChanlistRefresh(networkId: number): void {
   chanlistDb.setMeta(networkId, { inProgress: true, totalCount: 0, fetchedAt: null });
 }
 
-// Authenticate a `/ws` upgrade. Two accepted credentials, in order:
+// Authenticate a `/ws` upgrade. Accepted credentials, in order:
 //
 //   1. the signed `lurker_session` cookie — every browser client, unchanged;
-//   2. `Authorization: Bearer <session token>` — native clients, which unlike
-//      browsers can set arbitrary headers on the upgrade request.
+//   2. `Authorization: Bearer <token>` — native and third-party clients, which
+//      unlike browsers can set arbitrary headers on the upgrade request. The
+//      token is a session token or an OAuth access token (#891); see
+//      loadBearerCredential.
 //
-// Both resolve to the same `sessions` row, so everything downstream of the
-// upgrade (and every WS verb) is identical regardless of how the client
-// authenticated. Lives at module scope rather than inside attachWsHub so it is
-// reachable from tests without standing up a real WebSocket server.
-export function authenticateUpgrade(req: IncomingMessage, sessionSecret: string): User | null {
+// Every credential signs in as the member with the same access, so everything
+// downstream of the upgrade (and every WS verb) is identical regardless of how
+// the client authenticated. `oauthTokenId` comes back only so the socket can be
+// found and closed when that app is revoked. Lives at module scope rather than
+// inside attachWsHub so it is reachable from tests without standing up a real
+// WebSocket server.
+export function authenticateUpgrade(
+  req: IncomingMessage,
+  sessionSecret: string,
+): { user: User; oauthTokenId: number | null } | null {
   const header = req.headers.cookie;
   if (header) {
     const cookies = cookie.parse(header);
@@ -1852,19 +2006,17 @@ export function authenticateUpgrade(req: IncomingMessage, sessionSecret: string)
         // all, so in practice only one credential is ever on the request.
         if (session) {
           const user = findUserById(session.user_id);
-          if (user) return user;
+          if (user) return { user, oauthTokenId: null };
         }
       }
     }
   }
-  return loadBearerSession(req.headers.authorization)?.user ?? null;
+  const bearer = loadBearerCredential(req.headers.authorization);
+  return bearer ? { user: bearer.user, oauthTokenId: bearer.oauthToken?.id ?? null } : null;
 }
 
 export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_MESSAGE_BYTES });
-  // Per-user pending auto-away timers. Set when a user goes from 1→0 sockets;
-  // cleared on 0→1 or when the timer fires.
-  const autoAwayTimers = new Map();
   // In-flight /LIST refreshes, keyed by network_id. We belt-and-suspender the
   // chanlist_meta.in_progress column with this in-memory set so a duplicate
   // `list-channels` from a second tab is rejected without first reading the
@@ -1884,37 +2036,6 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
   }, HEARTBEAT_MS);
   heartbeat.unref?.();
   wss.on('close', () => clearInterval(heartbeat));
-
-  function clearAutoAwayTimer(userId: number): void {
-    const t = autoAwayTimers.get(userId);
-    if (t) {
-      clearTimeout(t);
-      autoAwayTimers.delete(userId);
-    }
-  }
-
-  function scheduleAutoAway(userId: number): void {
-    if (autoAwayTimers.has(userId)) return;
-    const enabled = !!effectiveSetting(userId, 'away.auto.enabled');
-    if (!enabled) return;
-    const rawDelay = Number(effectiveSetting(userId, 'away.auto.delay_seconds'));
-    const delaySec = Number.isFinite(rawDelay) && rawDelay > 0 ? rawDelay : 30;
-    // The user went idle the moment we scheduled this timer, not when it fires
-    // `delaySec` later — backdate the away "since" to now so it reflects when
-    // they actually stepped away (#155).
-    const afkSince = new Date();
-    const t = setTimeout(() => {
-      autoAwayTimers.delete(userId);
-      // Re-check: a client may have become visible during the delay.
-      // "Visible" rather than "connected" so a backgrounded tab — which the
-      // push pipeline already treats as absent — counts as absent here too.
-      if (userHasVisibleClient(userId)) return;
-      const message = buildAutoAwayMessage(userId, afkSince);
-      ircManager.setAwayAll(userId, message, { autoSet: true, since: afkSince });
-    }, delaySec * 1000);
-    t.unref?.();
-    autoAwayTimers.set(userId, t);
-  }
 
   function addSocket(userId: number, ws: LurkerWebSocket): void {
     // The user (re)opened a tab — cancel any pending guest teardown from a
@@ -1956,45 +2077,11 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     return false;
   }
 
-  // Single source of truth for "is the user present?" — shared by auto-away
-  // and push so an idle/backgrounded tab can't keep one system thinking the
-  // user is here while the other treats them as gone.
-  function evaluatePresence(userId: number): void {
-    if (userHasVisibleClient(userId)) {
-      clearAutoAwayTimer(userId);
-      ircManager.clearAwayAll(userId, { autoSet: true });
-    } else {
-      scheduleAutoAway(userId);
-    }
-  }
-
-  // Single path for "tell every tab of this user what the buffer's unread
-  // counts are now." Used by mark-read echo and by the live IRC-event fan-out
-  // below — the client doesn't increment locally anymore, so this is the
-  // only source of badge state.
-  // `bufferId` is threaded from callers that already hold it (the live pipe's
-  // decorated event, an id-addressed mark-read) — this runs per countable
-  // event, so the resolve is a fallback, not a habit.
-  function broadcastReadState(
-    userId: number,
-    networkId: number | null,
-    target: string,
-    lastReadId: number,
-    bufferId?: number | null,
-  ): void {
-    const counts = computeUnreadFor(userId, networkId, target, lastReadId);
-    fanOut(userId, {
-      kind: 'read-state',
-      networkId,
-      target,
-      bufferId:
-        bufferId !== undefined ? bufferId : (resolveBuffer(userId, networkId, target)?.id ?? null),
-      lastReadId: counts.lastReadId,
-      unread: counts.unread,
-      highlights: counts.highlights,
-      highlightsCapped: counts.highlightsCapped,
-    });
-  }
+  // A visible socket is the user being here, for auto-away (presence.ts) and for
+  // push below. "Visible" rather than "connected", so a backgrounded tab counts
+  // as absent for both. Auto-away also counts attached IRC clients; push
+  // doesn't, since an IRC client has no visibility to report.
+  setPresenceSource('web', (userId) => (userHasVisibleClient(userId) ? 1 : 0));
 
   // Push-suppression gates shared by message and presence pushes: a manual
   // /away (when mute_when_away is on — auto-away is the case push matters most,
@@ -2056,11 +2143,20 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     // render filter stay reactive client-side, so /unignore still reveals. A
     // NOHIGHLIGHT rule deliberately does NOT freeze push — the message is still
     // visible, it just doesn't highlight.
-    // Signal kind in priority order: DM beats matched beats always_notify.
-    // The `kind` doubles as the settings-key namespace, so picking a single
-    // priority winner here means a DM that also matched a rule still
-    // delivers as one notification, gated by the DM master toggle.
-    const kindKey = decorated.dm ? 'dm' : decorated.matched ? 'highlight' : 'always_notify';
+    // Signal kind in priority order: kicked beats DM beats matched beats
+    // always_notify. The `kind` doubles as the settings-key namespace, so
+    // picking a single priority winner here means a DM that also matched a rule
+    // still delivers as one notification, gated by the DM master toggle.
+    // `kicked` leads because it's the only one that can't overlap — a kick is
+    // never a DM and never matches a highlight — so its position is a statement
+    // about reading order, not a tiebreak.
+    const kindKey = decorated.selfKicked
+      ? 'kicked'
+      : decorated.dm
+        ? 'dm'
+        : decorated.matched
+          ? 'highlight'
+          : 'always_notify';
     if (!effectiveSetting(userId, `notifications.${kindKey}.enabled`)) return;
     if (pushQuietOrAway(userId)) return;
     const network = ircManager.getConnection(userId, decorated.networkId)?.network;
@@ -2323,14 +2419,11 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
           }
         : {}),
     });
-    // If the user toggled / shortened auto-away while disconnected, re-evaluate
-    // the pending timer with the new value.
+    // If the user toggled / shortened auto-away while nothing counts as them
+    // being here, restart the pending wait with the new value.
     const touchedAway =
       changes && ('away.auto.enabled' in changes || 'away.auto.delay_seconds' in changes);
-    if (touchedAway && (socketsByUser.get(userId)?.size || 0) === 0) {
-      clearAutoAwayTimer(userId);
-      scheduleAutoAway(userId);
-    }
+    if (touchedAway) rescheduleAutoAway(userId);
   });
 
   highlightRulesService.on('change', ({ userId }) => {
@@ -2393,7 +2486,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
       }
       socketsByUser.delete(userId);
     }
-    clearAutoAwayTimer(userId);
+    clearAutoAway(userId);
     systemLog.dropUser(userId);
   });
 
@@ -2406,7 +2499,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
     if (set) {
       for (const ws of set) ws.accountPaused = true;
     }
-    clearAutoAwayTimer(userId);
+    clearAutoAway(userId);
     fanOut(userId, { kind: 'account-state', paused: true });
   });
 
@@ -2440,12 +2533,13 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
       socket.destroy();
       return;
     }
-    const user = authenticateUpgrade(req, sessionSecret);
-    if (!user) {
+    const auth = authenticateUpgrade(req, sessionSecret);
+    if (!auth) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
+    const { user, oauthTokenId } = auth;
     // `?since=N` cursors the initial backlog: a reconnecting client passes the
     // highest event id it has, and the server ships only events newer than that
     // for each buffer. The first connect omits it (or sends 0), getting the
@@ -2466,6 +2560,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
       lurkerWs.presence = { visible: false };
       lurkerWs.isAlive = true;
       lurkerWs.accountPaused = user.is_paused === 1;
+      if (oauthTokenId !== null) lurkerWs.oauthTokenId = oauthTokenId;
       addSocket(user.id, lurkerWs);
       onConnection(lurkerWs, user);
     });
@@ -2955,6 +3050,40 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         const ctcpArgs = typeof msg.args === 'string' ? msg.args : '';
         const issuingTarget = typeof msg.issuingTarget === 'string' ? msg.issuingTarget : '';
         if (!Number.isFinite(networkId) || networkId <= 0 || !ctcpTarget || !ctcpType) break;
+        // A `=nick` DCC chat is a buffer, not a nick, and CTCP rides IRC — so
+        // ircManager refuses it. Say why here, where it can be said: its false
+        // alone would read as "this network isn't connected".
+        //
+        // ⚠ No command name on the line. `/ping bob` and `/ctcp bob PING` send
+        // the same frame, so this can't tell which was typed; the suggestion
+        // follows the frame instead, and is right for either.
+        //
+        // ⚠ It carries the arguments over, and offers `/ping` only for a PING
+        // that had none: `/ping` sends a fresh timestamp, so for
+        // `/ctcp =bob PING 12345` it would be a different request.
+        if (isDccChatTarget(ctcpTarget)) {
+          const peer = dccChatPeer(ctcpTarget);
+          const args = ctcpArgs.trim();
+          const suggestion =
+            ctcpType.toUpperCase() === 'PING' && !args
+              ? `/ping ${peer}`
+              : `/ctcp ${peer} ${ctcpType}${args ? ` ${args}` : ''}`;
+          // Only a peer that is a nick gets a suggestion. `==bob` peels to `=bob`,
+          // which this same check would refuse; a bare `=` peels to nothing.
+          const instead =
+            peer && !isDccChatTarget(peer) ? ` CTCP goes over IRC, so use ${suggestion}.` : '';
+          const evt = {
+            type: 'ctcp',
+            level: 'warn',
+            networkId,
+            target: issuingTarget,
+            text: `${ctcpTarget} is a DCC chat, not a nick.${instead}`,
+            time: new Date().toISOString(),
+            self: false,
+          } as unknown as MessageEvent;
+          fanOut(userId, { ...decorateMessage(userId, evt), kind: 'irc' });
+          break;
+        }
         const ok = ircManager.ctcpRequest(
           userId,
           networkId,
@@ -3064,49 +3193,11 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
         // Server pseudo-buffer can't be closed (it's the per-network log).
         if (!networkId || !target || target.startsWith(':server:')) break;
-        // Resolved BEFORE the close so the buffer-closed frame below can carry
-        // the id even though the row's state just flipped.
-        const closedBufferId =
-          addr?.bufferId ?? resolveBuffer(userId, networkId, target)?.id ?? null;
-        closeBufferRow(userId, networkId, target);
-        // The client renders the pinned section by intersecting pins with open
-        // buffers, so a pin on a now-closed buffer is invisible — and leaving
-        // the row would diverge the client's pin set from ours (issue #112).
-        // Close implies unpin. Match case-insensitively: the registry hides
-        // closed buffers folded, so a differently-cased close would otherwise
-        // hide the buffer while leaving the exact-cased pin row stranded — an
-        // invisible orphan (issue #405).
-        if (unpinBufferCaseInsensitive(userId, networkId, target)) {
-          fanOut(userId, pinsChangedFrame(userId, networkId));
-        }
-        // Same reasoning for favorites: the sections render favorites ∩ open
-        // buffers, so a favorite on a closed buffer is an invisible orphan.
-        // Close implies unfavorite.
-        if (unfavoriteBuffer(userId, networkId, target)) {
-          fanOut(userId, favoritesChangedFrame(userId));
-        }
-        if (isChannelTarget(target)) {
-          // Send PART if connected; partChannel also lowers autojoin. If
-          // disconnected, partChannel is a no-op, so lower autojoin here to
-          // keep the channel from auto-rejoining the next time the network
-          // connects. Update-only — closing a buffer that has no row must not
-          // conjure one (the last of the old upsertChannel conjure sites).
-          if (
-            !ircManager.partChannel(userId, networkId, target, msg.reason as string | undefined)
-          ) {
-            setBufferAutojoin(userId, networkId, target, false);
-          }
-        } else {
-          // Closing a DM means we stop tracking this peer. Drop them from
-          // the in-memory tracker and the DB row so a future reopen starts
-          // from a clean probe instead of inheriting stale state.
-          const conn = ircManager.getConnection(userId, networkId);
-          if (conn) conn.untrackDmPeer(target);
-        }
-        // Drop any draft for the now-closed buffer. The client mirror also
-        // drops it on `buffer-closed`, so the cleanup happens on both sides.
-        draftsService.clear(userId, networkId, target, ws);
-        fanOut(userId, { kind: 'buffer-closed', networkId, target, bufferId: closedBufferId });
+        closeBuffer(userId, networkId, target, {
+          reason: typeof msg.reason === 'string' ? msg.reason : undefined,
+          bufferId: addr?.bufferId,
+          originWs: ws,
+        });
         break;
       }
       case 'snapshot':
@@ -3229,7 +3320,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
             ? null
             : Number(msg.networkId);
         if (networkId !== null && !networkId) break;
-        const lastReadId = setReadState(userId, networkId, target, requested);
+        const lastReadId = ircManager.markRead(userId, networkId, target, requested);
         broadcastReadState(userId, networkId, target, lastReadId, addr?.bufferId);
         break;
       }
@@ -3297,7 +3388,7 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
             if (!target || !Number.isFinite(maxId) || maxId <= 0) continue;
             const before = getReadState(userId, networkId, target);
             if (before >= maxId) continue;
-            const after = setReadState(userId, networkId, target, maxId);
+            const after = ircManager.markRead(userId, networkId, target, maxId);
             if (isHiddenClosedBuffer(closed, conn, networkId, target)) continue;
             broadcastReadState(userId, networkId, target, after);
           }
@@ -3379,8 +3470,10 @@ export function attachWsHub(httpServer: HttpServer, sessionSecret: string) {
         if (addr === null) break;
         const networkId = addr ? Number(addr.networkId) : Number(msg.networkId);
         const target = addr ? addr.target : typeof msg.target === 'string' ? msg.target : '';
-        // Server/system pseudo-buffers aren't favoritable rows.
-        if (!networkId || !target || target.startsWith(':')) break;
+        // Server/system pseudo-buffers aren't favoritable rows, and neither is a
+        // `=nick` DCC chat: a favorite files a DM under FRIENDS with a presence
+        // dot, and a DCC peer has no presence — the socket is the whole story.
+        if (!networkId || !target || target.startsWith(':') || isDccChatTarget(target)) break;
         if (favoriteBuffer(userId, networkId, target)) {
           fanOut(userId, favoritesChangedFrame(userId));
           // Favorite implies unpin (the mirror of close⇒unpin): a favorited

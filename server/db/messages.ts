@@ -8,6 +8,9 @@ import {
   resolveOrMintForInsert,
 } from './bufferResolve.js';
 import { markBufferDirty, noteNoiseInsert } from './retention.js';
+import { networkCasemapping } from './buffers.js';
+import { foldTargetWith } from './casemapping.js';
+import type { Casemapping } from './casemapping.js';
 import { EARLY_PRUNE_TYPES } from '../../shared/eventFilter.js';
 import { countsTowardPage } from '../../shared/eventFilter.js';
 import type { PageUnit } from '../../shared/eventFilter.js';
@@ -574,7 +577,65 @@ const chathistoryMsgFilter = (alias = '') => {
   const p = alias ? `${alias}.` : '';
   return `${p}type IN ('message', 'action', 'notice') AND ${p}mirrored = 0 AND ${p}text IS NOT NULL AND ${p}text != ''`;
 };
-const CHATHISTORY_MSG_FILTER = chathistoryMsgFilter();
+
+// The event rows a draft/event-playback client also gets in history, as soju
+// replays them: joins, parts, quits, nick changes, kicks, and mode and topic
+// changes. Not chghost or invite rows: soju keeps neither, and the spec's list
+// names neither.
+export const HISTORY_EVENT_TYPES = ['join', 'part', 'quit', 'nick', 'kick', 'mode', 'topic'];
+
+// Who a history window is for. `me` is our current nick on the network.
+export interface HistoryEvents {
+  me: string | null;
+}
+
+// foldTargetWith as an SQL function, so a nick stored in a row folds exactly as
+// the network folds nicks (#707): ASCII, rfc1459's [ ] \\ ^ pairs, or Unicode
+// for rfc7613 and an undeclared mapping. SQLite's own lower() is ASCII-only.
+const FOLD_NICK_FN = 'lurker_fold_nick';
+db.function(FOLD_NICK_FN, { deterministic: true }, (mapping: unknown, nick: unknown) =>
+  typeof nick === 'string'
+    ? foldTargetWith(typeof mapping === 'string' ? (mapping as Casemapping) : null, nick)
+    : null,
+);
+
+// The rows a window holds: messages, and for a draft/event-playback client the
+// event rows too, every one counting toward the limit as soju's do. Filtered
+// here rather than at playback, because a batch shorter than its limit reads as
+// the start of history to halloy and gamja.
+//
+// Events naming our current nick stay out: a JOIN, PART, QUIT or NICK from it,
+// or a KICK of it, compared under the network's CASEMAPPING as clients compare
+// (goguma's isMyNick), so `foo{bar}` is `foo[bar]` on rfc1459 and `Älice` is
+// `älice` on rfc7613. goguma applies every replayed line to its live state
+// (client_controller.dart:577-721), and those are the ones it takes as ours: an
+// old PART marks the channel as left, an old NICK renames us. HexDroid rejoins
+// on an old JOIN of ours. An event under a nick we no longer use reads as
+// someone else's there. The rest still reach goguma's state as they do from
+// soju: an old TOPIC or MODE, or someone else's JOIN, PART or QUIT, until its
+// next NAMES or TOPIC. The operator accepted that (plan: draft/event-playback).
+function historyFilter(
+  alias: string,
+  events: HistoryEvents | null | undefined,
+  mapping: Casemapping | null,
+): { sql: string; params: Array<string | null> } {
+  const messages = chathistoryMsgFilter(alias);
+  if (!events) return { sql: messages, params: [] };
+  const p = alias ? `${alias}.` : '';
+  const types = HISTORY_EVENT_TYPES.map((t) => `'${t}'`).join(', ');
+  let eventSql = `${p}type IN (${types})`;
+  const params: Array<string | null> = [];
+  if (events.me) {
+    // COALESCE, or a row with no nick would compare NULL and drop out too.
+    const nick = `${FOLD_NICK_FN}(?, COALESCE(${p}nick, ''))`;
+    const kicked = `${FOLD_NICK_FN}(?, COALESCE(CASE WHEN json_valid(${p}extra) THEN json_extract(${p}extra, '$.kicked') END, ''))`;
+    eventSql += ` AND NOT (${p}type IN ('join', 'part', 'quit', 'nick') AND ${nick} = ?)`;
+    eventSql += ` AND NOT (${p}type = 'kick' AND ${kicked} = ?)`;
+    const me = foldTargetWith(mapping, events.me);
+    params.push(mapping, me, mapping, me);
+  }
+  return { sql: `((${messages}) OR (${eventSql}))`, params };
+}
 
 // Windowed history fetch for CHATHISTORY. `lower`/`upper` are exclusive ISO time
 // bounds (null = unbounded on that side). `newestFirst` takes the `limit` from
@@ -594,12 +655,16 @@ export function loadHistoryWindow(
   lower: string | null,
   upper: string | null,
   limit: number,
-  { newestFirst = false }: { newestFirst?: boolean } = {},
+  {
+    newestFirst = false,
+    events: forEvents,
+  }: { newestFirst?: boolean; events?: HistoryEvents | null } = {},
 ): MessageEvent[] {
   const bufferId = resolveBufferIdByNetwork(networkId, target);
   if (bufferId === undefined) return [];
-  const conds = ['buffer_id = ?', CHATHISTORY_MSG_FILTER];
-  const params: (string | number)[] = [bufferId];
+  const filter = historyFilter('', forEvents, forEvents?.me ? networkCasemapping(networkId) : null);
+  const conds = ['buffer_id = ?', filter.sql];
+  const params: (string | number | null)[] = [bufferId, ...filter.params];
   if (lower !== null) {
     conds.push('time > ?');
     params.push(lower);
@@ -620,35 +685,72 @@ export function loadHistoryWindow(
   return newestFirst ? events.toReversed() : events;
 }
 
+// The newest `limit` conversation rows in a buffer, oldest first: the rows a
+// chathistory window counts, for the bouncer's attach playback, so a buffer's
+// joins and parts don't use up its share. In id order, down
+// idx_messages_buf_unread, which carries `type`: it reads the rows it returns and
+// the events it passes on the way. A window in time order reads and sorts every
+// row in the buffer, once per buffer on every attach.
+export function listRecentMessages(
+  networkId: number,
+  target: string,
+  limit: number,
+): MessageEvent[] {
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return [];
+  const rows = db
+    .prepare(
+      `SELECT *, ${BOOKMARKED_COL('messages')} FROM messages
+        WHERE buffer_id = ? AND ${chathistoryMsgFilter()}
+        ORDER BY id DESC LIMIT ?`,
+    )
+    .all(bufferId, limit) as MessageRow[];
+  return rows.map(rowToEvent).toReversed();
+}
+
 // Buffers with real message activity inside a time window (exclusive), newest
 // first, for CHATHISTORY TARGETS. Excludes :server: pseudo-buffers and applies
-// the same message filter (a buffer whose only in-window rows are JOINs isn't
-// "active"). The two bounds may arrive in either order; we normalize.
+// the same filter as a window: a buffer whose only in-window rows are JOINs isn't
+// "active", except to a draft/event-playback client (soju). The two bounds may
+// arrive in either order; we normalize.
 export function listActiveTargetsInWindow(
   networkId: number,
   isoA: string,
   isoB: string,
   limit: number,
+  { events }: { events?: HistoryEvents | null } = {},
 ): BufferSummary[] {
   const [lo, hi] = isoA <= isoB ? [isoA, isoB] : [isoB, isoA];
+  const filter = historyFilter('m', events, events?.me ? networkCasemapping(networkId) : null);
   // Grouped by buffer_id and named from the registry row, so the summary
   // carries the canonical casing rather than whichever casing the window's
   // rows happened to arrive under. Sentinels are excluded by kind — the
   // registry's classification, not a name-shape LIKE.
+  //
+  // ⚠ And by SHAPE, not just kind: #528 was public and minted `=nick` rows as
+  // kind 'dm' (it predates the 'dcc' kind), so an install that ever ran it has
+  // rows the kind filter alone would hand straight to bouncer clients and MCP.
+  //
+  // ⚠ 'dcc' is excluded for a different reason than the sentinels: this feeds
+  // the bouncer's CHATHISTORY TARGETS, and a `=nick` target advertised there is
+  // one an attached client will happily open a query on and then PRIVMSG — a
+  // name that must never reach the wire. A DCC chat is a live socket this
+  // process owns, not account state to mirror to other clients.
   return db
     .prepare(
       `SELECT b.target AS target, MAX(m.time) AS lastMessageAt
          FROM messages m
          JOIN buffers b ON b.id = m.buffer_id
         WHERE b.network_id = ?
-          AND b.kind NOT IN ('server', 'system')
-          AND ${chathistoryMsgFilter('m')}
+          AND b.kind NOT IN ('server', 'system', 'dcc')
+          AND substr(b.target, 1, 1) <> '='
+          AND ${filter.sql}
           AND m.time > ? AND m.time < ?
         GROUP BY b.id
         ORDER BY lastMessageAt DESC
         LIMIT ?`,
     )
-    .all(networkId, lo, hi, limit) as BufferSummary[];
+    .all(networkId, ...filter.params, lo, hi, limit) as BufferSummary[];
 }
 
 export function listRecentForBuffers(
@@ -679,10 +781,12 @@ export function listBufferTargets(networkId: number): string[] {
   return (listBufferTargetsStmt.all(networkId) as Array<{ target: string }>).map((r) => r.target);
 }
 
-// Per-(network, target) summary for the MCP list_buffers verb. Aggregates
-// every buffer that has at least one message, with the freshest message
-// timestamp. Sentinel buffers are filtered by kind so they never leak into
-// the agent-facing surface; clients reach them via the snapshot only.
+// Per-(network, target) summary for the MCP list_buffers verb and the bouncer's
+// DM playback. Aggregates every buffer that has at least one message, with the
+// freshest message timestamp. Sentinel buffers are filtered by kind so they
+// never leak into the agent-facing surface; clients reach them via the snapshot
+// only. 'dcc' is filtered for the same reason it is in listActiveTargetsInWindow
+// — neither an agent nor an attached IRC client may be handed a `=nick` target.
 export function listBuffersForNetwork(networkId: number): BufferSummary[] {
   return db
     .prepare(
@@ -690,7 +794,8 @@ export function listBuffersForNetwork(networkId: number): BufferSummary[] {
          FROM buffers b
          JOIN messages m ON m.buffer_id = b.id
         WHERE b.network_id = ?
-          AND b.kind NOT IN ('server', 'system')
+          AND b.kind NOT IN ('server', 'system', 'dcc')
+          AND substr(b.target, 1, 1) <> '='
         GROUP BY b.id
         ORDER BY lastMessageAt DESC`,
     )
@@ -739,6 +844,78 @@ export function maxIdForBuffer(networkId: number, target: string): number {
   return row?.maxId || 0;
 }
 
+// The time of the newest row at or below a read pointer, or null when there is
+// none. MARKREAD carries a time where the pointer is an id (bouncer.ts), and the
+// pointer's own row may have been pruned since, so the row below it stands in.
+export function readMarkerTime(
+  networkId: number,
+  target: string,
+  lastReadId: number,
+): string | null {
+  if (!(lastReadId > 0)) return null;
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return null;
+  const row = db
+    .prepare('SELECT time FROM messages WHERE buffer_id = ? AND id <= ? ORDER BY id DESC LIMIT 1')
+    .get(bufferId, lastReadId) as { time: string } | undefined;
+  return row?.time ?? null;
+}
+
+// How far a buffer's times may run out of order. Rows get ids in arrival order,
+// but their times come from the network's servers and from Lurker's own clock,
+// which can disagree. newestIdAtOrBefore is exact while no row's time is more
+// than this far behind an earlier row's.
+const READ_MARKER_SKEW_MS = 60_000;
+
+// Where a MARKREAD's time puts the read pointer: the newest row above `afterId`
+// whose time is at or before `iso`, or 0 when there is none.
+//
+// messages.time has no index, so walking the whole buffer down from its tail
+// reads a table row per step: for a buffer far behind its pointer, every unread
+// row, on the one shared connection. Instead:
+// - Bisect the buffer's ids for the last row at or before `iso` plus the skew,
+//   one index seek a step. No row above one later than that can be at or before
+//   `iso`, so nothing the bisection skips is the answer.
+// - Walk down from there to the first row at or before `iso`. That reads only
+//   rows within twice the skew of `iso`.
+export function newestIdAtOrBefore(
+  networkId: number,
+  target: string,
+  afterId: number,
+  iso: string,
+): number {
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return 0;
+  const tail = db
+    .prepare('SELECT MAX(id) AS maxId FROM messages WHERE buffer_id = ?')
+    .get(bufferId) as { maxId: number | null } | undefined;
+  const newestIn = db.prepare(
+    'SELECT id, time FROM messages WHERE buffer_id = ? AND id > ? AND id <= ? ORDER BY id DESC LIMIT 1',
+  );
+  // Past year 9999 an ISO string gains a `+` and sorts before every stored time.
+  const boundMs = Math.min(
+    Date.parse(iso) + READ_MARKER_SKEW_MS,
+    Date.UTC(9999, 11, 31, 23, 59, 59, 999),
+  );
+  const bound = new Date(boundMs).toISOString();
+  const floor = Math.max(0, afterId);
+  // Nothing above `hi` is at or before `iso`.
+  let lo = floor;
+  let hi = tail?.maxId ?? 0;
+  while (lo < hi) {
+    const mid = lo + Math.ceil((hi - lo) / 2);
+    const row = newestIn.get(bufferId, lo, mid) as { id: number; time: string } | undefined;
+    if (row && row.time > bound) hi = row.id - 1;
+    else lo = mid;
+  }
+  const row = db
+    .prepare(
+      'SELECT id FROM messages WHERE buffer_id = ? AND id > ? AND id <= ? AND time <= ? ORDER BY id DESC LIMIT 1',
+    )
+    .get(bufferId, floor, lo, iso) as { id: number } | undefined;
+  return row?.id ?? 0;
+}
+
 // Cheap "does the user have any history with this target?" check used by the
 // no_such_nick router: only route a DM-shaped error into a per-nick buffer if
 // the user has actually conversed with that nick. Stops typo /whois replies
@@ -756,11 +933,38 @@ export function hasMessageForTarget(networkId: number, target: string): boolean 
   return !!db.prepare('SELECT 1 FROM messages WHERE buffer_id = ? LIMIT 1').get(bufferId);
 }
 
-// Whether a row with this server-assigned msgid already exists on the network.
-// Used by the engine-mode catch-up window (ircConnection.catchingUp): a line the
-// previous process persisted but had not yet acked when it died is delivered
-// again to its successor, and the msgid is the only thing that says so. Index
-// seek on idx_messages_msgid.
+// Whether this message is already stored: the same msgid in the same buffer,
+// with the same kind, sender and text (IrcConnection.alreadyPersisted). A server
+// can send a message twice. The buffer, sender and text have to match too, so a
+// server that reuses a msgid for a different message loses nothing. A seek on
+// idx_messages_msgid: `+buffer_id` keeps the planner off the per-buffer index,
+// which would walk the buffer.
+const sameMessageStmt = db.prepare(
+  `SELECT 1 FROM messages
+   WHERE network_id = ? AND msgid = ?
+     AND +buffer_id = ? AND type = ? AND nick IS ? AND text IS ?
+   LIMIT 1`,
+);
+export function hasSameMessageWithMsgid(
+  networkId: number,
+  target: string,
+  msgid: string,
+  type: string,
+  nick: string | null,
+  text: string | null,
+): boolean {
+  if (!networkId || !target || !msgid) return false;
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return false;
+  return !!sameMessageStmt.get(networkId, msgid, bufferId, type, nick, text);
+}
+
+// Whether a msgid is stored anywhere on the network. The engine catch-up window
+// uses this, not the buffer-scoped match: the backlog handed to the next
+// process can hold, after a line the last process stored, a NICK that renamed
+// that line's DM buffer, or our own NICK, which routes a notice elsewhere. The
+// stored row is then no longer in the buffer its copy resolves to. A seek on
+// idx_messages_msgid.
 const hasMsgidStmt = db.prepare(
   'SELECT 1 FROM messages WHERE network_id = ? AND msgid = ? LIMIT 1',
 );
@@ -773,9 +977,11 @@ export function hasMessageWithMsgid(networkId: number, msgid: string): boolean {
 // messages (Libera, OFTC, ZNC…): the same target, sender, kind and text within
 // a short window of the same time. Only ever consulted in the catch-up window,
 // where a repeat means a re-delivery, not a user saying the same thing twice.
+// By buffer, not by name: the network's casemapping folds `#foo[bar]` and
+// `#foo{bar}` into one buffer, and each row keeps the spelling it arrived under.
 const hasLikeStmt = db.prepare(
   `SELECT 1 FROM messages
-   WHERE network_id = ? AND target = ? AND type = ? AND nick IS ? AND text IS ?
+   WHERE buffer_id = ? AND type = ? AND nick IS ? AND text IS ?
      AND time BETWEEN ? AND ? LIMIT 1`,
 );
 export function hasRecentMessageLike(
@@ -790,9 +996,11 @@ export function hasRecentMessageLike(
   if (!networkId || !target) return false;
   const t = Date.parse(time);
   if (!Number.isFinite(t)) return false;
+  const bufferId = resolveBufferIdByNetwork(networkId, target);
+  if (bufferId === undefined) return false;
   const lo = new Date(t - toleranceMs).toISOString();
   const hi = new Date(t + toleranceMs).toISOString();
-  return !!hasLikeStmt.get(networkId, target, type, nick, text, lo, hi);
+  return !!hasLikeStmt.get(bufferId, type, nick, text, lo, hi);
 }
 
 // Whether a target has a real (non-notice) conversation — at least one PRIVMSG or

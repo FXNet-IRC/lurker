@@ -1,10 +1,12 @@
 // Copyright (c) 2026 Brad Root
 // SPDX-License-Identifier: MPL-2.0
 
-// DCC download-manager API (#270 phase 2). Lists the user's transfers and acts on
-// them (accept a pending offer, reject it, cancel an in-flight one). The list is
+// DCC API (#270). Two surfaces: the download manager (list the user's transfers
+// and act on them — accept a pending offer, reject it, cancel an in-flight one),
+// and DCC CHAT (open or close a direct chat with a peer). The transfer list is
 // the Transfers view's initial load; live updates arrive over the WS as
-// `dcc-transfer` frames. All routes are user-scoped via requireAuth.
+// `dcc-transfer` frames, and a chat's own output arrives as ordinary messages in
+// its `=nick` buffer. All routes are user-scoped via requireAuth.
 
 import { Router, type Request, type Response } from 'express';
 
@@ -12,6 +14,8 @@ import { requireAuth } from '../middleware/auth.js';
 import ircManager from '../services/ircManager.js';
 import { dccEnabledForUser } from '../services/dccConfig.js';
 import { getDccTransfer, listDccTransfers } from '../db/dccTransfers.js';
+import { getNetwork } from '../db/networks.js';
+import { isChannelTarget } from '../../shared/channels.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -86,6 +90,67 @@ router.post('/:id/cancel', (req: Request, res: Response) => {
     return;
   }
   res.json({ transfer: getDccTransfer(req.user!.id, id) });
+});
+
+// {networkId, nick}, ownership-checked. Shared by both chat routes so neither
+// can act on a network the caller doesn't own.
+function chatTarget(req: Request, res: Response): { networkId: number; nick: string } | null {
+  const networkId = Number(req.body?.networkId);
+  const nick = typeof req.body?.nick === 'string' ? req.body.nick.trim() : '';
+  if (!Number.isInteger(networkId) || networkId <= 0 || !nick) {
+    res.status(400).json({ error: 'networkId and nick are required' });
+    return null;
+  }
+  // ⚠ A nick with whitespace would become extra CTCP parameters on the wire;
+  // a `=`-prefixed one would name a buffer rather than a peer. Neither is a
+  // real nick, so refuse rather than normalise.
+  // Matching the control chars is the whole point here — same rule the DCC
+  // filename quoter states.
+  // eslint-disable-next-line no-control-regex
+  if (/[\s\u0000-\u001f]/.test(nick) || nick.startsWith('=')) {
+    res.status(400).json({ error: 'not a valid nick' });
+    return null;
+  }
+  // A DCC chat is with a peer. A channel name would broadcast the offer to the
+  // whole channel (ircConnection.offerDccChat refuses it too — this is the
+  // early, explained refusal).
+  if (isChannelTarget(nick)) {
+    res.status(400).json({ error: 'a DCC chat is with a person, not a channel' });
+    return null;
+  }
+  if (!getNetwork(networkId, req.user!.id)) {
+    res.status(404).json({ error: 'network not found' });
+    return null;
+  }
+  return { networkId, nick };
+}
+
+/**
+ * POST /api/dcc/chat — offer a DCC chat to a peer. Body: {networkId, nick,
+ * passive?}. Returns as soon as the offer is sent; the outcome (connected,
+ * refused, timed out) lands in the `=nick` buffer, because a DCC handshake can
+ * take as long as the peer takes to answer.
+ */
+router.post('/chat', (req: Request, res: Response) => {
+  const t = chatTarget(req, res);
+  if (!t) return;
+  const passive = req.body?.passive === true;
+  if (!ircManager.dccChatOpen(req.user!.id, t.networkId, t.nick, { passive })) {
+    res.status(409).json({ error: 'network not connected' });
+    return;
+  }
+  res.json({ ok: true, target: `=${t.nick}` });
+});
+
+/** POST /api/dcc/chat/close — close a live DCC chat. Body: {networkId, nick}. */
+router.post('/chat/close', (req: Request, res: Response) => {
+  const t = chatTarget(req, res);
+  if (!t) return;
+  if (!ircManager.dccChatClose(req.user!.id, t.networkId, t.nick)) {
+    res.status(404).json({ error: 'no live DCC chat with that peer' });
+    return;
+  }
+  res.json({ ok: true });
 });
 
 export default router;

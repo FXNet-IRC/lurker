@@ -12,9 +12,12 @@
 // BOTH must be true for a user to use DCC. The master-switch parser is pure (and
 // unit-tested); the per-user gate reads the DB.
 
+import net from 'net';
+
 import { CAPABILITY_DCC, userHasCapability } from '../db/userCapabilities.js';
 import { parseTruthyEnv } from '../utils/truthyEnv.js';
 import { isPublicModeEnabled } from '../utils/publicMode.js';
+import { encodeDccAddress } from './dcc.js';
 
 /** Parse a raw LURKER_DCC_ENABLED value to a boolean. Pure (no env access) so
  *  the rule is unit-testable. Unset / empty / anything-else is OFF — DCC must be
@@ -56,4 +59,64 @@ export function dccMaxFileBytes(): number {
  *  a self-hoster pulling from a bot on their own LAN can opt in. */
 export function dccAllowPrivateHosts(): boolean {
   return parseDccEnabled(process.env.LURKER_DCC_ALLOW_PRIVATE_HOSTS);
+}
+
+// ---------------------------------------------------------------------------
+// Outbound-side config: DCC SEND / CHAT offers and passive receive need Lurker
+// to LISTEN for an inbound connection and advertise a reachable address back to
+// the peer. All of this is only consulted when the user offers a send/chat or
+// accepts a passive send — plain XDCC downloads (dial-out) never touch it.
+// ---------------------------------------------------------------------------
+
+/** The public host to advertise in outgoing DCC offers (LURKER_DCC_EXTERNAL_HOST)
+ *  — the address a peer on the internet connects back to, i.e. the host's public
+ *  IPv4, NOT the container's private IP. An IPv6 literal works too.
+ *
+ *  ⚠ It must be a LITERAL address, not a hostname. The DCC wire format carries
+ *  IPv4 as a uint32 with no room for a name, so encodeDccAddress refuses a
+ *  hostname — and a config that looks set but can't be encoded is worse than an
+ *  unset one, which is why dccActiveListenAvailable checks encodability rather
+ *  than mere presence. Returns the trimmed value or null. */
+export function dccExternalHost(): string | null {
+  const h = (process.env.LURKER_DCC_EXTERNAL_HOST ?? '').trim();
+  return h || null;
+}
+
+/** Bind address for DCC listening sockets inside the container
+ *  (LURKER_DCC_LISTEN_BIND). Defaults to 0.0.0.0 so a Docker port-publish reaches
+ *  it; pin it to one interface if you run multi-homed. */
+export function dccListenBindHost(): string {
+  const h = (process.env.LURKER_DCC_LISTEN_BIND ?? '').trim();
+  if (h) return h;
+  // ⚠ Follow the ADVERTISED address's family. The default used to be 0.0.0.0
+  // unconditionally — IPv4 only — so with an IPv6 LURKER_DCC_EXTERNAL_HOST we
+  // told peers to dial a v6 address we weren't listening on, and every one of
+  // them was refused. Not `::` for everyone: a host with IPv6 disabled (common
+  // in containers) can't bind it at all, which would break v4-only installs.
+  return net.isIPv6(dccExternalHost() ?? '') ? '::' : '0.0.0.0';
+}
+
+/** The inclusive TCP port range DCC listeners are allocated from
+ *  (LURKER_DCC_LISTEN_PORT_MIN / _MAX). This exact range must be reachable from
+ *  the internet — opened in the firewall AND published by Docker. Returns null
+ *  when unset or invalid, which disables active listening (passive-only). The
+ *  range size also caps how many concurrent offers can be outstanding. */
+export function dccListenPortRange(): { min: number; max: number } | null {
+  const min = Number((process.env.LURKER_DCC_LISTEN_PORT_MIN ?? '').trim());
+  const max = Number((process.env.LURKER_DCC_LISTEN_PORT_MAX ?? '').trim());
+  if (!Number.isInteger(min) || !Number.isInteger(max)) return null;
+  if (min < 1 || max > 65535 || min > max) return null;
+  return { min, max };
+}
+
+/** Whether Lurker can open active (listening) DCC — needs a port range to listen
+ *  on AND a public address that can actually go on the wire.
+ *
+ *  ⚠ Encodability, not just presence: a hostname in LURKER_DCC_EXTERNAL_HOST
+ *  passes a null check and then fails at offer time, which left `/dcc chat` and
+ *  the passive-accept path reporting a misconfiguration the operator had already
+ *  been told was fine. Refusing here makes the fallbacks honest. */
+export function dccActiveListenAvailable(): boolean {
+  const host = dccExternalHost();
+  return host !== null && encodeDccAddress(host) !== null && dccListenPortRange() !== null;
 }

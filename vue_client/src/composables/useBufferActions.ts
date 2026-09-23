@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import type { ContextMenuItem } from './useContextMenu.js';
+import { useBuffersStore } from '../stores/buffers.js';
+import { useNetworksStore } from '../stores/networks.js';
 import { usePinsStore } from '../stores/pins.js';
 import { useFavoritesStore } from '../stores/favorites.js';
 import { useNickNotesStore } from '../stores/nickNotes.js';
@@ -9,7 +11,7 @@ import { useWhoisStore } from '../stores/whois.js';
 import { useContextMenu } from './useContextMenu.js';
 import { useNotifyLadder } from './useNotifyLadder.js';
 import { socketSend } from './useSocket.js';
-import { isChannelTarget } from '../../../shared/channels.js';
+import { isChannelTarget, isDccChatTarget, dccChatPeer } from '../../../shared/channels.js';
 
 export interface BufferLike {
   // The server's stable buffer id, when the caller's store entry has learned
@@ -32,6 +34,8 @@ export interface BufferActionsAPI {
 // same actions. Server buffers have their own dedicated affordances (edit
 // network, browse channels) and aren't handled here.
 export function useBufferActions(): BufferActionsAPI {
+  const buffers = useBuffersStore();
+  const networks = useNetworksStore();
   const pins = usePinsStore();
   const favorites = useFavoritesStore();
   const nickNotes = useNickNotesStore();
@@ -52,13 +56,36 @@ export function useBufferActions(): BufferActionsAPI {
     // never offered the DM-only profile/note items (whois on '&local' is
     // nonsense the old '#'-only test allowed).
     const isChannel = isChannelTarget(buf.target);
-    const kind = isChannel ? 'Channel' : 'DM';
+    // A `=nick` DCC chat is neither. It has a real peer behind it, so the
+    // profile/note actions still make sense — but they must act on the PEER,
+    // not on the buffer name: `whois.openViewer` puts its argument straight
+    // into `WHOIS <nick>` on the wire (verbs/whois.ts:41), so passing `=bob`
+    // there would leak a non-nick upstream. It is also not favoritable, for
+    // the reason the server gives in wsHub's favorite-buffer case.
+    const isDccChat = isDccChatTarget(buf.target);
+    const peerNick = isDccChat ? dccChatPeer(buf.target) : buf.target;
+    const kind = isChannel ? 'Channel' : isDccChat ? 'DCC Chat' : 'DM';
     const pinned = pins.isPinned(networkId, buf.target);
     // One flag, two labels: a favorited channel surfaces in the FAVORITES
     // section, a favorited DM under FRIENDS (the Friends/Contacts successor).
-    const favorited = favorites.isFavorite(networkId, buf.target);
+    const favorited = !isDccChat && favorites.isFavorite(networkId, buf.target);
     const favoriteSection = isChannel ? 'Favorites' : 'Friends';
     const items: ContextMenuItem[] = [];
+    // A parted channel (a /part, a kick, or a rejoin the server refused — #873)
+    // stays in the sidebar with its history, and getting back in is the usual
+    // reason to open its menu, so Join leads. Same gate as the network menu's
+    // Join Channel…: a JOIN needs a live connection.
+    if (isChannel && buffers.findByTarget(networkId, buf.target)?.joined === false) {
+      items.push(
+        {
+          label: 'Join Channel',
+          icon: 'fa-solid fa-right-to-bracket',
+          disabled: networks.states[networkId]?.state !== 'connected',
+          onClick: () => buffers.joinOrToast(networkId, buf.target),
+        },
+        { divider: true },
+      );
+    }
     // A favorited buffer can't be pinned (one placement per buffer:
     // favorite⇒unpin server-side), so the pin item on a favorited buffer is
     // noise — hidden. The favorite item on a PINNED buffer stays: it's the
@@ -79,19 +106,21 @@ export function useBufferActions(): BufferActionsAPI {
             },
       );
     }
-    items.push(
-      favorited
-        ? {
-            label: `Remove from ${favoriteSection}`,
-            icon: isChannel ? 'fa-regular fa-star' : 'fa-solid fa-user-minus',
-            onClick: () => favorites.unfavorite(networkId, buf.target),
-          }
-        : {
-            label: `Add to ${favoriteSection}`,
-            icon: isChannel ? 'fa-solid fa-star' : 'fa-solid fa-user-group',
-            onClick: () => favorites.favorite(networkId, buf.target),
-          },
-    );
+    if (!isDccChat) {
+      items.push(
+        favorited
+          ? {
+              label: `Remove from ${favoriteSection}`,
+              icon: isChannel ? 'fa-regular fa-star' : 'fa-solid fa-user-minus',
+              onClick: () => favorites.unfavorite(networkId, buf.target),
+            }
+          : {
+              label: `Add to ${favoriteSection}`,
+              icon: isChannel ? 'fa-solid fa-star' : 'fa-solid fa-user-group',
+              onClick: () => favorites.favorite(networkId, buf.target),
+            },
+      );
+    }
     // Notification "quietness" ladder (issue #359): channels get the full 4-rung
     // ladder (All / Highlights / Nothing / Muted), DMs the 3-rung one (no
     // "Highlights only" — every DM is already the signal).
@@ -106,18 +135,18 @@ export function useBufferActions(): BufferActionsAPI {
       // Channels can't carry a per-nick action from this menu (which nick?),
       // so these are DM-only; in-channel equivalents flow through the member
       // list menu.
-      const hasNote = nickNotes.hasNote(networkId, buf.target);
+      const hasNote = nickNotes.hasNote(networkId, peerNick);
       items.push(
         { divider: true },
         {
           label: 'View Profile…',
           icon: 'fa-solid fa-id-card',
-          onClick: () => whois.openViewer(networkId, buf.target),
+          onClick: () => whois.openViewer(networkId, peerNick),
         },
         {
           label: hasNote ? 'Edit Note…' : 'Add Note…',
           icon: 'fa-solid fa-note-sticky',
-          onClick: () => nickNotes.openEditor(networkId, buf.target),
+          onClick: () => nickNotes.openEditor(networkId, peerNick),
         },
       );
     }

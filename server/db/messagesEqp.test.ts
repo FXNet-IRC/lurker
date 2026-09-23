@@ -52,9 +52,44 @@ describe('page and probe paths', () => {
     expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
   });
 
+  // The bouncer's attach playback, per buffer on every attach. A time-ordered
+  // window here read and sorted the whole buffer (/code-review of
+  // draft/event-playback).
+  it('recent messages walk the per-buffer index without a sort (listRecentMessages shape)', () => {
+    const detail = plan(
+      `SELECT * FROM messages
+        WHERE buffer_id = 1 AND type IN ('message', 'action', 'notice') AND mirrored = 0
+          AND text IS NOT NULL AND text != ''
+        ORDER BY id DESC LIMIT 50`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
+    expect(detail).not.toMatch(/TEMP B-TREE/);
+  });
+
   it('the edge probe is an index seek (hasOlderThan shape)', () => {
     const detail = plan(`SELECT 1 FROM messages WHERE buffer_id = 1 AND id < 5 LIMIT 1`);
     expect(detail).toMatch(/USING COVERING INDEX idx_messages_buf_unread/);
+  });
+});
+
+describe('repeat probe', () => {
+  it('a repeated msgid is a seek on the msgid index (hasSameMessageWithMsgid shape)', () => {
+    const detail = plan(
+      `SELECT 1 FROM messages
+       WHERE network_id = 1 AND msgid = 'm'
+         AND +buffer_id = 1 AND type = 'message' AND nick IS 'n' AND text IS 't'
+       LIMIT 1`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_msgid/);
+  });
+
+  it('a line without a msgid is looked for on the per-buffer index (hasRecentMessageLike shape)', () => {
+    const detail = plan(
+      `SELECT 1 FROM messages
+       WHERE buffer_id = 1 AND type = 'message' AND nick IS 'n' AND text IS 't'
+         AND time BETWEEN 'a' AND 'b' LIMIT 1`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
   });
 });
 
@@ -234,5 +269,38 @@ describe('noise-clock paths', () => {
       .prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`)
       .get('idx_messages_noise_time') as { sql: string } | undefined;
     expect(row?.sql).toContain(`(${earlyPruneSql})`);
+  });
+});
+
+// MARKREAD maps a read pointer (an id) to a time and back (bouncer.ts). Both
+// lookups run on a client's command, and messages.time is unindexed, so each
+// step has to be a seek on the per-buffer id index, never a walk or a sort.
+describe('read-marker paths', () => {
+  it('each bisection step is an index seek (newestIdAtOrBefore shape)', () => {
+    const detail = plan(
+      `SELECT id, time FROM messages
+       WHERE buffer_id = 1 AND id > 0 AND id <= 100
+       ORDER BY id DESC LIMIT 1`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
+    expect(detail).not.toMatch(/TEMP B-TREE/);
+  });
+
+  it('the walk after the bisection stays on the per-buffer index (newestIdAtOrBefore shape)', () => {
+    const detail = plan(
+      `SELECT id FROM messages
+       WHERE buffer_id = 1 AND id > 0 AND id <= 100 AND time <= '2026-01-01T00:00:00.000Z'
+       ORDER BY id DESC LIMIT 1`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
+    expect(detail).not.toMatch(/TEMP B-TREE/);
+  });
+
+  it("a read pointer's time is an index seek (readMarkerTime shape)", () => {
+    const detail = plan(
+      `SELECT time FROM messages WHERE buffer_id = 1 AND id <= 5 ORDER BY id DESC LIMIT 1`,
+    );
+    expect(detail).toMatch(/USING INDEX idx_messages_buf_unread/);
+    expect(detail).not.toMatch(/TEMP B-TREE/);
   });
 });

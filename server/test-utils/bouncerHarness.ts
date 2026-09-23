@@ -24,32 +24,100 @@ import {
   attachedSessionCount,
   parseClientLine,
 } from '../services/bouncer.js';
+import { MonitorList } from '../services/monitorList.js';
+import type { MonitorSync } from '../services/monitorList.js';
 import { createUser, setPasswordHash } from '../db/users.js';
 import { hashPassword } from '../services/password.js';
 import { createToken } from '../db/apiTokens.js';
-import { createNetwork } from '../db/networks.js';
+import { createNetwork, deleteNetwork, listNetworksForUser } from '../db/networks.js';
 import type { Network } from '../db/networks.js';
 import type { User } from '../db/users.js';
 
 export interface FakeChannel {
   name: string;
   topic: string | null;
-  members: Map<string, { nick: string; modes: string[] }>;
+  members: Map<string, FakeMember>;
   modes: Set<string>;
 }
+
+// The ChannelMember fields the bouncer reads. The optional ones are unknown
+// until a test sets them, as they often are on a real connection.
+export interface FakeMember {
+  nick: string;
+  modes: string[];
+  account?: string | null;
+  user?: string | null;
+  host?: string | null;
+}
+
+// What irc-framework and IrcConnection typically end up negotiating with an
+// IRCv3 network. The bouncer offers its pass-through caps only while the bound
+// network has them; replace `upstream.client.network.cap.enabled` in a test to
+// model a network without some.
+export const UPSTREAM_CAPS = [
+  'cap-notify',
+  'batch',
+  'multi-prefix',
+  'message-tags',
+  'away-notify',
+  'invite-notify',
+  'account-notify',
+  'account-tag',
+  'server-time',
+  'userhost-in-names',
+  'extended-join',
+  'chghost',
+  'echo-message',
+  'extended-monitor',
+];
 
 // Minimal stand-in for IrcConnection covering exactly what bouncer.ts reads.
 export class FakeUpstream {
   state = 'connected';
+  // IrcConnection.network: the row the connection was built from. seedAccount
+  // and seedNetwork set it.
+  network: Network | null = null;
   currentNick = 'tester';
   registrationLines: string[] = [];
   channels = new Map<string, FakeChannel>();
-  // Lines the bouncer forwarded to the upstream network via conn.raw().
+  // Lines the bouncer forwarded to the upstream network via conn.raw(), plus
+  // the PART lines conn.part() puts on the wire.
   rawSent: string[] = [];
   // Whether this fake network negotiated IRCv3 message-tags. The bouncer gates
   // client-only tag relay on it (mirrors IrcConnection.supportsMessageTags);
   // flip to false in a test to exercise the non-IRCv3 strip path.
   messageTags = true;
+  // MONITOR on this network: whether its ISUPPORT offers it, whether that
+  // ISUPPORT is complete, the limit, and the list the attached clients share,
+  // as on a real IrcConnection. Lurker's own nicks aren't modelled.
+  useMonitor = true;
+  isupportComplete = true;
+  monitorLimit = 100;
+  readonly monitor = new MonitorList((line) => this.raw(line));
+  // IrcConnection.lineArrivedAt: when the line being relayed arrived. Null
+  // leaves the bouncer to stamp untimed lines itself; set it to pin that time.
+  lineArrivedAt: Date | null = null;
+  // IrcConnection.replyOwner: who the line being relayed is for. Null sends it
+  // to every client, as a line no query asked for; set it to model a reply.
+  replyOwner: import('../services/replyRouter.js').ReplyOwner | null = null;
+  // IrcConnection.ctcpAnswerer: who answers the CTCP request being relayed. Null
+  // relays the line like any other; 'lurker' or 'nobody' keeps it from clients.
+  ctcpAnswerer: import('../services/ctcp.js').CtcpAnswerer | null = null;
+  readonly replies = {
+    dropClient: (_client: import('../services/replyRouter.js').ReplyClient): void => {},
+  };
+  // IrcConnection.membersPending: channels whose NAMES haven't arrived, folded.
+  readonly pendingNames = new Set<string>();
+  membersPending = (name: string): boolean => this.pendingNames.has(name.toLowerCase());
+  // IrcConnection.channelState, folding with toLowerCase.
+  channelState = (name: string): FakeChannel | undefined => this.channels.get(name.toLowerCase());
+  // IrcConnection.isChannelJoined: membership, folded the same way.
+  isChannelJoined = (name: string): boolean => this.channels.has(name.toLowerCase());
+  // IrcConnection.mayBeJoined: membership plus any JOIN still awaiting its
+  // echo. The fake has none in flight, so it reduces to membership.
+  mayBeJoined = (name: string): boolean => this.isChannelJoined(name);
+  // IrcConnection.restoring: true while an engine re-attach replays the session.
+  restoring = false;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   client: any;
 
@@ -69,6 +137,7 @@ export class FakeUpstream {
           { mode: 'v', symbol: '+' },
         ],
       },
+      cap: { enabled: [...UPSTREAM_CAPS] },
     };
     this.client = client;
   }
@@ -77,17 +146,46 @@ export class FakeUpstream {
     this.rawSent.push(line);
   }
 
+  // IrcConnection.part, which on a real connection is irc-framework's
+  // client.part() — the PART line on the wire. Recorded with the rest so a
+  // test can assert on everything the network was sent, in order. Membership
+  // is NOT dropped here: on a real connection the PART *echo* is what leaves
+  // the channel, so a test models that itself (channels.delete) rather than
+  // having the fake quietly do the ircd's half of the exchange.
+  part(channel: string, reason?: string): void {
+    this.rawSent.push(reason ? `PART ${channel} :${reason}` : `PART ${channel}`);
+  }
+
+  // IrcConnection.dispose: it marks itself disposed before it quits, so it
+  // publishes nothing, not even a state change.
+  dispose(): void {}
+
   supportsMessageTags(): boolean {
     return this.messageTags;
   }
 
+  // IrcConnection.syncMonitor, with no nicks of Lurker's own.
+  syncMonitor(): MonitorSync | null {
+    if (!this.useMonitor || this.state !== 'connected') return null;
+    return this.monitor.sync([], this.monitorLimit);
+  }
+
   // Simulate the upstream network sending a raw line down to attached clients.
+  // A MONITOR reply then updates the list, as IrcConnection's handlers do after
+  // irc-framework emits the raw line.
   pushUpstream(line: string): void {
     this.client.emit('raw', { from_server: true, line });
+    const msg = parseClientLine(line);
+    if (!msg) return;
+    const targets = msg.params[msg.command === '734' ? 2 : 1] ?? '';
+    const nicks = targets.split(',').map((t) => t.split('!')[0]);
+    if (msg.command === '730') this.monitor.noteStatus(nicks, true);
+    else if (msg.command === '731') this.monitor.noteStatus(nicks, false);
+    else if (msg.command === '734') this.monitor.noteRefused(nicks);
   }
 
   addChannel(name: string, opts: { topic?: string; members?: string[] } = {}): FakeChannel {
-    const members = new Map<string, { nick: string; modes: string[] }>();
+    const members = new Map<string, FakeMember>();
     for (const raw of opts.members ?? []) {
       const modes: string[] = [];
       let nick = raw;
@@ -152,9 +250,18 @@ export function seedAccount(
   } as Parameters<typeof createNetwork>[1])!;
 
   const upstream = opts.upstream ?? new FakeUpstream(nick);
+  upstream.network = network;
   ircManager.connectionsForUser(user.id).set(network.id, upstream as never);
 
   return { user, network, password, token, upstream };
+}
+
+/** Remove every network an account owns, leaving it with an empty bouncer. */
+export function dropNetworks(user: User): void {
+  for (const network of listNetworksForUser(user.id)) {
+    ircManager.connectionsForUser(user.id).delete(network.id);
+    deleteNetwork(network.id, user.id);
+  }
 }
 
 /** Registered bouncer sessions currently attached to an account's network. */
@@ -162,9 +269,20 @@ export function attachedFor(acct: HarnessAccount): number {
   return attachedSessionCount(acct.user.id, acct.network.id);
 }
 
-/** Simulate an upstream network state change flowing through ircManager. */
-export function emitNetworkState(userId: number, networkId: number, state: string): void {
-  ircManager.emit('event', { userId, networkId, type: 'state', state });
+/**
+ * Simulate an upstream network state change flowing through ircManager. Like
+ * IrcConnection.setState, the connection's state moves before the event goes
+ * out; `extra` rides the event (an `error`, say).
+ */
+export function emitNetworkState(
+  userId: number,
+  networkId: number,
+  state: string,
+  extra: Record<string, unknown> = {},
+): void {
+  const conn = ircManager.getConnection(userId, networkId);
+  if (conn) conn.state = state;
+  ircManager.emit('event', { userId, networkId, type: 'state', state, ...extra });
 }
 
 /** Add a second network + upstream to an already-seeded user. */
@@ -181,6 +299,7 @@ export function seedNetwork(
     nick,
   } as Parameters<typeof createNetwork>[1])!;
   const upstream = opts.upstream ?? new FakeUpstream(nick);
+  upstream.network = network;
   ircManager.connectionsForUser(user.id).set(network.id, upstream as never);
   return { network, upstream };
 }

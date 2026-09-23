@@ -215,6 +215,90 @@ export function formatCtcpReplyLine(
  *  (irc.look.display_ctcp_reply); we fold it into the one probe line to keep the
  *  buffer quiet while still surfacing exactly what was disclosed. */
 export function formatCtcpRequestLine(nick: string, type: string, reply: string | null): string {
-  const base = `${nick} requested CTCP ${type.toUpperCase()}`;
+  const base = requestLineBase(nick, type);
   return reply === null ? `${base} (no reply)` : `${base} (replied: ${reply})`;
+}
+
+/** Display line for an inbound CTCP request left to the IRC clients attached
+ *  through the bouncer, which answer it in Lurker's place (#932). */
+export function formatCtcpForwardedLine(nick: string, type: string): string {
+  return `${requestLineBase(nick, type)} (forwarded to your IRC client)`;
+}
+
+function requestLineBase(nick: string, type: string): string {
+  return `${nick} requested CTCP ${type.toUpperCase()}`;
+}
+
+// ─── Who answers, with IRC clients attached through the bouncer (#932) ──────
+// One side answers a request, as in ZNC. A client's VERSION reply says Lurker
+// carried it. References: ZNC's IRCSock.cpp:550 (who answers) and
+// Client.cpp:1378 (" via ZNC"); irssi's proxy/listen.c:533 lets one side answer
+// too. soju answers nothing.
+
+// U+0001, which frames a CTCP inside a PRIVMSG or NOTICE. Built from its code so
+// no control character sits in the source.
+const CTCP_DELIM = String.fromCharCode(0x01);
+
+/**
+ * Who answers a CTCP request of a type Lurker can answer:
+ * - `lurker`: Lurker answers from the user's settings, or stays silent, and no
+ *   attached client is sent the request;
+ * - `clients`: the attached clients are sent it, and Lurker doesn't answer;
+ * - `nobody`: the asker is over its limit, so neither happens.
+ */
+export type CtcpAnswerer = 'lurker' | 'clients' | 'nobody';
+
+// Each templated type's reply setting. PING has none.
+const CTCP_TEMPLATE_SETTINGS: Readonly<Record<string, string>> = Object.freeze({
+  VERSION: 'ctcp.version',
+  TIME: 'ctcp.time',
+  SOURCE: 'ctcp.source',
+  CLIENTINFO: 'ctcp.clientinfo',
+});
+
+/** Every setting ctcpAnsweredBySettings reads. */
+export const CTCP_ANSWER_SETTINGS: readonly string[] = [
+  'ctcp.replies',
+  ...Object.values(CTCP_TEMPLATE_SETTINGS),
+];
+
+/** Whether Lurker has an answer for this request type (buildCtcpReply). */
+export function isAnswerableCtcp(type: string): boolean {
+  const t = type.toUpperCase();
+  return t === 'PING' || Object.prototype.hasOwnProperty.call(CTCP_TEMPLATE_SETTINGS, t);
+}
+
+/**
+ * Whether the user's settings keep a request Lurker's even with an IRC client
+ * attached: they turned replies off, or changed that type's reply. A reply ZNC
+ * is given keeps the request from its clients the same way. `changed` holds the
+ * keys the user changed (settingsService.changedSettings).
+ */
+export function ctcpAnsweredBySettings(type: string, changed: ReadonlySet<string>): boolean {
+  if (changed.has('ctcp.replies')) return true;
+  const key = CTCP_TEMPLATE_SETTINGS[type.toUpperCase()];
+  return key !== undefined && changed.has(key);
+}
+
+/**
+ * The CTCP a PRIVMSG's text carries, or null for plain text. Framed the way
+ * irc-framework frames a request (messaging.js: U+0001 first and last), so this
+ * and its 'ctcp request' event agree on what is one.
+ */
+export function ctcpInText(text: string): { type: string; args: string } | null {
+  if (!text.startsWith(CTCP_DELIM) || !text.endsWith(CTCP_DELIM)) return null;
+  return parseCtcp(text.slice(1, -1));
+}
+
+/**
+ * A client's CTCP reply with ` via <via>` added when it answers VERSION, as ZNC
+ * adds itself. Any other text comes back as it was. A reply missing its closing
+ * U+0001 gets one, as ZNC frames the text again.
+ */
+export function ctcpVersionVia(text: string, via: string): string {
+  if (!text.startsWith(CTCP_DELIM)) return text;
+  const closed = text.length > 1 && text.endsWith(CTCP_DELIM);
+  const body = closed ? text.slice(1, -1) : text.slice(1);
+  if (parseCtcp(body).type !== 'VERSION') return text;
+  return `${CTCP_DELIM}${body} via ${via}${CTCP_DELIM}`;
 }

@@ -29,20 +29,25 @@ import {
   sendRejectionText,
   outgoingAddr,
   resolveKeyModeChange,
+  monitorLimitFromIsupport,
 } from './ircConnection.js';
+import type { MonitorHolder } from './monitorList.js';
 import { createIdentdServer, unregisterIdent } from './identd.js';
 import connectScheduler from './connectScheduler.js';
 import { getRecent } from './systemLog.js';
 import { createUser } from '../db/users.js';
 import { createNetwork, getNetwork } from '../db/networks.js';
+import type { Network } from '../db/networks.js';
 import {
   getBuffer,
   ensureOpen as ensureBufferOpen,
   seedAutojoinChannel,
   listForNetwork as listBufferRowsForNetwork,
+  close as closeBuffer,
 } from '../db/buffers.js';
 import { getPeerPresence, writePeerState } from '../db/peerPresence.js';
 import { setUserSetting, deleteUserSetting } from '../db/settings.js';
+import { typeCountsForUnread } from '../db/messages.js';
 
 // The bare IrcConnections built below carry user_id: 1, and their join/part
 // handlers write system_messages (FK → users.id). Seed user id 1 in the
@@ -378,10 +383,168 @@ describe('resolveChannelContext (#439)', () => {
   });
 });
 
+// CertFP (#459): every way an attached certificate can fail to reach the wire.
+// The rule is the same in all of them — a connection that presents no
+// certificate is not a degraded version of what the user configured, it is a
+// different identity, so the dial is refused and says why.
+describe('client certificate refusals', () => {
+  // One real pair for the whole block: the refusals under test are about
+  // everything AROUND the certificate, so an invalid one would just trip the
+  // validity check first and prove nothing.
+  let pair: { cert: string; key: string };
+  beforeAll(async () => {
+    pair = await (await import('../utils/clientCert.js')).generateClientCert('nick');
+  });
+
+  function makeCertConn(fields: Partial<Network> = {}): { conn: IrcConnection } {
+    const conn = new IrcConnection({
+      network: {
+        client_cert: pair.cert,
+        client_key: pair.key,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
+        id: 1,
+        user_id: 1,
+        name: 'certfail',
+        host: 'irc.example.test',
+        port: 6697,
+        tls: 1,
+        trusted_certificates: 0,
+        nick: 'nick',
+        username: null,
+        realname: null,
+        server_password: null,
+        autoconnect: 1,
+        sasl_account: null,
+        sasl_password: null,
+        connect_commands: null,
+        position: 0,
+        casemapping: null,
+        created_at: new Date().toISOString(),
+        last_client_ip: null,
+        ...fields,
+      },
+      onEvent: () => {},
+    });
+    return { conn };
+  }
+
+  // publish() is stubbed rather than read through onEvent: these networks are
+  // synthetic rows that no buffer registry knows, and the real publish writes
+  // history.
+  function attempt(fields: Partial<Network> = {}): {
+    dialed: ReturnType<typeof vi.fn>;
+    published: Record<string, unknown>[];
+    conn: IrcConnection;
+  } {
+    const { conn } = makeCertConn(fields);
+    const published: Record<string, unknown>[] = [];
+    conn.publish = (event: unknown) => {
+      published.push(event as Record<string, unknown>);
+    };
+    const dialed = vi.fn<(options: ConnectOptions) => void>();
+    conn.client.connect = dialed;
+    conn.connect();
+    return { dialed, published, conn };
+  }
+
+  const refusal = (published: Record<string, unknown>[]) =>
+    String(
+      published.find((e) => e.type === 'error' && /Not connecting/.test(String(e.text)))?.text,
+    );
+
+  it('does not dial when the network is plaintext', () => {
+    const { dialed, published } = attempt({ tls: 0, port: 6667 });
+    expect(dialed).not.toHaveBeenCalled();
+    expect(refusal(published)).toMatch(/only be presented over TLS/);
+  });
+
+  // Archive import inserts client_cert/client_key verbatim (exportSchema drives
+  // its column list), so an edited or truncated archive is a real source of
+  // half a pair — and of a key that tls.connect throws on, SYNCHRONOUSLY,
+  // inside client.connect().
+  it('does not dial on half a pair', () => {
+    const { dialed, published } = attempt({ client_key: null });
+    expect(dialed).not.toHaveBeenCalled();
+    expect(refusal(published)).toMatch(/half a client certificate/);
+  });
+
+  it('does not hand an unparseable pair to tls.connect', () => {
+    const { dialed, published } = attempt({ client_cert: 'not a pem', client_key: 'not a key' });
+    expect(dialed).not.toHaveBeenCalled();
+    expect(refusal(published)).toMatch(/unusable/);
+  });
+
+  it('leaves the network disconnected rather than pinned on connecting', () => {
+    const { conn } = attempt({ tls: 0 });
+    expect(conn.state).toBe('disconnected');
+  });
+
+  // Engine mode dials in another process, which cannot be handed the
+  // certificate yet. Presenting nothing while the app still asks for SASL
+  // EXTERNAL fails registration and blames the wrong thing.
+  it('does not dial through an engine too old to present it', async () => {
+    const { EngineLink } = await import('./engineLink.js');
+    const link = EngineLink.shared();
+    const realMinor = link.engineMinor;
+    process.env.LURKER_ENGINE_URL = 'tcp://127.0.0.1:9999';
+    link.engineMinor = 1; // predates the certificate field
+    try {
+      const { dialed, published } = attempt();
+      expect(dialed).not.toHaveBeenCalled();
+      expect(refusal(published)).toMatch(/engine/);
+    } finally {
+      delete process.env.LURKER_ENGINE_URL;
+      link.engineMinor = realMinor;
+    }
+  });
+
+  // An engine that has not said hello yet has an unknown minor, and this check
+  // is deliberately quiet about those: the transport makes the same call again
+  // at frame-build time, after the link is ready, so a cold-start dial that
+  // outruns the hello is caught there rather than guessed at here.
+  it('leaves an engine of unknown vintage to the transport', async () => {
+    const { EngineLink } = await import('./engineLink.js');
+    const link = EngineLink.shared();
+    const realMinor = link.engineMinor;
+    process.env.LURKER_ENGINE_URL = 'tcp://127.0.0.1:9999';
+    link.engineMinor = null;
+    try {
+      const { dialed } = attempt();
+      expect(dialed).toHaveBeenCalled();
+    } finally {
+      delete process.env.LURKER_ENGINE_URL;
+      link.engineMinor = realMinor;
+    }
+  });
+
+  it('dials normally once the pair is valid and nothing is in the way', () => {
+    const { dialed } = attempt();
+    expect(dialed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sasl_mechanism: 'EXTERNAL',
+        client_certificate: { certificate: pair.cert, private_key: pair.key },
+      }),
+    );
+  });
+});
+
 describe('tls certificate trust setting', () => {
   function makeConn(trusted_certificates: number): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -443,6 +606,14 @@ describe('addPeerWatch live presence seed (#302)', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -471,7 +642,7 @@ describe('addPeerWatch live presence seed (#302)', () => {
   // only SHOULD (not MUST) volunteer current state in reply to MONITOR +, so
   // without the explicit status query a freshly-added offline peer lands with
   // no state and renders as if online until a reconnect re-seeds.
-  it('follows MONITOR + with MONITOR S when a peer is tracked on a live connection', () => {
+  it('follows MONITOR + with MONITOR S when a peer is tracked on a live connection', async () => {
     const conn = makeConn();
     conn.useMonitor = true;
     conn.monitorLimit = 100;
@@ -480,6 +651,7 @@ describe('addPeerWatch live presence seed (#302)', () => {
     conn.client.raw = raw;
 
     conn.trackDmPeer('offlinepal');
+    await Promise.resolve(); // the MONITOR S goes out at the end of the turn
 
     // Order matters: the nick must be added before MONITOR S, or the status
     // dump won't include it.
@@ -503,6 +675,14 @@ describe('nick-regain MONITOR teardown gating (#384)', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -538,7 +718,12 @@ describe('nick-regain MONITOR teardown gating (#384)', () => {
     conn.state = 'connected';
     conn.regainNick = 'nick'; // the primary we still want back
     conn.pendingRegainSetup = true;
+    // ⚠ Both copies. Registering under a fallback sets currentNick to the
+    // nick the server gave us (ircConnection sets it from the registered
+    // nick), so a test that moved only the framework's copy was modelling a
+    // state a real connection never reaches — and self-detection reads ours.
     conn.client.user.nick = 'nick1'; // currently on the fallback
+    conn.currentNick = 'nick1';
     conn.publish = vi.fn<(event: unknown) => void>(); // we assert on the wire, not the buffer
     const raw = vi.fn<(...args: unknown[]) => void>();
     conn.client.raw = raw;
@@ -560,15 +745,295 @@ describe('nick-regain MONITOR teardown gating (#384)', () => {
     conn.regainNick = 'nick';
     conn.pendingRegainSetup = false;
     conn.client.user.nick = 'nick1';
+    conn.currentNick = 'nick1'; // as registration under a fallback would leave it
     conn.publish = vi.fn<(event: unknown) => void>();
     const raw = vi.fn<(...args: unknown[]) => void>();
     conn.client.raw = raw;
+    conn.syncMonitor(); // puts the regain watch on the list
+    raw.mockClear();
 
     conn.client.emit('nick', { nick: 'nick1', new_nick: 'nick' });
 
-    // removeMonitor() emits the line as args: ['MONITOR', '-', 'nick'].
     expect(raw.mock.calls.flat(Infinity).join(' ')).toContain('MONITOR - nick');
     expect(conn.regainNick).toBeNull();
+  });
+});
+
+describe('monitorLimitFromIsupport', () => {
+  it('reads a number as the limit and a MONITOR token with no value as no limit', () => {
+    expect(monitorLimitFromIsupport('100')).toBe(100);
+    // irc-framework stores `MONITOR` with no value as true.
+    expect(monitorLimitFromIsupport(true)).toBe(Infinity);
+    expect(monitorLimitFromIsupport('')).toBe(Infinity);
+    expect(monitorLimitFromIsupport(undefined)).toBe(0);
+  });
+});
+
+describe('MONITOR list shared with bouncer clients', () => {
+  function makeConn(): { conn: IrcConnection; raw: ReturnType<typeof vi.fn> } {
+    const conn = new IrcConnection({
+      network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
+        id: 1,
+        user_id: 1,
+        name: 'n',
+        host: 'irc.example.test',
+        port: 6697,
+        tls: 1,
+        trusted_certificates: 1,
+        nick: 'nick',
+        username: null,
+        realname: null,
+        server_password: null,
+        autoconnect: 1,
+        sasl_account: null,
+        sasl_password: null,
+        connect_commands: null,
+        position: 0,
+        casemapping: null,
+        created_at: new Date().toISOString(),
+        last_client_ip: null,
+      },
+      onEvent: () => {},
+    });
+    conn.state = 'connected';
+    conn.publish = vi.fn<(event: unknown) => void>();
+    const raw = vi.fn<(...args: string[]) => void>();
+    conn.client.raw = raw;
+    return { conn, raw };
+  }
+
+  function holderOf(...nicks: string[]): MonitorHolder {
+    return { monitorTargets: () => nicks, onMonitorDropped: () => {} };
+  }
+
+  function sent(raw: ReturnType<typeof vi.fn>): unknown[] {
+    return raw.mock.calls.map((c) => c[0]);
+  }
+
+  it('keeps a closed DM peer on the list while a bouncer client watches the nick', async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.monitor.addHolder(holderOf('pal'));
+    conn.trackDmPeer('pal');
+    await Promise.resolve();
+    raw.mockClear();
+
+    conn.untrackDmPeer('pal');
+    await Promise.resolve();
+
+    expect(raw).not.toHaveBeenCalled();
+  });
+
+  it("takes a new DM peer's state from the list when a bouncer client already watches it", async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.monitor.addHolder(holderOf('pal'));
+    conn.syncMonitor();
+    conn.monitor.noteStatus(['pal'], true);
+    await Promise.resolve();
+    const mark = vi.spyOn(conn, 'markPeerEvent').mockImplementation(() => {});
+    raw.mockClear();
+
+    conn.trackDmPeer('Pal');
+    await Promise.resolve();
+
+    expect(raw).not.toHaveBeenCalled();
+    expect(mark).toHaveBeenCalledWith('Pal', 'online');
+  });
+
+  it('asks for the state of a new DM peer a bouncer client listed before any answer came', async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.monitor.addHolder(holderOf('pal'));
+    conn.syncMonitor();
+    await Promise.resolve();
+    raw.mockClear();
+
+    conn.trackDmPeer('pal');
+    await Promise.resolve();
+
+    // No second MONITOR +, but the same MONITOR S a fresh add gets (#302).
+    expect(sent(raw)).toEqual(['MONITOR S']);
+  });
+
+  it('stops re-adding a DM peer the network refused, even with no advertised limit', async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = Infinity; // a MONITOR token with no value
+    conn.trackDmPeer('alice');
+    conn.trackDmPeer('bob');
+    await Promise.resolve();
+    conn.client.emit('raw', {
+      from_server: true,
+      line: ':irc.example.test 734 nick 1 bob :Monitor list is full',
+    });
+    raw.mockClear();
+
+    conn.syncMonitor();
+    conn.trackDmPeer('carol');
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual([]);
+    expect(conn.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: 'MONITOR limit (1) reached; live presence skipped for carol.',
+      }),
+    );
+  });
+
+  it("keeps a 734 out of the server buffer and notes only Lurker's own refused nicks", () => {
+    const { conn } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.trackDmPeer('pal');
+    const refuse = (nicks: string) =>
+      conn.client.emit('raw', {
+        from_server: true,
+        line: `:irc.example.test 734 nick 2 ${nicks} :Monitor list is full`,
+      });
+
+    refuse('clientpal'); // a bouncer client's nick; that client is sent the 734
+    expect(conn.publish).not.toHaveBeenCalled();
+
+    refuse('pal');
+    conn.client.emit('irc error', { error: 'monitor_list_full', reason: 'Monitor list is full' });
+    expect(conn.publish).toHaveBeenCalledTimes(1);
+    expect(conn.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: 'MONITOR limit (2) reached; live presence skipped for pal.',
+      }),
+    );
+  });
+
+  it("applies a raw MONITOR C to the raw sender's own nicks, not Lurker's", async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.trackDmPeer('pal');
+    conn.raw('MONITOR + scripted');
+    await Promise.resolve();
+    expect(sent(raw)).toEqual(['MONITOR + pal', 'MONITOR + scripted', 'MONITOR S']);
+    raw.mockClear();
+
+    conn.raw('MONITOR C');
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR - scripted']);
+    expect(conn.monitor.status('pal')).toBeNull();
+  });
+
+  it('keeps a raw watch after a bouncer client that shared the nick lets go', async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.raw('MONITOR + scripted');
+    const client = holderOf('scripted');
+    conn.monitor.addHolder(client);
+    conn.syncMonitor();
+    await Promise.resolve();
+    raw.mockClear();
+
+    conn.monitor.removeHolder(client);
+    conn.syncMonitor();
+    await Promise.resolve();
+
+    expect(raw).not.toHaveBeenCalled();
+  });
+
+  it("keeps a connect command's MONITOR watch after a bouncer client that shared it lets go", async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.network.connect_commands = 'MONITOR + scripted';
+    conn.runConnectCommands();
+    const client = holderOf('scripted');
+    conn.monitor.addHolder(client);
+    conn.syncMonitor();
+    await Promise.resolve();
+    expect(sent(raw)).toEqual(['MONITOR + scripted', 'MONITOR S']);
+    raw.mockClear();
+
+    conn.monitor.removeHolder(client);
+    conn.syncMonitor();
+    await Promise.resolve();
+
+    expect(raw).not.toHaveBeenCalled();
+  });
+
+  it('drops a raw MONITOR + the network refused, and says so', async () => {
+    const { conn, raw } = makeConn();
+    conn.useMonitor = true;
+    conn.monitorLimit = 100;
+    conn.trackDmPeer('pal');
+    conn.raw('MONITOR + scripted');
+    await Promise.resolve();
+    conn.client.emit('raw', {
+      from_server: true,
+      line: ':irc.example.test 734 nick 2 scripted :Monitor list is full',
+    });
+    expect(conn.publish).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'MONITOR limit (2) reached; not watching scripted.' }),
+    );
+    raw.mockClear();
+
+    conn.untrackDmPeer('pal'); // frees the slot scripted was refused at
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR - pal']);
+  });
+
+  it("brings a connect command's MONITOR watch back when seeding a re-attach", async () => {
+    const { conn, raw } = makeConn();
+    conn.network.connect_commands = 'MODE nick +i\nMONITOR + scripted';
+    conn.restoring = true;
+    conn.client.network.options.MONITOR = '100';
+
+    conn.client.emit('server options', {});
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR C', 'MONITOR + scripted', 'MONITOR S']);
+  });
+
+  it('marks ISUPPORT complete when the MOTD ends the registration burst', () => {
+    const { conn } = makeConn();
+    expect(conn.isupportComplete).toBe(false);
+    conn.client.emit('motd', { error: 'MOTD File is missing' });
+    expect(conn.isupportComplete).toBe(true);
+  });
+
+  it("seeds bouncer clients' nicks after Lurker's own once ISUPPORT confirms MONITOR", async () => {
+    const { conn, raw } = makeConn();
+    conn.trackDmPeer('dmpal');
+    conn.monitor.addHolder(holderOf('clientpal'));
+    conn.client.network.options.MONITOR = '100';
+
+    conn.client.emit('server options', {});
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR + dmpal,clientpal', 'MONITOR S']);
+  });
+
+  it('clears the list the last app process left before seeding a re-attach', async () => {
+    const { conn, raw } = makeConn();
+    conn.trackDmPeer('dmpal');
+    conn.restoring = true;
+    conn.client.network.options.MONITOR = '100';
+
+    conn.client.emit('server options', {});
+    await Promise.resolve();
+
+    expect(sent(raw)).toEqual(['MONITOR C', 'MONITOR + dmpal', 'MONITOR S']);
   });
 });
 
@@ -796,6 +1261,14 @@ describe('refused-message handler routing (#283)', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -1090,6 +1563,37 @@ describe('refused-message handler routing (#283)', () => {
     expect(publish).not.toHaveBeenCalledWith(expect.objectContaining({ target: '#anime' }));
   });
 
+  it('reports an unclaimed 401 in the server buffer without badging it (#904)', () => {
+    // A /whois for someone who isn't online. Nothing claims the 401 — no
+    // channel command, no /ctcp, no DM history — and the profile modal already
+    // says they aren't on the network. Fed through irc-framework the way a
+    // socket line is, so both handlers see it: 'raw' first, then the library's
+    // own parsed 'irc error'.
+    const conn = makeConn();
+    conn.client.raw = vi.fn<(line: string) => void>();
+    const publish = vi.fn<(event: unknown) => void>();
+    conn.publish = publish;
+
+    conn.raw('WHOIS fartbarf');
+    conn.client.connection.addReadBuffer(
+      ':irc.example.test 401 nick fartbarf :No such nick/channel',
+    );
+
+    expect(publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'motd',
+        target: ':server:1',
+        text: 'fartbarf No such nick/channel',
+      }),
+    );
+    // That raw line is the whole report. The generic handler used to add a
+    // second copy as an 'error' row, which the server buffer counts as unread.
+    const badging = publish.mock.calls
+      .map(([event]) => event as { type: string; target: string })
+      .filter((event) => typeCountsForUnread(event.target, event.type));
+    expect(badging).toEqual([]);
+  });
+
   it('leaves a command aimed at a channel we are not in in the server buffer', () => {
     // No buffer to land in, and fabricating one would be worse than the status
     // quo. The raw line still reports it.
@@ -1144,10 +1648,16 @@ describe('refused-message handler routing (#283)', () => {
     conn.publish = publish;
 
     conn.raw('WHOIS fartboy');
-    conn.client.emit('irc error', { error: 'no_such_nick', nick: 'fartboy' });
+    // A wire line, not a hand-built 'irc error': the server buffer's report of
+    // an unclaimed 401 is the raw handler's line (#904).
+    conn.client.connection.addReadBuffer(
+      ':irc.example.test 401 nick fartboy :No such nick/channel',
+    );
 
     expect(publish).not.toHaveBeenCalledWith(expect.objectContaining({ target: 'fartboy' }));
-    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ target: ':server:1' }));
+    expect(publish).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'motd', target: ':server:1' }),
+    );
   });
 
   it("doesn't open a query from a /ctcp to a nick that isn't there", () => {
@@ -1297,6 +1807,7 @@ describe('refused-message handler routing (#283)', () => {
     conn.publish = vi.fn<(event: unknown) => void>();
     conn.client.raw = vi.fn<(...args: string[]) => void>(); // swallow the on-join MODE request
     conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
     (conn.client as unknown as { network: { cap: { enabled: string[] } } }).network = {
       cap: { enabled: ['message-tags'] },
     };
@@ -1454,6 +1965,14 @@ describe('built-in identd registration', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -1555,6 +2074,14 @@ describe('disconnect quit message (#324)', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -1634,6 +2161,14 @@ describe('cancelled-reconnect notice (#785)', () => {
   function makeConn(events: unknown[]): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -1703,6 +2238,14 @@ describe('self nick updates the input bar (#362)', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -1804,6 +2347,14 @@ describe('capability negotiation (#310)', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -1837,6 +2388,7 @@ describe('capability negotiation (#310)', () => {
     const caps = (conn as unknown as { client: { request_extra_caps: string[] } }).client
       .request_extra_caps;
     expect(caps).toContain('extended-monitor');
+    expect(caps).toContain('draft/extended-monitor');
     expect(caps).toContain('message-tags');
   });
 });
@@ -1978,8 +2530,10 @@ describe('disconnect-offline sweep + WHO re-light (no-MONITOR presence)', () => 
     const conn = makeConn('relight');
     conn.publish = vi.fn<typeof conn.publish>(); // assert on presence, not history
     conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
     conn.trackDmPeer('chanpal');
     // Peer shares a channel with us…
+    conn.client.emit('join', { channel: '#room', nick: 'me' });
     conn.client.emit('join', { channel: '#room', nick: 'chanpal', ident: 'u', hostname: 'h' });
     // …then our socket drops (peer quit unseen or not — doesn't matter):
     conn.markAllPeersOffline();
@@ -1996,7 +2550,9 @@ describe('disconnect-offline sweep + WHO re-light (no-MONITOR presence)', () => 
     const conn = makeConn('relight-away');
     conn.publish = vi.fn<typeof conn.publish>();
     conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
     conn.trackDmPeer('awaychan');
+    conn.client.emit('join', { channel: '#room', nick: 'me' });
     conn.client.emit('join', { channel: '#room', nick: 'awaychan' });
     conn.client.emit('wholist', { target: '#room', users: [{ nick: 'awaychan', away: true }] });
     expect(getPeerPresence(conn.network.id, 'awaychan')?.state).toBe('away');
@@ -2145,6 +2701,20 @@ describe('auto-reconnect controller', () => {
       expect(conn.connect).toHaveBeenCalledTimes(1);
     });
 
+    it('says why on the state it settles to', () => {
+      vi.useFakeTimers();
+      const { conn, events } = makeGatedConn('rc-gate-error', () => ({
+        ok: false,
+        reason: 'this account is paused',
+      }));
+      conn.client.emit('close', true);
+      vi.runAllTimers();
+      expect(events.filter((e) => e.type === 'state').at(-1)).toMatchObject({
+        state: 'disconnected',
+        error: 'Not reconnecting automatically: this account is paused.',
+      });
+    });
+
     it('refuses to reconnect a paused account', () => {
       vi.useFakeTimers();
       const { conn, events } = makeGatedConn('rc-gate-paused', () => ({
@@ -2242,6 +2812,48 @@ describe('auto-reconnect controller', () => {
     ).toBe(true);
   });
 
+  // Why an attempt failed rides the state event that ends it. ircManager keeps
+  // it for bouncer clients (BOUNCER NETWORK's `error`) until the next connect.
+  describe("the error on a failed attempt's state", () => {
+    const lastState = (events: Record<string, unknown>[]) =>
+      events.filter((e) => e.type === 'state').at(-1);
+
+    it('names a socket error', () => {
+      const { conn, events } = makeConn('rc-error-socket');
+      conn.client.emit('socket close', {
+        code: 'ECONNREFUSED',
+        message: 'connect ECONNREFUSED 192.0.2.1:6697',
+      });
+      expect(lastState(events)).toEqual(
+        expect.objectContaining({
+          state: 'disconnected',
+          error:
+            'Connection failed (irc.example.test:6697): ECONNREFUSED: connect ECONNREFUSED 192.0.2.1:6697',
+        }),
+      );
+    });
+
+    it('has none for a close without one', () => {
+      const { conn, events } = makeConn('rc-error-clean');
+      conn.client.emit('socket close', {});
+      expect(lastState(events)).toMatchObject({ state: 'disconnected' });
+      expect(lastState(events)).not.toHaveProperty('error');
+    });
+
+    it('names a ban once reconnecting stops for it', () => {
+      vi.useFakeTimers();
+      const { conn, events } = makeConn('rc-error-ban');
+      conn.client.emit('irc error', { error: 'irc', reason: 'Closing Link: nick[u@h] (G-Lined)' });
+      conn.client.emit('socket close', {});
+      conn.client.emit('close', true);
+      vi.runAllTimers();
+      expect(lastState(events)).toMatchObject({ state: 'disconnected' });
+      expect(String(lastState(events)?.error)).toMatch(
+        /^Not reconnecting automatically: banned by the server/,
+      );
+    });
+  });
+
   // #651: a ban-shaped ERROR that did NOT close its own socket must not lie in
   // wait — before the pending/promote treatment it set the terminal flag on
   // sight, and the next unrelated drop (netsplit, ping timeout, laptop lid)
@@ -2324,6 +2936,31 @@ describe('auto-reconnect controller', () => {
     expect(
       events.some((e) => e.type === 'error' && /SASL authentication failed/i.test(String(e.text))),
     ).toBe(true);
+  });
+
+  // The give-up message is the one place a SASL rejection is actually spoken to
+  // the user, so it has to name the credential that was offered. Under EXTERNAL
+  // there is no password to go and check — the fingerprint has to be registered
+  // at NickServ, which is a different action in a different place. (#459)
+  it('tells a CertFP network what to fix, not to check a password it never sent', () => {
+    vi.useFakeTimers();
+    const { conn, events } = makeConn('rc-sasl-certfp');
+    conn.network.client_cert = 'cert-pem';
+    conn.network.client_key = 'key-pem';
+    for (let i = 0; i < 3; i += 1) {
+      conn.client.emit('sasl failed', { reason: 'fail' });
+      conn.client.emit('close', true);
+      vi.runAllTimers();
+    }
+    const text = String(
+      events.find((e) => e.type === 'error' && /SASL authentication failed/i.test(String(e.text)))
+        ?.text,
+    );
+    expect(text).toMatch(/CERT ADD/);
+    expect(text).not.toMatch(/account credentials/);
+    // And a way out of the loop: on a network that requires SASL, this
+    // rejection is exactly what stops you connecting to run that command.
+    expect(text).toMatch(/remove the certificate/);
   });
 
   // #617: a single rejection is not proof the credentials killed THIS socket. On
@@ -2427,6 +3064,14 @@ describe('IRCv3 draft/multiline (#381)', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -2513,6 +3158,23 @@ describe('IRCv3 draft/multiline (#381)', () => {
         nick: 'alice',
         text: 'line one\nline two',
         self: false,
+      });
+    });
+
+    it('without server-time, takes the time the first fragment arrived', () => {
+      // The bouncer relays each fragment with the time it arrived, so a MARKREAD
+      // can name any of them. The stored message has to be no later than the first.
+      const { conn, publish } = makeReceiver();
+      const first = new Date('2024-01-01T10:00:00.100Z');
+      conn.lineArrivedAt = first;
+      conn.client.emit('message', fragment('bt', 'line one'));
+      conn.lineArrivedAt = new Date('2024-01-01T10:00:00.250Z');
+      conn.client.emit('message', fragment('bt', 'line two'));
+      conn.lineArrivedAt = new Date('2024-01-01T10:00:00.400Z');
+      conn.client.emit('batch end draft/multiline', { id: 'bt' });
+      expect(publish.mock.calls[0][0]).toMatchObject({
+        text: 'line one\nline two',
+        time: first.getTime(),
       });
     });
 
@@ -2687,6 +3349,14 @@ describe('WEBIRC real-IP forwarding', () => {
   function makeConn(last_client_ip: string | null): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -2760,6 +3430,14 @@ describe('inbound INVITE handler (#261)', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -2852,6 +3530,120 @@ describe('inbound INVITE handler (#261)', () => {
   });
 });
 
+// A kick of US is a notification signal (#968), and only the connection can say
+// so: it is the one place that holds both the kicked nick and the nick we are
+// currently wearing. Everything downstream — the notify fold, the push kind, the
+// toast — reads the flag stamped here, so if it stops being set, the whole
+// feature goes quiet with nothing else failing.
+describe('self-kick stamping (#968)', () => {
+  function makeConn(): IrcConnection {
+    return new IrcConnection({
+      network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
+        id: 1,
+        user_id: 1,
+        name: 'n',
+        host: 'irc.example.test',
+        port: 6697,
+        tls: 1,
+        trusted_certificates: 1,
+        nick: 'me',
+        username: null,
+        realname: null,
+        server_password: null,
+        autoconnect: 1,
+        sasl_account: null,
+        sasl_password: null,
+        connect_commands: null,
+        position: 0,
+        casemapping: null,
+        created_at: new Date().toISOString(),
+        last_client_ip: null,
+      },
+      onEvent: () => {},
+    });
+  }
+
+  // `nick` is our server-tracked nick; `frameworkNick` is irc-framework's
+  // lagging copy, which defaults to the same thing and is only set apart in the
+  // fallback test below.
+  function kickEvents(
+    kicked: string,
+    nick = 'me',
+    frameworkNick = nick,
+  ): Array<Record<string, unknown>> {
+    const conn = makeConn();
+    conn.currentNick = nick;
+    conn.client.user.nick = frameworkNick;
+    const publish = vi.fn<(event: unknown) => void>();
+    conn.publish = publish;
+    conn.client.emit('kick', {
+      channel: '#lurker',
+      nick: 'op',
+      kicked,
+      message: 'read the topic',
+    });
+    return publish.mock.calls.map((c) => c[0] as Record<string, unknown>);
+  }
+
+  it('stamps selfKicked on a kick of us, with the kicker and reason intact', () => {
+    const kick = kickEvents('me').find((e) => e.type === 'kick');
+    expect(kick).toMatchObject({
+      type: 'kick',
+      target: '#lurker',
+      // The KICKER — what the notification names. `kicked` is us.
+      nick: 'op',
+      kicked: 'me',
+      text: 'read the topic',
+      selfKicked: true,
+    });
+  });
+
+  it('matches our nick case-insensitively, as IRC does', () => {
+    const kick = kickEvents('ME').find((e) => e.type === 'kick');
+    expect(kick?.selfKicked).toBe(true);
+  });
+
+  it('leaves the flag off a kick of someone else', () => {
+    const kick = kickEvents('bob').find((e) => e.type === 'kick');
+    expect(kick).toMatchObject({ type: 'kick', kicked: 'bob' });
+    // Absent, not false: the field only exists when it means something, so an
+    // ordinary kick's wire shape is unchanged.
+    expect(kick).not.toHaveProperty('selfKicked');
+  });
+
+  it("reads the server-tracked nick, not the framework's lagging copy", () => {
+    // The nick-fallback shape (#362): the server registered us as `me_` because
+    // the primary was taken, so currentNick says `me_` while c.user.nick still
+    // says `me`. irc-framework fires the 'all' proxy that routes events to us
+    // BEFORE its own listener updates user.nick, which is why RPL_WELCOME and
+    // snapshot() route around it too. Reading the stale copy here would drop
+    // the notification AND leave the channel styled as joined.
+    const events = kickEvents('me_', 'me_', 'me');
+    expect(events.find((e) => e.type === 'kick')?.selfKicked).toBe(true);
+    expect(events.some((e) => e.type === 'channel-parted')).toBe(true);
+    // ...and the stale nick is not itself a match: a kick of `me` once we are
+    // `me_` is a kick of whoever took the name, not of us.
+    const other = kickEvents('me', 'me_', 'me');
+    expect(other.find((e) => e.type === 'kick')).not.toHaveProperty('selfKicked');
+    expect(other.some((e) => e.type === 'channel-parted')).toBe(false);
+  });
+
+  it('still parts the buffer on a self-kick', () => {
+    // The flag is derived from the same comparison that drives the part, so a
+    // refactor that breaks one should be caught breaking the other.
+    expect(kickEvents('me').some((e) => e.type === 'channel-parted')).toBe(true);
+    expect(kickEvents('bob').some((e) => e.type === 'channel-parted')).toBe(false);
+  });
+});
+
 // Outbound /invite confirmation (RPL_INVITING 341 -> 'invited') and op-visibility
 // invite-notify lines (#261). Both render a persisted "X invited Y" channel line
 // via publish(); the self-echo is deduped against the 341 line.
@@ -2859,6 +3651,14 @@ describe('invite channel lines + dedup (#261)', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -2948,6 +3748,14 @@ describe('channel mode display (status bar)', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -3392,6 +4200,14 @@ describe('join key forwarding', () => {
   function makeConn(): IrcConnection {
     return new IrcConnection({
       network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
         id: 1,
         user_id: 1,
         name: 'n',
@@ -3537,6 +4353,7 @@ describe('join echo, forwarded joins (470), and un-partable channels (442)', () 
   it('self-join echo mints the registry row with autojoin and the stashed key', () => {
     const conn = makeConn('echo-mints');
     conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
     conn.stashJoinKey('#Secret', 'hunter2');
 
     conn.client.emit('join', { channel: '#Secret', nick: 'me' });
@@ -3564,6 +4381,76 @@ describe('join echo, forwarded joins (470), and un-partable channels (442)', () 
     const row = getBuffer(conn.network.user_id, conn.network.id, '#chan');
     expect(row?.autojoin).toBe(false);
     expect(row?.key).toBe(null);
+  });
+
+  // The PART echo lowers autojoin, not only ircManager.partChannel. That path
+  // is the app's own /part and buffer-close, so before this a PART Lurker did
+  // not originate left the row flagged for auto-rejoin and the next reconnect
+  // put the user back into a channel they had left — indistinguishable, from
+  // the client, from the part having failed.
+  it('self-part echo lowers autojoin, so a raw PART is not undone on reconnect', () => {
+    const conn = makeConn('part-echo-autojoin');
+    conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
+    conn.upsertChannel('#apple');
+    ensureBufferOpen(conn.network.user_id, conn.network.id, '#apple', {
+      kind: 'channel',
+      autojoin: true,
+    });
+
+    // No partChannel call: this is /quote PART, another client on the bouncer,
+    // or a server forcing one — the echo is all Lurker ever sees.
+    conn.client.emit('part', { channel: '#apple', nick: 'me' });
+
+    expect(conn.channels.has('#apple')).toBe(false);
+    expect(getBuffer(conn.network.user_id, conn.network.id, '#apple')?.autojoin).toBe(false);
+  });
+
+  // The server echoes our nick with whatever casing it holds it in, which
+  // need not match c.user.nick. This branch lowers autojoin now, so the
+  // self-match has to be case-insensitive — as the self-kick branch already
+  // is — or a raw PART on such a server is silently undone on reconnect.
+  it('self-part echo matches our nick case-insensitively', () => {
+    const conn = makeConn('part-echo-nick-case');
+    conn.client.user.nick = 'Me';
+    conn.currentNick = 'Me'; // as registration leaves it
+    conn.upsertChannel('#apple');
+    ensureBufferOpen(conn.network.user_id, conn.network.id, '#apple', {
+      kind: 'channel',
+      autojoin: true,
+    });
+
+    conn.client.emit('part', { channel: '#apple', nick: 'me' });
+
+    expect(conn.channels.has('#apple')).toBe(false);
+    expect(getBuffer(conn.network.user_id, conn.network.id, '#apple')?.autojoin).toBe(false);
+  });
+
+  it("someone else's part leaves autojoin alone", () => {
+    const conn = makeConn('part-echo-other');
+    conn.client.user.nick = 'me';
+    conn.upsertChannel('#apple');
+    ensureBufferOpen(conn.network.user_id, conn.network.id, '#apple', {
+      kind: 'channel',
+      autojoin: true,
+    });
+
+    conn.client.emit('part', { channel: '#apple', nick: 'stranger' });
+
+    expect(getBuffer(conn.network.user_id, conn.network.id, '#apple')?.autojoin).toBe(true);
+  });
+
+  // /part takes an arbitrary argument and is not gated on membership, so this
+  // reaches a channel there was no row for. setAutojoin is update-only and
+  // conjures nothing; the row that does appear is minted by persisting the part
+  // event, and what matters is that it carries no rejoin flag.
+  it('a self-part for a channel we had no row for is not flagged for rejoin', () => {
+    const conn = makeConn('part-echo-norow');
+    conn.client.user.nick = 'me';
+
+    conn.client.emit('part', { channel: '#nowhere', nick: 'me' });
+
+    expect(getBuffer(conn.network.user_id, conn.network.id, '#nowhere')?.autojoin).toBe(false);
   });
 
   it('470 deletes a history-less pre-existing row even when the server relays a different case', () => {
@@ -3867,6 +4754,53 @@ describe('join echo, forwarded joins (470), and un-partable channels (442)', () 
     );
   });
 
+  // connect() attempts SASL on a PASSWORD, using the nick as the authcid when no
+  // account is set — so a password-only network is mid-identification too. It
+  // bites where identifiedToServices never gets set: that flag comes from
+  // RPL_LOGGEDIN (900) alone, and a server may answer a successful SASL with 903
+  // and nothing else.
+  it('473 before RPL_LOGGEDIN leaves autojoin alone on a password-only SASL network', () => {
+    const conn = makeNickServConn('inviteonly-saslpw');
+    conn.network.connect_commands = null; // no NickServ script to hint off
+    conn.network.sasl_account = null; // authcid falls back to the nick
+    conn.network.sasl_password = 'hunter2';
+    ensureBufferOpen(conn.network.user_id, conn.network.id, '#marco', {
+      kind: 'channel',
+      autojoin: true,
+    });
+
+    conn.client.emit('irc error', {
+      error: 'invite_only_channel',
+      channel: '#marco',
+      reason: 'Cannot join channel (+i)',
+    });
+
+    expect(getBuffer(conn.network.user_id, conn.network.id, '#marco')?.autojoin).toBe(true);
+  });
+
+  // A CertFP network identifies on the certificate: SASL EXTERNAL sends no
+  // account name, and passive NickServ CertFP sends nothing at all — so the
+  // sasl_account this gate used to read is empty on exactly the networks that
+  // ARE waiting for services. (#459)
+  it('473 before RPL_LOGGEDIN leaves autojoin alone on a CertFP network', () => {
+    const conn = makeNickServConn('inviteonly-certfp');
+    conn.network.connect_commands = null; // the cert is the only credential
+    conn.network.client_cert = 'cert-pem';
+    conn.network.client_key = 'key-pem';
+    ensureBufferOpen(conn.network.user_id, conn.network.id, '#marco', {
+      kind: 'channel',
+      autojoin: true,
+    });
+
+    conn.client.emit('irc error', {
+      error: 'invite_only_channel',
+      channel: '#marco',
+      reason: 'Cannot join channel (+i)',
+    });
+
+    expect(getBuffer(conn.network.user_id, conn.network.id, '#marco')?.autojoin).toBe(true);
+  });
+
   it('473 after RPL_LOGGEDIN does stop auto-joining on a NickServ network', () => {
     // Same network, same rejection — but now services have confirmed us, so
     // the invex would already have matched. The refusal is durable.
@@ -4006,6 +4940,103 @@ describe('join echo, forwarded joins (470), and un-partable channels (442)', () 
     });
 
     expect(getBuffer(conn.network.user_id, conn.network.id, '#apple')?.autojoin).toBe(false);
+  });
+});
+
+// Regression pin for a bug in the engine-restore "late PART" correction: it
+// used to delete the channel without nulling joinedFoldedCache, so a warm
+// cache kept answering "still joined". engineIntegration.test.ts covers this
+// branch too but via until(), which only proves eventual consistency — the
+// corrective PART's echo re-nulls the cache moments later through a
+// different, already-correct path, hiding the regression. These tests read
+// isChannelJoined() synchronously, same tick as the delete, before that echo
+// could arrive.
+describe('engine-restore late PART keeps isChannelJoined in sync (#stale-cache)', () => {
+  function makeConn(name: string): IrcConnection {
+    const network = createNetwork(1, {
+      name,
+      host: 'irc.example.test',
+      port: 6697,
+      tls: 1,
+      trusted_certificates: 1,
+      nick: 'nick',
+      username: null,
+      realname: null,
+      server_password: null,
+      autoconnect: 0,
+      sasl_account: null,
+      sasl_password: null,
+      connect_commands: null,
+    })!;
+    return new IrcConnection({ network, onEvent: () => {} });
+  }
+
+  it('reports not-joined immediately for an un-autojoined channel, even with a warm cache', () => {
+    const conn = makeConn('restore-late-part-autojoin');
+    conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
+    // Survived the engine's attach-time live-channel diff (still really
+    // joined on the ircd), but the row says we left it while disconnected.
+    conn.upsertChannel('#leaving');
+    ensureBufferOpen(conn.network.user_id, conn.network.id, '#leaving', {
+      kind: 'channel',
+      autojoin: false,
+    });
+    conn.restoring = true;
+
+    // Warm the cache BEFORE the synthesised join, the way some other probe
+    // earlier in a real restore plausibly would — this is the state the
+    // stale-cache bug needed in order to bite.
+    expect(conn.isChannelJoined('#leaving')).toBe(true);
+
+    conn.client.emit('join', { channel: '#leaving', nick: 'me' });
+
+    // No await, no timer: this is the value in the exact tick the delete
+    // happens, before anything — including the raw PART this branch fires —
+    // gets a chance to correct it a different way.
+    expect(conn.channels.has('#leaving')).toBe(false);
+    expect(conn.isChannelJoined('#leaving')).toBe(false);
+  });
+
+  it('reports not-joined immediately for a closed-but-still-autojoined channel, even with a warm cache', () => {
+    const conn = makeConn('restore-late-part-closed');
+    conn.client.user.nick = 'me';
+    conn.currentNick = 'me'; // as registration leaves it
+    conn.upsertChannel('#leaving');
+    ensureBufferOpen(conn.network.user_id, conn.network.id, '#leaving', {
+      kind: 'channel',
+      autojoin: true,
+    });
+    closeBuffer(conn.network.user_id, conn.network.id, '#leaving');
+    conn.restoring = true;
+
+    expect(conn.isChannelJoined('#leaving')).toBe(true);
+
+    conn.client.emit('join', { channel: '#leaving', nick: 'me' });
+
+    expect(conn.channels.has('#leaving')).toBe(false);
+    expect(conn.isChannelJoined('#leaving')).toBe(false);
+  });
+
+  it('leaves an untouched channel joined and cached', () => {
+    const conn = makeConn('restore-late-part-sibling');
+    conn.client.user.nick = 'me';
+    conn.upsertChannel('#leaving');
+    conn.upsertChannel('#stay');
+    ensureBufferOpen(conn.network.user_id, conn.network.id, '#leaving', {
+      kind: 'channel',
+      autojoin: false,
+    });
+    ensureBufferOpen(conn.network.user_id, conn.network.id, '#stay', {
+      kind: 'channel',
+      autojoin: true,
+    });
+    conn.restoring = true;
+    expect(conn.isChannelJoined('#stay')).toBe(true);
+
+    conn.client.emit('join', { channel: '#leaving', nick: 'me' });
+
+    expect(conn.isChannelJoined('#stay')).toBe(true);
   });
 });
 
@@ -4362,5 +5393,150 @@ describe('probePresence intent gate', () => {
     });
     conn.probePresence('NickServ');
     expect(tracked).toEqual([]);
+  });
+});
+
+// Proxy refusals and wiring (#303), dial path A.
+//
+// ⚠⚠ Every case here is a REFUSAL, never a fallback to a direct dial. That is
+// the whole feature: connecting anyway hands the ircd the address the user was
+// specifically trying not to expose, silently, and the connection works — which
+// is the worst possible outcome. The assertion that matters in each test is
+// `dialed` NOT having been called.
+describe('proxy refusals and wiring', () => {
+  const PROXIED = {
+    proxy_enabled: 1,
+    proxy_type: 'socks5',
+    proxy_host: '127.0.0.1',
+    proxy_port: 9050,
+  };
+
+  function makeProxyConn(fields: Partial<Network> = {}): IrcConnection {
+    return new IrcConnection({
+      network: {
+        client_cert: null,
+        client_key: null,
+        proxy_enabled: 0,
+        proxy_type: null,
+        proxy_host: null,
+        proxy_port: null,
+        proxy_username: null,
+        proxy_password: null,
+        id: 1,
+        user_id: 1,
+        name: 'proxied',
+        host: 'irc.example.test',
+        port: 6697,
+        tls: 1,
+        trusted_certificates: 1,
+        nick: 'nick',
+        username: null,
+        realname: null,
+        server_password: null,
+        autoconnect: 1,
+        sasl_account: null,
+        sasl_password: null,
+        connect_commands: null,
+        position: 0,
+        casemapping: null,
+        created_at: new Date().toISOString(),
+        last_client_ip: null,
+        ...fields,
+      },
+      onEvent: () => {},
+    });
+  }
+
+  function attemptProxy(fields: Partial<Network> = {}): {
+    dialed: ReturnType<typeof vi.fn>;
+    published: Record<string, unknown>[];
+  } {
+    const conn = makeProxyConn(fields);
+    const published: Record<string, unknown>[] = [];
+    conn.publish = (event: unknown) => {
+      published.push(event as Record<string, unknown>);
+    };
+    const dialed = vi.fn<(options: ConnectOptions) => void>();
+    conn.client.connect = dialed;
+    conn.connect();
+    return { dialed, published };
+  }
+
+  const refusalText = (published: Record<string, unknown>[]) =>
+    String(
+      published.find((e) => e.type === 'error' && /Not connecting/.test(String(e.text)))?.text,
+    );
+
+  it('dials through the proxy transport when one is configured', () => {
+    const { dialed } = attemptProxy(PROXIED as Partial<Network>);
+    expect(dialed).toHaveBeenCalledOnce();
+    const options = dialed.mock.calls[0][0];
+    expect(options.proxy).toEqual({ type: 'socks5', host: '127.0.0.1', port: 9050 });
+    expect(options.transport).toBeDefined();
+  });
+
+  it('dials directly, with no transport override, when there is no proxy', () => {
+    const { dialed } = attemptProxy();
+    expect(dialed).toHaveBeenCalledOnce();
+    expect(dialed.mock.calls[0][0].proxy).toBeUndefined();
+    expect(dialed.mock.calls[0][0].transport).toBeUndefined();
+  });
+
+  it('dials DIRECTLY when a proxy is configured but disabled', () => {
+    // The affordance, and the one case where "configured" and "in effect"
+    // legitimately differ: proxy_enabled is what the dial path asks.
+    const { dialed } = attemptProxy({ ...PROXIED, proxy_enabled: 0 } as Partial<Network>);
+    expect(dialed).toHaveBeenCalledOnce();
+    expect(dialed.mock.calls[0][0].proxy).toBeUndefined();
+  });
+
+  // ⚠⚠ Archive import writes the proxy columns verbatim (exportSchema drives
+  // its column list), so an unusable stored proxy is reachable without anyone
+  // typing it. It must stop the dial, not quietly become a direct connection.
+  it('does not dial when an enabled proxy is unusable', () => {
+    const cases: Array<Partial<Network>> = [
+      { ...PROXIED, proxy_type: 'socks4' } as Partial<Network>,
+      { ...PROXIED, proxy_port: 0 } as Partial<Network>,
+      { ...PROXIED, proxy_host: '' } as Partial<Network>,
+      { ...PROXIED, proxy_password: 'orphan' } as Partial<Network>,
+    ];
+    const results = cases.map((fields) => {
+      const { dialed, published } = attemptProxy(fields);
+      return { dialedTimes: dialed.mock.calls.length, refusal: refusalText(published) };
+    });
+    expect(results.map((r) => r.dialedTimes)).toEqual([0, 0, 0, 0]);
+    for (const r of results) expect(r.refusal).toMatch(/proxy is unusable/);
+  });
+
+  it('does not dial a user-set proxy on a locked-down instance', async () => {
+    // The lockdown is re-checked on the connect path, not only on write — an
+    // admin who closes the instance has to close the connections it has.
+    const { setAllowUserDefinedNetworks } = await import('../db/instanceSettings.js');
+    setAllowUserDefinedNetworks(false);
+    try {
+      const { dialed, published } = attemptProxy(PROXIED as Partial<Network>);
+      expect(dialed).not.toHaveBeenCalled();
+      expect(refusalText(published)).toMatch(/does not allow connecting through a proxy/);
+    } finally {
+      setAllowUserDefinedNetworks(true);
+    }
+  });
+});
+
+describe('formatSocketCloseErrorMessage with a proxy failure', () => {
+  it('names the proxy, not the ircd', () => {
+    // Without this arm the user reads "Connection failed
+    // (irc.libera.chat:6697): connection refused" when what refused was Tor on
+    // their own machine — and goes and debugs the wrong host.
+    const text = formatSocketCloseErrorMessage(
+      {
+        code: 'PROXY_UNREACHABLE',
+        message: 'the SOCKS5 proxy at socks5://127.0.0.1:9050: nothing is listening there',
+      },
+      'irc.libera.chat:6697',
+      true,
+    );
+    expect(text).toContain('127.0.0.1:9050');
+    expect(text).not.toContain('irc.libera.chat');
   });
 });

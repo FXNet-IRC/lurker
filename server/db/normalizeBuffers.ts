@@ -32,6 +32,24 @@ import { foldTargetWith, normalizeCasemapping } from './casemapping.js';
 
 const FOLD_FN = 'lurker_fold_target';
 
+// Classify a target the way the v17 mint does.
+//
+// ⚠ The prefix sets are spelled out here rather than calling the shared
+// `isChannelTarget` / `isDccChatTarget`, and deliberately so — the same rule
+// contactsToFavoritesSeed states: a migration has to keep classifying rows the
+// way it did the day it ran, and an already-normalized database must not
+// retroactively disagree with itself. Do not "clean this up".
+//
+// ⚠⚠ `=nick` is a DCC chat, never an IRC target. This path is re-runnable and
+// the archive import reuses it, so an import carrying `=nick` history would
+// otherwise mint it as a plain DM — the classification that puts a non-nick
+// into the MONITOR seed and the bouncer's playback set.
+function kindForNormalizedTarget(target: string): 'channel' | 'dm' | 'dcc' {
+  const first = target[0] ?? '';
+  if ('#&+!'.includes(first)) return 'channel';
+  return first === '=' && target.length > 1 ? 'dcc' : 'dm';
+}
+
 export function registerFoldFunction(db: Database): void {
   // Registering the same name twice replaces the implementation — harmless —
   // but wrap anyway so a driver that objects can't turn boot into a crash.
@@ -144,7 +162,7 @@ export function mintOrphanBuffersFromMessages(db: Database): number {
     if (target.startsWith(':')) continue;
     const folded = foldFor(networkId, target);
     if (exists.get(owner.userId, networkId, folded)) continue;
-    const kind = '#&+!'.includes(target[0] ?? '') ? 'channel' : 'dm';
+    const kind = kindForNormalizedTarget(target);
     minted += insert.run(owner.userId, networkId, target, folded, kind).changes;
   }
   return minted;
@@ -336,7 +354,7 @@ export function mintOrphanBuffersFromSatellites(db: Database, tables: readonly s
     for (const { userId, networkId, target } of rows) {
       if (target.startsWith(':')) continue;
       if (networkId != null && !networkExists.get(networkId)) continue; // FK would reject
-      const kind = '#&+!'.includes(target[0] ?? '') ? 'channel' : 'dm';
+      const kind = kindForNormalizedTarget(target);
       minted += insert.run(userId, networkId, target, foldFor(networkId, target), kind).changes;
     }
   }

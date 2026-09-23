@@ -231,7 +231,7 @@ environment:
   - LOCAL_UPLOADS_DIR=/data/uploads
 ```
 
-The link Lurker pastes into IRC has to be an **absolute** URL, or nobody else can open it. Lurker works the origin out from the incoming request, which is right for most reverse-proxy setups. If your links come out with the wrong hostname or scheme, pin it explicitly:
+The link Lurker pastes into IRC has to be an **absolute** URL, or nobody else can open it. Lurker works the origin out from the incoming request, which is right for most reverse-proxy setups. If your links come out with the wrong hostname or scheme, pin it explicitly. The [bouncer](#irc-bouncer-attach-from-other-irc-clients) needs it set to offer file uploads to IRC clients, since it has no web request to work the origin out from:
 
 ```yaml
 environment:
@@ -499,7 +499,7 @@ When set, the env var takes precedence and the file is ignored.
 
 ### Outbound contact info (User-Agent)
 
-When Lurker talks to external services (image hosts, link previews, etc.) and replies to CTCP VERSION on IRC, it identifies itself with a User-Agent string. Set `USER_AGENT_CONTACT` to a `mailto:` or URL so the operators of those services can reach _you_ if your instance misbehaves:
+When Lurker talks to external services (image hosts, link previews, etc.), it identifies itself with a User-Agent string. Set `USER_AGENT_CONTACT` to a `mailto:` or URL so the operators of those services can reach _you_ if your instance misbehaves:
 
 ```yaml
 environment:
@@ -518,22 +518,35 @@ environment:
   - LURKER_BOUNCER_PORT=6667 # remember to publish this port in docker-compose
 ```
 
+Your members don't have to be told any of this: with the bouncer on, **Settings → Bouncer** shows each of them the address, their username, and the two login forms below, with their own network names filled in.
+
+If the bouncer answers somewhere other than this instance's own hostname and listener — TLS terminated in front of it, or a hostname of its own — say so, and the pane shows that instead:
+
+```yaml
+environment:
+  - LURKER_BOUNCER_PUBLIC_URL=ircs://irc.example.com:6697 # ircs = TLS, irc = without; give the port whenever it isn't Lurker's own
+```
+
 Point your IRC client at the host/port with a **server password** of:
 
 - `username:secret` — when you have one network configured
 - `username/networkname:secret` — to pick one of several (the network's name as shown in the web UI, or its numeric id)
 
-The secret can be your Lurker account password, but a **read-write API token** (web UI → **Settings → API tokens**) is the better choice — IRC clients store the server password in plaintext config files, and a token can be revoked without changing your password.
+Logging in as just `username` when you have several networks is not an error — you land on an idle connection that isn't attached to anything, and Lurker sends a notice naming the networks you can pick from. Reconnect with `username/networkname` to attach one. An account with no networks yet lands on that same idle connection with a notice telling you to add one in the web UI first; networks are created there, not from an IRC client.
+
+The secret can be your Lurker account password, but a **read-write API token** (web UI → **Settings → API tokens**) is the better choice — IRC clients store the server password in plaintext config files, and a token can be revoked without changing your password. Revoking it also disconnects any IRC client still logged in with it.
 
 Modern IRCv3 clients (Halloy, gamja, Goguma, …) get more than the server-password floor above:
 
 - **SASL** — log in with the same credential via SASL PLAIN instead of a server password.
-- **Network discovery** (`soju.im/bouncer-networks`) — the client lists and binds your networks itself, so you don't hardcode `username/networkname`; connect as just `username` and pick from the list.
-- **On-demand scrollback** (`draft/chathistory`) — page back through history on demand instead of relying only on the fixed replay-on-attach.
+- **Network discovery** (`soju.im/bouncer-networks`) — the client lists and binds your networks itself, so you don't hardcode `username/networkname`; connect as just `username` and pick from the list. This is what the idle connection above is for.
+- **On-demand scrollback** (`draft/chathistory`) — the client fetches the history it wants itself, so Lurker skips the replay on attach.
+- **Read markers** (`draft/read-marker`) — what you read in one client shows as read in your other clients and in the web and iOS apps, and the other way round.
+- **File uploads** (`soju.im/FILEHOST`) — attach a file in Goguma, gamja or Halloy and it goes through your uploader, same as a paste in the web app. This needs [`PUBLIC_BASE_URL`](#file-uploads-on-your-own-disk) set to your instance's **https** address; without it the bouncer doesn't offer uploads.
 
 These are negotiated automatically; plain clients that don't support them keep working over the server-password path.
 
-#### TLS
+#### Bouncer TLS
 
 Plain-text IRC would send that credential across the wire in the clear, so **the bouncer speaks TLS by default** — you don't have to do anything to get an encrypted connection. Connect in your IRC client's **TLS/SSL** mode. There are three ways the cert is sourced:
 
@@ -549,13 +562,13 @@ Plain-text IRC would send that credential across the wire in the clear, so **the
 
   Note the bouncer is raw IRC over TCP, so your **HTTP reverse proxy (Caddy/Cloudflare) can't front it** — the bouncer terminates its own TLS. Lurker re-reads the cert files periodically and hot-swaps a renewed cert, so certbot renewals need no restart.
 
-- **Plain-text (opt-in, private networks only).** If — and only if — you keep the listener private (`LURKER_BOUNCER_BIND=127.0.0.1` behind an SSH tunnel, or a VPN/Tailscale interface), you can turn TLS off with `LURKER_BOUNCER_TLS=off`. On a non-loopback bind without TLS, Lurker logs a loud security warning. Don't do this on a public address.
+- **TLS via a reverse proxy.** If you're hiding Lurker behind a reverse proxy where you're handling TLS termination yourself, you'll want to set `LURKER_BOUNCER_BIND=<ip address>` and turn off Lurker's TLS with `LURKER_BOUNCER_TLS=off`.
 
 Repeated failed logins from an address are throttled automatically.
 
-Playback replays the last 50 lines per joined channel (plus your 20 most recently active DMs) on attach; tune with `LURKER_BOUNCER_PLAYBACK` (0 disables, max 1000). Clients that negotiate IRCv3 `server-time` get real timestamps on replayed lines.
+Playback replays the last 50 lines per joined channel (plus your 20 most recently active DMs) on attach; tune with `LURKER_BOUNCER_PLAYBACK` (0 disables, max 1000). Clients that negotiate IRCv3 `server-time` get real timestamps on replayed lines. Clients that negotiate `draft/chathistory` get no playback, since they fetch their own.
 
-Known limitations (shared-connection bouncer semantics): replies to one attached client's WHOIS/LIST are visible to all attached clients on that network; Lurker-side ignore rules don't filter the live relay; and on end-to-end encrypted channels an attached client sees the wire ciphertext for incoming messages.
+A reply goes only to the client that asked for it: your WHOIS or LIST isn't seen by other attached clients or by the web app. Known limitations: Lurker-side ignore rules don't filter the live relay, and on end-to-end encrypted channels an attached client sees the wire ciphertext for incoming messages.
 
 ### IRC engine (upgrade without dropping IRC)
 

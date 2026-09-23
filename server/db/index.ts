@@ -661,6 +661,57 @@ function migrate() {
     );
     CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
 
+    -- OAuth 2 authorization server (#891). A third-party client registers itself
+    -- (open, RFC 7591), the member approves it in the browser, and the client
+    -- exchanges the one-time code for an access token with the same access as a
+    -- password sign-in. Public clients only: client_id is public and there is no
+    -- client secret, because with open registration a secret proves nothing.
+    -- PKCE binds each code to whoever started the flow instead.
+    --
+    -- first_authorized_at is set on the first approval. Registrations still NULL
+    -- an hour after creation are purged, which is what bounds a table anyone can
+    -- write to.
+    CREATE TABLE IF NOT EXISTS oauth_apps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_id TEXT NOT NULL UNIQUE,
+      client_name TEXT NOT NULL,
+      client_uri TEXT,
+      redirect_uris TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      first_authorized_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_oauth_apps_pending
+      ON oauth_apps(created_at) WHERE first_authorized_at IS NULL;
+
+    -- One row per approval until the client exchanges it. Only the SHA-256 of the
+    -- code is stored, and exchanging DELETEs the row, which is what makes a code
+    -- single-use. Bound to the redirect_uri and PKCE challenge it was issued for.
+    CREATE TABLE IF NOT EXISTS oauth_codes (
+      code_hash TEXT PRIMARY KEY,
+      app_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      redirect_uri TEXT NOT NULL,
+      code_challenge TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      FOREIGN KEY (app_id) REFERENCES oauth_apps(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    -- Access tokens. SHA-256 only, never expire, and revoking DELETEs the row.
+    -- push_subscriptions.oauth_token_id cascades from it (added at the end of
+    -- this file), so an app's push registrations go with its token.
+    CREATE TABLE IF NOT EXISTS oauth_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_hash TEXT NOT NULL UNIQUE,
+      app_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      last_used_at TEXT,
+      FOREIGN KEY (app_id) REFERENCES oauth_apps(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_oauth_tokens_user_app ON oauth_tokens(user_id, app_id);
+
     -- Per-user data-export jobs. A request to export account data spawns a
     -- background worker (separate readonly SQLite connection) that builds the
     -- .lurk archive to disk under data/exports/<token>.lurk; the row tracks
@@ -1095,9 +1146,34 @@ ensureColumn('messages', 'userhost', 'TEXT');
 ensureColumn('networks', 'sasl_account', 'TEXT');
 ensureColumn('networks', 'sasl_password', 'TEXT');
 ensureColumn('networks', 'trusted_certificates', 'INTEGER NOT NULL DEFAULT 1');
+// CertFP (#459): the TLS client certificate this network presents, so services
+// can recognise the user by its fingerprint — passively (NickServ CertFP) or
+// through SASL EXTERNAL. Stored as a pair because a cert without its key can't
+// complete a handshake; both are written together or not at all, and both are
+// encrypted at rest (see exportSchema encryptedColumns).
+ensureColumn('networks', 'client_cert', 'TEXT');
+ensureColumn('networks', 'client_key', 'TEXT');
 // Newline-delimited raw IRC commands fired after RPL_WELCOME, IRCCloud-style.
 // Supports `WAIT <seconds>` lines that pause before the next command.
 ensureColumn('networks', 'connect_commands', 'TEXT');
+// SOCKS5 / HTTP CONNECT proxy for this network's IRC socket (#303). Stored as
+// parts rather than a URL because Lurker never hands a stored secret back to a
+// client: under one `socks5://user:pass@host:1080` string the form could only
+// ever show a redacted value, so changing the port would mean retyping the
+// password. See shared/proxy.ts (parsing + validation) and
+// server/utils/proxyDial.ts (the dial itself).
+//
+// ⚠ `proxy_enabled` is the ONLY thing the dial path asks. Credentials with the
+// flag off means direct, deliberately — it lets someone go direct for a minute
+// without deleting what they configured, and it gives "is this proxied" one
+// unambiguous field instead of something inferred from a non-empty host.
+ensureColumn('networks', 'proxy_enabled', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('networks', 'proxy_type', 'TEXT');
+ensureColumn('networks', 'proxy_host', 'TEXT');
+ensureColumn('networks', 'proxy_port', 'INTEGER');
+ensureColumn('networks', 'proxy_username', 'TEXT');
+// Encrypted at rest, like every other network secret (see exportSchema).
+ensureColumn('networks', 'proxy_password', 'TEXT');
 // Per-user sidebar order. Dense integers (0..n-1) maintained on every
 // create/reorder; ties fall back to id ASC so freshly migrated rows stay in
 // their original creation order. See schemaVersion < 6 backfill below.
@@ -2573,5 +2649,20 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_ignored_masks_user_net
 // CREATE already ran before it — so recreate here for both fresh and rebuilt
 // paths. hasEnabledForUser hits it on the push hot path.
 db.exec(`CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions(user_id)`);
+
+// #891: which OAuth token registered a push subscription, so revoking the app
+// deletes its registrations through the cascade. NULL for anything registered
+// through a session. Added HERE, after the unversioned push_subscriptions rebuild
+// above, and not in the ensureColumn block near the top: that rebuild copies an
+// explicit column list into a new table, so on a database still in the pre-#490
+// shape a column added earlier would be silently dropped.
+ensureColumn(
+  'push_subscriptions',
+  'oauth_token_id',
+  'INTEGER REFERENCES oauth_tokens(id) ON DELETE CASCADE',
+);
+db.exec(
+  `CREATE INDEX IF NOT EXISTS idx_push_subs_oauth_token ON push_subscriptions(oauth_token_id)`,
+);
 
 export default db;

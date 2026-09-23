@@ -73,6 +73,40 @@ describe('ircManager pause linchpin', () => {
 // #616: the gate the auto-reconnect controller now asks before each retry. Same
 // implementation startNetwork uses, so the two can't drift apart — which is the
 // whole point, since the reconnect path used to skip both checks entirely.
+// #459. A dial refused because the network's client certificate cannot be
+// presented opens no socket, so nothing ever schedules a retry — and
+// startNetwork is a documented no-op when a connection object already exists.
+// Leaving the refused one in the map would make /connect answer ok and do
+// nothing, forever, even after the user removes the certificate.
+describe('ircManager and a connection refused over its certificate', () => {
+  it('drops the refused connection so a later /connect builds a working one', async () => {
+    const { setNetworkClientCert } = await import('../db/networks.js');
+    const user = createUser('certfp-corpse');
+    const network = createNetwork(user.id, {
+      name: 'certfp-corpse-net',
+      host: 'irc.example.test',
+      port: 6697,
+      tls: true,
+      nick: 'nick',
+      autoconnect: false,
+    })!;
+    // Half a pair — what a hand-edited archive plants, and one of the reasons
+    // the dial is refused outright.
+    setNetworkClientCert(network.id, user.id, { cert: 'cert-only', key: '' });
+
+    expect(ircManager.startNetwork(user.id, network.id)).not.toBe(null);
+    // Refused, and gone: not a corpse the next call would hand back.
+    expect(ircManager.getConnection(user.id, network.id)).toBeFalsy();
+
+    // The user fixes it the only way the UI offers.
+    setNetworkClientCert(network.id, user.id, null);
+    const revived = ircManager.startNetwork(user.id, network.id);
+    expect(revived).not.toBe(null);
+    expect(ircManager.getConnection(user.id, network.id)).toBe(revived);
+    ircManager.disposeNetwork(user.id, network.id, 'test over');
+  });
+});
+
 describe('ircManager.connectGate', () => {
   let seq = 0;
   function gateUserNet(host = 'irc.example.invalid') {
@@ -483,6 +517,99 @@ describe('planChannelRejoins', () => {
 
     expect(buffers.getBuffer(user.id, net.id, '#here')!.key).toBe('direct-key');
     expect(conn.takeStashedJoinKey('#here')).toBeUndefined();
+  });
+
+  it('joinChannel sends the stored key when rejoining a parted +k channel without one (#873)', () => {
+    // The Join Channel menu item, the invite toast and a bare /join send no key.
+    // A part only clears autojoin, so the row still holds the key the echo stored.
+    const user = createUser('irc-join-storedkey');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'irc.example.invalid',
+      port: 6697,
+      tls: true,
+      nick: 'a',
+    })!;
+    const conn = ircManager.startNetwork(user.id, net.id, { deferrable: true })!;
+    const join = vi.fn<(channel: string, key?: string) => void>();
+    conn.client.join = join;
+    conn.client.part = vi.fn<(channel: string, reason?: string) => void>();
+
+    ircManager.joinChannel(user.id, net.id, '#secret', 'hunter2');
+    conn.client.user.nick = 'a';
+    conn.client.emit('join', { channel: '#secret', nick: 'a' });
+    ircManager.partChannel(user.id, net.id, '#secret');
+    conn.client.emit('part', { channel: '#secret', nick: 'a' });
+    expect(conn.isChannelJoined('#secret')).toBe(false);
+    expect(buffers.getBuffer(user.id, net.id, '#secret')!.key).toBe('hunter2');
+
+    join.mockClear();
+    ircManager.joinChannel(user.id, net.id, '#Secret');
+    expect(join).toHaveBeenCalledWith('#Secret', 'hunter2');
+    // Nothing stashed: the row already holds the key.
+    expect(conn.takeStashedJoinKey('#Secret')).toBeUndefined();
+
+    // A key the caller sends still wins.
+    join.mockClear();
+    ircManager.joinChannel(user.id, net.id, '#secret', 'newkey');
+    expect(join).toHaveBeenCalledWith('#secret', 'newkey');
+  });
+
+  it('joinChannel joins keyless when the stored key cannot be decrypted', async () => {
+    // A key stored under a rotated or unknown key-id makes decryptSecret throw,
+    // and joinChannel runs on the unguarded ws path.
+    const db = (await import('../db/index.js')).default;
+    const user = createUser('irc-join-badstoredkey');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'irc.example.invalid',
+      port: 6697,
+      tls: true,
+      nick: 'a',
+    })!;
+    const conn = ircManager.startNetwork(user.id, net.id, { deferrable: true })!;
+    const join = vi.fn<(channel: string, key?: string) => void>();
+    conn.client.join = join;
+
+    buffers.ensureOpen(user.id, net.id, '#vault', { kind: 'channel' });
+    db.prepare(
+      "UPDATE buffers SET key = ? WHERE user_id = ? AND network_id = ? AND kind = 'channel'",
+    ).run('lk1.deadbeef.AAAAAAAA', user.id, net.id);
+    expect(() => buffers.getBuffer(user.id, net.id, '#vault')).toThrow(/secretCrypto/);
+
+    expect(() => ircManager.joinChannel(user.id, net.id, '#vault')).not.toThrow();
+    expect(join).toHaveBeenCalledWith('#vault', undefined);
+  });
+
+  it('a keyless rejoin drops the key a refused JOIN left stashed', () => {
+    // A refused JOIN gets no echo, so its key stays stashed. The keyless rejoin
+    // after it sends the stored key and lands; its echo must not store the
+    // refused key over the one that worked.
+    const user = createUser('irc-join-stalestash');
+    const net = createNetwork(user.id, {
+      name: 'n',
+      host: 'irc.example.invalid',
+      port: 6697,
+      tls: true,
+      nick: 'a',
+    })!;
+    const conn = ircManager.startNetwork(user.id, net.id, { deferrable: true })!;
+    const join = vi.fn<(channel: string, key?: string) => void>();
+    conn.client.join = join;
+    conn.client.part = vi.fn<(channel: string, reason?: string) => void>();
+
+    ircManager.joinChannel(user.id, net.id, '#secret', 'hunter2');
+    conn.client.user.nick = 'a';
+    conn.client.emit('join', { channel: '#secret', nick: 'a' });
+    ircManager.partChannel(user.id, net.id, '#secret');
+    conn.client.emit('part', { channel: '#secret', nick: 'a' });
+
+    ircManager.joinChannel(user.id, net.id, '#secret', 'wrong'); // refused: no echo
+    ircManager.joinChannel(user.id, net.id, '#secret');
+    expect(join).toHaveBeenLastCalledWith('#secret', 'hunter2');
+    conn.client.emit('join', { channel: '#secret', nick: 'a' });
+
+    expect(buffers.getBuffer(user.id, net.id, '#secret')!.key).toBe('hunter2');
   });
 
   it('joinChannel drops a non-string key from an untrusted payload without throwing', () => {

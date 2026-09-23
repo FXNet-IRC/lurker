@@ -17,7 +17,29 @@
 // new op is a minor change; renaming or re-meaning one is a major.
 
 export const PROTOCOL_MAJOR = 1;
-export const PROTOCOL_MINOR = 1;
+// minor 2 (#459): `connect` carries an optional client certificate. An app that
+// needs one refuses to dial through an engine below this rather than connecting
+// as an unrecognised stranger — an older engine would ignore the field, and
+// silence is indistinguishable from success on the app side.
+// minor 3 (#889): the engine follows RENAME in its tracked channel set, so a
+// re-attach replays the name a channel has now. An engine below this replays
+// the name it had at the rename — silently, and for the life of the socket —
+// which is why the app half of draft/channel-rename (#858) has a minor to gate
+// on rather than having to assume.
+// minor 4 (#894): `held` — a session offered AFTER hello. The hello's list
+// withholds what another link still claims, a dead link's included, and until
+// this minor nothing ever re-listed those: a session released after the hello
+// stayed unadopted (or, for a paused account, un-closed) until the orphan
+// reaper or the next restart. An engine below this still lists correctly at
+// hello; it just never says anything afterwards.
+// minor 5 (#303): `connect` carries an optional proxy. An app whose network is
+// proxied refuses to dial through an engine below this rather than connecting
+// direct — an older engine ignores the field, and a direct connection is not a
+// degraded version of a proxied one, it is the user's real address on the wire
+// while the UI says otherwise. Same shape as the client-certificate gate at
+// minor 2, and for a stronger reason: a missing certificate fails visibly, a
+// missing proxy succeeds.
+export const PROTOCOL_MINOR = 5;
 
 // One frame is one JSON object on one line. Most wrap a single IRC line (≤ 8191
 // bytes with tags); the one large frame is `attached`, whose replay is bounded by
@@ -96,6 +118,31 @@ export type AppToEngine =
       // the app because it is derived from the account, which the engine never
       // sees.
       ident?: string;
+      // CertFP (#459): the TLS client certificate to present on the handshake.
+      // The private key crosses this link, which is the same trust boundary the
+      // link already carries PASS and AUTHENTICATE lines across — but the engine
+      // must never log it, and must validate the pair before dialing, because
+      // tls.connect throws SYNCHRONOUSLY on a malformed key and an uncaught
+      // throw there is every held socket in the process.
+      clientCert?: { cert: string; key: string };
+      // SOCKS5 / HTTP CONNECT proxy for this socket (#303). The app parses the
+      // user's setting into these parts; the engine validates the shape and
+      // never parses text of its own. The password crosses this link, which
+      // already carries PASS and AUTHENTICATE lines — but, like the client
+      // key, the engine must never log it.
+      //
+      // ⚠ `matchesDial` compares this. Without that, editing or removing a
+      // proxy re-attaches to the socket held under the OLD one, and since a
+      // proxy change deliberately takes effect on the next connect rather than
+      // tearing down the live socket, that comparison is the ONLY thing that
+      // makes the change ever apply.
+      proxy?: {
+        type: 'socks5' | 'http';
+        host: string;
+        port: number;
+        username?: string;
+        password?: string;
+      };
     }
   | { op: 'write'; id: string; line: string }
   // Everything up to and including `seq` has been persisted; the engine may
@@ -150,6 +197,13 @@ export type EngineToApp =
   | { op: 'detached'; id: string; reason: 'taken-over' }
   // The IRC socket is gone. The engine forgets the id.
   | { op: 'closed'; id: string; error?: string }
+  // A session this instance may attach to that the hello could not list: the
+  // link holding it has since died, or detached it, or it finished registering
+  // with nobody attached. One more entry in hello.held: adopt if policy
+  // allows, close if not. It can cross a `close` the app has already sent for
+  // the id; the app drops an offer for an id it has closed on this link
+  // (engineLink.ts), which frames-in-order makes exact.
+  | { op: 'held'; id: string }
   | { op: 'listing'; connections: ConnectionInfo[] }
   | { op: 'error'; id?: string; message: string };
 

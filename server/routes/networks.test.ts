@@ -22,9 +22,15 @@ const fakeManager = {
   calls: Array<unknown[]>(),
   reset() {
     this.calls = [];
+    this.certAtDial = null;
   },
   startNetwork(userId: number, networkId: number) {
     this.calls.push(['startNetwork', userId, networkId]);
+    // What the row looked like AT DIAL TIME. A certificate is presented during
+    // the TLS handshake, so one written after this point misses the connect it
+    // was created for — and that is the connect the user has to run
+    // `CERT ADD` from. (#459)
+    this.certAtDial = certOnRow(networkId);
   },
   stopNetwork(userId: number, networkId: number, reason: string) {
     this.calls.push(['stopNetwork', userId, networkId, reason]);
@@ -35,6 +41,18 @@ const fakeManager = {
   disposeNetwork(userId: number, networkId: number, reason: string) {
     this.calls.push(['disposeNetwork', userId, networkId, reason]);
   },
+  // Records whether the row still existed: a DCC chat socket that outlived a
+  // Disconnect has to be ended BEFORE the row goes, or the peer's next line
+  // publishes into a network that no longer exists.
+  endDccChats(userId: number, networkId: number, reason: string) {
+    this.calls.push(['endDccChats', userId, networkId, reason, rowExists(networkId)]);
+  },
+  // Records whether the row was there when the change was announced: a bouncer
+  // client is told about a new or edited network from its row, and a deleted
+  // one by its absence.
+  networkChanged(userId: number, networkId: number) {
+    this.calls.push(['networkChanged', userId, networkId, rowExists(networkId)]);
+  },
   joinChannel(userId: number, networkId: number, channel: string, key?: string) {
     this.calls.push(['joinChannel', userId, networkId, channel, key]);
     return this.joinReturn !== undefined ? this.joinReturn : true;
@@ -43,11 +61,25 @@ const fakeManager = {
     this.calls.push(['partChannel', userId, networkId, channel, reason]);
     return this.partReturn !== undefined ? this.partReturn : true;
   },
+  certAtDial: null as string | null,
   joinReturn: undefined as boolean | undefined,
   partReturn: undefined as boolean | undefined,
 };
 
 vi.mock('../services/ircManager.js', () => ({ default: fakeManager }));
+
+// Read straight from the row: the point is what was STORED by the time the dial
+// went out, not what an API response said afterwards.
+function certOnRow(networkId: number): string | null {
+  const row = dbRef?.prepare('SELECT client_cert FROM networks WHERE id = ?').get(networkId) as
+    | { client_cert: string | null }
+    | undefined;
+  return row?.client_cert ?? null;
+}
+function rowExists(networkId: number): boolean {
+  return !!dbRef?.prepare('SELECT 1 FROM networks WHERE id = ?').get(networkId);
+}
+let dbRef: typeof import('../db/index.js').default | null = null;
 
 let app: Express;
 let aliceAgent: LurkerTestAgent;
@@ -61,6 +93,7 @@ beforeAll(async () => {
 
   alice = createUser('net-alice');
   bob = createUser('net-bob');
+  dbRef = (await import('../db/index.js')).default;
   app = createTestApp({ '/api/networks': router });
   aliceAgent = await createAuthedAgent(app, alice.id);
   bobAgent = await createAuthedAgent(app, bob.id);
@@ -118,11 +151,52 @@ describe('POST /api/networks', () => {
     expect(fakeManager.calls.some(([m]) => m === 'startNetwork')).toBe(true);
   });
 
+  it('announces the new network before connecting it', async () => {
+    const res = await makeNet(aliceAgent, { name: 'announced' });
+    expect(res.status).toBe(201);
+    const id = res.body.network.id;
+    const methods = fakeManager.calls.map(([m]) => m);
+    expect(fakeManager.calls).toContainEqual(['networkChanged', alice.id, id, true]);
+    expect(methods.indexOf('networkChanged')).toBeLessThan(methods.indexOf('startNetwork'));
+  });
+
   it('still starts the connection on create when autoconnect is false (#186)', async () => {
     fakeManager.reset();
     const res = await makeNet(aliceAgent, { autoconnect: false, name: 'no-autoconn' });
     expect(res.status).toBe(201);
     expect(fakeManager.calls.some(([m]) => m === 'startNetwork')).toBe(true);
+  });
+
+  // The body goes to createNetwork unvalidated, and a client that sends a
+  // number is taken at its word: 0 is off (it read as on until #894 found
+  // it), and a null is "unset", which is the default — on.
+  it('stores a numeric 0 as off and a null as the default', async () => {
+    const off = await makeNet(aliceAgent, { autoconnect: 0, name: 'num-off' });
+    expect(off.status).toBe(201);
+    expect(off.body.network.autoconnect).toBe(false);
+    const unset = await makeNet(aliceAgent, { autoconnect: null, name: 'null-unset' });
+    expect(unset.status).toBe(201);
+    expect(unset.body.network.autoconnect).toBe(true);
+  });
+
+  // The same null on an update means "unchanged", for all three flags: the
+  // old coercion read it as false, which for `tls` turned "leave it" into
+  // "drop the encryption".
+  it('a null flag on PATCH leaves that flag alone', async () => {
+    const net = await makeNet(aliceAgent, { autoconnect: false, tls: true, name: 'null-patch' });
+    expect(net.status).toBe(201);
+    const id = net.body.network.id;
+    const nulls = await aliceAgent
+      .patch(`/api/networks/${id}`)
+      .send({ autoconnect: null, tls: null, trusted_certificates: null, nick: 'renamed' });
+    expect(nulls.status).toBe(200);
+    expect(nulls.body.network.autoconnect).toBe(false);
+    expect(nulls.body.network.tls).toBe(true);
+    expect(nulls.body.network.nick).toBe('renamed');
+    const on = await aliceAgent.patch(`/api/networks/${id}`).send({ autoconnect: true });
+    expect(on.body.network.autoconnect).toBe(true);
+    const off = await aliceAgent.patch(`/api/networks/${id}`).send({ autoconnect: 0 });
+    expect(off.body.network.autoconnect).toBe(false);
   });
 
   it('500s and does not connect if createNetwork returns undefined', async () => {
@@ -238,6 +312,19 @@ describe('PATCH /api/networks/:id', () => {
     expect(res.status).toBe(200);
     expect(res.body.network.nick).toBe('newnick');
     expect(res.body.network.trusted_certificates).toBe(false);
+    expect(fakeManager.calls).toContainEqual([
+      'networkChanged',
+      alice.id,
+      net.body.network.id,
+      true,
+    ]);
+  });
+
+  it('announces nothing for an edit it refuses', async () => {
+    const bobNet = await makeNet(bobAgent, { name: 'bobs-quiet' });
+    fakeManager.reset();
+    await aliceAgent.patch(`/api/networks/${bobNet.body.network.id}`).send({ nick: 'x' });
+    expect(fakeManager.calls.some(([m]) => m === 'networkChanged')).toBe(false);
   });
 });
 
@@ -247,6 +334,21 @@ describe('DELETE /api/networks/:id', () => {
     const res = await aliceAgent.delete(`/api/networks/${net.body.network.id}`);
     expect(res.status).toBe(200);
     expect(fakeManager.calls.some(([m]) => m === 'disposeNetwork')).toBe(true);
+    // DCC chats end while the row is still there (the trailing `true`).
+    expect(fakeManager.calls).toContainEqual([
+      'endDccChats',
+      alice.id,
+      net.body.network.id,
+      'network removed',
+      true,
+    ]);
+    // Announced once the row is gone, so the bouncer reads it as deleted.
+    expect(fakeManager.calls).toContainEqual([
+      'networkChanged',
+      alice.id,
+      net.body.network.id,
+      false,
+    ]);
     const list = await aliceAgent.get('/api/networks');
     expect(
       list.body.networks.find((n: { id: number }) => n.id === net.body.network.id),
@@ -456,5 +558,462 @@ describe('instance network lockdown', () => {
       const res = await lockdownAgent.delete(`/api/networks/${id}`);
       expect(res.status).toBe(200);
     });
+  });
+});
+
+// CertFP (#459). The cert deliberately does NOT ride the PATCH allowlist, so
+// these routes are the whole write surface — and the private key must never
+// leave through any of the read ones.
+describe('client certificate', () => {
+  async function netWithCert(agent: LurkerTestAgent = aliceAgent) {
+    const id = (await makeNet(agent, { name: `cert-${Math.random()}`, nick: 'certnick' })).body
+      .network.id;
+    const res = await agent.post(`/api/networks/${id}/certificate`).send({ mode: 'generate' });
+    expect(res.status).toBe(200);
+    return { id, res };
+  }
+
+  it('generates a pair and reports its fingerprint', async () => {
+    const { res } = await netWithCert();
+    expect(res.body.certificate.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(res.body.network.client_cert.sha256).toBe(res.body.certificate.sha256);
+    // CN borrows the nick so the cert is recognisable in another client's list.
+    expect(res.body.certificate.subject).toContain('certnick');
+  });
+
+  it('never ships the private key with a network payload', async () => {
+    const { id } = await netWithCert();
+    const listing = await aliceAgent.get('/api/networks');
+    const mine = listing.body.networks.find((n: { id: number }) => n.id === id);
+    expect(mine.client_cert.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(mine.client_key).toBeUndefined();
+    expect(JSON.stringify(listing.body)).not.toContain('PRIVATE KEY');
+  });
+
+  it('imports an existing pair, keeping the fingerprint services already know', async () => {
+    const { generateClientCert, describeClientCert } = await import('../utils/clientCert.js');
+    const pair = await generateClientCert('elsewhere');
+    const id = (await makeNet(aliceAgent, { name: 'import-me' })).body.network.id;
+    const res = await aliceAgent
+      .post(`/api/networks/${id}/certificate`)
+      .send({ mode: 'import', cert: pair.cert, key: pair.key });
+    expect(res.status).toBe(200);
+    expect(res.body.certificate.sha256).toBe(describeClientCert(pair.cert).sha256);
+  });
+
+  it('rejects a mismatched pair with a message, not a stack trace', async () => {
+    const { generateClientCert } = await import('../utils/clientCert.js');
+    const [mine, theirs] = await Promise.all([generateClientCert('a'), generateClientCert('b')]);
+    const id = (await makeNet(aliceAgent, { name: 'bad-import' })).body.network.id;
+    const res = await aliceAgent
+      .post(`/api/networks/${id}/certificate`)
+      .send({ mode: 'import', cert: mine.cert, key: theirs.key });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/doesn't match/);
+    expect(
+      (await aliceAgent.get('/api/networks')).body.networks.find((n: { id: number }) => n.id === id)
+        .client_cert,
+    ).toBe(null);
+  });
+
+  // A certificate is presented during a TLS handshake; a plaintext network has
+  // none, so attaching one would hand the user a fingerprint to register that
+  // the network is never shown.
+  it('refuses to attach a certificate to a plaintext network', async () => {
+    const id = (await makeNet(aliceAgent, { name: 'plaintext', tls: false, port: 6667 })).body
+      .network.id;
+    const res = await aliceAgent.post(`/api/networks/${id}/certificate`).send({ mode: 'generate' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/TLS/);
+  });
+
+  // Turning TLS off would strand the network: every dial is then refused
+  // because the certificate can't be presented, and PATCH can't clear it.
+  it('refuses to turn TLS off while a certificate is attached', async () => {
+    const { id } = await netWithCert();
+    const res = await aliceAgent.patch(`/api/networks/${id}`).send({ tls: false });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/remove/i);
+    // Still TLS, still connectable.
+    const after = (await aliceAgent.get('/api/networks')).body.networks.find(
+      (n: { id: number }) => n.id === id,
+    );
+    expect(after.tls).toBe(true);
+    // And the order that does work.
+    expect((await aliceAgent.delete(`/api/networks/${id}/certificate`)).status).toBe(200);
+    expect((await aliceAgent.patch(`/api/networks/${id}`).send({ tls: false })).status).toBe(200);
+  });
+
+  // Archive import writes both columns verbatim, so a stored certificate that
+  // doesn't parse is reachable without anyone pasting one. Reading as "no
+  // certificate" would leave the user looking at a network that claims to have
+  // none and refuses to connect because of one.
+  it('says a stored certificate is unusable rather than pretending there is none', async () => {
+    const { id } = await netWithCert();
+    const db = (await import('../db/index.js')).default;
+    db.prepare('UPDATE networks SET client_cert = ? WHERE id = ?').run('not a pem', id);
+    const listed = (await aliceAgent.get('/api/networks')).body.networks.find(
+      (n: { id: number }) => n.id === id,
+    );
+    expect(listed.client_cert).toEqual({ unusable: true });
+    expect(listed.client_key).toBeUndefined();
+  });
+
+  // Half a pair refuses every dial too, so it must not read as a healthy
+  // fingerprint (a Download link that 404s, next to a network that won't
+  // connect) or as no certificate at all (nothing on screen to remove).
+  it('calls half a stored pair unusable, whichever half is missing', async () => {
+    const db = (await import('../db/index.js')).default;
+    const read = async (id: number) =>
+      (await aliceAgent.get('/api/networks')).body.networks.find((n: { id: number }) => n.id === id)
+        .client_cert;
+
+    const { id } = await netWithCert();
+    db.prepare('UPDATE networks SET client_key = NULL WHERE id = ?').run(id);
+    expect(await read(id)).toEqual({ unusable: true });
+
+    const other = await netWithCert();
+    db.prepare('UPDATE networks SET client_cert = NULL WHERE id = ?').run(other.id);
+    expect(await read(other.id)).toEqual({ unusable: true });
+    // ...and the export route agrees there is nothing to hand over.
+    expect((await aliceAgent.get(`/api/networks/${other.id}/certificate/export`)).status).toBe(404);
+  });
+
+  // The reason this exists: every network's instructions are "connect with the
+  // certificate, then register it from that connection". A certificate attached
+  // after the network is created misses the first connect, which is the one the
+  // user is sitting in front of.
+  it('mints one during create, and has it stored before the dial goes out', async () => {
+    const res = await makeNet(aliceAgent, {
+      name: 'born-with-cert',
+      nick: 'certborn',
+      generate_client_cert: true,
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.network.client_cert.sha512).toMatch(/^[0-9a-f]{128}$/);
+    // The assertion that matters — not that the row has a certificate now, but
+    // that it had one when startNetwork ran.
+    expect(fakeManager.certAtDial).toBeTruthy();
+    expect(fakeManager.certAtDial).toContain('BEGIN CERTIFICATE');
+  });
+
+  // Someone arriving from another client already has a pair, and their
+  // fingerprint is already registered — making them create the network first,
+  // connect once without it, then attach, wastes exactly the connect this is
+  // all about.
+  it('takes an existing pair at create, and has it stored before the dial', async () => {
+    const { generateClientCert, describeClientCert } = await import('../utils/clientCert.js');
+    const pair = await generateClientCert('from-elsewhere');
+    const res = await makeNet(aliceAgent, {
+      name: 'born-imported',
+      client_cert: pair.cert,
+      client_key: pair.key,
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.network.client_cert.sha512).toBe(describeClientCert(pair.cert).sha512);
+    expect(fakeManager.certAtDial).toContain('BEGIN CERTIFICATE');
+  });
+
+  it('rejects a bad pair at create, and creates nothing', async () => {
+    const { generateClientCert } = await import('../utils/clientCert.js');
+    const [mine, theirs] = await Promise.all([generateClientCert('a'), generateClientCert('b')]);
+    const before = (await aliceAgent.get('/api/networks')).body.networks.length;
+    const res = await makeNet(aliceAgent, {
+      name: 'bad-pair-born',
+      client_cert: mine.cert,
+      client_key: theirs.key,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/doesn't match/);
+    expect((await aliceAgent.get('/api/networks')).body.networks).toHaveLength(before);
+  });
+
+  it('refuses to be told to both mint and import', async () => {
+    const { generateClientCert } = await import('../utils/clientCert.js');
+    const pair = await generateClientCert('both');
+    const res = await makeNet(aliceAgent, {
+      name: 'both-born',
+      generate_client_cert: true,
+      client_cert: pair.cert,
+      client_key: pair.key,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses to mint one for a plaintext network, and creates nothing', async () => {
+    const before = (await aliceAgent.get('/api/networks')).body.networks.length;
+    const res = await makeNet(aliceAgent, {
+      name: 'plaintext-born',
+      tls: false,
+      port: 6667,
+      generate_client_cert: true,
+    });
+    expect(res.status).toBe(400);
+    expect((await aliceAgent.get('/api/networks')).body.networks).toHaveLength(before);
+  });
+
+  it('leaves a network without one when it was not asked for', async () => {
+    const res = await makeNet(aliceAgent, { name: 'no-cert-asked' });
+    expect(res.body.network.client_cert).toBe(null);
+    expect(fakeManager.certAtDial).toBe(null);
+  });
+
+  it('rejects an unknown mode rather than silently doing nothing', async () => {
+    const id = (await makeNet(aliceAgent, { name: 'bad-mode' })).body.network.id;
+    const res = await aliceAgent.post(`/api/networks/${id}/certificate`).send({ mode: 'rotate' });
+    expect(res.status).toBe(400);
+  });
+
+  it('exports the pair as the single file other clients keep on disk', async () => {
+    const { id, res: gen } = await netWithCert();
+    const res = await aliceAgent.get(`/api/networks/${id}/certificate/export`);
+    expect(res.status).toBe(200);
+    expect(res.headers['content-disposition']).toContain('.pem');
+    expect(res.text).toContain('BEGIN PRIVATE KEY');
+    expect(res.text).toContain('BEGIN CERTIFICATE');
+    const { describeClientCert } = await import('../utils/clientCert.js');
+    const cert = res.text.slice(res.text.indexOf('-----BEGIN CERTIFICATE-----'));
+    expect(describeClientCert(cert).sha256).toBe(gen.body.certificate.sha256);
+  });
+
+  it('has nothing to export before a cert is attached', async () => {
+    const id = (await makeNet(aliceAgent, { name: 'no-cert' })).body.network.id;
+    expect((await aliceAgent.get(`/api/networks/${id}/certificate/export`)).status).toBe(404);
+  });
+
+  it('clears the pair on delete', async () => {
+    const { id } = await netWithCert();
+    const res = await aliceAgent.delete(`/api/networks/${id}/certificate`);
+    expect(res.status).toBe(200);
+    expect(res.body.network.client_cert).toBe(null);
+    expect((await aliceAgent.get(`/api/networks/${id}/certificate/export`)).status).toBe(404);
+  });
+
+  // Ownership, on every verb: a fingerprint identifies its owner to services,
+  // and the key IS the credential.
+  it("refuses another user's network on every verb", async () => {
+    const { id } = await netWithCert();
+    expect(
+      (await bobAgent.post(`/api/networks/${id}/certificate`).send({ mode: 'generate' })).status,
+    ).toBe(404);
+    expect((await bobAgent.get(`/api/networks/${id}/certificate/export`)).status).toBe(404);
+    expect((await bobAgent.delete(`/api/networks/${id}/certificate`)).status).toBe(404);
+    // ...and alice still has hers.
+    expect((await aliceAgent.get(`/api/networks/${id}/certificate/export`)).status).toBe(200);
+  });
+
+  it('ignores a cert smuggled through a PATCH body', async () => {
+    const id = (await makeNet(aliceAgent, { name: 'patch-smuggle' })).body.network.id;
+    const res = await aliceAgent
+      .patch(`/api/networks/${id}`)
+      .send({ client_cert: 'not a pem', client_key: 'not a key', name: 'renamed' });
+    expect(res.status).toBe(200);
+    expect(res.body.network.name).toBe('renamed');
+    expect(res.body.network.client_cert).toBe(null);
+    expect((await aliceAgent.get(`/api/networks/${id}/certificate/export`)).status).toBe(404);
+  });
+});
+
+// Proxy support (#303). Three things are being pinned here: the payload never
+// carries the password, the two write paths refuse identically, and a PATCH is
+// validated against the row it will PRODUCE rather than the body it received.
+describe('network proxy', () => {
+  const PROXY = {
+    proxy_enabled: true,
+    proxy_type: 'socks5',
+    proxy_host: '127.0.0.1',
+    proxy_port: 9050,
+    proxy_username: 'u',
+    proxy_password: 'sup3rsecret',
+  };
+
+  it('returns the proxy as parts with the password reduced to a boolean', async () => {
+    const res = await makeNet(aliceAgent, { name: 'proxied', ...PROXY });
+    expect(res.status).toBe(201);
+    expect(res.body.network.proxy).toEqual({
+      enabled: true,
+      type: 'socks5',
+      host: '127.0.0.1',
+      port: 9050,
+      username: 'u',
+      has_password: true,
+    });
+    // Parts, not a URL, is what makes "leave blank to keep" possible in the
+    // form — and the password must not survive the trip in any shape.
+    expect(JSON.stringify(res.body)).not.toContain('sup3rsecret');
+    expect(res.body.network.proxy_password).toBeUndefined();
+    expect(res.body.network.proxy_host).toBeUndefined();
+  });
+
+  it('reports no proxy as null', async () => {
+    const res = await makeNet(aliceAgent, { name: 'direct' });
+    expect(res.body.network.proxy).toBeNull();
+  });
+
+  it('refuses an unusable proxy on create', async () => {
+    const res = await makeNet(aliceAgent, {
+      name: 'bad-proxy',
+      ...PROXY,
+      proxy_type: 'socks4',
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/SOCKS4|proxy type/i);
+  });
+
+  it('accepts proxy details while the network stays direct', async () => {
+    // A half-finished proxy is not an error: proxy_enabled is what decides, so
+    // saving the form with the box unticked must work like any other draft.
+    const res = await makeNet(aliceAgent, {
+      name: 'draft-proxy',
+      proxy_enabled: false,
+      proxy_type: 'socks5',
+      proxy_host: '',
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.network.proxy?.enabled ?? false).toBe(false);
+  });
+
+  it('refuses an unusable proxy on PATCH too', async () => {
+    // A rule enforced on create but not on edit is a rule you can edit your way
+    // around — the same reasoning the host lockdown's PATCH arm exists for.
+    const created = await makeNet(aliceAgent, { name: 'patch-proxy' });
+    const id = created.body.network.id;
+    const res = await aliceAgent
+      .patch(`/api/networks/${id}`)
+      .send({ proxy_enabled: true, proxy_type: 'socks5', proxy_host: 'has a space' });
+    expect(res.status).toBe(400);
+  });
+
+  // ⚠ A PATCH is partial. Switching a configured proxy back on sends only the
+  // flag, and validating the BODY alone would refuse it for having no type.
+  it('validates the row a PATCH will produce, not the body it received', async () => {
+    const created = await makeNet(aliceAgent, { name: 'toggle-proxy', ...PROXY });
+    const id = created.body.network.id;
+    expect(
+      (await aliceAgent.patch(`/api/networks/${id}`).send({ proxy_enabled: false })).status,
+    ).toBe(200);
+    const back = await aliceAgent.patch(`/api/networks/${id}`).send({ proxy_enabled: true });
+    expect(back.status).toBe(200);
+    expect(back.body.network.proxy).toMatchObject({ enabled: true, host: '127.0.0.1' });
+  });
+
+  it('leaves the stored password alone when a PATCH omits it', async () => {
+    // The whole reason the columns are parts rather than a URL: changing the
+    // port must not mean retyping a password the client was never given.
+    const created = await makeNet(aliceAgent, { name: 'keep-pw', ...PROXY });
+    const id = created.body.network.id;
+    const res = await aliceAgent.patch(`/api/networks/${id}`).send({ proxy_port: 1080 });
+    expect(res.status).toBe(200);
+    expect(res.body.network.proxy).toMatchObject({ port: 1080, has_password: true });
+  });
+
+  // ⚠⚠ The regression the first cut shipped: the form sends all six proxy
+  // columns on every save (it must — that is the only way it can send
+  // proxy_enabled:false), and gating the lockdown on key PRESENCE made every
+  // save 403 on a locked instance. It also trapped anyone whose stored proxy
+  // the connect path refuses, since turning it off is itself a body that
+  // mentions a proxy.
+  it('allows an unrelated save that repeats the stored proxy, even when locked down', async () => {
+    const { setAllowUserDefinedNetworks } = await import('../db/instanceSettings.js');
+    const created = await makeNet(aliceAgent, { name: 'locked-repeat', ...PROXY });
+    const id = created.body.network.id;
+    setAllowUserDefinedNetworks(false);
+    try {
+      const res = await aliceAgent.patch(`/api/networks/${id}`).send({
+        name: 'renamed-under-lockdown',
+        proxy_enabled: true,
+        proxy_type: 'socks5',
+        proxy_host: '127.0.0.1',
+        proxy_port: 9050,
+        proxy_username: 'u',
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.network.name).toBe('renamed-under-lockdown');
+    } finally {
+      setAllowUserDefinedNetworks(true);
+    }
+  });
+
+  it('compares the proxy by meaning, so a restated port in another shape is not a change', async () => {
+    // validateProxy accepts a string port and any case of type, so a client
+    // may legitimately send either — and a raw !== would read that as a change
+    // and 403 a save that altered nothing.
+    const { setAllowUserDefinedNetworks } = await import('../db/instanceSettings.js');
+    const created = await makeNet(aliceAgent, { name: 'locked-restate', ...PROXY });
+    const id = created.body.network.id;
+    setAllowUserDefinedNetworks(false);
+    try {
+      const res = await aliceAgent.patch(`/api/networks/${id}`).send({
+        name: 'restated',
+        proxy_enabled: true,
+        proxy_type: 'SOCKS5',
+        proxy_host: '127.0.0.1',
+        proxy_port: '9050',
+        proxy_username: 'u',
+      });
+      expect(res.status).toBe(200);
+    } finally {
+      setAllowUserDefinedNetworks(true);
+    }
+  });
+
+  it('always allows turning a proxy OFF, even when locked down', async () => {
+    // Otherwise the network is both unconnectable and uneditable.
+    const { setAllowUserDefinedNetworks } = await import('../db/instanceSettings.js');
+    const created = await makeNet(aliceAgent, { name: 'locked-off', ...PROXY });
+    const id = created.body.network.id;
+    setAllowUserDefinedNetworks(false);
+    try {
+      const res = await aliceAgent.patch(`/api/networks/${id}`).send({ proxy_enabled: false });
+      expect(res.status).toBe(200);
+      expect(res.body.network.proxy?.enabled).toBe(false);
+    } finally {
+      setAllowUserDefinedNetworks(true);
+    }
+  });
+
+  it('allows creating an ordinary network under lockdown with empty proxy fields', async () => {
+    // What the add form sends for a network with no proxy configured.
+    const { setAllowUserDefinedNetworks } = await import('../db/instanceSettings.js');
+    setAllowUserDefinedNetworks(false);
+    try {
+      const res = await makeNet(aliceAgent, {
+        name: 'irc.libera.chat',
+        host: 'irc.libera.chat',
+        proxy_enabled: false,
+        proxy_type: 'socks5',
+        proxy_host: '',
+        proxy_port: 1080,
+      });
+      // Under lockdown with no presets the HOST allowlist refuses this first,
+      // which is correct and unrelated. The claim under test is that the empty
+      // proxy fields did NOT add a refusal of their own, so assert on WHICH
+      // refusal came back rather than on the status alone.
+      expect(res.body.error ?? '').not.toMatch(/proxy/i);
+    } finally {
+      setAllowUserDefinedNetworks(true);
+    }
+  });
+
+  it('refuses a user-set proxy on a locked-down instance', async () => {
+    // On a locked instance a proxy is a second, unapproved destination that
+    // nothing else gates — the escape hatch the lockdown exists to close.
+    const { setAllowUserDefinedNetworks } = await import('../db/instanceSettings.js');
+    const created = await makeNet(aliceAgent, { name: 'locked-proxy' });
+    const id = created.body.network.id;
+    setAllowUserDefinedNetworks(false);
+    try {
+      const patched = await aliceAgent.patch(`/api/networks/${id}`).send({ proxy_enabled: true });
+      expect(patched.status).toBe(403);
+      const posted = await makeNet(aliceAgent, { name: 'locked-new', ...PROXY });
+      expect(posted.status).toBe(403);
+      // A body that says nothing about the proxy is unaffected by the switch.
+      const renamed = await aliceAgent
+        .patch(`/api/networks/${id}`)
+        .send({ name: 'still-editable' });
+      expect(renamed.status).toBe(200);
+    } finally {
+      setAllowUserDefinedNetworks(true);
+    }
   });
 });

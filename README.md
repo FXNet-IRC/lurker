@@ -14,14 +14,14 @@ Lurker is a beautiful self-hosted IRC client with a retro aesthetic and modern c
 # Features
 
 - **Always-on and multi-user.** Each invited user connects to their own set of IRC networks, and Lurker stays connected when they're away. Admins can restrict which networks users can connect to, and make channel recommendations for newcomers.
-- **Fully working search.** Search your message history, filter by nick, channel, or network; and jump to any message instantly, no matter how old it is.
 - **Modern conveniences.** Peer presence, automatic nick regain, join/part summarization, smart nickname completion, message drafts, saved messages, user notes, and more.
+- **Fully working search.** Search your message history, filter by nick, channel, or network; and jump to any message instantly, no matter how old it is.
 - **Image uploads.** Paste an image into the input box, and Lurker optimizes it, sanitizes it, and uploads it to local storage, S3, Zipline, Chibisafe, or external services like x0.at or catbox.moe.
 - **Customizable UI.** The beautiful retro terminal-style PWA interface has 40+ settings to customize it how you want.
-- **Native Apps.** Lurker has official native apps [for iOS](https://github.com/amiantos/lurker-ios) (in beta) and Android (coming soon). There's also third party clients like [Spooky](https://github.com/JawshTheDark/lurker-android-upstream) (Android) and [Scully](https://github.com/JawshTheDark/scully) (PC).
-- **Built-in soju-compatible bouncer.** Don't want to use the Lurker clients? Then don't. Lurker has a ZNC and soju-compatible bouncer built in, complete with `soju.im/bouncer-networks` support so you can use any client you want.
+- **Native apps.** Lurker has official native apps [for iOS](https://github.com/amiantos/lurker-ios) (in beta) and Android (coming soon). There are also third-party clients such as [Spooky](https://github.com/JawshTheDark/lurker-android-upstream) (Android), and [luir](https://luir.org) (TUI), which bring their own flavor to Lurker.
+- **Built-in bouncer.** Don't want to use the Lurker clients? Then don't. Lurker has a best-in-class IRC bouncer built in, complete with `soju.im/bouncer-networks`, `soju.im/FILEHOST` support and more, so you can use any IRC client you want, like [clircs](https://github.com/rekkals/clircs), [Halloy](https://github.com/squidowl/halloy), [Goguma](https://codeberg.org/emersion/goguma), [HexDroid](https://github.com/boxlabss/hexdroid) and others.
 - **Inline link & media previews.** Links, images, _and_ videos get proper preview images in every client. Implemented as a separate container, to isolate malicious links from your users' data. (Optional, requires `lurker-previews` container.)
-- **Decoupled IRC connections.** Say goodbye to disconnect/reconnect floods when updating Lurker — a secondary container keeps the connections alive while the service restarts. (Optional, requires `lurker-engine` container.)
+- **Decoupled IRC connections.** Say goodbye to disconnect/reconnect floods when updating Lurker — a secondary container keeps the connections alive while the main service restarts. (Optional, requires `lurker-engine` container.)
 
 # Screenshot (PWA)
 
@@ -40,7 +40,8 @@ Lurker is a beautiful self-hosted IRC client with a retro aesthetic and modern c
 - `<helsinski> Lurker iOS is certainly shaping up to be real good.`
 - `<quark> These days I am only using Lurker. Desktop and mobile.`
 - `<CrashOverripe> Lurker solves most of my IRC problems - very happy you decided to take it on as more than just a solution for yourself.`
-- `<Samien> Ever since I started using [Lurker], things have become so much more convenient. I can use IRC anytime, anywhere—whether at the office, at home, or on the metro—without any restrictions. and it's far way better than irc cloud`
+- `<Samien> Ever since I started using Lurker, things have become so much more convenient. I can use IRC anytime, anywhere—whether at the office, at home, or on the metro—without any restrictions. and it's far way better than irc cloud`
+- `<slakker> welp, Lurker officially won me over as bouncer of choice. dude, you know how fucking handy it is to have what is effectively the most convenient bouncer config tool ever? :D`
 
 # Installation
 

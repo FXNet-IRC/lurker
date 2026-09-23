@@ -89,9 +89,13 @@ export function jsonBody(resp: PostBufferResult): unknown {
   }
 }
 
-// RFC 7578: backslashes and quotes in filenames need escaping.
+// RFC 7578: backslashes and quotes in filenames need escaping. A CR or LF would
+// end the header, so they're percent-encoded, as browsers do.
 function encodeFilename(name: string): string {
-  return name.replace(/["\\]/g, (c) => `\\${c}`);
+  return name
+    .replace(/["\\]/g, (c) => `\\${c}`)
+    .replace(/\r/g, '%0D')
+    .replace(/\n/g, '%0A');
 }
 
 function partHeader(boundary: string, part: MultipartPart | StreamPart): Buffer {

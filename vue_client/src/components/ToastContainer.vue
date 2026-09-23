@@ -101,6 +101,11 @@ function onAction(t: Toast) {
 .toast.kind-always_notify {
   --toast-accent: var(--good);
 }
+/* Being removed from a channel is the one alert here that reports something
+   going wrong for you, so it reads in the same color an error does. */
+.toast.kind-kicked {
+  --toast-accent: var(--bad);
+}
 .toast.kind-info {
   --toast-accent: var(--fg-muted);
 }

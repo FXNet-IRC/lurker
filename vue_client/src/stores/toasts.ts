@@ -12,7 +12,15 @@ let nextId = 1;
 // dismiss()/clear() so the map can't outlive its toast.
 const actionHandlers = new Map<number, () => void>();
 
-export type ToastKind = 'highlight' | 'dm' | 'always_notify' | 'notify' | 'info' | 'warn' | 'error';
+export type ToastKind =
+  | 'highlight'
+  | 'dm'
+  | 'always_notify'
+  | 'kicked'
+  | 'notify'
+  | 'info'
+  | 'warn'
+  | 'error';
 
 // An explicit call-to-action button rendered inside the toast (e.g. the "Join"
 // on a channel-invite toast). Distinct from the whole-toast click, which only

@@ -32,6 +32,40 @@ import { useDccStore } from '../stores/dcc.js';
 import { useUploadsStore } from '../stores/uploads.js';
 import { makeClientId } from '../utils/clientId.js';
 import { useToastsStore } from '../stores/toasts.js';
+
+// Live DCC-chat offer toasts, keyed by network + peer. Module-local rather than
+// in a store for the same reason the toast action handlers are: this is
+// transport bookkeeping, not state anything renders. An offer is sticky, so it
+// needs an explicit way to be retired when the server says it is over.
+const dccOfferToasts = new Map<string, number>();
+
+function dccOfferKey(networkId: number, from: string): string {
+  return `${networkId}::${from.toLowerCase()}`;
+}
+
+// ⚠ The offer toast is sticky, and normally the live `dcc-chat-offer-closed`
+// event retires it. But that event can be missed: the tab's socket drops, or
+// the server restarts, while an offer is pending — and then the toast outlives
+// its offer, with an Accept button that now sends the peer a FRESH offer, a
+// different act than the one it names. Every snapshot carries the offers still
+// pending, so reconcile against it. (Deliberately dismiss-only: re-showing a
+// pending offer here would re-pop a toast the user had already dismissed.)
+function retireStaleDccOfferToasts(snapshot: any[]): void {
+  const pending = new Set<string>();
+  for (const net of snapshot || []) {
+    for (const nick of net?.dccChatOffers ?? []) pending.add(dccOfferKey(net.networkId, nick));
+  }
+  for (const key of dccOfferToasts.keys()) {
+    if (!pending.has(key)) dismissDccOfferToast(key);
+  }
+}
+
+function dismissDccOfferToast(key: string): void {
+  const id = dccOfferToasts.get(key);
+  if (id === undefined) return;
+  dccOfferToasts.delete(key);
+  useToastsStore().dismiss(id);
+}
 import { downloadTextFile } from '../utils/download.js';
 import { notifyForEvent, playSound } from './useHighlightNotifier.js';
 import { isChannelTarget } from '../../../shared/channels.js';
@@ -236,6 +270,11 @@ function applyEvent(event: any): void {
     case 'kick':
       if (!buffers.pushMessage(event)) break;
       buffers.removeMember(event.networkId, event.target, event.kicked);
+      // Only a kick of US notifies, and the server already decided that — this
+      // call is gated on `event.notify` like every other one, so a kick of
+      // someone else falls straight back out (#968). Behind the dedupe, so a
+      // resume gap can't re-toast a kick we've already been told about.
+      notifyForEvent(event);
       break;
     case 'nick':
       if (!buffers.pushMessage(event)) break;
@@ -327,6 +366,57 @@ function applyEvent(event: any): void {
         ttlMs: 15000,
         action: { label: 'Join', onClick: () => buffers.joinOrActivate(event.networkId, channel) },
       });
+      break;
+    }
+    // A peer wants to open a DCC chat. Same shape as the invite above —
+    // ephemeral, server-pseudo-buffer target, read from `from` — but STICKY
+    // (ttlMs 0): an invite you miss can be re-requested and the channel isn't
+    // going anywhere, whereas a chat offer is one peer waiting on an answer,
+    // and the window is finite. Dismissing is a real "no".
+    //
+    // Safe to make sticky only because the server broadcasts the offer's
+    // lifecycle: accepted, declined, expired or torn down all send
+    // `dcc-chat-offer-closed`, which retires the toast below. Otherwise the
+    // Accept button would outlive the offer and quietly become "send THEM a
+    // fresh offer", which is a different act than the one it names.
+    case 'dcc-chat-offer': {
+      const from = String(event.from ?? '');
+      if (!from) break;
+      const networkId = event.networkId as number;
+      const toasts = useToastsStore();
+      const key = dccOfferKey(networkId, from);
+      dismissDccOfferToast(key);
+      dccOfferToasts.set(
+        key,
+        toasts.push({
+          kind: 'notify',
+          title: `DCC chat from ${from}`,
+          body: event.passive
+            ? `${from} wants to chat directly (they're firewalled, so this server listens)`
+            : `${from} wants to chat directly`,
+          ttlMs: 0,
+          action: {
+            label: 'Accept',
+            onClick: () => {
+              dccOfferToasts.delete(key);
+              void useDccStore()
+                .openChat(networkId, from)
+                .then(() => buffers.activate(networkId, `=${from}`))
+                .catch(() => {});
+            },
+          },
+        }),
+      );
+      break;
+    }
+    case 'dcc-chat-state': {
+      const from = String(event.from ?? '');
+      if (from) networks.applyDccChatState(event.networkId, from, !!event.live);
+      break;
+    }
+    case 'dcc-chat-offer-closed': {
+      const from = String(event.from ?? '');
+      if (from) dismissDccOfferToast(dccOfferKey(event.networkId as number, from));
       break;
     }
     case 'channel-parted':
@@ -581,6 +671,7 @@ function applySnapshot(snapshot: any[], globalIgnores: any[] = []): void {
   ignores.applySnapshot(snapshot, globalIgnores);
   nickNotes.applySnapshot(snapshot);
   relayBots.applySnapshot(snapshot);
+  retireStaleDccOfferToasts(snapshot);
   // Highlight rules aren't in the snapshot; load them now so client-side
   // render-time highlight evaluation (#349) works app-wide, not just after the
   // settings pane has been opened.
@@ -1143,6 +1234,11 @@ export function socketSendWithAck(payload: Record<string, unknown>): Promise<Ack
 // logout (and any other session reset). Strips handlers before closing so the
 // `onclose` reconnect arm can't fire even if `auth.user` is briefly truthy.
 export function resetSocket(): void {
+  // ⚠⚠ DISMISS the offer toasts, don't just forget them. resetSession never
+  // clears the toast store, and every other toast expires within seconds — but
+  // an offer toast is sticky, so it would sit on the NEXT user's screen after a
+  // logout, with an Accept button bound to the previous account's session.
+  for (const key of dccOfferToasts.keys()) dismissDccOfferToast(key);
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;

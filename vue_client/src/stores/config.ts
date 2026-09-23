@@ -16,6 +16,8 @@ export type Edition = 'standalone' | 'node';
  *  a flag doesn't have the feature. */
 export interface Features {
   linkPreviews: boolean;
+  /** Whether this instance runs the IRC bouncer (Settings' Bouncer pane). */
+  bouncer: boolean;
 }
 
 // Shared in-flight fetch so concurrent callers — App.vue's boot fetch and the
@@ -37,7 +39,7 @@ export const useConfigStore = defineStore('config', {
     // ⚠ Defaults to OFF, unlike `edition`, which defaults to the fully-featured value. A fetch
     // failure must not conjure a feature the server may not have: guessing "on" here would show
     // the two settings and then have every resolve 404.
-    features: { linkPreviews: false } as Features,
+    features: { linkPreviews: false, bouncer: false } as Features,
     checked: false,
   }),
   getters: {
@@ -49,6 +51,8 @@ export const useConfigStore = defineStore('config', {
     isPublicMode: (s): boolean => s.publicMode,
     /** Whether this instance has link previews / inline media enabled at all. */
     linkPreviews: (s): boolean => s.features.linkPreviews === true,
+    /** Whether this instance runs the IRC bouncer. */
+    bouncer: (s): boolean => s.features.bouncer === true,
   },
   actions: {
     async fetch(): Promise<Edition> {
@@ -65,7 +69,10 @@ export const useConfigStore = defineStore('config', {
           this.edition = data.edition === 'node' ? 'node' : 'standalone';
           this.networkLock = data.networkLock === true;
           this.publicMode = data.publicMode === true;
-          this.features = { linkPreviews: data.features?.linkPreviews === true };
+          this.features = {
+            linkPreviews: data.features?.linkPreviews === true,
+            bouncer: data.features?.bouncer === true,
+          };
           // Latch `checked` ONLY on success. A transient failure must not wedge
           // the session on the safe defaults — leaving it false lets the next
           // caller retry and self-heal. That second caller is the router guard,
@@ -77,7 +84,7 @@ export const useConfigStore = defineStore('config', {
           this.edition = 'standalone';
           this.networkLock = false;
           this.publicMode = false;
-          this.features = { linkPreviews: false };
+          this.features = { linkPreviews: false, bouncer: false };
         } finally {
           inflight = null;
         }

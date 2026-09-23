@@ -26,6 +26,8 @@ import themesRouter from './routes/themes.js';
 import pushRouter from './routes/push.js';
 import adminRouter from './routes/admin.js';
 import uploadsRouter from './routes/uploads.js';
+import filehostRouter from './routes/filehost.js';
+import { isBouncerEnabled } from './utils/bouncerConfig.js';
 import uploadersRouter from './routes/uploaders.js';
 import localUploadsRouter from './routes/localUploads.js';
 import dccRouter from './routes/dcc.js';
@@ -33,10 +35,13 @@ import draftsRouter from './routes/drafts.js';
 import { exportsRouter, importRouter } from './routes/exports.js';
 import apiTokensRouter from './routes/apiTokens.js';
 import configRouter from './routes/config.js';
+import aboutRouter from './routes/about.js';
+import bouncerRouter from './routes/bouncer.js';
 import linkPreviewRouter from './routes/linkPreview.js';
 import nodeRouter from './routes/node.js';
 import provisionRouter from './routes/provision.js';
 import guestRouter from './routes/guest.js';
+import { oauthRouter, wellKnownRouter } from './routes/oauth.js';
 import mcpRouter from './services/mcpServer.js';
 import { requireApiAuth } from './middleware/apiAuth.js';
 import { isNodeMode } from './utils/edition.js';
@@ -45,19 +50,44 @@ import { trustProxyConfig } from './utils/clientIp.js';
 import { previewsEnabled } from './utils/previews.js';
 import { allowedBrowserOrigins } from './utils/corsOrigins.js';
 
+// body-parser marks its own failures (malformed JSON or form data, a body over
+// the limit, an unsupported charset) with a `type` such as 'entity.parse.failed'
+// and a 4xx `status`.
+function isBodyParseError(err: unknown): err is { status: number } {
+  if (!err || typeof err !== 'object') return false;
+  const { type, status } = err as { type?: unknown; status?: unknown };
+  return typeof type === 'string' && typeof status === 'number' && status >= 400 && status < 500;
+}
+
 const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
+  // A body that didn't parse is the client's mistake, not a server fault. The
+  // parser attaches the raw body to the error, and that body can be a password or
+  // an OAuth code, so it is answered with its 4xx and never logged. This has to
+  // live here: the JSON parser runs app-wide, ahead of every router, so an error
+  // it raises never reaches a router's own handler.
+  if (isBodyParseError(err)) {
+    if (res.headersSent) return next(err);
+    res.status(err.status).json({ error: 'invalid_request' });
+    return;
+  }
   console.error('[lurker] error:', err);
   if (res.headersSent) return next(err);
   res.status(500).json({ error: 'internal error' });
 };
 
+export interface BuildAppOptions {
+  /** The built web client to serve. Defaults to vue_client/dist. */
+  clientDist?: string;
+}
+
 /**
  * Build the fully-wired Express app. `sessionSecret` keys cookie-parser for the
  * signed `lurker_session` cookie (the same secret server.ts hands to the WS
  * hub). Route gating reads the cached edition, so set LURKER_EDITION before the
- * first getEdition() call.
+ * first getEdition() call. Tests pass `clientDist` to serve a stand-in client,
+ * because CI runs the suite without building vue_client.
  */
-export function buildApp(sessionSecret: string): Express {
+export function buildApp(sessionSecret: string, options: BuildAppOptions = {}): Express {
   const app = express();
 
   // Honor X-Forwarded-For only when configured to sit behind a trusted proxy, so
@@ -79,6 +109,14 @@ export function buildApp(sessionSecret: string): Express {
       `[lurker] CORS_ORIGIN is set ("${process.env.CORS_ORIGIN}") but no valid origin parsed from it — cross-origin requests will be rejected. Each entry needs a scheme, e.g. https://irc.example.com`,
     );
   }
+  // soju.im/FILEHOST, the bouncer's upload URL for IRC clients. Ahead of cors()
+  // and the JSON parser: it answers its own preflight with CORS for any origin
+  // (it takes no cookies), and its body is the file, which a `.json` upload's
+  // Content-Type would otherwise hand to express.json. Self-host only, like the
+  // bouncer's credentials: a hosted cell holds no account password and no API
+  // tokens, and the proxy can't route a Basic header to a cell. Only with the
+  // bouncer on: nothing else advertises it, and it takes the bouncer's logins.
+  if (!isNodeMode() && isBouncerEnabled()) app.use('/api/filehost', filehostRouter);
   app.use(cors({ origin: corsOrigins, credentials: true }));
   app.use(express.json({ limit: '1mb' }));
   app.use(cookieParser(sessionSecret));
@@ -117,6 +155,9 @@ export function buildApp(sessionSecret: string): Express {
   app.use('/api/exports', exportsRouter);
   app.use('/api/imports', importRouter);
   app.use('/api/config', configRouter);
+  app.use('/api/about', aboutRouter);
+  // Only where there's a bouncer to describe (the hosted edition runs none).
+  if (!isNodeMode() && isBouncerEnabled()) app.use('/api/bouncer', bouncerRouter);
   // ⚠ Not mounted at all when the feature is off, so both endpoints 404 rather than existing
   // and refusing. The in-route and resolver guards stay as defence in depth — this is the outer
   // one, and it's what makes "off" mean the surface isn't there.
@@ -133,22 +174,43 @@ export function buildApp(sessionSecret: string): Express {
   // the router fails closed (404) unless LURKER_PUBLIC_MODE is enabled.
   app.use('/api/guest', guestRouter);
 
-  // The HTTP API-token feature and the MCP server are the two ends of the same
-  // bearer-token model: /api/api-tokens (session-cookie auth) mints the tokens,
-  // and /mcp (bearer auth) consumes them. The hosted service routes a customer
-  // to their cell by the cp_session cookie, but a bearer client carries no such
-  // cookie — so /mcp can't be addressed through the per-cell proxy, which makes
-  // the tokens unusable there. Disable both in node edition (A7); A3 hides the
-  // matching UI.
+  // API tokens are minted in Settings and sent as a bearer. The hosted service
+  // routes a customer to their cell by the cp_session cookie, and nothing in an API
+  // token says which cell it belongs to, so node edition doesn't mount them (A7; A3
+  // hides the matching UI).
   //
-  // FXNet: this is the AI-agent surface, which has no place on a public webchat —
-  // throwaway guests must never mint long-lived bearer tokens or reach the MCP
-  // server. So we also disable both when LURKER_PUBLIC_MODE is on, and hide the
-  // matching Settings tab (see categoryVisible / hideInPublicMode). A standalone,
-  // non-public self-hosted instance keeps them fully featured.
+  // FXNet: this bearer/agent surface has no place on a public webchat — throwaway
+  // guests must never mint long-lived API tokens. So we also disable it when
+  // LURKER_PUBLIC_MODE is on, and hide the matching Settings tab (see
+  // categoryVisible / hideInPublicMode). The MCP server and the OAuth sign-in
+  // surface below are gated the same way for the same reason.
   if (!isNodeMode() && !isPublicModeEnabled()) {
     app.use('/api/api-tokens', apiTokensRouter);
+  }
+  // The MCP server takes an API token or an OAuth access token. In node edition
+  // only the second exists, and it names the cell that issued it, so the hosted
+  // proxy can route it here. FXNet: this is the AI-agent surface, so it is
+  // disabled in public mode alongside api-tokens/oauth — throwaway guests must
+  // never reach it.
+  if (!isPublicModeEnabled()) {
     app.use('/mcp', requireApiAuth, mcpRouter);
+  }
+
+  // OAuth sign-in for third-party clients (#891). A cell in node edition approves,
+  // exchanges and revokes exactly as a self-hosted server does, but registration and
+  // discovery belong to the orchestrator in front of the cells: one registration is
+  // valid on every cell, and discovery has to name the public origin (see
+  // routes/oauth.ts). Discovery sits under /.well-known and has to be mounted before
+  // express.static below, or the SPA fallback answers it with index.html.
+  //
+  // FXNet: OAuth issues bearer access tokens for programmatic third-party access —
+  // the same throwaway-guest exposure as api-tokens/MCP — so the whole surface is
+  // off in public mode.
+  if (!isPublicModeEnabled()) {
+    app.use('/api/oauth', oauthRouter);
+    if (!isNodeMode()) {
+      app.use('/.well-known', wellKnownRouter);
+    }
   }
 
   // Orchestrator-only control surface. Mounted exclusively in node edition so a
@@ -161,10 +223,9 @@ export function buildApp(sessionSecret: string): Express {
     res.json({ status: 'ok', time: new Date().toISOString() });
   });
 
-  // SPA fallback for client-side routes. `mcp` joins `api`/`ws` in the exclusion
-  // so that in node edition — where /mcp isn't mounted — a stray GET /mcp 404s
-  // instead of being served index.html; it's a disabled endpoint, not a page.
-  // (In standalone the mounted /mcp middleware handles it before this anyway.)
+  // SPA fallback for client-side routes. `mcp` joins `api`/`ws` in the exclusion:
+  // it's an endpoint, never a page, and the mounted /mcp middleware answers it
+  // before this anyway.
   //
   // `assets` is excluded for a different reason: everything under it is a real
   // hashed build artifact served by express.static above, never a client route.
@@ -172,9 +233,28 @@ export function buildApp(sessionSecret: string): Express {
   // index.html back with a 200 and Content-Type: text/html, so the browser
   // reports a confusing module-type refusal instead of a plain 404 — and the
   // client can't cleanly tell "chunk is gone" from "page is fine" (#571).
-  const clientDist = path.join(import.meta.dirname, '../vue_client/dist');
+  //
+  // `.well-known` is for machines, never a page. A client probing for a document
+  // this server doesn't publish (an MCP client asking for OAuth protected-resource
+  // metadata before falling back to the authorization-server document, #891)
+  // needs a 404 it can act on, not the SPA's HTML with a 200.
+  const clientDist = options.clientDist ?? path.join(import.meta.dirname, '../vue_client/dist');
   app.use(express.static(clientDist));
-  app.get(/^\/(?!api|ws|mcp|assets).*/, (_req, res, next) => {
+  app.get(/^\/(?!api|ws|mcp|assets|[.]well-known).*/, (req, res, next) => {
+    // The OAuth approval page (#891) must never render inside someone else's
+    // frame, where an Approve click could be steered. Scoped to this one path so
+    // self-hosters can keep embedding the rest of the app; the page's route forces
+    // a full document load when reached client-side, so these always apply to it.
+    // Compared the way the client router matches routes (case-insensitive, trailing
+    // slash optional), or /OAuth/Authorize/ would render the page without them.
+    if (req.path.toLowerCase().replace(/\/+$/, '') === '/oauth/authorize') {
+      res.set({
+        'Content-Security-Policy': "frame-ancestors 'none'",
+        'X-Frame-Options': 'DENY',
+        'Cache-Control': 'no-store',
+        'Referrer-Policy': 'no-referrer',
+      });
+    }
     res.sendFile(path.join(clientDist, 'index.html'), (err) => {
       if (err) next();
     });

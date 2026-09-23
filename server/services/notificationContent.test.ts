@@ -81,6 +81,40 @@ describe('composeNotification', () => {
     ).toBe('someone in #lurker');
   });
 
+  it('titles a kick with the kicker, the channel and the network (#968)', () => {
+    expect(
+      composeNotification(
+        payload({ kind: 'kicked', target: '#lurker', nick: 'bob', text: 'read the topic' }),
+      ),
+    ).toEqual({
+      title: 'bob kicked you from #lurker (Libera)',
+      // The reason, which is the only thing the title doesn't already say.
+      body: 'read the topic',
+      tag: '7::#lurker::kick',
+    });
+  });
+
+  it('titles a server-issued kick without inventing a kicker', () => {
+    // "someone kicked you" would read as a person; a kick with no prefix nick
+    // is the server, so the sentence loses its subject instead.
+    expect(
+      composeNotification(payload({ kind: 'kicked', target: '#lurker', nick: null })).title,
+    ).toBe('You were kicked from #lurker (Libera)');
+    expect(
+      composeNotification(
+        payload({ kind: 'kicked', target: '#lurker', nick: null, networkName: '' }),
+      ).title,
+    ).toBe('You were kicked from #lurker');
+  });
+
+  it('a kick never shares a collapse tag with the channel it happened in', () => {
+    // The one that would bite: without its own namespace, the next line in a
+    // channel you were just removed from REPLACES the notification saying so.
+    const kick = composeNotification(payload({ kind: 'kicked', target: '#lurker', nick: 'bob' }));
+    const line = composeNotification(payload({ kind: 'highlight', target: '#lurker' }));
+    expect(kick.tag).not.toBe(line.tag);
+  });
+
   it('strips mIRC formatting codes from the body (#606)', () => {
     // A native alert renders body as plain text, so \x03 colors and \x02 bold
     // would otherwise land as literal control chars on the lock screen.
@@ -166,6 +200,13 @@ describe('parity with the service worker fallback', () => {
       'friend_online with no display name',
       payload({ kind: 'friend_online', target: 'nostimo', displayName: null }),
     ],
+    ['kicked', payload({ kind: 'kicked', target: '#lurker', nick: 'bob' })],
+    ['kicked with no kicker', payload({ kind: 'kicked', target: '#lurker', nick: null })],
+    [
+      'kicked with no network',
+      payload({ kind: 'kicked', target: '#lurker', nick: 'bob', networkName: '' }),
+    ],
+    ['kicked with no target', payload({ kind: 'kicked', target: '', nick: 'bob' })],
     [
       'friend_online with no network',
       payload({

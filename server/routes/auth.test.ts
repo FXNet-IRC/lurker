@@ -263,6 +263,18 @@ describe('GET /api/auth/passkeys', () => {
   });
 });
 
+describe('POST /api/auth/passkeys/options', () => {
+  it('offers Ed25519, ES256 and RS256, never experimental ML-DSA', async () => {
+    const { findUserByUsername } = await import('../db/users.js');
+    const agent = await createAuthedAgent(app, findUserByUsername('firstadmin')!.id);
+    const res = await agent.post('/api/auth/passkeys/options');
+    expect(res.status).toBe(200);
+    expect(res.body.options.pubKeyCredParams.map((p: { alg: number }) => p.alg)).toEqual([
+      -8, -7, -257,
+    ]);
+  });
+});
+
 describe('GET /api/auth/invite/:token', () => {
   it('valid:false for an unknown token', async () => {
     const res = await testRequest(app).get('/api/auth/invite/no-such-token');

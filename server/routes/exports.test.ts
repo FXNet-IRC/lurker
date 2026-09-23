@@ -221,10 +221,19 @@ describe('POST /api/imports', () => {
     const carol = createUser('exports-carol');
     const carolAgent = await createAuthedAgent(app, carol.id);
     const buf = await exportToBuffer(alice.id, true);
+    const ircManager = (await import('../services/ircManager.js')).default;
+    const announced: unknown[] = [];
+    const onChanged = (change: unknown) => announced.push(change);
+    ircManager.on('network-changed', onChanged);
 
-    const res = await carolAgent
-      .post('/api/imports')
-      .attach('archive', buf, { filename: 'alice.lurk' });
+    let res;
+    try {
+      res = await carolAgent
+        .post('/api/imports')
+        .attach('archive', buf, { filename: 'alice.lurk' });
+    } finally {
+      ircManager.off('network-changed', onChanged);
+    }
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
 
@@ -235,5 +244,7 @@ describe('POST /api/imports', () => {
     expect(carolNets[0].name).toBe('libera');
     const carolMsgs = listMessages(carolNets[0].id, '#general', { limit: 100 });
     expect(carolMsgs.length).toBe(3);
+    // A bouncer client already attached to the empty account hears of them.
+    expect(announced).toEqual([{ userId: carol.id, networkId: carolNets[0].id }]);
   });
 });
